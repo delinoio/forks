@@ -1,0 +1,14 @@
+# Dependency lockfiles
+pnpm-lock.yaml
+
+# Generated protobuf and Connect RPC Go bindings
+*.pb.go
+*.connect.go
+
+# Generated sqlc Go bindings
+**/db/query/*.sql.go
+**/db/query/db.go
+**/db/query/models.go
+
+# Generated Tauri platform projects
+apps/*/src-tauri/gen/
