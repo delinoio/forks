@@ -1,4 +1,0 @@
-interface:
-  display_name: "Rsbuild Best Practices"
-  short_description: "Apply reliable Rsbuild project practices"
-  default_prompt: "Use $rsbuild-best-practices to review and improve this Rsbuild configuration."
