@@ -19,6 +19,7 @@ import type {
   RootSchemaSchema,
   StartupInputSchema,
   StructuredInputSchema,
+  TagRulesSchema,
   TaskInputSchema,
   TurboConfigurationSchema,
   UiSchema,
@@ -56,6 +57,7 @@ export type StartupInput = EffectSchema.Schema.Type<typeof StartupInputSchema>;
 export type StructuredInput = EffectSchema.Schema.Type<
   typeof StructuredInputSchema
 >;
+export type TagRules = EffectSchema.Schema.Type<typeof TagRulesSchema>;
 export type TaskInput = EffectSchema.Schema.Type<typeof TaskInputSchema>;
 export type UI = EffectSchema.Schema.Type<typeof UiSchema>;
 export type WorkspaceSchema = EffectSchema.Schema.Type<

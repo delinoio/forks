@@ -234,13 +234,44 @@ rows:
       - tasks
       - ui
       - boundaries.dependencies
+      - boundaries.dependencies.allow
+      - boundaries.dependencies.deny
       - boundaries.dependents
+      - boundaries.dependents.allow
+      - boundaries.dependents.deny
       - boundaries.implicitDependencies
       - boundaries.tags
+      - boundaries.tags.*.dependencies
+      - boundaries.tags.*.dependencies.allow
+      - boundaries.tags.*.dependencies.deny
+      - boundaries.tags.*.dependents
+      - boundaries.tags.*.dependents.allow
+      - boundaries.tags.*.dependents.deny
+      - futureFlags.affectedUsingTaskInputs
+      - futureFlags.errorsOnlyShowHash
+      - futureFlags.experimentalCargoWorkspaces
+      - futureFlags.experimentalObservability
+      - futureFlags.experimentalPythonWorkspaces
+      - futureFlags.filterUsingTasks
+      - futureFlags.githubActionsRemoteBaseRefFallback
+      - futureFlags.globalConfiguration
+      - futureFlags.longerSignatureKey
+      - futureFlags.pruneIncludesGlobalFiles
+      - futureFlags.strictTaskEntrypointSelection
+      - futureFlags.watchUsingTaskInputs
       - global.inputs
       - global.env
       - global.passThroughEnv
       - global.remoteCache
+      - global.remoteCache.apiUrl
+      - global.remoteCache.enabled
+      - global.remoteCache.loginUrl
+      - global.remoteCache.preflight
+      - global.remoteCache.signature
+      - global.remoteCache.teamId
+      - global.remoteCache.teamSlug
+      - global.remoteCache.timeout
+      - global.remoteCache.uploadTimeout
       - global.ui
       - global.concurrency
       - global.dangerouslyDisablePackageManagerCheck
@@ -255,6 +286,10 @@ rows:
       - tasks.*.description
       - tasks.*.env
       - tasks.*.inputs
+      - tasks.*.inputs.*.from
+      - tasks.*.inputs.*.globs
+      - tasks.*.inputs.*.mode
+      - tasks.*.inputs.*.withDefaults
       - tasks.*.interactive
       - tasks.*.interruptible
       - tasks.*.outputLogs
@@ -443,6 +478,7 @@ rows:
       - runtime-dependency-audit
     tests:
       - configuration.generated
+      - fixtures.synthetic
       - oracle.external
       - mock-hosted.scoped
       - normalizers.deterministic

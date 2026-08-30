@@ -1,10 +1,16 @@
 import type {
   RootSchema,
+  TagRules,
   Schema as TurboConfiguration,
   WorkspaceSchema,
 } from "../src/index.js";
 
 export const validEmptyRootType: RootSchema = {};
+
+export const validTagRulesType: TagRules = {
+  dependencies: { allow: ["shared"], deny: null },
+  dependents: { allow: null, deny: ["private"] },
+};
 
 export const validNullTasksRootType: RootSchema = { tasks: null };
 

@@ -15,6 +15,8 @@ turbo-ts 0.1.0 (compatible with turbo 2.10.12)
 The only supported package exports are generated named configuration types and
 the distributed `schema.json`. Internal CLI, graph, scheduler, cache, process,
 and protocol modules are not stable APIs.
+The named configuration surface includes `TagRules`, synchronized with the
+authoritative `TagRulesSchema` and distributed `TagRules` definition.
 
 ## Clean-Room Compatibility
 

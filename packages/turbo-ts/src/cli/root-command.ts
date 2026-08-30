@@ -11,7 +11,7 @@ export const rootCommand = Command.make("turbo-ts", {}, () =>
       surface: "root invocation",
       targetGate: 2,
     });
-    const colorEnabled = yield* terminal.colorEnabled;
+    const colorEnabled = yield* terminal.stderrColorEnabled;
     yield* terminal.writeStderr(
       renderUnsupportedCompatibilityError(error, colorEnabled),
     );

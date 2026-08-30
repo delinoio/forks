@@ -3,3 +3,10 @@ provenance: independently-authored
 sources:
   - public Turborepo configuration documentation
 purpose: package discovery, dependency graph, and deterministic task output
+files:
+  - package.json
+  - pnpm-workspace.yaml
+  - turbo.json
+  - packages/app/package.json
+  - packages/app/turbo.json
+  - packages/library/package.json

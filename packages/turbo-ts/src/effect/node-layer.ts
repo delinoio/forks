@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Writable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 import { Cause, Effect, Exit, Layer, Option, Ref } from "effect";
 import { BoundaryError, ProcessExecutionError } from "./errors.js";
 import {
@@ -24,6 +24,7 @@ import {
   RandomnessService,
   SignalService,
   TelemetryService,
+  type TerminalOperations,
   TerminalService,
 } from "./services.js";
 
@@ -207,6 +208,69 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
   ),
 });
 
+interface ChildProcessIo {
+  readonly stdin: Writable;
+  readonly stdout: Readable;
+  readonly stderr: Readable;
+  readonly onceClose: (listener: (exitCode: number | null) => void) => void;
+  readonly onceError: (listener: (cause: Error) => void) => void;
+}
+
+export const collectChildProcessOutput = (
+  child: ChildProcessIo,
+  command: string,
+  stdin: string | undefined,
+): Effect.Effect<
+  {
+    readonly exitCode: number;
+    readonly stdout: string;
+    readonly stderr: string;
+  },
+  ProcessExecutionError
+> =>
+  Effect.async((resume) => {
+    let settled = false;
+    let stdout = "";
+    let stderr = "";
+    const fail = (cause: unknown) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resume(Effect.fail(processExecutionError(command, cause)));
+    };
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.onceError(fail);
+    child.stdin.on("error", fail);
+    child.stdout.once("error", fail);
+    child.stderr.once("error", fail);
+    child.onceClose((exitCode) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resume(
+        Effect.succeed({
+          exitCode: exitCode ?? 1,
+          stdout,
+          stderr,
+        }),
+      );
+    });
+    if (stdin === undefined) {
+      child.stdin.end();
+    } else {
+      child.stdin.end(stdin);
+    }
+  });
+
 const processLayer = Layer.succeed(ProcessService, {
   run: (request) =>
     Effect.acquireUseRelease(
@@ -237,46 +301,21 @@ const processLayer = Layer.succeed(ProcessService, {
         catch: (cause) => processExecutionError(request.command, cause),
       }),
       ({ child }) =>
-        Effect.async((resume) => {
-          let settled = false;
-          let stdout = "";
-          let stderr = "";
-          const fail = (cause: unknown) => {
-            if (settled) {
-              return;
-            }
-            settled = true;
-            resume(Effect.fail(processExecutionError(request.command, cause)));
-          };
-          child.stdout.setEncoding("utf8");
-          child.stderr.setEncoding("utf8");
-          child.stdout.on("data", (chunk: string) => {
-            stdout += chunk;
-          });
-          child.stderr.on("data", (chunk: string) => {
-            stderr += chunk;
-          });
-          child.once("error", fail);
-          child.stdin.on("error", fail);
-          child.once("close", (exitCode) => {
-            if (settled) {
-              return;
-            }
-            settled = true;
-            resume(
-              Effect.succeed({
-                exitCode: exitCode ?? 1,
-                stdout,
-                stderr,
-              }),
-            );
-          });
-          if (request.stdin === undefined) {
-            child.stdin.end();
-          } else {
-            child.stdin.end(request.stdin);
-          }
-        }),
+        collectChildProcessOutput(
+          {
+            stdin: child.stdin,
+            stdout: child.stdout,
+            stderr: child.stderr,
+            onceClose: (listener) => {
+              child.once("close", listener);
+            },
+            onceError: (listener) => {
+              child.once("error", listener);
+            },
+          },
+          request.command,
+          request.stdin,
+        ),
       terminateChild,
     ),
 });
@@ -314,6 +353,7 @@ export const makeTerminalWriter =
       try {
         stream.write(text, (cause) => {
           if (settled || (cause !== undefined && cause !== null)) {
+            fail(cause);
             return;
           }
           settled = true;
@@ -324,15 +364,39 @@ export const makeTerminalWriter =
         stream.off("error", onError);
         fail(cause);
       }
-    }).pipe(Effect.uninterruptible);
+      return Effect.sync(() => {
+        settled = true;
+        stream.off("error", onError);
+      });
+    });
 
-const terminalLayer = Layer.succeed(TerminalService, {
-  writeStdout: makeTerminalWriter(process.stdout),
-  writeStderr: makeTerminalWriter(process.stderr),
-  colorEnabled: Effect.sync(
-    () => process.env.NO_COLOR === undefined && process.stdout.isTTY === true,
+interface TerminalStream extends Writable {
+  readonly isTTY?: boolean;
+}
+
+export const makeTerminalOperations = (
+  stdout: TerminalStream,
+  stderr: TerminalStream,
+  noColor: () => string | undefined,
+): TerminalOperations => ({
+  writeStdout: makeTerminalWriter(stdout),
+  writeStderr: makeTerminalWriter(stderr),
+  stdoutColorEnabled: Effect.sync(
+    () => noColor() === undefined && stdout.isTTY === true,
+  ),
+  stderrColorEnabled: Effect.sync(
+    () => noColor() === undefined && stderr.isTTY === true,
   ),
 });
+
+const terminalLayer = Layer.succeed(
+  TerminalService,
+  makeTerminalOperations(
+    process.stdout,
+    process.stderr,
+    () => process.env.NO_COLOR,
+  ),
+);
 
 const clockLayer = Layer.succeed(ClockService, {
   now: Effect.sync(() => Date.now()),

@@ -11,6 +11,7 @@ export const evidenceId = {
   configurationGenerated: "configuration.generated",
   dependenciesRuntime: "dependencies.runtime",
   effectsScoped: "effects.scoped",
+  fixturesSynthetic: "fixtures.synthetic",
   mockHostedScoped: "mock-hosted.scoped",
   nondeterminismEvidence: "nondeterminism.evidence",
   normalizersAllowlist: "normalizers.allowlist",
@@ -49,6 +50,11 @@ export const evidenceRegistry = {
     kind: "rstest",
     file: "test/effect-foundation.test.ts",
     binding: "effectsScoped",
+  },
+  [evidenceId.fixturesSynthetic]: {
+    kind: "rstest",
+    file: "test/configuration-and-ledger.test.ts",
+    binding: "fixturesSynthetic",
   },
   [evidenceId.mockHostedScoped]: {
     kind: "rstest",

@@ -1,13 +1,15 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Writable } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, it } from "@rstest/core";
 import { Effect, Fiber, Schedule, Schema } from "effect";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import {
+  collectChildProcessOutput,
+  makeTerminalOperations,
   makeTerminalWriter,
   makeWithTemporaryDirectory,
   nodeFoundationLayer,
@@ -106,13 +108,56 @@ describe("Effect foundation", () => {
     }
   });
 
+  it("preserves interruption for stalled terminal writes", async () => {
+    const stream = new Writable({
+      write: () => {
+        // Deliberately retain backpressure by never completing the write.
+      },
+    });
+    const fiber = Effect.runFork(makeTerminalWriter(stream)("payload"));
+    await Effect.runPromise(Effect.yieldNow());
+    expect(stream.listenerCount("error")).toBe(1);
+    await Effect.runPromise(Fiber.interrupt(fiber));
+    expect(stream.listenerCount("error")).toBe(0);
+  });
+
+  it("determines color support from each destination stream", async () => {
+    const makeStream = (isTTY: boolean) =>
+      Object.assign(
+        new Writable({
+          write: (_chunk, _encoding, callback) => {
+            callback();
+          },
+        }),
+        { isTTY },
+      );
+    const stdout = makeStream(true);
+    const stderr = makeStream(false);
+    const terminal = makeTerminalOperations(stdout, stderr, () => undefined);
+    expect(
+      await Effect.runPromise(
+        Effect.all([terminal.stdoutColorEnabled, terminal.stderrColorEnabled]),
+      ),
+    ).toEqual([true, false]);
+
+    const noColorTerminal = makeTerminalOperations(stdout, stderr, () => "1");
+    expect(
+      await Effect.runPromise(
+        Effect.all([
+          noColorTerminal.stdoutColorEnabled,
+          noColorTerminal.stderrColorEnabled,
+        ]),
+      ),
+    ).toEqual([false, false]);
+  });
+
   it("disables terminal color when NO_COLOR is set", async () => {
     const previousValue = process.env.NO_COLOR;
     process.env.NO_COLOR = "1";
     try {
       const colorEnabled = await Effect.runPromise(
         TerminalService.pipe(
-          Effect.flatMap((terminal) => terminal.colorEnabled),
+          Effect.flatMap((terminal) => terminal.stderrColorEnabled),
           Effect.provide(nodeFoundationLayer),
         ),
       );
@@ -260,6 +305,43 @@ describe("Effect foundation", () => {
       expect(outcome.left).toBeInstanceOf(ProcessExecutionError);
     } else {
       expect(typeof outcome.right.exitCode).toBe("number");
+    }
+  });
+
+  it("reports child stdout and stderr stream errors as typed errors", async () => {
+    for (const outputName of ["stdout", "stderr"] as const) {
+      const stdin = new PassThrough();
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const command = `synthetic-${outputName}-failure`;
+      const fiber = Effect.runFork(
+        Effect.either(
+          collectChildProcessOutput(
+            {
+              stdin,
+              stdout,
+              stderr,
+              onceClose: () => {
+                // The stream error settles the synthetic process first.
+              },
+              onceError: () => {
+                // The selected output stream supplies the failure.
+              },
+            },
+            command,
+            undefined,
+          ),
+        ),
+      );
+      await Effect.runPromise(Effect.yieldNow());
+      const output = outputName === "stdout" ? stdout : stderr;
+      output.emit("error", new Error(`${outputName} failed`));
+      const outcome = await Effect.runPromise(Fiber.join(fiber));
+      expect(outcome._tag).toBe("Left");
+      if (outcome._tag === "Left") {
+        expect(outcome.left).toBeInstanceOf(ProcessExecutionError);
+        expect(outcome.left.command).toBe(command);
+      }
     }
   });
 

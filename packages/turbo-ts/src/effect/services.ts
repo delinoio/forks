@@ -56,7 +56,8 @@ export class EnvironmentService extends Context.Tag(
 export interface TerminalOperations {
   readonly writeStdout: (text: string) => Effect.Effect<void, BoundaryError>;
   readonly writeStderr: (text: string) => Effect.Effect<void, BoundaryError>;
-  readonly colorEnabled: Effect.Effect<boolean>;
+  readonly stdoutColorEnabled: Effect.Effect<boolean>;
+  readonly stderrColorEnabled: Effect.Effect<boolean>;
 }
 
 export class TerminalService extends Context.Tag("turbo-ts/TerminalService")<

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "@rstest/core";
 import { Schema } from "effect";
@@ -22,6 +23,103 @@ import {
 } from "../src/config/schema.js";
 
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
+
+interface JsonSchemaNode {
+  readonly $ref?: string;
+  readonly additionalProperties?: boolean | JsonSchemaNode;
+  readonly allOf?: ReadonlyArray<JsonSchemaNode>;
+  readonly anyOf?: ReadonlyArray<JsonSchemaNode>;
+  readonly items?: JsonSchemaNode | ReadonlyArray<JsonSchemaNode>;
+  readonly oneOf?: ReadonlyArray<JsonSchemaNode>;
+  readonly properties?: Readonly<Record<string, JsonSchemaNode>>;
+}
+
+interface DistributedJsonSchema extends JsonSchemaNode {
+  readonly definitions: Readonly<Record<string, JsonSchemaNode>>;
+}
+
+const definitionReferencePrefix = "#/definitions/";
+
+const decodeJsonPointerSegment = (value: string): string =>
+  value.replaceAll("~1", "/").replaceAll("~0", "~");
+
+const collectConfigurationPropertyPaths = (
+  document: DistributedJsonSchema,
+): ReadonlyArray<string> => {
+  const paths = new Set<string>();
+
+  const visit = (
+    schema: JsonSchemaNode,
+    prefix: string,
+    activeReferences: ReadonlySet<string>,
+  ): void => {
+    if (schema.$ref !== undefined && !activeReferences.has(schema.$ref)) {
+      if (!schema.$ref.startsWith(definitionReferencePrefix)) {
+        throw new Error(`unsupported schema reference: ${schema.$ref}`);
+      }
+      const definitionName = decodeJsonPointerSegment(
+        schema.$ref.slice(definitionReferencePrefix.length),
+      );
+      const definition = document.definitions[definitionName];
+      if (definition === undefined) {
+        throw new Error(`missing schema definition: ${definitionName}`);
+      }
+      visit(definition, prefix, new Set([...activeReferences, schema.$ref]));
+    }
+
+    for (const keyword of ["allOf", "anyOf", "oneOf"] as const) {
+      for (const branch of schema[keyword] ?? []) {
+        visit(branch, prefix, activeReferences);
+      }
+    }
+
+    for (const [name, property] of Object.entries(schema.properties ?? {})) {
+      const propertyPath = prefix === "" ? name : `${prefix}.${name}`;
+      paths.add(propertyPath);
+      visit(property, propertyPath, activeReferences);
+    }
+
+    const wildcardPath = prefix === "" ? "*" : `${prefix}.*`;
+    if (
+      typeof schema.additionalProperties === "object" &&
+      schema.additionalProperties !== null
+    ) {
+      visit(schema.additionalProperties, wildcardPath, activeReferences);
+    }
+    const items = Array.isArray(schema.items)
+      ? schema.items
+      : schema.items === undefined
+        ? []
+        : [schema.items];
+    for (const item of items) {
+      visit(item, wildcardPath, activeReferences);
+    }
+  };
+
+  visit(document, "", new Set());
+  return [...paths].sort();
+};
+
+const listFixtureFiles = async (
+  root: string,
+  relativeDirectory = "",
+): Promise<ReadonlyArray<string>> => {
+  const entries = await readdir(join(root, relativeDirectory), {
+    withFileTypes: true,
+  });
+  const paths = await Promise.all(
+    entries.map(async (entry) => {
+      const relativePath =
+        relativeDirectory === ""
+          ? entry.name
+          : `${relativeDirectory}/${entry.name}`;
+      return entry.isDirectory()
+        ? listFixtureFiles(root, relativePath)
+        : [relativePath];
+    }),
+  );
+  return paths.flat().sort();
+};
 
 describe("configuration generation and compatibility ledger", () => {
   it("matches the distributed Turbo 2.10.12 schema", async () => {
@@ -96,26 +194,30 @@ describe("configuration generation and compatibility ledger", () => {
     ).toEqual({ tags: ["app"] });
   });
 
-  it("inventories every distributed global configuration field", async () => {
+  it("inventories every recursive distributed configuration field", async () => {
     const distributedSchema = JSON.parse(
       await readFile(`${packageRoot}/schema.json`, "utf8"),
+    ) as DistributedJsonSchema;
+    const expected = collectConfigurationPropertyPaths(distributedSchema);
+    const ledgerDocument = parseYaml(
+      await readFile(`${packageRoot}/compatibility/ledger.yaml`, "utf8"),
     ) as {
-      definitions: {
-        GlobalConfig: { properties: Record<string, unknown> };
-      };
+      rows: Array<{ id: string; variants?: Array<string> }>;
     };
-    const expected = Object.keys(
-      distributedSchema.definitions.GlobalConfig.properties,
-    )
-      .map((field) => `global.${field}`)
-      .sort();
-    const actual = requiredLedgerVariants.configuration
-      .filter(
-        (variant) =>
-          variant.startsWith("global.") &&
-          !variant.slice("global.".length).includes("."),
-      )
-      .sort();
+    const actual = [
+      ...(ledgerDocument.rows.find(
+        (row) => row.id === "configuration.distributed",
+      )?.variants ?? []),
+    ].sort();
+
+    expect(expected).toEqual(
+      expect.arrayContaining([
+        "boundaries.dependencies.allow",
+        "boundaries.tags.*.dependents.deny",
+        "global.remoteCache.uploadTimeout",
+        "tasks.*.inputs.*.mode",
+      ]),
+    );
     expect(actual).toEqual(expected);
   });
 
@@ -143,6 +245,79 @@ describe("configuration generation and compatibility ledger", () => {
     ) as { files: Array<string>; provenance: string };
     expect(provenance.provenance).toBe("independently-authored");
     expect(provenance.files).toEqual(["invalid-root.json", "valid-root.json"]);
+  });
+
+  it(evidenceId.fixturesSynthetic, async () => {
+    const fixtureRoot = `${packageRoot}/test/fixtures/basic-workspace`;
+    const metadata = parseYaml(
+      await readFile(`${fixtureRoot}/fixture.yaml`, "utf8"),
+    ) as {
+      files: Array<string>;
+      provenance: string;
+      purpose: string;
+    };
+    const actualPayloadFiles = (await listFixtureFiles(fixtureRoot)).filter(
+      (path) => path !== "fixture.yaml",
+    );
+    expect(metadata.provenance).toBe("independently-authored");
+    expect(metadata.purpose).toBe(
+      "package discovery, dependency graph, and deterministic task output",
+    );
+    expect([...metadata.files].sort()).toEqual(actualPayloadFiles);
+
+    const readJson = async (path: string): Promise<unknown> =>
+      JSON.parse(await readFile(`${fixtureRoot}/${path}`, "utf8")) as unknown;
+    const rootConfiguration = await readJson("turbo.json");
+    const workspaceConfiguration = await readJson("packages/app/turbo.json");
+    expect(
+      Schema.decodeUnknownSync(RootSchemaSchema)(rootConfiguration),
+    ).toEqual(rootConfiguration);
+    expect(
+      Schema.decodeUnknownSync(WorkspaceSchemaSchema)(workspaceConfiguration),
+    ).toEqual(workspaceConfiguration);
+
+    const workspace = parseYaml(
+      await readFile(`${fixtureRoot}/pnpm-workspace.yaml`, "utf8"),
+    ) as { packages: Array<string> };
+    expect(workspace.packages).toEqual(["packages/*"]);
+    expect(
+      (await readdir(`${fixtureRoot}/packages`, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+        .sort(),
+    ).toEqual(["app", "library"]);
+
+    interface FixtureManifest {
+      readonly dependencies?: Readonly<Record<string, string>>;
+      readonly name: string;
+      readonly packageManager?: string;
+      readonly private: boolean;
+      readonly scripts: Readonly<Record<string, string>>;
+    }
+    const rootManifest = (await readJson("package.json")) as FixtureManifest;
+    const appManifest = (await readJson(
+      "packages/app/package.json",
+    )) as FixtureManifest;
+    const libraryManifest = (await readJson(
+      "packages/library/package.json",
+    )) as FixtureManifest;
+    expect(rootManifest.packageManager).toBe("pnpm@10.34.5");
+    expect([rootManifest.name, appManifest.name, libraryManifest.name]).toEqual(
+      ["synthetic-basic-workspace", "synthetic-app", "synthetic-library"],
+    );
+    expect(appManifest.dependencies?.[libraryManifest.name]).toBe(
+      "workspace:*",
+    );
+    expect([
+      rootManifest.scripts.build,
+      appManifest.scripts.build,
+      libraryManifest.scripts.build,
+    ]).toEqual([
+      "node -e \"console.log('root build')\"",
+      "node -e \"console.log('app build')\"",
+      "node -e \"console.log('library build')\"",
+    ]);
+    expect(appManifest.scripts.fail).toBe('node -e "process.exitCode = 7"');
   });
 
   it("matches distributed nullable fields and structured task inputs", () => {

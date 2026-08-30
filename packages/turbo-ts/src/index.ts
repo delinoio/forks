@@ -18,6 +18,7 @@ export type {
   Schema,
   StartupInput,
   StructuredInput,
+  TagRules,
   TaskInput,
   UI,
   WorkspaceSchema,
