@@ -7,34 +7,14 @@ import {
 
 describe("deterministic normalizers", () => {
   it(evidenceId.normalizersAllowlist, () => {
-    expect(normalizerIds).toEqual([
-      "branding",
-      "version",
-      "executable-path",
-      "temporary-path",
-      "path-separator",
-    ]);
+    expect(normalizerIds).toEqual(["branding", "version"]);
   });
 
   it(evidenceId.normalizersDeterministic, () => {
     const input = "turbo-ts 0.1.0 /opt/tool /tmp/case nested\\path";
-    const enabled = [
-      "branding",
-      "version",
-      "executable-path",
-      "temporary-path",
-      "path-separator",
-    ] as const;
-    const once = normalizeOutput(input, enabled, {
-      executablePaths: ["/opt/tool"],
-      temporaryPaths: ["/tmp/case"],
-    });
-    expect(
-      normalizeOutput(once, enabled, {
-        executablePaths: ["/opt/tool"],
-        temporaryPaths: ["/tmp/case"],
-      }),
-    ).toBe(once);
-    expect(once).toBe("<PRODUCT> <VERSION> <EXECUTABLE> <TEMP> nested/path");
+    const enabled = ["branding", "version"] as const;
+    const once = normalizeOutput(input, enabled);
+    expect(normalizeOutput(once, enabled)).toBe(once);
+    expect(once).toBe("<PRODUCT> <VERSION> /opt/tool /tmp/case nested\\path");
   });
 });

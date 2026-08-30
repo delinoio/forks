@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Effect, Layer } from "effect";
+import { Cause, Effect, Exit, Layer, Option, Ref } from "effect";
 import { BoundaryError, ProcessExecutionError } from "./errors.js";
 import {
   CacheService,
@@ -13,6 +13,7 @@ import {
   DaemonService,
   deterministicRetryLayer,
   EnvironmentService,
+  type FileSystemOperations,
   FileSystemService,
   GitService,
   HttpService,
@@ -37,6 +38,64 @@ const boundaryFailure = (boundary: string) => ({
 });
 
 const gracefulTerminationTimeoutMilliseconds = 1_000;
+
+const filesystemError = (cause: unknown): BoundaryError =>
+  new BoundaryError({
+    boundary: "filesystem",
+    message: String(cause),
+    retryable: false,
+  });
+
+const effectFromExit = <A, E>(exit: Exit.Exit<A, E>): Effect.Effect<A, E> =>
+  Exit.isSuccess(exit)
+    ? Effect.succeed(exit.value)
+    : Effect.failCause(exit.cause);
+
+export const makeWithTemporaryDirectory =
+  (
+    makeDirectory: () => Promise<string>,
+    removeDirectory: (path: string) => Promise<void>,
+  ): FileSystemOperations["withTemporaryDirectory"] =>
+  (use) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const cleanupResult = yield* Ref.make<
+          Option.Option<Exit.Exit<void, BoundaryError>>
+        >(Option.none());
+        const useResult = yield* Effect.scoped(
+          Effect.acquireRelease(
+            Effect.tryPromise({
+              try: makeDirectory,
+              catch: filesystemError,
+            }),
+            (path) =>
+              Effect.exit(
+                Effect.tryPromise({
+                  try: () => removeDirectory(path),
+                  catch: filesystemError,
+                }),
+              ).pipe(
+                Effect.flatMap((exit) =>
+                  Ref.set(cleanupResult, Option.some(exit)),
+                ),
+              ),
+          ).pipe(
+            Effect.flatMap((path) => restore(use(path))),
+            Effect.exit,
+          ),
+        );
+        const cleanup = yield* Ref.get(cleanupResult);
+        if (Option.isSome(cleanup) && Exit.isFailure(cleanup.value)) {
+          if (Exit.isFailure(useResult)) {
+            return yield* Effect.failCause(
+              Cause.sequential(useResult.cause, cleanup.value.cause),
+            );
+          }
+          return yield* Effect.failCause(cleanup.value.cause);
+        }
+        return yield* effectFromExit(useResult);
+      }),
+    );
 
 interface ScopedChildProcess {
   readonly child: ChildProcessWithoutNullStreams;
@@ -122,34 +181,19 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
   readText: (path) =>
     Effect.tryPromise({
       try: () => readFile(path, "utf8"),
-      catch: (cause) =>
-        new BoundaryError({
-          boundary: "filesystem",
-          message: String(cause),
-          retryable: false,
-        }),
+      catch: filesystemError,
     }),
   writeText: (path, contents) =>
     Effect.tryPromise({
       try: () => writeFile(path, contents, "utf8"),
-      catch: (cause) =>
-        new BoundaryError({
-          boundary: "filesystem",
-          message: String(cause),
-          retryable: false,
-        }),
+      catch: filesystemError,
     }),
-  temporaryDirectory: Effect.acquireRelease(
-    Effect.tryPromise({
-      try: () => mkdtemp(join(tmpdir(), "turbo-ts-")),
-      catch: (cause) =>
-        new BoundaryError({
-          boundary: "filesystem",
-          message: String(cause),
-          retryable: false,
-        }),
-    }),
-    (path) => Effect.promise(() => rm(path, { force: true, recursive: true })),
+  // Effect finalizers cannot fail in the typed error channel. Own the scope and
+  // capture cleanup exits so callers still receive BoundaryError. This wrapper
+  // can be removed if typed finalizer failures become representable directly.
+  withTemporaryDirectory: makeWithTemporaryDirectory(
+    () => mkdtemp(join(tmpdir(), "turbo-ts-")),
+    (path) => rm(path, { force: true, recursive: true }),
   ),
 });
 

@@ -28,7 +28,9 @@ The compatibility ledger is the exhaustive inventory of commands, options,
 environment variables, configuration, protocols, package managers, success
 paths, and failures. A row can be marked passing only with automated evidence.
 Normalizers are limited to approved compatibility differences or repeated-run
-evidence of reference nondeterminism.
+evidence of reference nondeterminism. Gate 1 approves only branding and version
+normalization; path normalization remains disabled until supported by repeated
+black-box evidence.
 
 ## Runtime and Architecture
 
@@ -47,7 +49,9 @@ JavaScript and exact-pinned.
 Effect Schema is authoritative for runtime configuration validation and for
 the generated named types and `schema.json`. Runtime-only hidden configuration
 remains internal. Generated artifacts must pass byte-for-byte synchronization
-checks.
+checks. The runtime `Schema` type preserves the complete nondiscriminated
+distributed configuration shape, while `RootSchema` and `WorkspaceSchema`
+remain narrower named projections.
 
 ## Gate 1 and Later Work
 

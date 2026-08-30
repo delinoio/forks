@@ -495,9 +495,6 @@ rows:
     variants:
       - branding
       - version
-      - executable-path
-      - temporary-path
-      - path-separator
     tests: [normalizers.allowlist, nondeterminism.evidence]
     source: issue-3
   - id: differences.approved

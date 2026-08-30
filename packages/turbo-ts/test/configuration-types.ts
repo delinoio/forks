@@ -1,4 +1,8 @@
-import type { RootSchema, WorkspaceSchema } from "../src/index.js";
+import type {
+  RootSchema,
+  Schema as TurboConfiguration,
+  WorkspaceSchema,
+} from "../src/index.js";
 
 export const validEmptyRootType: RootSchema = {};
 
@@ -21,6 +25,12 @@ export const validRootType: RootSchema = {
 
 export const validWorkspaceType: WorkspaceSchema = {
   extends: ["//"],
+};
+
+export const validMixedConfigurationType: TurboConfiguration = {
+  extends: ["//"],
+  globalDependencies: ["package.json"],
+  tags: ["app"],
 };
 
 export const validNullTasksWorkspaceType: WorkspaceSchema = {

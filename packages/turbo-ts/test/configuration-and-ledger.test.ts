@@ -79,6 +79,45 @@ describe("configuration generation and compatibility ledger", () => {
     ).toEqual({ extends: null, tags: null, boundaries: null });
   });
 
+  it("preserves every declared field in the nondiscriminated configuration shape", () => {
+    const mixedConfiguration = {
+      extends: ["//"],
+      globalDependencies: ["package.json"],
+    };
+    expect(
+      Schema.decodeUnknownSync(TurboConfigurationSchema)(mixedConfiguration),
+    ).toEqual(mixedConfiguration);
+    expect(
+      Schema.decodeUnknownSync(TurboConfigurationSchema)({ tags: ["app"] }),
+    ).toEqual({ tags: ["app"] });
+  });
+
+  it("rejects fractional remote-cache timeouts", () => {
+    for (const field of ["timeout", "uploadTimeout"] as const) {
+      expect(
+        Schema.decodeUnknownSync(TurboConfigurationSchema)({
+          remoteCache: { [field]: 1 },
+        }),
+      ).toEqual({ remoteCache: { [field]: 1 } });
+      expect(() =>
+        Schema.decodeUnknownSync(TurboConfigurationSchema)({
+          remoteCache: { [field]: 0.5 },
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("records configuration fixture provenance", async () => {
+    const provenance = parseYaml(
+      await readFile(
+        `${packageRoot}/test/fixtures/configuration/fixture.yaml`,
+        "utf8",
+      ),
+    ) as { files: Array<string>; provenance: string };
+    expect(provenance.provenance).toBe("independently-authored");
+    expect(provenance.files).toEqual(["invalid-root.json", "valid-root.json"]);
+  });
+
   it("matches distributed nullable fields and structured task inputs", () => {
     const configuration = {
       $schema: null,

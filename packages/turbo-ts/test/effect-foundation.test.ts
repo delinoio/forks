@@ -6,7 +6,10 @@ import { describe, expect, it } from "@rstest/core";
 import { Effect, Fiber, Schedule, Schema } from "effect";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
-import { nodeFoundationLayer } from "../src/effect/node-layer.js";
+import {
+  makeWithTemporaryDirectory,
+  nodeFoundationLayer,
+} from "../src/effect/node-layer.js";
 import { ProcessService, RandomnessService } from "../src/effect/services.js";
 
 const waitForTextFile = async (path: string): Promise<string> => {
@@ -59,6 +62,26 @@ describe("Effect foundation", () => {
     );
     expect(result).toBe("ok");
     expect(attempts).toBe(3);
+  });
+
+  it("reports temporary-directory cleanup failures as typed errors", async () => {
+    let removedPath: string | undefined;
+    const withTemporaryDirectory = makeWithTemporaryDirectory(
+      () => Promise.resolve("/virtual/turbo-ts-test"),
+      (path) => {
+        removedPath = path;
+        return Promise.reject(new Error("directory is locked"));
+      },
+    );
+    const outcome = await Effect.runPromise(
+      Effect.either(withTemporaryDirectory((path) => Effect.succeed(path))),
+    );
+    expect(removedPath).toBe("/virtual/turbo-ts-test");
+    expect(outcome._tag).toBe("Left");
+    if (outcome._tag === "Left") {
+      expect(outcome.left).toBeInstanceOf(BoundaryError);
+      expect(outcome.left.boundary).toBe("filesystem");
+    }
   });
 
   it("removes undefined environment overrides before spawning", async () => {

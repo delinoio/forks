@@ -4,6 +4,7 @@ import { parse } from "yaml";
 import { BoundaryError } from "../effect/errors.js";
 import { nodeFoundationLayer } from "../effect/node-layer.js";
 import { EnvironmentService, FileSystemService } from "../effect/services.js";
+import { isForbiddenProductionDependency } from "./runtime-dependency-policy.js";
 
 const expectedRuntimeDependencies = {
   "@effect/cli": "0.77.0",
@@ -99,10 +100,8 @@ const program = Effect.gen(function* () {
     }
   }
 
-  const forbidden = [...productionClosure].filter((key) =>
-    /(?:^|\/)(?:[^@/]+-)?(?:binding|wasm|native)(?:-|@)|msgpackr-extract|node-gyp|node-addon-api/i.test(
-      key,
-    ),
+  const forbidden = [...productionClosure].filter(
+    isForbiddenProductionDependency,
   );
   if (forbidden.length > 0) {
     return yield* Effect.fail(

@@ -22,11 +22,9 @@ export interface FileSystemOperations {
     path: string,
     contents: string,
   ) => Effect.Effect<void, BoundaryError>;
-  readonly temporaryDirectory: Effect.Effect<
-    string,
-    BoundaryError,
-    Scope.Scope
-  >;
+  readonly withTemporaryDirectory: <A, E, R>(
+    use: (path: string) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | BoundaryError, R>;
 }
 
 export class FileSystemService extends Context.Tag(

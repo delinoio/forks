@@ -112,8 +112,8 @@ export const RemoteCacheSchema = Schema.Struct({
   preflight: Schema.optional(Schema.NullOr(Schema.Boolean)),
   apiUrl: Schema.optional(Schema.NullOr(Schema.String)),
   loginUrl: Schema.optional(Schema.NullOr(Schema.String)),
-  timeout: Schema.optional(Schema.NullOr(Schema.NonNegative)),
-  uploadTimeout: Schema.optional(Schema.NullOr(Schema.NonNegative)),
+  timeout: Schema.optional(Schema.NullOr(Schema.NonNegativeInt)),
+  uploadTimeout: Schema.optional(Schema.NullOr(Schema.NonNegativeInt)),
   teamId: Schema.optional(Schema.NullOr(Schema.String)),
   teamSlug: Schema.optional(Schema.NullOr(Schema.String)),
 }).annotations({ identifier: "RemoteCache" });
@@ -207,9 +207,12 @@ export const WorkspaceSchemaSchema = Schema.extend(
   }),
 ).annotations({ identifier: "WorkspaceSchema" });
 
-export const TurboConfigurationSchema = Schema.Union(
-  WorkspaceSchemaSchema,
+export const TurboConfigurationSchema = Schema.extend(
   RootSchemaSchema,
+  Schema.Struct({
+    extends: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
+    tags: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
+  }),
 ).annotations({
   jsonSchema: parseDistributedSchema(distributedSchemaBase64),
 });
