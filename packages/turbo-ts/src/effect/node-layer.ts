@@ -410,6 +410,7 @@ export const collectChildProcessOutput = (
     readonly exitCode: number;
     readonly stdout: string;
     readonly stderr: string;
+    readonly combinedOutput: string;
   },
   ProcessExecutionError
 > =>
@@ -417,6 +418,7 @@ export const collectChildProcessOutput = (
     let settled = false;
     let stdout = "";
     let stderr = "";
+    let combinedOutput = "";
     const stopInheritedInput = () => {
       if (inheritStdin) {
         process.stdin.unpipe(child.stdin);
@@ -434,9 +436,11 @@ export const collectChildProcessOutput = (
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
+      combinedOutput += chunk;
     });
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
+      combinedOutput += chunk;
     });
     child.onceError(fail);
     child.stdin.on("error", fail);
@@ -453,6 +457,7 @@ export const collectChildProcessOutput = (
           exitCode: exitCode ?? 1,
           stdout,
           stderr,
+          combinedOutput,
         }),
       );
     });
@@ -473,6 +478,7 @@ const waitForInheritedChild = (
     readonly exitCode: number;
     readonly stdout: string;
     readonly stderr: string;
+    readonly combinedOutput: string;
   },
   ProcessExecutionError
 > =>
@@ -487,7 +493,12 @@ const waitForInheritedChild = (
       if (settled) return;
       settled = true;
       resume(
-        Effect.succeed({ exitCode: exitCode ?? 1, stdout: "", stderr: "" }),
+        Effect.succeed({
+          exitCode: exitCode ?? 1,
+          stdout: "",
+          stderr: "",
+          combinedOutput: "",
+        }),
       );
     });
   });

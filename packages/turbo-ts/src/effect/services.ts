@@ -16,6 +16,7 @@ export interface ExecutionResult {
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
+  readonly combinedOutput: string;
 }
 
 export interface FileSystemOperations {

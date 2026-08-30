@@ -69,6 +69,7 @@ describe("CLI and external oracle", () => {
       exitCode: 0,
       stdout: `${versionOutput}\n`,
       stderr: "",
+      combinedOutput: `${versionOutput}\n`,
     });
   });
 

@@ -161,6 +161,98 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
+  it("excludes deleted tracked files from task hash inputs", async () => {
+    const directory = await mkdtemp(join(packageRoot, "test-deleted-input-"));
+    await cp(fixtureRoot, directory, { recursive: true });
+    const trackedPath = `${directory}/packages/library/tracked.txt`;
+    try {
+      await writeFile(trackedPath, "tracked\n");
+      for (const args of [["init"], ["add", "."]]) {
+        const result = await run("git", args, directory);
+        expect(result.exitCode, `${args.join(" ")}: ${result.stderr}`).toBe(0);
+      }
+      const command = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      expect(
+        (await run(process.execPath, command, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      await rm(trackedPath);
+      const result = await run(process.execPath, command, repositoryRoot);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("cache miss");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("includes repository-root task inputs in task hashes", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["$TURBO_ROOT$/shared/config.json"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${directory}/shared`, { recursive: true });
+      const sharedConfiguration = `${directory}/shared/config.json`;
+      await writeFile(sharedConfiguration, '{"value":"first"}\n');
+      const command = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      expect(
+        (await run(process.execPath, command, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      await writeFile(sharedConfiguration, '{"value":"second"}\n');
+      expect(
+        (await run(process.execPath, command, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("rejects a missing explicit root configuration", async () => {
+    const directory = await makeFixture();
+    try {
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--root-turbo-json=missing-turbo.json",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("missing-turbo.json");
+      expect(result.stdout).not.toContain("library build");
+      expect(result.stdout).not.toContain("app build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("preserves dependency hashes in parallel mode", async () => {
     const directory = await makeFixture();
     const args = [
@@ -389,6 +481,103 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("propagates persistent companion failures", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.check = { cache: false, with: ["serve"] };
+      configuration.tasks.serve = { cache: false, persistent: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.serve = 'node -e "process.exit(8)"';
+      manifest.scripts.check =
+        "node -e \"setTimeout(() => require('node:fs').writeFileSync('owner.finished', '1'), 1000)\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--concurrency=1",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).not.toBe(0);
+      await expect(
+        readFile(`${packageDirectory}/owner.finished`, "utf8"),
+      ).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("runs a standalone Cargo package from its manifest directory", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/rust-tool`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { futureFlags?: Record<string, boolean> };
+      configuration.futureFlags = { experimentalCargoWorkspaces: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${packageDirectory}/src`, { recursive: true });
+      await writeFile(
+        `${packageDirectory}/Cargo.toml`,
+        '[package]\nname = "synthetic-rust-tool"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(`${packageDirectory}/src/main.rs`, "fn main() {}\n");
+      await cp(
+        `${repositoryRoot}/rust-toolchain`,
+        `${directory}/rust-toolchain`,
+      );
+      const lockfile = await run(
+        "cargo",
+        [
+          "generate-lockfile",
+          "--manifest-path",
+          `${packageDirectory}/Cargo.toml`,
+        ],
+        packageDirectory,
+      );
+      expect(lockfile.exitCode, lockfile.stderr).toBe(0);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-rust-tool",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(0);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
 
   it("hashes global dependency contents and restores declared dist outputs", async () => {
     const directory = await makeFixture();
@@ -807,10 +996,36 @@ describe("core CLI execution", () => {
       expect(result.exitCode).toBe(0);
       expect(result.stdout).not.toContain("library build");
       expect(result.stdout).not.toContain("app build");
+      await writeFile(
+        `${directory}/packages/library/source.txt`,
+        "changed library input\n",
+      );
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "library input"], directory))
+          .exitCode,
+      ).toBe(0);
+      const dependencyResult = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--affected",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(dependencyResult.exitCode).toBe(0);
+      expect(dependencyResult.stdout).toContain("library build");
+      expect(dependencyResult.stdout).toContain("app build");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  });
+  }, 15_000);
 
   it("rejects unknown configuration keys before execution", async () => {
     const directory = await makeFixture();
@@ -864,7 +1079,7 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  });
+  }, 10_000);
 });
 
 describe("cache interoperability and safety", () => {
@@ -1238,6 +1453,90 @@ describe("cache interoperability and safety", () => {
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(linkedRoot, { force: true });
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("retries transient remote cache statuses", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-remote-retry-"));
+    const attempts = { OPTIONS: 0, GET: 0, PUT: 0 };
+    let artifact = new Uint8Array();
+    const server = createServer((request, response) => {
+      const method = request.method;
+      const chunks: Array<Buffer> = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        if (method !== "OPTIONS" && method !== "GET" && method !== "PUT") {
+          response.writeHead(405);
+          response.end();
+          return;
+        }
+        attempts[method] += 1;
+        if (attempts[method] === 1) {
+          response.writeHead(503);
+          response.end();
+          return;
+        }
+        if (method === "PUT") {
+          artifact = new Uint8Array(Buffer.concat(chunks));
+          response.writeHead(201);
+          response.end();
+          return;
+        }
+        if (method === "GET") {
+          response.writeHead(200, {
+            "content-type": "application/octet-stream",
+          });
+          response.end(artifact);
+          return;
+        }
+        response.writeHead(200);
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    const options = {
+      apiUrl: `http://127.0.0.1:${address.port}`,
+      timeoutMilliseconds: 5_000,
+      uploadTimeoutMilliseconds: 5_000,
+      preflight: true,
+      requireSignature: false,
+    };
+    try {
+      await Effect.runPromise(
+        writeRemoteCache(
+          options,
+          "9988776655443322",
+          [
+            {
+              path: "remote.txt",
+              contents: new TextEncoder().encode("retried remote cache\n"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+          ],
+          1,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(
+        await Effect.runPromise(
+          restoreRemoteCache(directory, options, "9988776655443322").pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        ),
+      ).toBe(true);
+      expect(await readFile(`${directory}/remote.txt`, "utf8")).toBe(
+        "retried remote cache\n",
+      );
+      expect(attempts).toEqual({ OPTIONS: 3, GET: 2, PUT: 2 });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(directory, { force: true, recursive: true });
     }
   });

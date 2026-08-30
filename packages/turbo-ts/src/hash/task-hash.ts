@@ -84,55 +84,89 @@ export const inferredEnvironmentPatterns = (
     )
     .flatMap((framework) => framework.patterns);
 
+interface TaskInputFile {
+  readonly absolutePath: string;
+  readonly hashPath: string;
+  readonly matchPath: string;
+}
+
+const turboRootInputPrefix = "$TURBO_ROOT$/";
+
+const isIgnoredInputPath = (path: string): boolean =>
+  path.includes("/.turbo/") || path.includes("/node_modules/");
+
+const usesTurboRootInput = (node: TaskNode): boolean =>
+  (node.definition.inputs ?? []).some((input) =>
+    typeof input === "string"
+      ? input.replace(/^!/, "").startsWith(turboRootInputPrefix)
+      : (input.globs ?? []).some((glob) =>
+          glob.replace(/^!/, "").startsWith(turboRootInputPrefix),
+        ),
+  );
+
 const taskInputFiles = (
+  repository: RepositoryModel,
   node: TaskNode,
-  allFiles: ReadonlyArray<string>,
-): ReadonlyArray<string> => {
-  const defaults = allFiles
-    .filter(
-      (path) => !path.includes("/.turbo/") && !path.includes("/node_modules/"),
-    )
-    .map((path) => relativePath(node.package.directory, path));
+  packageFiles: ReadonlyArray<string>,
+  repositoryFiles: ReadonlyArray<string>,
+): ReadonlyArray<TaskInputFile> => {
+  const defaults = packageFiles
+    .filter((path) => !isIgnoredInputPath(path))
+    .map((absolutePath) => {
+      const relative = relativePath(node.package.directory, absolutePath);
+      return { absolutePath, hashPath: relative, matchPath: relative };
+    });
+  const rootFiles = repositoryFiles
+    .filter((path) => !isIgnoredInputPath(path))
+    .map((absolutePath) => {
+      const relative = relativePath(repository.root, absolutePath);
+      return {
+        absolutePath,
+        hashPath: `${turboRootInputPrefix}${relative}`,
+        matchPath: relative,
+      };
+    });
   const inputs = node.definition.inputs;
   if (inputs === undefined || inputs === null || inputs.length === 0) {
-    return defaults.sort();
+    return defaults.sort((left, right) =>
+      left.hashPath.localeCompare(right.hashPath),
+    );
   }
-  const selected = new Set<string>();
+  const selected = new Map<string, TaskInputFile>();
+  const matchingFiles = (pattern: string): ReadonlyArray<TaskInputFile> => {
+    const rootRelative = pattern.startsWith(turboRootInputPrefix);
+    const matcher = rootRelative
+      ? pattern.slice(turboRootInputPrefix.length)
+      : pattern;
+    return (rootRelative ? rootFiles : defaults).filter((file) =>
+      matchesGlob(file.matchPath, matcher),
+    );
+  };
+  const include = (files: ReadonlyArray<TaskInputFile>): void => {
+    for (const file of files) selected.set(file.absolutePath, file);
+  };
   for (const input of inputs) {
     if (typeof input !== "string") {
       for (const glob of input.globs ?? []) {
-        for (const file of defaults) {
-          if (matchesGlob(file, glob)) {
-            selected.add(file);
-          }
-        }
+        include(matchingFiles(glob));
       }
       if (input.withDefaults !== false) {
-        for (const file of defaults) {
-          selected.add(file);
-        }
+        include(defaults);
       }
       continue;
     }
     if (input === "$TURBO_DEFAULT$") {
-      for (const file of defaults) {
-        selected.add(file);
-      }
+      include(defaults);
     } else if (input.startsWith("!")) {
-      for (const file of selected) {
-        if (matchesGlob(file, input.slice(1))) {
-          selected.delete(file);
-        }
-      }
+      for (const file of matchingFiles(input.slice(1)))
+        selected.delete(file.absolutePath);
     } else {
-      for (const file of defaults) {
-        if (matchesGlob(file, input)) {
-          selected.add(file);
-        }
-      }
+      include(matchingFiles(input));
     }
   }
-  return [...selected].sort();
+  return [...selected.values()].sort((left, right) =>
+    left.hashPath.localeCompare(right.hashPath),
+  );
 };
 
 export interface TaskHashResult {
@@ -151,6 +185,7 @@ const discoverFiles = (
 > =>
   Effect.gen(function* () {
     const processService = yield* ProcessService;
+    const fileSystem = yield* FileSystemService;
     const relativeDirectory = relativePath(repository.root, directory);
     const git = yield* Effect.either(
       Effect.scoped(
@@ -170,11 +205,23 @@ const discoverFiles = (
       ),
     );
     if (git._tag === "Right" && git.right.exitCode === 0) {
-      return git.right.stdout
+      const discovered = git.right.stdout
         .split("\0")
         .filter(Boolean)
         .map((path) => joinPath(repository.root, path))
         .sort();
+      const existing = yield* Effect.forEach(
+        discovered,
+        (path) =>
+          fileSystem.exists(path).pipe(
+            Effect.map((exists) => (exists ? path : undefined)),
+            Effect.mapError(
+              (error) => new RepositoryError({ path, message: error.message }),
+            ),
+          ),
+        { concurrency: 8 },
+      );
+      return existing.filter((path): path is string => path !== undefined);
     }
     return yield* listRepositoryFiles(directory);
   });
@@ -211,8 +258,19 @@ export const hashTask = (
     const digest = yield* DigestService;
     const environmentService = yield* EnvironmentService;
     const environment = yield* environmentService.entries;
-    const allFiles = yield* discoverFiles(repository, node.package.directory);
-    const inputFiles = taskInputFiles(node, allFiles);
+    const packageFiles = yield* discoverFiles(
+      repository,
+      node.package.directory,
+    );
+    const repositoryFiles = usesTurboRootInput(node)
+      ? yield* discoverFiles(repository, repository.root)
+      : [];
+    const inputFiles = taskInputFiles(
+      repository,
+      node,
+      packageFiles,
+      repositoryFiles,
+    );
     const hashFile = (path: string, relative: string) =>
       fileSystem.metadata(path).pipe(
         Effect.flatMap((metadata) =>
@@ -230,10 +288,7 @@ export const hashTask = (
       );
     const fileHashes = yield* Effect.forEach(
       inputFiles,
-      (relative) => {
-        const path = joinPath(node.package.directory, relative);
-        return hashFile(path, relative);
-      },
+      (input) => hashFile(input.absolutePath, input.hashPath),
       { concurrency: 8 },
     );
     const globalSettings = activeGlobalSettings(repository);
@@ -289,7 +344,11 @@ export const hashTask = (
         globalFiles: globalFileHashes,
       }),
     );
-    return { hash, environment: hashedEnvironment, inputFiles };
+    return {
+      hash,
+      environment: hashedEnvironment,
+      inputFiles: inputFiles.map((input) => input.hashPath),
+    };
   });
 
 const strictBaselineEnvironment = [

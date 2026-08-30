@@ -37,6 +37,11 @@ export const makeExternalOracle = (
             Effect.mapError(
               (error) => new OracleError({ message: error.message }),
             ),
+            Effect.map(({ exitCode, stdout, stderr }) => ({
+              exitCode,
+              stdout,
+              stderr,
+            })),
           ),
       );
 

@@ -415,6 +415,14 @@ export const loadRootConfiguration = (
     }
     const path = hasJson ? jsonPath : hasJsonc ? jsoncPath : jsonPath;
     if (!hasJson && !hasJsonc) {
+      if (overridePath !== undefined) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: overridePath,
+            message: `explicit root configuration does not exist: ${overridePath}`,
+          }),
+        );
+      }
       return { path, value: {}, hiddenFutureFlags: {} };
     }
     const source = yield* fileSystem

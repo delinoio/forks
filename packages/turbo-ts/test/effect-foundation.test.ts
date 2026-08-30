@@ -230,7 +230,12 @@ describe("Effect foundation", () => {
           }),
         ).pipe(Effect.provide(nodeFoundationLayer)),
       );
-      expect(result).toEqual({ exitCode: 0, stdout: "false", stderr: "" });
+      expect(result).toEqual({
+        exitCode: 0,
+        stdout: "false",
+        stderr: "",
+        combinedOutput: "false",
+      });
     } finally {
       if (previousValue === undefined) {
         delete process.env[environmentName];
@@ -307,7 +312,12 @@ describe("Effect foundation", () => {
           }),
         ).pipe(Effect.provide(nodeFoundationLayer)),
       );
-      expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+      expect(result).toEqual({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        combinedOutput: "",
+      });
       expect(JSON.parse(await readFile(resultPath, "utf8"))).toEqual(expected);
     } finally {
       await rm(directory, { force: true, recursive: true });
@@ -432,6 +442,42 @@ describe("Effect foundation", () => {
         expect(outcome.left.command).toBe(command);
       }
     }
+  });
+
+  it("preserves observed stdout and stderr chunk order", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let close: ((exitCode: number | null) => void) | undefined;
+    const fiber = Effect.runFork(
+      collectChildProcessOutput(
+        {
+          stdin,
+          stdout,
+          stderr,
+          onceClose: (listener) => {
+            close = listener;
+          },
+          onceError: () => {
+            // The synthetic process exits through the close callback.
+          },
+        },
+        "synthetic-interleaved-output",
+        undefined,
+      ),
+    );
+    await Effect.runPromise(Effect.yieldNow());
+    stdout.write("stdout-one\n");
+    stderr.write("stderr-one\n");
+    stdout.write("stdout-two\n");
+    close?.(0);
+    const result = await Effect.runPromise(Fiber.join(fiber));
+    expect(result).toEqual({
+      exitCode: 0,
+      stdout: "stdout-one\nstdout-two\n",
+      stderr: "stderr-one\n",
+      combinedOutput: "stdout-one\nstderr-one\nstdout-two\n",
+    });
   });
 
   it("generates canonical lowercase UUID v7 identifiers", async () => {

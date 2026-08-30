@@ -1,4 +1,4 @@
-import { Effect } from "effect";
+import { Effect, Fiber } from "effect";
 import {
   type CacheWriteEntry,
   restoreLocalCache,
@@ -568,11 +568,22 @@ const selectAffectedTasks = (
   rootChanged: boolean,
 ): TaskGraph => {
   if (rootChanged) return graph;
+  const entrypointUsesChangedInput = (id: string): boolean => {
+    const visited = new Set<string>();
+    const pending = [id];
+    while (pending.length > 0) {
+      const current = pending.pop()!;
+      if (visited.has(current)) continue;
+      visited.add(current);
+      const node = graph.nodes.get(current);
+      if (node === undefined) continue;
+      if (taskMatchesChangedFiles(node, changedFiles)) return true;
+      pending.push(...node.dependencies);
+    }
+    return false;
+  };
   const retained = new Set(
-    graph.entrypoints.filter((id) => {
-      const node = graph.nodes.get(id);
-      return node !== undefined && taskMatchesChangedFiles(node, changedFiles);
-    }),
+    graph.entrypoints.filter(entrypointUsesChangedInput),
   );
   const pending = [...retained];
   while (pending.length > 0) {
@@ -879,7 +890,7 @@ const executeTask = (
         command: invocation.command,
         args: invocation.arguments,
         cwd:
-          node.package.manager === "cargo" || node.package.manager === "uv"
+          node.package.manager === "uv"
             ? repository.root
             : node.package.directory,
         inheritEnvironment: false,
@@ -896,7 +907,7 @@ const executeTask = (
         },
       }),
     );
-    const output = `${result.stdout}${result.stderr}`;
+    const output = result.combinedOutput;
     yield* fileSystem.makeDirectory(joinPath(node.package.directory, ".turbo"));
     yield* fileSystem.writeText(logPath, output);
     if (
@@ -1178,15 +1189,56 @@ export const executeRun = (
           const foreground = members.filter((id) => !background.includes(id));
           return Effect.scoped(
             Effect.gen(function* () {
-              for (const id of background) {
-                yield* Effect.forkScoped(runNode(id));
-              }
+              const backgroundFibers = yield* Effect.forEach(background, (id) =>
+                Effect.forkScoped(runNode(id)),
+              );
               if (background.length > 0) yield* Effect.yieldNow();
-              const results = yield* Effect.forEach(foreground, runNode, {
+              const foregroundCompletion = Effect.forEach(foreground, runNode, {
                 concurrency: "unbounded",
-              });
+              }).pipe(
+                Effect.map((results) => ({
+                  _tag: "ForegroundComplete" as const,
+                  results,
+                })),
+              );
+              if (backgroundFibers.length === 0) {
+                return (yield* foregroundCompletion).results;
+              }
+              const backgroundFailures = backgroundFibers.map((fiber) =>
+                Fiber.join(fiber).pipe(
+                  Effect.flatMap((outcome) =>
+                    outcome.exitCode === 0
+                      ? Effect.never
+                      : Effect.succeed({
+                          _tag: "BackgroundFailed" as const,
+                          outcome,
+                        }),
+                  ),
+                ),
+              );
+              const firstBackgroundFailure = backgroundFailures
+                .slice(1)
+                .reduce(
+                  (left, right) => Effect.race(left, right),
+                  backgroundFailures[0]!,
+                );
+              const completion = yield* Effect.race(
+                foregroundCompletion,
+                firstBackgroundFailure,
+              );
+              if (completion._tag === "BackgroundFailed") {
+                return members.map((id) =>
+                  id === completion.outcome.id
+                    ? completion.outcome
+                    : {
+                        id,
+                        exitCode: 1,
+                        skipped: true,
+                      },
+                );
+              }
               return [
-                ...results,
+                ...completion.results,
                 ...background.map((id) => ({
                   id,
                   exitCode: 0,

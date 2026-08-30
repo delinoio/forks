@@ -33,6 +33,9 @@ const remoteError = (
   retryable = false,
 ): CacheError => new CacheError({ path, message: String(cause), retryable });
 
+const isTransientStatus = (status: number): boolean =>
+  status === 408 || status === 429 || (status >= 500 && status <= 599);
+
 const artifactUrl = (options: RemoteCacheOptions, hash: string): string => {
   const url = new URL(`/v8/artifacts/${hash}`, options.apiUrl);
   if (options.teamId?.startsWith("team_") === true) {
@@ -71,6 +74,13 @@ const preflight = (
       })
       .pipe(
         Effect.mapError((error) => remoteError(url, error.message, true)),
+        Effect.flatMap((response) =>
+          isTransientStatus(response.status)
+            ? Effect.fail(
+                remoteError(url, `preflight returned ${response.status}`, true),
+              )
+            : Effect.succeed(response),
+        ),
         Effect.retry(retry.transient),
       );
     if (response.status < 200 || response.status >= 300) {
@@ -113,6 +123,17 @@ export const restoreRemoteCache = (
       })
       .pipe(
         Effect.mapError((error) => remoteError(url, error.message, true)),
+        Effect.flatMap((response) =>
+          isTransientStatus(response.status)
+            ? Effect.fail(
+                remoteError(
+                  url,
+                  `remote cache returned ${response.status}`,
+                  true,
+                ),
+              )
+            : Effect.succeed(response),
+        ),
         Effect.retry(retry.transient),
       );
     if (response.status === 404) {
@@ -278,6 +299,17 @@ export const writeRemoteCache = (
       })
       .pipe(
         Effect.mapError((error) => remoteError(url, error.message, true)),
+        Effect.flatMap((response) =>
+          isTransientStatus(response.status)
+            ? Effect.fail(
+                remoteError(
+                  url,
+                  `remote cache returned ${response.status}`,
+                  true,
+                ),
+              )
+            : Effect.succeed(response),
+        ),
         Effect.retry(retry.transient),
       );
     if (response.status < 200 || response.status >= 300) {
