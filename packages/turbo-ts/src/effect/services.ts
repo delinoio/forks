@@ -23,6 +23,7 @@ export interface FileSystemOperations {
   readonly readBytes: (
     path: string,
   ) => Effect.Effect<Uint8Array, BoundaryError>;
+  readonly readLink: (path: string) => Effect.Effect<string, BoundaryError>;
   readonly exists: (path: string) => Effect.Effect<boolean, BoundaryError>;
   readonly list: (
     path: string,
@@ -42,6 +43,10 @@ export interface FileSystemOperations {
   readonly writeBytes: (
     path: string,
     contents: Uint8Array,
+  ) => Effect.Effect<void, BoundaryError>;
+  readonly createSymlink: (
+    target: string,
+    path: string,
   ) => Effect.Effect<void, BoundaryError>;
   readonly setFileMetadata: (
     path: string,
@@ -142,9 +147,13 @@ export class SignalService extends Context.Tag("turbo-ts/SignalService")<
   SignalService,
   BoundaryOperations
 >() {}
+export interface ConcurrencyOperations {
+  readonly availableParallelism: Effect.Effect<number>;
+}
+
 export class ConcurrencyService extends Context.Tag(
   "turbo-ts/ConcurrencyService",
-)<ConcurrencyService, BoundaryOperations>() {}
+)<ConcurrencyService, ConcurrencyOperations>() {}
 export interface HttpRequest {
   readonly url: string;
   readonly method: "GET" | "HEAD" | "OPTIONS" | "POST" | "PUT";

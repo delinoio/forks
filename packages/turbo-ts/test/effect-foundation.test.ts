@@ -1,5 +1,6 @@
 import { fstatSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -17,6 +18,7 @@ import {
   nodeFoundationLayer,
 } from "../src/effect/node-layer.js";
 import {
+  HttpService,
   ProcessService,
   RandomnessService,
   TerminalService,
@@ -170,6 +172,40 @@ describe("Effect foundation", () => {
       } else {
         process.env.NO_COLOR = previousValue;
       }
+    }
+  });
+
+  it("treats a zero HTTP timeout as unlimited", async () => {
+    const server = createServer((_request, response) => {
+      setTimeout(() => {
+        response.writeHead(200);
+        response.end("ok");
+      }, 25);
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    try {
+      const response = await Effect.runPromise(
+        HttpService.pipe(
+          Effect.flatMap((http) =>
+            http.request({
+              url: `http://127.0.0.1:${address.port}`,
+              method: "GET",
+              timeoutMilliseconds: 0,
+            }),
+          ),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(response.status).toBe(200);
+      expect(new TextDecoder().decode(response.body)).toBe("ok");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 

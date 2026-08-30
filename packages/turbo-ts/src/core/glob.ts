@@ -1,36 +1,12 @@
+import { minimatch } from "minimatch";
 import { toUnixPath } from "./path.js";
 
-const escapeRegularExpression = (value: string): string =>
-  value.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
-
-export const globToRegularExpression = (pattern: string): RegExp => {
-  const normalized = toUnixPath(pattern).replace(/^\.\//, "");
-  let source = "";
-  for (let index = 0; index < normalized.length; index += 1) {
-    const character = normalized[index]!;
-    if (character === "*") {
-      if (normalized[index + 1] === "*") {
-        index += 1;
-        if (normalized[index + 1] === "/") {
-          index += 1;
-          source += "(?:.*/)?";
-        } else {
-          source += ".*";
-        }
-      } else {
-        source += "[^/]*";
-      }
-    } else if (character === "?") {
-      source += "[^/]";
-    } else {
-      source += escapeRegularExpression(character);
-    }
-  }
-  return new RegExp(`^${source}$`);
-};
-
 export const matchesGlob = (path: string, pattern: string): boolean =>
-  globToRegularExpression(pattern).test(toUnixPath(path).replace(/^\.\//, ""));
+  minimatch(
+    toUnixPath(path).replace(/^\.\//, ""),
+    toUnixPath(pattern).replace(/^\.\//, ""),
+    { dot: true },
+  );
 
 export const selectByGlobs = (
   values: ReadonlyArray<string>,

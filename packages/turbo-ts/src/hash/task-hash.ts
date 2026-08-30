@@ -200,6 +200,7 @@ export const hashTask = (
   node: TaskNode,
   dependencyHashes: ReadonlyArray<string>,
   frameworkInference: boolean,
+  passThroughArguments: ReadonlyArray<string>,
 ): Effect.Effect<
   TaskHashResult,
   RepositoryError,
@@ -212,20 +213,27 @@ export const hashTask = (
     const environment = yield* environmentService.entries;
     const allFiles = yield* discoverFiles(repository, node.package.directory);
     const inputFiles = taskInputFiles(node, allFiles);
+    const hashFile = (path: string, relative: string) =>
+      fileSystem.metadata(path).pipe(
+        Effect.flatMap((metadata) =>
+          metadata.kind === "symlink"
+            ? fileSystem
+                .readLink(path)
+                .pipe(Effect.map((target) => new TextEncoder().encode(target)))
+            : fileSystem.readBytes(path),
+        ),
+        Effect.flatMap((bytes) => digest.gitBlobSha1(bytes)),
+        Effect.map((hash) => [relative, hash] as const),
+        Effect.mapError(
+          (error) => new RepositoryError({ path, message: error.message }),
+        ),
+      );
     const fileHashes = yield* Effect.forEach(
       inputFiles,
-      (relative) =>
-        fileSystem.readBytes(joinPath(node.package.directory, relative)).pipe(
-          Effect.flatMap((bytes) => digest.gitBlobSha1(bytes)),
-          Effect.map((hash) => [relative, hash] as const),
-          Effect.mapError(
-            (error) =>
-              new RepositoryError({
-                path: joinPath(node.package.directory, relative),
-                message: error.message,
-              }),
-          ),
-        ),
+      (relative) => {
+        const path = joinPath(node.package.directory, relative);
+        return hashFile(path, relative);
+      },
       { concurrency: 8 },
     );
     const globalSettings = activeGlobalSettings(repository);
@@ -259,18 +267,10 @@ export const hashTask = (
           );
     const globalFileHashes = yield* Effect.forEach(
       globalInputFiles,
-      (relative) =>
-        fileSystem.readBytes(joinPath(repository.root, relative)).pipe(
-          Effect.flatMap((bytes) => digest.gitBlobSha1(bytes)),
-          Effect.map((hash) => [relative, hash] as const),
-          Effect.mapError(
-            (error) =>
-              new RepositoryError({
-                path: joinPath(repository.root, relative),
-                message: error.message,
-              }),
-          ),
-        ),
+      (relative) => {
+        const path = joinPath(repository.root, relative);
+        return hashFile(path, relative);
+      },
       { concurrency: 8 },
     );
     const hash = xxhash64Hex(
@@ -280,6 +280,7 @@ export const hashTask = (
         package: node.package.relativeDirectory,
         task: node.task,
         command: node.command,
+        passThroughArguments,
         definition: node.definition,
         files: fileHashes,
         environment: hashedEnvironment,

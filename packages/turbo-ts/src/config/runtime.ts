@@ -90,12 +90,19 @@ const stripJsonComments = (source: string): string => {
     }
     if (character === "/" && next === "*") {
       index += 2;
+      let closed = false;
       while (
         index < source.length &&
         !(source[index] === "*" && source[index + 1] === "/")
       ) {
         output += source[index] === "\n" ? "\n" : " ";
         index += 1;
+      }
+      if (index < source.length) {
+        closed = true;
+      }
+      if (!closed) {
+        throw new TypeError("unterminated block comment");
       }
       index += 1;
       continue;

@@ -2,10 +2,16 @@ import { Effect } from "effect";
 import { parse as parseYaml } from "yaml";
 import type { LoadedRootConfiguration } from "../config/runtime.js";
 import { loadPackageConfiguration } from "../config/runtime.js";
-import { matchesGlob } from "../core/glob.js";
-import { baseName, joinPath, relativePath } from "../core/path.js";
+import { selectByGlobs } from "../core/glob.js";
+import {
+  baseName,
+  joinPath,
+  normalizePath,
+  parentPath,
+  relativePath,
+} from "../core/path.js";
 import { RepositoryError } from "../effect/errors.js";
-import { FileSystemService } from "../effect/services.js";
+import { FileSystemService, ProcessService } from "../effect/services.js";
 import type { Pipeline } from "../generated/configuration.js";
 import { type ParsedLockfile, parseLockfile } from "./lockfiles.js";
 
@@ -396,22 +402,88 @@ const polyglotScripts = (
         test: "uv run --frozen pytest",
       };
 
-const cargoDependencyNames = (source: string): ReadonlyArray<string> => {
-  const names = new Set<string>();
-  let dependencies = false;
-  for (const line of source.split(/\r?\n/)) {
-    const section = /^\s*\[([^\]]+)\]\s*$/.exec(line)?.[1];
-    if (section !== undefined) {
-      dependencies = /(?:^|\.)(?:build-|dev-)?dependencies$/.test(section);
-      continue;
-    }
-    if (dependencies) {
-      const name = /^\s*([A-Za-z0-9_-]+)\s*=/.exec(line)?.[1];
-      if (name !== undefined) names.add(name);
-    }
+interface CargoPackageMetadata {
+  readonly name: string;
+  readonly dependencyNames: ReadonlyArray<string>;
+}
+
+export const parseCargoMetadata = (
+  source: string,
+  manifestPath: string,
+): CargoPackageMetadata | undefined => {
+  const document = JSON.parse(source) as {
+    readonly packages?: ReadonlyArray<{
+      readonly name?: unknown;
+      readonly manifest_path?: unknown;
+      readonly dependencies?: ReadonlyArray<{ readonly name?: unknown }>;
+    }>;
+  };
+  const packageMetadata = document.packages?.find(
+    (entry) =>
+      typeof entry.manifest_path === "string" &&
+      normalizePath(entry.manifest_path) === normalizePath(manifestPath),
+  );
+  if (
+    packageMetadata === undefined ||
+    typeof packageMetadata.name !== "string"
+  ) {
+    return undefined;
   }
-  return [...names].sort();
+  return {
+    name: packageMetadata.name,
+    dependencyNames: [
+      ...new Set(
+        (packageMetadata.dependencies ?? []).flatMap((dependency) =>
+          typeof dependency.name === "string" ? [dependency.name] : [],
+        ),
+      ),
+    ].sort(),
+  };
 };
+
+const cargoPackageMetadata = (
+  manifestPath: string,
+): Effect.Effect<
+  CargoPackageMetadata | undefined,
+  RepositoryError,
+  ProcessService
+> =>
+  Effect.gen(function* () {
+    const processService = yield* ProcessService;
+    const result = yield* Effect.scoped(
+      processService.run({
+        command: "cargo",
+        args: [
+          "metadata",
+          "--format-version=1",
+          "--no-deps",
+          "--manifest-path",
+          manifestPath,
+        ],
+        cwd: parentPath(manifestPath),
+      }),
+    ).pipe(
+      Effect.mapError(
+        (error) =>
+          new RepositoryError({ path: manifestPath, message: error.message }),
+      ),
+    );
+    if (result.exitCode !== 0) {
+      return yield* Effect.fail(
+        new RepositoryError({
+          path: manifestPath,
+          message: result.stderr || "cargo metadata failed",
+        }),
+      );
+    }
+    try {
+      return parseCargoMetadata(result.stdout, manifestPath);
+    } catch (cause) {
+      return yield* Effect.fail(
+        new RepositoryError({ path: manifestPath, message: String(cause) }),
+      );
+    }
+  });
 
 const pythonDependencyNames = (source: string): ReadonlyArray<string> => {
   const names = new Set<string>();
@@ -428,7 +500,11 @@ const pythonDependencyNames = (source: string): ReadonlyArray<string> => {
 export const discoverRepository = (
   root: string,
   rootConfiguration: LoadedRootConfiguration,
-): Effect.Effect<RepositoryModel, RepositoryError, FileSystemService> =>
+): Effect.Effect<
+  RepositoryModel,
+  RepositoryError,
+  FileSystemService | ProcessService
+> =>
   Effect.gen(function* () {
     const rootManifestPath = joinPath(root, "package.json");
     const rootManifest = decodeManifest(
@@ -446,13 +522,17 @@ export const discoverRepository = (
     const managerIdentity = yield* discoverManager(root, declaredManager);
     const patterns = yield* workspacePatterns(root, rootManifest);
     const directories = yield* walkDirectories(root);
-    const candidateDirectories = directories.filter((directory) => {
-      const relative = relativePath(root, directory);
-      return (
-        relative !== "." &&
-        patterns.some((pattern) => matchesGlob(relative, pattern))
-      );
-    });
+    const candidateDirectoryPaths = new Set(
+      selectByGlobs(
+        directories
+          .map((directory) => relativePath(root, directory))
+          .filter((relative) => relative !== "."),
+        patterns,
+      ),
+    );
+    const candidateDirectories = directories.filter((directory) =>
+      candidateDirectoryPaths.has(relativePath(root, directory)),
+    );
     const packageDrafts = yield* Effect.forEach(
       candidateDirectories,
       (directory) =>
@@ -545,9 +625,13 @@ export const discoverRepository = (
                     new RepositoryError({ path, message: error.message }),
                 ),
               );
+            const cargoMetadata =
+              candidate.manager === "cargo"
+                ? yield* cargoPackageMetadata(path)
+                : undefined;
             const name =
               candidate.manager === "cargo"
-                ? /^name\s*=\s*"([^"]+)"/m.exec(source)?.[1]
+                ? cargoMetadata?.name
                 : /^name\s*=\s*["']([^"']+)["']/m.exec(source)?.[1];
             if (name === undefined) {
               continue;
@@ -560,7 +644,7 @@ export const discoverRepository = (
               scripts: polyglotScripts(candidate.manager),
               dependencyNames:
                 candidate.manager === "cargo"
-                  ? cargoDependencyNames(source)
+                  ? (cargoMetadata?.dependencyNames ?? [])
                   : pythonDependencyNames(source),
               tasks: (rootConfiguration.value.tasks ?? {}) as Readonly<
                 Record<string, Pipeline>
@@ -682,7 +766,7 @@ export const listRepositoryFiles = (
           !(options.ignoredDirectories ?? ignoredDirectories).has(entry.name)
         ) {
           pending.push(joinPath(current, entry.name));
-        } else if (entry.kind === "file") {
+        } else if (entry.kind === "file" || entry.kind === "symlink") {
           files.push(joinPath(current, entry.name));
         }
       }

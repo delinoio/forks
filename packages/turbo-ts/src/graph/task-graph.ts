@@ -57,10 +57,10 @@ const expandPackageClosure = (
 const selectFilterBase = (
   repository: RepositoryModel,
   selector: string,
-  affectedPackages: ReadonlySet<string>,
+  gitRangePackages: ReadonlyMap<string, ReadonlySet<string>>,
 ): ReadonlySet<string> => {
   if (selector.startsWith("[") && selector.endsWith("]")) {
-    return affectedPackages;
+    return gitRangePackages.get(selector.slice(1, -1)) ?? new Set();
   }
   const directoryMatch = /^\{(.+)\}$/.exec(selector);
   const pattern = directoryMatch?.[1] ?? selector;
@@ -82,14 +82,18 @@ const selectFilterBase = (
 export const selectPackages = (
   repository: RepositoryModel,
   filters: ReadonlyArray<string>,
-  affectedPackages: ReadonlySet<string> = new Set(),
+  gitRangePackages: ReadonlyMap<string, ReadonlySet<string>> = new Map(),
 ): ReadonlyArray<RepositoryPackage> => {
   if (filters.length === 0) {
     return repository.packages;
   }
   const dependents = packageDependents(repository);
-  const selected = new Set<string>();
-  for (const rawFilter of filters) {
+  const selected = new Set<string>(
+    filters.some((filter) => !filter.startsWith("!"))
+      ? []
+      : repository.packages.map((packageModel) => packageModel.name),
+  );
+  const applyFilter = (rawFilter: string): void => {
     const negative = rawFilter.startsWith("!");
     let filter = negative ? rawFilter.slice(1) : rawFilter;
     const includeDependents = filter.startsWith("...");
@@ -100,7 +104,7 @@ export const selectPackages = (
     if (includeDependencies) {
       filter = filter.slice(0, -3);
     }
-    let matches = selectFilterBase(repository, filter, affectedPackages);
+    let matches = selectFilterBase(repository, filter, gitRangePackages);
     if (includeDependencies) {
       matches = expandPackageClosure(
         matches,
@@ -115,12 +119,15 @@ export const selectPackages = (
       );
     }
     for (const name of matches) {
-      if (negative) {
-        selected.delete(name);
-      } else {
-        selected.add(name);
-      }
+      if (negative) selected.delete(name);
+      else selected.add(name);
     }
+  };
+  for (const filter of filters.filter((entry) => !entry.startsWith("!"))) {
+    applyFilter(filter);
+  }
+  for (const filter of filters.filter((entry) => entry.startsWith("!"))) {
+    applyFilter(filter);
   }
   return repository.packages.filter((packageModel) =>
     selected.has(packageModel.name),
@@ -129,6 +136,13 @@ export const selectPackages = (
 
 const taskId = (packageName: string, task: string): string =>
   `${packageName}#${task}`;
+
+const taskDefinition = (
+  packageModel: RepositoryPackage,
+  task: string,
+): Pipeline | undefined =>
+  packageModel.tasks[`${packageModel.name}#${task}`] ??
+  packageModel.tasks[task];
 
 const resolveTaskReference = (
   repository: RepositoryModel,
@@ -168,7 +182,7 @@ export const buildTaskGraph = (
     task: string,
   ): string | undefined => {
     const id = taskId(packageModel.name, task);
-    const configuredDefinition = packageModel.tasks[task];
+    const configuredDefinition = taskDefinition(packageModel, task);
     const definition = configuredDefinition ?? {};
     const command = packageModel.scripts[task];
     if (command === undefined && configuredDefinition === undefined) {
@@ -194,7 +208,7 @@ export const buildTaskGraph = (
             continue;
           }
           const dependencyDefinition =
-            dependencyPackage.tasks[dependencyTask] ?? {};
+            taskDefinition(dependencyPackage, dependencyTask) ?? {};
           if (dependencyDefinition.persistent === true) {
             throw new GraphError({
               task: id,

@@ -182,11 +182,34 @@ export const restoreRemoteCache = (
           .pipe(
             Effect.mapError((error) => remoteError(destination, error.message)),
           );
-        if (metadata.kind === "symlink") {
+        if (metadata.kind === "symlink" && entry.kind !== "symlink") {
           return yield* Effect.fail(
             remoteError(destination, "archive destination is a symlink"),
           );
         }
+        if (entry.kind === "symlink") {
+          yield* fileSystem
+            .remove(destination)
+            .pipe(
+              Effect.mapError((error) =>
+                remoteError(destination, error.message),
+              ),
+            );
+        }
+      }
+      if (entry.kind === "symlink") {
+        const target = joinPath(parentPath(destination), entry.linkTarget);
+        if (!isPathContained(root, target)) {
+          return yield* Effect.fail(
+            remoteError(destination, "archive link target escapes repository"),
+          );
+        }
+        yield* fileSystem
+          .createSymlink(entry.linkTarget, destination)
+          .pipe(
+            Effect.mapError((error) => remoteError(destination, error.message)),
+          );
+        continue;
       }
       yield* fileSystem
         .writeBytes(destination, entry.contents)

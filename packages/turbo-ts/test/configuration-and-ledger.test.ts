@@ -483,6 +483,17 @@ describe("configuration generation and compatibility ledger", () => {
     expect(
       ledger.rows.find((row) => row.id === "normalization.approved")?.variants,
     ).toEqual(normalizerIds);
+    expect(
+      ledger.rows.find((row) => row.id === "success.lockfile-pruning"),
+    ).toMatchObject({
+      status: "planned",
+      variants: ["lockfile-parse-and-prune"],
+    });
+    expect(
+      ledger.rows
+        .filter((row) => row.status === "passing")
+        .flatMap((row) => row.variants ?? []),
+    ).not.toContain("lockfile-parse-and-prune");
     expect(() =>
       parseCompatibilityLedger(
         ledgerSource.replace(

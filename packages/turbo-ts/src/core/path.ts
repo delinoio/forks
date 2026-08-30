@@ -1,6 +1,9 @@
 export const toUnixPath = (value: string): string =>
   value.replaceAll("\\", "/");
 
+export const isAbsolutePath = (value: string): boolean =>
+  value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+
 export const normalizePath = (value: string): string => {
   const unix = toUnixPath(value);
   const drive = /^[A-Za-z]:/.exec(unix)?.[0] ?? "";

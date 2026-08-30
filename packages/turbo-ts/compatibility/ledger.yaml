@@ -484,7 +484,6 @@ rows:
       - git-repository
       - no-vcs-repository
       - package-discovery
-      - lockfile-parse-and-prune
       - package-graph
       - task-graph
       - filter-and-affected
@@ -500,6 +499,13 @@ rows:
       - official-to-typescript-cache
       - typescript-to-official-cache
     source: issue-3
+  - id: success.lockfile-pruning
+    category: success
+    subject: lockfile parsing and pruning workflow
+    targetGate: 3
+    status: planned
+    variants: [lockfile-parse-and-prune]
+    source: pull-request-review-5060889456
   - id: success.repository-workflows
     category: success
     subject: graph formats, profiles, summaries, and alternate output workflows

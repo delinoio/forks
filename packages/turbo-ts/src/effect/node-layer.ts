@@ -17,13 +17,15 @@ import {
   open,
   readdir,
   readFile,
+  readlink,
   realpath,
   rename,
   rm,
+  symlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { promisify } from "node:util";
@@ -259,6 +261,11 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
       try: async () => new Uint8Array(await readFile(path)),
       catch: filesystemError,
     }),
+  readLink: (path) =>
+    Effect.tryPromise({
+      try: () => readlink(path),
+      catch: filesystemError,
+    }),
   exists: (path) =>
     Effect.tryPromise({
       try: async () => {
@@ -345,6 +352,11 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
   writeBytes: (path, contents) =>
     Effect.tryPromise({
       try: () => writeFile(path, contents),
+      catch: filesystemError,
+    }),
+  createSymlink: (target, path) =>
+    Effect.tryPromise({
+      try: () => symlink(target, path),
       catch: filesystemError,
     }),
   setFileMetadata: (path, mode, modifiedMilliseconds) =>
@@ -681,7 +693,8 @@ const httpLayer = Layer.succeed(HttpService, {
       try: async () => {
         const controller = new AbortController();
         const timeout =
-          request.timeoutMilliseconds === undefined
+          request.timeoutMilliseconds === undefined ||
+          request.timeoutMilliseconds === 0
             ? undefined
             : setTimeout(() => controller.abort(), request.timeoutMilliseconds);
         try {
@@ -756,6 +769,10 @@ const digestLayer = Layer.succeed(DigestService, {
     }),
 });
 
+const concurrencyLayer = Layer.succeed(ConcurrencyService, {
+  availableParallelism: Effect.sync(availableParallelism),
+});
+
 export const nodeFoundationLayer = Layer.mergeAll(
   fileSystemLayer,
   processLayer,
@@ -770,7 +787,7 @@ export const nodeFoundationLayer = Layer.mergeAll(
   Layer.succeed(GitService, boundaryFailure("git")),
   Layer.succeed(PackageManagerService, boundaryFailure("package-manager")),
   Layer.succeed(SignalService, boundaryFailure("signals")),
-  Layer.succeed(ConcurrencyService, boundaryFailure("concurrency")),
+  concurrencyLayer,
   Layer.succeed(CredentialService, boundaryFailure("credentials")),
   Layer.succeed(CacheService, boundaryFailure("cache")),
   Layer.succeed(DaemonService, boundaryFailure("daemon")),

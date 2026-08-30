@@ -72,6 +72,12 @@ model. Gate 2 cache archives and Vercel-compatible artifact transport are
 tested bidirectionally against the external official binary when addressed by
 an oracle-provided hash.
 
+Gate 2 selection resolves package-qualified tasks and explicit Git ranges,
+applies ordered workspace exclusions and brace/class-aware globs, and discovers
+the owning repository from nested working directories. Task hashes preserve
+Git symlink and dependency semantics, while scheduled `with` groups and cached
+outputs preserve scoped process and safe symlink behavior.
+
 Gate 2 is not closed: the composed task-hash serializer does not yet reproduce
 the official 2.10.12 task hashes. Individual source-file hashes match Git and
 the oracle, but the official binary does not distribute the serialization

@@ -14,11 +14,18 @@ import {
   loadRootConfiguration,
 } from "../config/runtime.js";
 import { matchesGlob } from "../core/glob.js";
-import { joinPath, relativePath } from "../core/path.js";
+import {
+  isAbsolutePath,
+  joinPath,
+  normalizePath,
+  parentPath,
+  relativePath,
+} from "../core/path.js";
 import { ConfigurationError, RepositoryError } from "../effect/errors.js";
 import {
   ClockService,
   CompressionService,
+  ConcurrencyService,
   DigestService,
   EnvironmentService,
   FileSystemService,
@@ -35,8 +42,13 @@ import {
   selectPackages,
   type TaskGraph,
   type TaskNode,
+  topologicalOrder,
 } from "../graph/task-graph.js";
-import { hashTask, taskEnvironment } from "../hash/task-hash.js";
+import {
+  hashTask,
+  type TaskHashResult,
+  taskEnvironment,
+} from "../hash/task-hash.js";
 import { renderLogEvent } from "../logging/events.js";
 import {
   discoverRepository,
@@ -84,6 +96,7 @@ interface TaskOutcome {
 type RunRequirements =
   | ClockService
   | CompressionService
+  | ConcurrencyService
   | DigestService
   | EnvironmentService
   | FileSystemService
@@ -170,18 +183,91 @@ const parseCachePolicy = (
   return policy;
 };
 
+const repositoryRootMarkers = [
+  ".git",
+  "aube.lock",
+  "bun.lock",
+  "bun.lockb",
+  "Cargo.lock",
+  "nub.lock",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+  "uv.lock",
+  "yarn.lock",
+] as const;
+
+export const discoverRepositoryRoot = (
+  start: string,
+): Effect.Effect<string, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    let current = normalizePath(start);
+    let nearestPackage: string | undefined;
+    while (true) {
+      const packagePath = joinPath(current, "package.json");
+      const hasPackage = yield* fileSystem.exists(packagePath).pipe(
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({
+              path: packagePath,
+              message: error.message,
+            }),
+        ),
+      );
+      if (hasPackage) {
+        nearestPackage ??= current;
+        const markerResults = yield* Effect.all(
+          repositoryRootMarkers.map((marker) =>
+            fileSystem.exists(joinPath(current, marker)),
+          ),
+        ).pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({ path: current, message: error.message }),
+          ),
+        );
+        const hasMarker = markerResults.some(Boolean);
+        let hasWorkspaces = false;
+        if (!hasMarker) {
+          const source = yield* fileSystem.readText(packagePath).pipe(
+            Effect.mapError(
+              (error) =>
+                new RepositoryError({
+                  path: packagePath,
+                  message: error.message,
+                }),
+            ),
+          );
+          try {
+            const manifest = JSON.parse(source) as {
+              readonly workspaces?: unknown;
+            };
+            hasWorkspaces = manifest.workspaces !== undefined;
+          } catch {
+            // Configuration loading reports malformed root manifests after
+            // discovery; a malformed nested manifest is not a root marker.
+          }
+        }
+        if (hasMarker || hasWorkspaces) {
+          return current;
+        }
+      }
+      const parent = parentPath(current);
+      if (parent === current) {
+        return nearestPackage ?? normalizePath(start);
+      }
+      current = parent;
+    }
+  });
+
 const resolveOptions = (
   parsed: ParsedRunOptions,
-  processCwd: string,
+  root: string,
   environment: Readonly<Record<string, string | undefined>>,
   configuration: LoadedRootConfiguration,
+  availableParallelism: number,
 ): ResolvedRunOptions => {
-  const root =
-    parsed.cwd === undefined
-      ? processCwd
-      : parsed.cwd.startsWith("/") || /^[A-Za-z]:[\\/]/.test(parsed.cwd)
-        ? parsed.cwd
-        : joinPath(processCwd, parsed.cwd);
   const value = configuration.value;
   const global = value.global;
   const concurrency =
@@ -265,10 +351,13 @@ const resolveOptions = (
     passThroughArguments: parsed.passThroughArguments,
     filters: parsed.filters,
     affected: parsed.affected,
-    concurrency: parseConcurrency(concurrency ?? undefined),
+    concurrency: parseConcurrency(
+      concurrency ?? undefined,
+      availableParallelism,
+    ),
     continueMode: parsed.continueMode ?? "never",
     environmentMode: environmentModeValue,
-    cacheDirectory: cacheDirectoryValue.startsWith("/")
+    cacheDirectory: isAbsolutePath(cacheDirectoryValue)
       ? cacheDirectoryValue
       : joinPath(root, cacheDirectoryValue),
     cacheMaxAgeMilliseconds: parseQuantity(
@@ -299,24 +388,41 @@ const resolveOptions = (
   };
 };
 
+interface GitRange {
+  readonly base: string;
+  readonly head: string;
+}
+
+interface AffectedPackages {
+  readonly packages: ReadonlySet<string>;
+  readonly changedFiles: ReadonlyArray<string>;
+  readonly rootChanged: boolean;
+}
+
+const parseGitRange = (selector: string): GitRange => {
+  const separator = selector.indexOf("...");
+  const base = separator === -1 ? selector : selector.slice(0, separator);
+  const head = separator === -1 ? "HEAD" : selector.slice(separator + 3);
+  if (base === "" || head === "") {
+    throw new ConfigurationError({
+      path: "<arguments>",
+      message: `invalid Git range filter: [${selector}]`,
+    });
+  }
+  return { base, head };
+};
+
 const findAffectedPackages = (
   repository: RepositoryModel,
   environment: Readonly<Record<string, string | undefined>>,
-): Effect.Effect<
-  {
-    readonly packages: ReadonlySet<string>;
-    readonly changedFiles: ReadonlyArray<string>;
-    readonly rootChanged: boolean;
-  },
-  never,
-  ProcessService
-> =>
+  range?: GitRange,
+): Effect.Effect<AffectedPackages, never, ProcessService> =>
   Effect.gen(function* () {
     const processService = yield* ProcessService;
     const explicitBase = environment.TURBO_SCM_BASE;
     const githubBase = environment.GITHUB_BASE_REF;
-    const base = explicitBase ?? githubBase ?? "main";
-    const head = environment.TURBO_SCM_HEAD ?? "HEAD";
+    const base = range?.base ?? explicitBase ?? githubBase ?? "main";
+    const head = range?.head ?? environment.TURBO_SCM_HEAD ?? "HEAD";
     const diff = (baseReference: string) =>
       Effect.either(
         Effect.scoped(
@@ -330,6 +436,7 @@ const findAffectedPackages = (
     let result = yield* diff(base);
     if (
       (result._tag === "Left" || result.right.exitCode !== 0) &&
+      range === undefined &&
       explicitBase === undefined &&
       githubBase !== undefined &&
       repository.rootConfiguration.value.futureFlags
@@ -367,6 +474,59 @@ const findAffectedPackages = (
           ),
       changedFiles,
       rootChanged,
+    };
+  });
+
+const defaultAffectedSelector = "$TURBO_DEFAULT_AFFECTED$";
+
+const resolveAffectedPackages = (
+  repository: RepositoryModel,
+  options: ResolvedRunOptions,
+  environment: Readonly<Record<string, string | undefined>>,
+): Effect.Effect<
+  {
+    readonly filters: ReadonlyArray<string>;
+    readonly ranges: ReadonlyMap<string, ReadonlySet<string>>;
+    readonly changedFiles: ReadonlyArray<string>;
+    readonly rootChanged: boolean;
+  },
+  never,
+  ProcessService
+> =>
+  Effect.gen(function* () {
+    const ranges = new Map<string, ReadonlySet<string>>();
+    const results: Array<AffectedPackages> = [];
+    const selectors = [
+      ...new Set(
+        options.filters.flatMap((filter) => {
+          const match = /\[([^\]]+)\]/.exec(filter);
+          return match?.[1] === undefined ? [] : [match[1]];
+        }),
+      ),
+    ];
+    for (const selector of selectors) {
+      const affected = yield* findAffectedPackages(
+        repository,
+        environment,
+        parseGitRange(selector),
+      );
+      ranges.set(selector, affected.packages);
+      results.push(affected);
+    }
+    if (options.affected) {
+      const affected = yield* findAffectedPackages(repository, environment);
+      ranges.set(defaultAffectedSelector, affected.packages);
+      results.push(affected);
+    }
+    return {
+      filters: options.affected
+        ? [...options.filters, `...[${defaultAffectedSelector}]`]
+        : options.filters,
+      ranges,
+      changedFiles: [
+        ...new Set(results.flatMap((result) => result.changedFiles)),
+      ].sort(),
+      rootChanged: results.some((result) => result.rootChanged),
     };
   });
 
@@ -433,7 +593,7 @@ const selectAffectedTasks = (
   };
 };
 
-const packageManagerCommand = (
+export const packageManagerCommand = (
   node: TaskNode,
   passThroughArguments: ReadonlyArray<string>,
 ): { readonly command: string; readonly arguments: ReadonlyArray<string> } => {
@@ -452,7 +612,9 @@ const packageManagerCommand = (
           ? "clippy"
           : node.task === "format"
             ? "fmt"
-            : node.task;
+            : node.task === "dev"
+              ? "run"
+              : node.task;
       const locked = cargoTask === "fmt" ? [] : ["--locked"];
       const target = [`--package=${node.package.name}`];
       const passThrough =
@@ -561,14 +723,6 @@ const collectCacheEntries = (
       selected,
       (path) =>
         Effect.gen(function* () {
-          const contents = yield* fileSystem
-            .readBytes(path)
-            .pipe(
-              Effect.mapError(
-                (error) =>
-                  new RepositoryError({ path, message: error.message }),
-              ),
-            );
           const metadata = yield* fileSystem
             .metadata(path)
             .pipe(
@@ -577,12 +731,36 @@ const collectCacheEntries = (
                   new RepositoryError({ path, message: error.message }),
               ),
             );
-          return {
+          const common = {
             path: relativePath(repository.root, path),
-            contents,
             mode: metadata.mode,
             modifiedSeconds: metadata.modifiedMilliseconds / 1_000,
           };
+          if (metadata.kind === "symlink") {
+            const linkTarget = yield* fileSystem
+              .readLink(path)
+              .pipe(
+                Effect.mapError(
+                  (error) =>
+                    new RepositoryError({ path, message: error.message }),
+                ),
+              );
+            return {
+              ...common,
+              kind: "symlink" as const,
+              linkTarget,
+              contents: new Uint8Array(),
+            };
+          }
+          const contents = yield* fileSystem
+            .readBytes(path)
+            .pipe(
+              Effect.mapError(
+                (error) =>
+                  new RepositoryError({ path, message: error.message }),
+              ),
+            );
+          return { ...common, contents };
         }),
       { concurrency: 8 },
     );
@@ -598,7 +776,7 @@ const executeTask = (
   repository: RepositoryModel,
   node: TaskNode,
   options: ResolvedRunOptions,
-  dependencyHashes: ReadonlyArray<string>,
+  hash: TaskHashResult,
   sourceEnvironment: Readonly<Record<string, string | undefined>>,
 ): Effect.Effect<TaskOutcome, unknown, RunRequirements> =>
   Effect.gen(function* () {
@@ -609,12 +787,6 @@ const executeTask = (
       options.outputLogs === "none" || !options.colorEnabled
         ? false
         : yield* terminal.stdoutColorEnabled;
-    const hash = yield* hashTask(
-      repository,
-      node,
-      dependencyHashes,
-      options.frameworkInference,
-    );
     if (node.command === undefined) {
       return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
     }
@@ -759,32 +931,92 @@ const executeTask = (
     return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
   });
 
+const computeTaskHashes = (
+  repository: RepositoryModel,
+  graph: TaskGraph,
+  options: ResolvedRunOptions,
+): Effect.Effect<
+  ReadonlyMap<string, TaskHashResult>,
+  RepositoryError,
+  FileSystemService | EnvironmentService | DigestService | ProcessService
+> =>
+  Effect.gen(function* () {
+    const hashes = new Map<string, TaskHashResult>();
+    for (const id of topologicalOrder(graph)) {
+      const node = graph.nodes.get(id)!;
+      const result = yield* hashTask(
+        repository,
+        node,
+        node.dependencies.map((dependency) => hashes.get(dependency)!.hash),
+        options.frameworkInference,
+        options.passThroughArguments,
+      );
+      hashes.set(id, result);
+    }
+    return hashes;
+  });
+
+const taskGroups = (graph: TaskGraph): ReadonlyArray<ReadonlyArray<string>> => {
+  const reverseWith = new Map<string, Array<string>>();
+  for (const node of graph.nodes.values()) {
+    for (const companion of node.with) {
+      const owners = reverseWith.get(companion) ?? [];
+      owners.push(node.id);
+      reverseWith.set(companion, owners);
+    }
+  }
+  const groups: Array<ReadonlyArray<string>> = [];
+  const visited = new Set<string>();
+  for (const start of [...graph.nodes.keys()].sort()) {
+    if (visited.has(start)) continue;
+    const members = new Set<string>();
+    const pending = [start];
+    while (pending.length > 0) {
+      const id = pending.pop()!;
+      if (members.has(id)) continue;
+      members.add(id);
+      visited.add(id);
+      const node = graph.nodes.get(id);
+      pending.push(...(node?.with ?? []), ...(reverseWith.get(id) ?? []));
+    }
+    groups.push([...members].sort());
+  }
+  return groups;
+};
+
 export const executeRun = (
   parsed: ParsedRunOptions,
 ): Effect.Effect<number, unknown, RunRequirements> =>
   Effect.gen(function* () {
     const environmentService = yield* EnvironmentService;
+    const concurrencyService = yield* ConcurrencyService;
     const processCwd = yield* environmentService.cwd;
     const environment = yield* environmentService.entries;
-    const preliminaryRoot =
+    const requestedRoot =
       parsed.cwd === undefined
-        ? processCwd
-        : parsed.cwd.startsWith("/")
+        ? undefined
+        : isAbsolutePath(parsed.cwd)
           ? parsed.cwd
           : joinPath(processCwd, parsed.cwd);
+    const preliminaryRoot =
+      requestedRoot === undefined
+        ? yield* discoverRepositoryRoot(processCwd)
+        : normalizePath(requestedRoot);
     const configuration = yield* loadRootConfiguration(
       preliminaryRoot,
       parsed.rootTurboJson === undefined
         ? undefined
-        : parsed.rootTurboJson.startsWith("/")
+        : isAbsolutePath(parsed.rootTurboJson)
           ? parsed.rootTurboJson
           : joinPath(preliminaryRoot, parsed.rootTurboJson),
     );
+    const availableParallelism = yield* concurrencyService.availableParallelism;
     const options = resolveOptions(
       parsed,
-      processCwd,
+      preliminaryRoot,
       environment,
       configuration,
+      availableParallelism,
     );
     const repository = yield* discoverRepository(options.root, configuration);
     const packageManagerCheckDisabled =
@@ -808,17 +1040,15 @@ export const executeRun = (
         }),
       );
     }
-    const affected =
-      options.affected || options.filters.some((filter) => filter.includes("["))
-        ? yield* findAffectedPackages(repository, environment)
-        : { packages: new Set<string>(), changedFiles: [], rootChanged: false };
-    const effectiveFilters = options.affected
-      ? [...options.filters, "...[affected]"]
-      : options.filters;
+    const affected = yield* resolveAffectedPackages(
+      repository,
+      options,
+      environment,
+    );
     const packages = selectPackages(
       repository,
-      effectiveFilters,
-      affected.packages,
+      affected.filters,
+      affected.ranges,
     );
     const flags = repository.rootConfiguration.value.futureFlags;
     const unfilteredGraph = buildTaskGraph(
@@ -847,18 +1077,25 @@ export const executeRun = (
           affected.rootChanged,
         )
       : unfilteredGraph;
-    const pending = new Set(graph.nodes.keys());
+    const hashes = yield* computeTaskHashes(repository, graph, options);
+    const groups = taskGroups(graph);
+    const pending = new Map(groups.map((members) => [members[0]!, members]));
     const outcomes = new Map<string, TaskOutcome>();
     while (pending.size > 0) {
-      const ready = [...pending]
-        .filter((id) => {
-          const node = graph.nodes.get(id)!;
+      const ready = [...pending.entries()]
+        .filter(([, members]) => {
+          const memberSet = new Set(members);
           return (
             options.parallel ||
-            node.dependencies.every((dependency) => outcomes.has(dependency))
+            members.every((id) =>
+              graph.nodes
+                .get(id)!
+                .dependencies.filter((dependency) => !memberSet.has(dependency))
+                .every((dependency) => outcomes.has(dependency)),
+            )
           );
         })
-        .sort();
+        .sort(([left], [right]) => left.localeCompare(right));
       if (ready.length === 0) {
         throw new RepositoryError({
           path: options.root,
@@ -866,51 +1103,105 @@ export const executeRun = (
         });
       }
       const batch = ready.slice(0, options.concurrency);
-      const results = yield* Effect.forEach(
+      const groupedResults = yield* Effect.forEach(
         batch,
-        (id): Effect.Effect<TaskOutcome, never, RunRequirements> => {
-          const node = graph.nodes.get(id)!;
-          const dependencyOutcomes = options.parallel
-            ? []
-            : node.dependencies.map((dependency) => outcomes.get(dependency)!);
-          const dependencyFailed = dependencyOutcomes.some(
-            (outcome) => outcome.exitCode !== 0 || outcome.skipped,
+        ([, members]): Effect.Effect<
+          ReadonlyArray<TaskOutcome>,
+          never,
+          RunRequirements
+        > => {
+          const memberSet = new Set(members);
+          const runNode = (
+            id: string,
+          ): Effect.Effect<TaskOutcome, never, RunRequirements> => {
+            const node = graph.nodes.get(id)!;
+            const dependencyOutcomes = options.parallel
+              ? []
+              : node.dependencies.flatMap((dependency) => {
+                  const outcome = outcomes.get(dependency);
+                  return outcome === undefined ? [] : [outcome];
+                });
+            const externalDependencyFailed = node.dependencies
+              .filter((dependency) => !memberSet.has(dependency))
+              .some((dependency) => {
+                const outcome = outcomes.get(dependency);
+                return (
+                  outcome !== undefined &&
+                  (outcome.exitCode !== 0 || outcome.skipped)
+                );
+              });
+            if (
+              !options.parallel &&
+              externalDependencyFailed &&
+              options.continueMode !== "always"
+            ) {
+              return Effect.succeed({
+                id,
+                exitCode: 1,
+                skipped: true,
+              });
+            }
+            return executeTask(
+              repository,
+              node,
+              options,
+              hashes.get(id)!,
+              environment,
+            ).pipe(
+              Effect.catchAll((cause) =>
+                Effect.gen(function* () {
+                  const terminal = yield* TerminalService;
+                  yield* terminal
+                    .writeStderr(`turbo-ts: ${String(cause)}\n`)
+                    .pipe(Effect.ignore);
+                  return {
+                    id,
+                    exitCode: 1,
+                    skipped: false,
+                  } satisfies TaskOutcome;
+                }),
+              ),
+            );
+          };
+          const owners = new Set(
+            members.filter((id) => graph.nodes.get(id)!.with.length > 0),
           );
-          if (dependencyFailed && options.continueMode !== "always") {
-            return Effect.succeed({
-              id,
-              exitCode: 1,
-              skipped: true,
-            } as TaskOutcome);
-          }
-          return executeTask(
-            repository,
-            node,
-            options,
-            dependencyOutcomes.flatMap((outcome) =>
-              outcome.hash === undefined ? [] : [outcome.hash],
-            ),
-            environment,
-          ).pipe(
-            Effect.catchAll((cause) =>
-              Effect.gen(function* () {
-                const terminal = yield* TerminalService;
-                yield* terminal
-                  .writeStderr(`turbo-ts: ${String(cause)}\n`)
-                  .pipe(Effect.ignore);
-                return {
+          const targets = new Set(
+            members.flatMap((id) => graph.nodes.get(id)!.with),
+          );
+          const background = members.filter(
+            (id) =>
+              targets.has(id) &&
+              !owners.has(id) &&
+              graph.nodes.get(id)!.definition.persistent === true,
+          );
+          const foreground = members.filter((id) => !background.includes(id));
+          return Effect.scoped(
+            Effect.gen(function* () {
+              for (const id of background) {
+                yield* Effect.forkScoped(runNode(id));
+              }
+              if (background.length > 0) yield* Effect.yieldNow();
+              const results = yield* Effect.forEach(foreground, runNode, {
+                concurrency: "unbounded",
+              });
+              return [
+                ...results,
+                ...background.map((id) => ({
                   id,
-                  exitCode: 1,
+                  exitCode: 0,
+                  hash: hashes.get(id)!.hash,
                   skipped: false,
-                } satisfies TaskOutcome;
-              }),
-            ),
+                })),
+              ];
+            }),
           );
         },
         { concurrency: options.concurrency },
       );
+      const results = groupedResults.flat();
+      for (const [groupId] of batch) pending.delete(groupId);
       for (const result of results) {
-        pending.delete(result.id);
         outcomes.set(result.id, result);
       }
       if (

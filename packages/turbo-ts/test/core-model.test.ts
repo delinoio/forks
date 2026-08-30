@@ -7,6 +7,7 @@ import {
 } from "../src/config/runtime.js";
 import { matchesGlob, selectByGlobs } from "../src/core/glob.js";
 import {
+  isAbsolutePath,
   isPathContained,
   joinPath,
   normalizePath,
@@ -16,6 +17,7 @@ import { GraphError } from "../src/effect/errors.js";
 import {
   buildTaskGraph,
   selectPackages,
+  type TaskNode,
   topologicalOrder,
 } from "../src/graph/task-graph.js";
 import { selectEnvironment } from "../src/hash/task-hash.js";
@@ -25,8 +27,12 @@ import type {
   RepositoryModel,
   RepositoryPackage,
 } from "../src/repository/model.js";
-import { managerFromIdentity } from "../src/repository/model.js";
-import { parseRunArguments } from "../src/run/options.js";
+import {
+  managerFromIdentity,
+  parseCargoMetadata,
+} from "../src/repository/model.js";
+import { packageManagerCommand } from "../src/run/engine.js";
+import { parseConcurrency, parseRunArguments } from "../src/run/options.js";
 
 const encoder = new TextEncoder();
 
@@ -89,6 +95,8 @@ describe("core repository model", () => {
     expect(relativePath("/repo", "/repo/packages/app")).toBe("packages/app");
     expect(isPathContained("/repo", "/repo/packages/app")).toBe(true);
     expect(isPathContained("/repo", "/outside")).toBe(false);
+    expect(isAbsolutePath("C:\\repo")).toBe(true);
+    expect(isAbsolutePath("packages/app")).toBe(false);
   });
 
   it("matches workspace and input globs with negation", () => {
@@ -101,6 +109,9 @@ describe("core repository model", () => {
         ["src/**", "!**/*.test.ts"],
       ),
     ).toEqual(["src/a.ts"]);
+    expect(matchesGlob("src/app.tsx", "src/**/*.{ts,tsx}")).toBe(true);
+    expect(matchesGlob("assets/7-logo.png", "assets/[0-9]*.png")).toBe(true);
+    expect(matchesGlob("assets/a-logo.png", "assets/[0-9]*.png")).toBe(false);
   });
 
   it("parses JSONC without interpreting comment markers inside strings", () => {
@@ -114,6 +125,9 @@ describe("core repository model", () => {
       description: "keep, } and, ]",
       tasks: { build: {} },
     });
+    expect(() =>
+      parseJsonConfiguration('{"tasks": {}} /* unfinished', "turbo.jsonc"),
+    ).toThrow(/unterminated block comment/);
   });
 
   it("merges package task arrays and the explicit inheritance marker", () => {
@@ -248,6 +262,12 @@ describe("core repository model", () => {
     expect(
       selectPackages(model, ["app..."]).map((entry) => entry.name),
     ).toEqual(["app", "library"]);
+    expect(
+      selectPackages(model, ["!library"]).map((entry) => entry.name),
+    ).toEqual(["app"]);
+    expect(
+      selectPackages(model, ["!app", "*"]).map((entry) => entry.name),
+    ).toEqual(["library"]);
     const graph = buildTaskGraph(model, [app], ["build"], false);
     expect(topologicalOrder(graph)).toEqual(["library#build", "app#build"]);
 
@@ -258,6 +278,47 @@ describe("core repository model", () => {
     expect(() => buildTaskGraph(cyclic, [app], ["build"], false)).toThrow(
       GraphError,
     );
+  });
+
+  it("prefers package-qualified task definitions", () => {
+    const library = packageModel("library", []);
+    const app = {
+      ...packageModel("app", ["library"]),
+      tasks: {
+        build: { cache: true },
+        "app#build": { cache: false, dependsOn: ["library#build"] },
+      },
+    } satisfies RepositoryPackage;
+    const graph = buildTaskGraph(
+      repository([app, library]),
+      [app],
+      ["build"],
+      false,
+    );
+    expect(graph.nodes.get("app#build")?.definition).toMatchObject({
+      cache: false,
+      dependsOn: ["library#build"],
+    });
+    expect(graph.nodes.get("app#build")?.dependencies).toEqual([
+      "library#build",
+    ]);
+  });
+
+  it("resolves renamed Cargo dependencies from metadata", () => {
+    expect(
+      parseCargoMetadata(
+        JSON.stringify({
+          packages: [
+            {
+              name: "app",
+              manifest_path: "/repo/crates/app/Cargo.toml",
+              dependencies: [{ name: "util", rename: "util_alias" }],
+            },
+          ],
+        }),
+        "/repo/crates/app/Cargo.toml",
+      ),
+    ).toEqual({ name: "app", dependencyNames: ["util"] });
   });
 
   it("models root task entrypoints and dependencies in the //# namespace", () => {
@@ -344,6 +405,35 @@ describe("core repository model", () => {
     ]);
   });
 
+  it("uses available parallelism for percentages and maps Cargo dev to run", () => {
+    expect(parseConcurrency("50%", 8)).toBe(4);
+    expect(parseConcurrency("100%", 1)).toBe(1);
+    const packageModel = {
+      name: "app",
+      directory: "/repo/crates/app",
+      relativeDirectory: "crates/app",
+      manager: "cargo" as const,
+      scripts: { dev: "cargo run" },
+      dependencyNames: [],
+      internalDependencies: [],
+      tasks: { dev: {} },
+      manifest: { name: "app" },
+    };
+    const node: TaskNode = {
+      id: "app#dev",
+      package: packageModel,
+      task: "dev",
+      command: "cargo run",
+      definition: {},
+      dependencies: [],
+      with: [],
+    };
+    expect(packageManagerCommand(node, [])).toEqual({
+      command: "cargo",
+      arguments: ["run", "--package=app", "--locked"],
+    });
+  });
+
   it("rejects unknown output log modes", () => {
     expect(() =>
       parseRunArguments(["run", "build", "--output-logs=unexpected"]),
@@ -370,6 +460,21 @@ describe("cache archive safety", () => {
     expect(parseTarArchive(createTarArchive(entries))).toEqual(
       entries.sort((left, right) => left.path.localeCompare(right.path)),
     );
+  });
+
+  it("round trips safe symlink entries and rejects escaping targets", () => {
+    const entry = {
+      kind: "symlink" as const,
+      path: "packages/app/dist/current.txt",
+      linkTarget: "value.txt",
+      contents: new Uint8Array(),
+      mode: 0o777,
+      modifiedSeconds: 2,
+    };
+    expect(parseTarArchive(createTarArchive([entry]))).toEqual([entry]);
+    expect(() =>
+      createTarArchive([{ ...entry, linkTarget: "../../../../outside" }]),
+    ).toThrow(/escapes repository/);
   });
 
   it("round trips ustar paths longer than the name field", () => {

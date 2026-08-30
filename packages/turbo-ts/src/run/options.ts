@@ -298,7 +298,10 @@ export const parseRunArguments = (
   };
 };
 
-export const parseConcurrency = (value: string | undefined): number => {
+export const parseConcurrency = (
+  value: string | undefined,
+  availableParallelism: number,
+): number => {
   if (value === undefined) {
     return 10;
   }
@@ -310,7 +313,10 @@ export const parseConcurrency = (value: string | undefined): number => {
         message: `invalid concurrency: ${value}`,
       });
     }
-    return Math.max(1, Math.ceil((percentage / 100) * 4));
+    return Math.max(
+      1,
+      Math.ceil((percentage / 100) * Math.max(1, availableParallelism)),
+    );
   }
   const count = Number(value);
   if (!Number.isSafeInteger(count) || count <= 0) {

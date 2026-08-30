@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readlink,
   rm,
   symlink,
   utimes,
@@ -112,6 +113,278 @@ describe("core CLI execution", () => {
           "utf8",
         ),
       ).toContain("app build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("includes pass-through arguments in task hashes", async () => {
+    const directory = await makeFixture();
+    try {
+      const manifestPath = `${directory}/packages/library/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"console.log(process.argv.slice(1).join(':'))\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const common = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter",
+        "synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      const production = await run(
+        process.execPath,
+        [...common, "--", "--mode=production"],
+        repositoryRoot,
+      );
+      const development = await run(
+        process.execPath,
+        [...common, "--", "--mode=development"],
+        repositoryRoot,
+      );
+      expect(production.stdout).toContain("cache miss");
+      expect(development.stdout).toContain("cache miss");
+      expect(
+        await readFile(
+          `${directory}/packages/library/.turbo/turbo-build.log`,
+          "utf8",
+        ),
+      ).toContain("--mode=development");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("preserves dependency hashes in parallel mode", async () => {
+    const directory = await makeFixture();
+    const args = [
+      candidateEntrypoint,
+      "run",
+      "build",
+      "--cwd",
+      directory,
+      "--parallel",
+      "--concurrency=2",
+      "--output-logs=hash-only",
+    ];
+    try {
+      const first = await run(process.execPath, args, repositoryRoot);
+      expect((first.stdout.match(/cache miss/g) ?? []).length).toBe(2);
+      await writeFile(
+        `${directory}/packages/library/source.txt`,
+        "changed dependency\n",
+      );
+      const second = await run(process.execPath, args, repositoryRoot);
+      expect((second.stdout.match(/cache miss/g) ?? []).length).toBe(2);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("honors Git revisions encoded in package filters", async () => {
+    await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
+    const directory = await mkdtemp(
+      join(repositoryRoot, ".turbo/turbo-ts-git-range-"),
+    );
+    await cp(fixtureRoot, directory, { recursive: true });
+    try {
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "base"],
+        ["branch", "release"],
+      ]) {
+        const result = await run("git", args, directory);
+        expect(result.exitCode, `${args.join(" ")}: ${result.stderr}`).toBe(0);
+      }
+      await writeFile(`${directory}/packages/library/source.txt`, "library\n");
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "library"], directory)).exitCode,
+      ).toBe(0);
+      expect(
+        (await run("git", ["branch", "develop"], directory)).exitCode,
+      ).toBe(0);
+      await writeFile(`${directory}/packages/app/source.txt`, "app\n");
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "app"], directory)).exitCode,
+      ).toBe(0);
+      const execute = (filter: string) =>
+        run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "build",
+            "--cwd",
+            directory,
+            `--filter=${filter}`,
+            "--only",
+            "--no-cache",
+          ],
+          repositoryRoot,
+        );
+      const sinceDevelop = await execute("[develop]");
+      expect(sinceDevelop.stdout).toContain("app build");
+      expect(sinceDevelop.stdout).not.toContain("library build");
+      const releaseToDevelop = await execute("[release...develop]");
+      expect(releaseToDevelop.stdout).toContain("library build");
+      expect(releaseToDevelop.stdout).not.toContain("app build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("discovers the root from a nested workspace and applies exclusions", async () => {
+    const directory = await makeFixture();
+    try {
+      await mkdir(`${directory}/packages/legacy`, { recursive: true });
+      await writeFile(
+        `${directory}/packages/legacy/package.json`,
+        JSON.stringify({
+          name: "synthetic-legacy",
+          private: true,
+          scripts: { build: "node -e \"console.log('legacy build')\"" },
+        }),
+      );
+      await writeFile(
+        `${directory}/pnpm-workspace.yaml`,
+        "packages:\n  - packages/*\n  - '!packages/legacy'\n",
+      );
+      const result = await run(
+        process.execPath,
+        [candidateEntrypoint, "run", "build", "--no-cache"],
+        `${directory}/packages/app`,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("app build");
+      expect(result.stdout).toContain("library build");
+      expect(result.stdout).not.toContain("legacy build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("hashes input links and restores output links from cache", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        tasks: Record<
+          string,
+          { inputs?: Array<string>; outputs?: Array<string> }
+        >;
+      };
+      configuration.tasks.build = {
+        inputs: ["input.txt"],
+        outputs: ["dist/**"],
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',fs.readFileSync('input.txt')); fs.symlinkSync('value.txt','dist/current.txt')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      await writeFile(`${packageDirectory}/source-a.txt`, "same\n");
+      await writeFile(`${packageDirectory}/source-b.txt`, "same\n");
+      await symlink("source-a.txt", `${packageDirectory}/input.txt`);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      await rm(`${packageDirectory}/dist`, { force: true, recursive: true });
+      await rm(`${packageDirectory}/input.txt`, { force: true });
+      await symlink("source-b.txt", `${packageDirectory}/input.txt`);
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      await rm(`${packageDirectory}/dist`, { force: true, recursive: true });
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache hit");
+      expect(await readlink(`${packageDirectory}/dist/current.txt`)).toBe(
+        "value.txt",
+      );
+      await writeFile(`${packageDirectory}/source-b.txt`, "changed target\n");
+      await rm(`${packageDirectory}/dist`, { force: true, recursive: true });
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache hit");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("starts persistent with companions inside one concurrency slot", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.check = { cache: false, with: ["serve"] };
+      configuration.tasks.serve = { cache: false, persistent: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.serve =
+        "node -e \"const fs=require('node:fs'); fs.writeFileSync('serve.ready','1'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('owner.done')){clearInterval(timer)}else if(Date.now()-started>4000){process.exit(8)}},10)\"";
+      manifest.scripts.check =
+        "node -e \"const fs=require('node:fs'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('serve.ready')){fs.writeFileSync('owner.done','1'); clearInterval(timer)}else if(Date.now()-started>3000){process.exit(7)}},10)\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--concurrency=1",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(await readFile(`${packageDirectory}/serve.ready`, "utf8")).toBe(
+        "1",
+      );
+      expect(await readFile(`${packageDirectory}/owner.done`, "utf8")).toBe(
+        "1",
+      );
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
