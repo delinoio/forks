@@ -26,8 +26,10 @@ import {
   writeRemoteCache,
 } from "../src/cache/remote-cache.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
+import { loadRootConfiguration } from "../src/config/runtime.js";
 import { nodeFoundationLayer } from "../src/effect/node-layer.js";
 import { ProcessService } from "../src/effect/services.js";
+import { discoverRepository } from "../src/repository/model.js";
 
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
@@ -113,6 +115,97 @@ describe("core CLI execution", () => {
           "utf8",
         ),
       ).toContain("app build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("accepts documented cache policies and rejects malformed policies", async () => {
+    const directory = await makeFixture();
+    try {
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--cache=local:rw",
+        "--output-logs=hash-only",
+      ];
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache hit");
+      const malformed = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--cache=local:read",
+        ],
+        repositoryRoot,
+      );
+      expect(malformed.exitCode).not.toBe(0);
+      expect(malformed.stderr).toContain("invalid cache specification");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("merges qualified root tasks before validating workspace overrides", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks["synthetic-app#build"] = {
+        cache: false,
+        outputs: ["qualified/**"],
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(
+        model.packagesByName.get("synthetic-app")?.tasks["synthetic-app#build"],
+      ).toMatchObject({ cache: false, outputs: ["build/**"] });
+
+      configuration.tasks["synthetic-app#build"] = {
+        cache: false,
+        interactive: true,
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const workspacePath = `${directory}/packages/app/turbo.json`;
+      const workspace = JSON.parse(await readFile(workspacePath, "utf8")) as {
+        tasks: Record<string, Record<string, unknown>>;
+      };
+      workspace.tasks.build!.cache = true;
+      await writeFile(workspacePath, `${JSON.stringify(workspace, null, 2)}\n`);
+      const invalid = await run(
+        process.execPath,
+        [candidateEntrypoint, "run", "build", "--cwd", directory],
+        repositoryRoot,
+      );
+      expect(invalid.exitCode).not.toBe(0);
+      expect(invalid.stderr).toContain(
+        "interactive tasks must disable caching",
+      );
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -526,6 +619,71 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("includes companion task hashes in an owner's cache key", async () => {
+    const directory = await makeFixture();
+    const libraryDirectory = `${directory}/packages/library`;
+    const appDirectory = `${directory}/packages/app`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.integration = {
+        with: ["synthetic-app#serve"],
+      };
+      configuration.tasks.serve = { cache: false, persistent: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const appManifestPath = `${appDirectory}/package.json`;
+      const appManifest = JSON.parse(
+        await readFile(appManifestPath, "utf8"),
+      ) as { scripts: Record<string, string> };
+      appManifest.scripts.serve = 'node -e "setInterval(() => {}, 1000)"';
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, null, 2)}\n`,
+      );
+      await writeFile(`${appDirectory}/server.txt`, "first\n");
+      const libraryManifestPath = `${libraryDirectory}/package.json`;
+      const libraryManifest = JSON.parse(
+        await readFile(libraryManifestPath, "utf8"),
+      ) as { scripts: Record<string, string> };
+      libraryManifest.scripts.integration =
+        "node -e \"const fs=require('node:fs'); const path='../../owner-runs.txt'; const count=fs.existsSync(path)?Number(fs.readFileSync(path,'utf8')):0; fs.writeFileSync(path,String(count+1))\"";
+      await writeFile(
+        libraryManifestPath,
+        `${JSON.stringify(libraryManifest, null, 2)}\n`,
+      );
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "integration",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--concurrency=1",
+        "--output-logs=hash-only",
+      ];
+      const cold = await run(process.execPath, args, repositoryRoot);
+      const warm = await run(process.execPath, args, repositoryRoot);
+      expect(cold.exitCode).toBe(0);
+      expect(warm.stdout).toContain("synthetic-library:integration: cache hit");
+      expect(await readFile(`${directory}/owner-runs.txt`, "utf8")).toBe("1");
+
+      await writeFile(`${appDirectory}/server.txt`, "second\n");
+      const changed = await run(process.execPath, args, repositoryRoot);
+      expect(changed.exitCode).toBe(0);
+      expect(changed.stdout).toContain(
+        "synthetic-library:integration: cache miss",
+      );
+      expect(await readFile(`${directory}/owner-runs.txt`, "utf8")).toBe("2");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
 
   it("runs a standalone Cargo package from its manifest directory", async () => {
     const directory = await makeFixture();

@@ -31,7 +31,12 @@ import {
   managerFromIdentity,
   parseCargoMetadata,
 } from "../src/repository/model.js";
-import { packageManagerCommand } from "../src/run/engine.js";
+import {
+  cargoWorkspaceHash,
+  packageManagerCommand,
+  parseCacheSpecification,
+  planCargoWorkspaceTasks,
+} from "../src/run/engine.js";
 import { parseConcurrency, parseRunArguments } from "../src/run/options.js";
 
 const encoder = new TextEncoder();
@@ -308,6 +313,7 @@ describe("core repository model", () => {
     expect(
       parseCargoMetadata(
         JSON.stringify({
+          workspace_root: "/repo",
           packages: [
             {
               name: "app",
@@ -318,7 +324,11 @@ describe("core repository model", () => {
         }),
         "/repo/crates/app/Cargo.toml",
       ),
-    ).toEqual({ name: "app", dependencyNames: ["util"] });
+    ).toEqual({
+      name: "app",
+      dependencyNames: ["util"],
+      workspaceDirectory: "/repo",
+    });
   });
 
   it("models root task entrypoints and dependencies in the //# namespace", () => {
@@ -431,6 +441,116 @@ describe("core repository model", () => {
     expect(packageManagerCommand(node, [])).toEqual({
       command: "cargo",
       arguments: ["run", "--package=app", "--locked"],
+      cwd: "/repo/crates/app",
+    });
+  });
+
+  it("parses cache provider modes and rejects malformed specifications", () => {
+    expect(parseCacheSpecification("local:rw,remote:r")).toEqual({
+      localRead: true,
+      localWrite: true,
+      remoteRead: true,
+      remoteWrite: false,
+    });
+    expect(parseCacheSpecification("remote:w")).toEqual({
+      localRead: false,
+      localWrite: false,
+      remoteRead: false,
+      remoteWrite: true,
+    });
+    expect(() => parseCacheSpecification("local:read")).toThrow(
+      /invalid cache specification/,
+    );
+    expect(() => parseCacheSpecification("local:rw;remote:rw")).toThrow(
+      /invalid cache specification/,
+    );
+  });
+
+  it("plans one unfiltered Cargo verification per workspace", () => {
+    const cargoPackage = (name: string): RepositoryPackage => ({
+      ...packageModel(name, []),
+      directory: `/repo/crates/${name}`,
+      relativeDirectory: `crates/${name}`,
+      workspaceDirectory: "/repo",
+      manager: "cargo",
+      scripts: { format: "cargo fmt", test: "cargo test" },
+      tasks: { format: {}, test: {} },
+    });
+    const app = cargoPackage("app");
+    const library = cargoPackage("library");
+    const model = repository([app, library]);
+    const graph = buildTaskGraph(model, model.packages, ["test"], false);
+    const workspacePlan = planCargoWorkspaceTasks(graph, ["test"], true);
+    expect(workspacePlan.graph.entrypoints).toEqual(["app#test"]);
+    const workspaceNode = workspacePlan.graph.nodes.get("app#test")!;
+    const workspaceScope = workspacePlan.scopes.get("app#test")!;
+    expect(packageManagerCommand(workspaceNode, [], workspaceScope)).toEqual({
+      command: "cargo",
+      arguments: ["test", "--workspace", "--locked"],
+      cwd: "/repo",
+    });
+
+    const formatGraph = buildTaskGraph(
+      model,
+      model.packages,
+      ["format"],
+      false,
+    );
+    const formatPlan = planCargoWorkspaceTasks(formatGraph, ["format"], true);
+    const formatNode = formatPlan.graph.nodes.get("app#format")!;
+    expect(
+      packageManagerCommand(
+        formatNode,
+        [],
+        formatPlan.scopes.get("app#format")!,
+      ),
+    ).toEqual({ command: "cargo", arguments: ["fmt", "--all"], cwd: "/repo" });
+
+    const filteredPlan = planCargoWorkspaceTasks(graph, ["test"], false);
+    expect(filteredPlan.graph.entrypoints).toEqual([
+      "app#test",
+      "library#test",
+    ]);
+    expect(filteredPlan.scopes.size).toBe(0);
+    expect(packageManagerCommand(graph.nodes.get("app#test")!, [])).toEqual({
+      command: "cargo",
+      arguments: ["test", "--package=app", "--locked"],
+      cwd: "/repo/crates/app",
+    });
+    expect(
+      cargoWorkspaceHash([
+        ["app#test", "aaaa"],
+        ["library#test", "bbbb"],
+      ]),
+    ).not.toBe(
+      cargoWorkspaceHash([
+        ["app#test", "aaaa"],
+        ["library#test", "cccc"],
+      ]),
+    );
+  });
+
+  it("runs uv commands from the discovered project directory", () => {
+    const uvPackage = {
+      ...packageModel("python-app", []),
+      directory: "/repo/python/app",
+      relativeDirectory: "python/app",
+      manager: "uv" as const,
+      scripts: { format: "uv format", test: "uv run --frozen pytest" },
+      tasks: { format: {}, test: {} },
+    } satisfies RepositoryPackage;
+    const graph = buildTaskGraph(
+      repository([uvPackage]),
+      [uvPackage],
+      ["test"],
+      false,
+    );
+    expect(
+      packageManagerCommand(graph.nodes.get("python-app#test")!, []),
+    ).toEqual({
+      command: "uv",
+      arguments: ["run", "--frozen", "--package", "python-app", "pytest", "."],
+      cwd: "/repo/python/app",
     });
   });
 

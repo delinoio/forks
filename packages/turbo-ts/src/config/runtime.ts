@@ -533,6 +533,7 @@ export const mergePipeline = (
 
 export const loadPackageConfiguration = (
   packageDirectory: string,
+  packageName: string,
   root: LoadedRootConfiguration,
 ): Effect.Effect<
   Readonly<Record<string, Pipeline>>,
@@ -609,7 +610,13 @@ export const loadPackageConfiguration = (
     }
     const tasks = { ...rootTasks };
     for (const [name, pipeline] of Object.entries(workspace.tasks ?? {})) {
-      tasks[name] = mergePipeline(rootTasks[name], pipeline);
+      const qualifiedName = `${packageName}#${name}`;
+      const targetName =
+        rootTasks[qualifiedName] === undefined ? name : qualifiedName;
+      tasks[targetName] = mergePipeline(rootTasks[targetName], pipeline);
     }
-    return tasks;
+    return yield* validateConfigurationEffect(path, () => {
+      validateTaskKeys(tasks, path);
+      return tasks;
+    });
   });

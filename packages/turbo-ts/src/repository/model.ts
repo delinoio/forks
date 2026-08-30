@@ -53,6 +53,7 @@ export interface RepositoryPackage {
   readonly name: string;
   readonly directory: string;
   readonly relativeDirectory: string;
+  readonly workspaceDirectory?: string;
   readonly manager: PackageManagerName;
   readonly scripts: Readonly<Record<string, string>>;
   readonly dependencyNames: ReadonlyArray<string>;
@@ -405,6 +406,7 @@ const polyglotScripts = (
 interface CargoPackageMetadata {
   readonly name: string;
   readonly dependencyNames: ReadonlyArray<string>;
+  readonly workspaceDirectory?: string;
 }
 
 export const parseCargoMetadata = (
@@ -412,6 +414,7 @@ export const parseCargoMetadata = (
   manifestPath: string,
 ): CargoPackageMetadata | undefined => {
   const document = JSON.parse(source) as {
+    readonly workspace_root?: unknown;
     readonly packages?: ReadonlyArray<{
       readonly name?: unknown;
       readonly manifest_path?: unknown;
@@ -438,6 +441,9 @@ export const parseCargoMetadata = (
         ),
       ),
     ].sort(),
+    ...(typeof document.workspace_root === "string"
+      ? { workspaceDirectory: normalizePath(document.workspace_root) }
+      : {}),
   };
 };
 
@@ -556,6 +562,7 @@ export const discoverRepository = (
           const name = manifest.name ?? baseName(directory);
           const tasks = yield* loadPackageConfiguration(
             directory,
+            name,
             rootConfiguration,
           ).pipe(
             Effect.mapError(
@@ -640,6 +647,7 @@ export const discoverRepository = (
               name,
               directory,
               relativeDirectory: relativePath(root, directory),
+              workspaceDirectory: cargoMetadata?.workspaceDirectory,
               manager: candidate.manager,
               scripts: polyglotScripts(candidate.manager),
               dependencyNames:

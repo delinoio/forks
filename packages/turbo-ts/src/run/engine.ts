@@ -49,6 +49,7 @@ import {
   type TaskHashResult,
   taskEnvironment,
 } from "../hash/task-hash.js";
+import { xxhash64Hex } from "../hash/xxhash64.js";
 import { renderLogEvent } from "../logging/events.js";
 import {
   discoverRepository,
@@ -63,6 +64,35 @@ interface CachePolicy {
   readonly remoteRead: boolean;
   readonly remoteWrite: boolean;
 }
+
+export const parseCacheSpecification = (
+  specification: string,
+  path = "<arguments>",
+): CachePolicy => {
+  let policy: CachePolicy = {
+    localRead: false,
+    localWrite: false,
+    remoteRead: false,
+    remoteWrite: false,
+  };
+  for (const entry of specification.split(",")) {
+    const match = /^(local|remote):(r|w|rw)$/.exec(entry);
+    if (match === null) {
+      throw new ConfigurationError({
+        path,
+        message: `invalid cache specification: ${specification}`,
+      });
+    }
+    const [, source, operations] = match;
+    const read = operations === "r" || operations === "rw";
+    const write = operations === "w" || operations === "rw";
+    policy =
+      source === "local"
+        ? { ...policy, localRead: read, localWrite: write }
+        : { ...policy, remoteRead: read, remoteWrite: write };
+  }
+  return policy;
+};
 
 interface ResolvedRunOptions {
   readonly root: string;
@@ -143,22 +173,10 @@ const parseCachePolicy = (
   };
   const specification = parsed.cacheSpecification ?? environment.TURBO_CACHE;
   if (specification !== undefined) {
-    policy = {
-      localRead: false,
-      localWrite: false,
-      remoteRead: false,
-      remoteWrite: false,
-    };
-    for (const part of specification.split(";")) {
-      const [source, operations = ""] = part.split(":");
-      const read = operations.split(",").includes("r");
-      const write = operations.split(",").includes("w");
-      if (source === "local") {
-        policy = { ...policy, localRead: read, localWrite: write };
-      } else if (source === "remote") {
-        policy = { ...policy, remoteRead: read, remoteWrite: write };
-      }
-    }
+    policy = parseCacheSpecification(
+      specification,
+      parsed.cacheSpecification === undefined ? "TURBO_CACHE" : "<arguments>",
+    );
   }
   if (
     parsed.remoteOnly ||
@@ -604,10 +622,25 @@ const selectAffectedTasks = (
   };
 };
 
+export type TaskCommandScope =
+  | { readonly kind: "package" }
+  | {
+      readonly kind: "cargo-workspace";
+      readonly directory: string;
+      readonly members: ReadonlyArray<TaskNode>;
+    };
+
+const packageTaskCommandScope = { kind: "package" } as const;
+
 export const packageManagerCommand = (
   node: TaskNode,
   passThroughArguments: ReadonlyArray<string>,
-): { readonly command: string; readonly arguments: ReadonlyArray<string> } => {
+  scope: TaskCommandScope = packageTaskCommandScope,
+): {
+  readonly command: string;
+  readonly arguments: ReadonlyArray<string>;
+  readonly cwd: string;
+} => {
   switch (node.package.manager) {
     case "yarn":
     case "bun":
@@ -616,6 +649,7 @@ export const packageManagerCommand = (
       return {
         command: node.package.manager,
         arguments: ["run", node.task, ...passThroughArguments],
+        cwd: node.package.directory,
       };
     case "cargo": {
       const cargoTask =
@@ -627,7 +661,12 @@ export const packageManagerCommand = (
               ? "run"
               : node.task;
       const locked = cargoTask === "fmt" ? [] : ["--locked"];
-      const target = [`--package=${node.package.name}`];
+      const target =
+        scope.kind === "cargo-workspace"
+          ? cargoTask === "fmt"
+            ? ["--all"]
+            : ["--workspace"]
+          : [`--package=${node.package.name}`];
       const passThrough =
         passThroughArguments.length === 0
           ? []
@@ -637,6 +676,10 @@ export const packageManagerCommand = (
       return {
         command: "cargo",
         arguments: [cargoTask, ...target, ...locked, ...passThrough],
+        cwd:
+          scope.kind === "cargo-workspace"
+            ? scope.directory
+            : node.package.directory,
       };
     }
     case "uv":
@@ -648,17 +691,14 @@ export const packageManagerCommand = (
             `--package=${node.package.name}`,
             ...passThroughArguments,
           ],
+          cwd: node.package.directory,
         };
       }
       if (node.task === "format") {
         return {
           command: "uv",
-          arguments: [
-            "format",
-            ...passThroughArguments,
-            "--",
-            node.package.relativeDirectory,
-          ],
+          arguments: ["format", ...passThroughArguments, "--", "."],
+          cwd: node.package.directory,
         };
       }
       if (node.task === "check") {
@@ -670,6 +710,7 @@ export const packageManagerCommand = (
             `--package=${node.package.name}`,
             ...passThroughArguments,
           ],
+          cwd: node.package.directory,
         };
       }
       return {
@@ -681,8 +722,9 @@ export const packageManagerCommand = (
           node.package.name,
           "pytest",
           ...passThroughArguments,
-          node.package.relativeDirectory,
+          ".",
         ],
+        cwd: node.package.directory,
       };
     case "npm":
     case "pnpm":
@@ -692,13 +734,14 @@ export const packageManagerCommand = (
           passThroughArguments.length === 0
             ? ["run", node.task]
             : ["run", node.task, "--", ...passThroughArguments],
+        cwd: node.package.directory,
       };
   }
 };
 
 const collectCacheEntries = (
   repository: RepositoryModel,
-  node: TaskNode,
+  nodes: ReadonlyArray<TaskNode>,
   logPath: string,
 ): Effect.Effect<
   ReadonlyArray<CacheWriteEntry>,
@@ -707,31 +750,31 @@ const collectCacheEntries = (
 > =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
-    const files = [
-      ...(yield* listRepositoryFiles(node.package.directory, {
+    const selected = new Set<string>([logPath]);
+    for (const node of nodes) {
+      const files = yield* listRepositoryFiles(node.package.directory, {
         ignoredDirectories: new Set([".git", ".turbo", "node_modules"]),
-      })),
-      logPath,
-    ];
-    const outputPatterns = node.definition.outputs ?? [];
-    const selected = files.filter((path) => {
-      if (path === logPath) {
-        return true;
+      });
+      const outputPatterns = node.definition.outputs ?? [];
+      for (const path of files) {
+        const relative = relativePath(node.package.directory, path);
+        if (
+          outputPatterns.some(
+            (pattern) =>
+              !pattern.startsWith("!") && matchesGlob(relative, pattern),
+          ) &&
+          !outputPatterns.some(
+            (pattern) =>
+              pattern.startsWith("!") &&
+              matchesGlob(relative, pattern.slice(1)),
+          )
+        ) {
+          selected.add(path);
+        }
       }
-      const relative = relativePath(node.package.directory, path);
-      return (
-        outputPatterns.some(
-          (pattern) =>
-            !pattern.startsWith("!") && matchesGlob(relative, pattern),
-        ) &&
-        !outputPatterns.some(
-          (pattern) =>
-            pattern.startsWith("!") && matchesGlob(relative, pattern.slice(1)),
-        )
-      );
-    });
+    }
     return yield* Effect.forEach(
-      selected,
+      [...selected].sort(),
       (path) =>
         Effect.gen(function* () {
           const metadata = yield* fileSystem
@@ -789,6 +832,7 @@ const executeTask = (
   options: ResolvedRunOptions,
   hash: TaskHashResult,
   sourceEnvironment: Readonly<Record<string, string | undefined>>,
+  scope: TaskCommandScope = packageTaskCommandScope,
 ): Effect.Effect<TaskOutcome, unknown, RunRequirements> =>
   Effect.gen(function* () {
     const terminal = yield* TerminalService;
@@ -835,8 +879,12 @@ const executeTask = (
         hash.hash,
       );
     }
+    const executionDirectory =
+      scope.kind === "cargo-workspace"
+        ? scope.directory
+        : node.package.directory;
     const logPath = joinPath(
-      node.package.directory,
+      executionDirectory,
       ".turbo",
       `turbo-${node.task}.log`,
     );
@@ -883,16 +931,14 @@ const executeTask = (
     const invocation = packageManagerCommand(
       node,
       options.passThroughArguments,
+      scope,
     );
     const processService = yield* ProcessService;
     const result = yield* Effect.scoped(
       processService.run({
         command: invocation.command,
         args: invocation.arguments,
-        cwd:
-          node.package.manager === "uv"
-            ? repository.root
-            : node.package.directory,
+        cwd: invocation.cwd,
         inheritEnvironment: false,
         stdio: node.definition.interactive === true ? "inherit" : "capture",
         env: {
@@ -908,7 +954,7 @@ const executeTask = (
       }),
     );
     const output = result.combinedOutput;
-    yield* fileSystem.makeDirectory(joinPath(node.package.directory, ".turbo"));
+    yield* fileSystem.makeDirectory(joinPath(executionDirectory, ".turbo"));
     yield* fileSystem.writeText(logPath, output);
     if (
       shouldReplayOutput(outputMode, false) ||
@@ -930,7 +976,11 @@ const executeTask = (
       cacheable &&
       (options.cachePolicy.localWrite || options.cachePolicy.remoteWrite)
     ) {
-      const entries = yield* collectCacheEntries(repository, node, logPath);
+      const entries = yield* collectCacheEntries(
+        repository,
+        scope.kind === "cargo-workspace" ? scope.members : [node],
+        logPath,
+      );
       const duration = (yield* clock.now) - started;
       if (options.cachePolicy.localWrite) {
         yield* writeLocalCache(localOptions, hash.hash, entries, duration);
@@ -953,12 +1003,27 @@ const computeTaskHashes = (
 > =>
   Effect.gen(function* () {
     const hashes = new Map<string, TaskHashResult>();
-    for (const id of topologicalOrder(graph)) {
+    const hashGraph: TaskGraph = {
+      ...graph,
+      nodes: new Map(
+        [...graph.nodes].map(([id, node]) => [
+          id,
+          {
+            ...node,
+            dependencies: [...new Set([...node.dependencies, ...node.with])],
+          },
+        ]),
+      ),
+    };
+    for (const id of topologicalOrder(hashGraph)) {
       const node = graph.nodes.get(id)!;
+      const upstreamIds = [
+        ...new Set([...node.dependencies, ...node.with]),
+      ].sort();
       const result = yield* hashTask(
         repository,
         node,
-        node.dependencies.map((dependency) => hashes.get(dependency)!.hash),
+        upstreamIds.map((upstream) => hashes.get(upstream)!.hash),
         options.frameworkInference,
         options.passThroughArguments,
       );
@@ -966,6 +1031,135 @@ const computeTaskHashes = (
     }
     return hashes;
   });
+
+const cargoWorkspaceVerificationTasks = new Set([
+  "check",
+  "format",
+  "lint",
+  "test",
+]);
+
+export interface CargoWorkspaceTaskPlan {
+  readonly graph: TaskGraph;
+  readonly scopes: ReadonlyMap<string, TaskCommandScope>;
+}
+
+export const planCargoWorkspaceTasks = (
+  graph: TaskGraph,
+  requestedTasks: ReadonlyArray<string>,
+  unfiltered: boolean,
+): CargoWorkspaceTaskPlan => {
+  const eligibleTasks = new Set(
+    requestedTasks.filter(
+      (task) =>
+        !task.includes("#") && cargoWorkspaceVerificationTasks.has(task),
+    ),
+  );
+  if (!unfiltered || eligibleTasks.size === 0) {
+    return { graph, scopes: new Map() };
+  }
+  const grouped = new Map<string, Array<TaskNode>>();
+  for (const id of graph.entrypoints) {
+    const node = graph.nodes.get(id)!;
+    if (node.package.manager !== "cargo" || !eligibleTasks.has(node.task)) {
+      continue;
+    }
+    const workspaceDirectory =
+      node.package.workspaceDirectory ?? node.package.directory;
+    const key = `${workspaceDirectory}\0${node.task}`;
+    const members = grouped.get(key) ?? [];
+    members.push(node);
+    grouped.set(key, members);
+  }
+  const aliases = new Map<string, string>();
+  const scopes = new Map<string, TaskCommandScope>();
+  for (const members of grouped.values()) {
+    members.sort((left, right) => left.id.localeCompare(right.id));
+    const representative = members[0]!;
+    for (const member of members) aliases.set(member.id, representative.id);
+    scopes.set(representative.id, {
+      kind: "cargo-workspace",
+      directory:
+        representative.package.workspaceDirectory ??
+        representative.package.directory,
+      members,
+    });
+  }
+  const nodes = new Map<string, TaskNode>();
+  for (const [id, node] of graph.nodes) {
+    const canonicalId = aliases.get(id) ?? id;
+    if (canonicalId !== id) continue;
+    const scope = scopes.get(id);
+    const sourceNodes =
+      scope?.kind === "cargo-workspace" ? scope.members : [node];
+    const adjacent = (select: (source: TaskNode) => ReadonlyArray<string>) =>
+      [
+        ...new Set(
+          sourceNodes
+            .flatMap(select)
+            .map((target) => aliases.get(target) ?? target)
+            .filter((target) => target !== id),
+        ),
+      ].sort();
+    nodes.set(id, {
+      ...node,
+      dependencies: adjacent((source) => source.dependencies),
+      with: adjacent((source) => source.with),
+    });
+  }
+  return {
+    graph: {
+      nodes,
+      entrypoints: [
+        ...new Set(
+          graph.entrypoints.map(
+            (entrypoint) => aliases.get(entrypoint) ?? entrypoint,
+          ),
+        ),
+      ].sort(),
+    },
+    scopes,
+  };
+};
+
+const applyCargoWorkspaceHashes = (
+  hashes: ReadonlyMap<string, TaskHashResult>,
+  scopes: ReadonlyMap<string, TaskCommandScope>,
+): ReadonlyMap<string, TaskHashResult> => {
+  const combined = new Map(hashes);
+  for (const [id, scope] of scopes) {
+    if (scope.kind !== "cargo-workspace") continue;
+    const representative = hashes.get(id)!;
+    const members = scope.members.map((member) => {
+      const result = hashes.get(member.id)!;
+      return [member.id, result.hash] as const;
+    });
+    combined.set(id, {
+      ...representative,
+      hash: cargoWorkspaceHash(members),
+      inputFiles: [
+        ...new Set(
+          scope.members.flatMap(
+            (member) => hashes.get(member.id)?.inputFiles ?? [],
+          ),
+        ),
+      ].sort(),
+    });
+  }
+  return combined;
+};
+
+export const cargoWorkspaceHash = (
+  members: ReadonlyArray<readonly [string, string]>,
+): string =>
+  xxhash64Hex(
+    JSON.stringify({
+      scope: "cargo-workspace",
+      members: [...members].sort(([left], [right]) =>
+        left.localeCompare(right),
+      ),
+    }),
+  );
 
 const taskGroups = (graph: TaskGraph): ReadonlyArray<ReadonlyArray<string>> => {
   const reverseWith = new Map<string, Array<string>>();
@@ -1081,14 +1275,23 @@ export const executeRun = (
       (options.affected && flags?.affectedUsingTaskInputs === true) ||
       (options.filters.some((filter) => filter.includes("[")) &&
         flags?.filterUsingTasks === true);
-    const graph = useTaskInputs
+    const selectedGraph = useTaskInputs
       ? selectAffectedTasks(
           unfilteredGraph,
           affected.changedFiles,
           affected.rootChanged,
         )
       : unfilteredGraph;
-    const hashes = yield* computeTaskHashes(repository, graph, options);
+    const cargoWorkspacePlan = planCargoWorkspaceTasks(
+      selectedGraph,
+      options.tasks,
+      affected.filters.length === 0,
+    );
+    const graph = cargoWorkspacePlan.graph;
+    const hashes = applyCargoWorkspaceHashes(
+      yield* computeTaskHashes(repository, selectedGraph, options),
+      cargoWorkspacePlan.scopes,
+    );
     const groups = taskGroups(graph);
     const pending = new Map(groups.map((members) => [members[0]!, members]));
     const outcomes = new Map<string, TaskOutcome>();
@@ -1158,6 +1361,7 @@ export const executeRun = (
               options,
               hashes.get(id)!,
               environment,
+              cargoWorkspacePlan.scopes.get(id),
             ).pipe(
               Effect.catchAll((cause) =>
                 Effect.gen(function* () {

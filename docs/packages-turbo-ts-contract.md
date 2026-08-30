@@ -78,6 +78,14 @@ the owning repository from nested working directories. Task hashes preserve
 Git symlink and dependency semantics, while scheduled `with` groups and cached
 outputs preserve scoped process and safe symlink behavior.
 
+Workspace task overrides merge with their effective package-qualified root
+definition and the merged task invariants are revalidated before execution.
+Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
+reject malformed entries. Companion task hashes participate in the owning
+task's cache key. Standalone uv tasks execute from their project directory. Unfiltered Cargo
+`test`, `check`, `lint`, and `format` tasks execute once per Cargo workspace;
+filtered and package-qualified runs retain package targeting.
+
 Gate 2 is not closed: the composed task-hash serializer does not yet reproduce
 the official 2.10.12 task hashes. Individual source-file hashes match Git and
 the oracle, but the official binary does not distribute the serialization
