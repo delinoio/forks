@@ -18,6 +18,8 @@ import type {
   RootBoundariesConfigSchema,
   RootSchemaSchema,
   StartupInputSchema,
+  StructuredInputSchema,
+  TaskInputSchema,
   TurboConfigurationSchema,
   UiSchema,
   WorkspaceSchemaSchema,
@@ -51,6 +53,10 @@ export type RootBoundariesConfig = EffectSchema.Schema.Type<
 export type RootSchema = EffectSchema.Schema.Type<typeof RootSchemaSchema>;
 export type Schema = EffectSchema.Schema.Type<typeof TurboConfigurationSchema>;
 export type StartupInput = EffectSchema.Schema.Type<typeof StartupInputSchema>;
+export type StructuredInput = EffectSchema.Schema.Type<
+  typeof StructuredInputSchema
+>;
+export type TaskInput = EffectSchema.Schema.Type<typeof TaskInputSchema>;
 export type UI = EffectSchema.Schema.Type<typeof UiSchema>;
 export type WorkspaceSchema = EffectSchema.Schema.Type<
   typeof WorkspaceSchemaSchema

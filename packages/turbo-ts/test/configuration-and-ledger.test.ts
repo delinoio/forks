@@ -64,6 +64,116 @@ describe("configuration generation and compatibility ledger", () => {
         tasks: null,
       }),
     ).toEqual({ extends: ["//"], tasks: null });
+    expect(
+      Schema.decodeUnknownSync(TurboConfigurationSchema)({
+        extends: ["//"],
+        tags: ["app"],
+      }),
+    ).toEqual({ extends: ["//"], tags: ["app"] });
+    expect(
+      Schema.decodeUnknownSync(TurboConfigurationSchema)({
+        extends: null,
+        tags: null,
+        boundaries: null,
+      }),
+    ).toEqual({ extends: null, tags: null, boundaries: null });
+  });
+
+  it("matches distributed nullable fields and structured task inputs", () => {
+    const configuration = {
+      $schema: null,
+      globalDependencies: null,
+      globalEnv: null,
+      globalPassThroughEnv: null,
+      remoteCache: {
+        signature: null,
+        enabled: null,
+        preflight: null,
+        apiUrl: null,
+        loginUrl: null,
+        timeout: null,
+        uploadTimeout: null,
+        teamId: null,
+        teamSlug: null,
+      },
+      ui: null,
+      concurrency: null,
+      dangerouslyDisablePackageManagerCheck: null,
+      cacheDir: null,
+      cacheMaxAge: null,
+      cacheMaxSize: null,
+      daemon: null,
+      envMode: null,
+      boundaries: {
+        implicitDependencies: null,
+        dependencies: { allow: null, deny: null },
+        dependents: null,
+        tags: {
+          app: {
+            dependencies: null,
+            dependents: { allow: null, deny: null },
+          },
+        },
+      },
+      noUpdateNotifier: null,
+      global: {
+        inputs: null,
+        env: null,
+        passThroughEnv: null,
+        remoteCache: null,
+        ui: null,
+        concurrency: null,
+        dangerouslyDisablePackageManagerCheck: null,
+        cacheDir: null,
+        cacheMaxAge: null,
+        cacheMaxSize: null,
+        daemon: null,
+        envMode: null,
+        noUpdateNotifier: null,
+      },
+      futureFlags: null,
+      tasks: {
+        build: {
+          description: null,
+          dependsOn: null,
+          env: null,
+          passThroughEnv: null,
+          outputs: null,
+          cache: null,
+          inputs: [
+            {},
+            {
+              from: null,
+              globs: null,
+              mode: null,
+              withDefaults: null,
+            },
+            { mode: "future-mode" },
+          ],
+          outputLogs: null,
+          persistent: null,
+          interactive: null,
+          interruptible: null,
+          with: null,
+        },
+      },
+    };
+    expect(
+      Schema.decodeUnknownSync(TurboConfigurationSchema)(configuration),
+    ).toEqual(configuration);
+    expect(
+      Schema.decodeUnknownSync(RootSchemaSchema)({
+        boundaries: null,
+        remoteCache: null,
+        global: null,
+        futureFlags: null,
+      }),
+    ).toEqual({
+      boundaries: null,
+      remoteCache: null,
+      global: null,
+      futureFlags: null,
+    });
   });
 
   it("validates and expands the exhaustive compatibility ledger", async () => {

@@ -5,7 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, it } from "@rstest/core";
 import { Effect, Fiber, Schedule, Schema } from "effect";
 import { evidenceId } from "../src/compatibility/ledger.js";
-import { BoundaryError } from "../src/effect/errors.js";
+import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import { nodeFoundationLayer } from "../src/effect/node-layer.js";
 import { ProcessService, RandomnessService } from "../src/effect/services.js";
 
@@ -94,36 +94,84 @@ describe("Effect foundation", () => {
 
   it(evidenceId.effectsScoped, async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-process-test-"));
-    const pidPath = join(directory, "pid");
+    const parentPidPath = join(directory, "parent-pid");
+    const workerPidPath = join(directory, "worker-pid");
     let childPid: number | undefined;
+    let workerPid: number | undefined;
     try {
+      const workerScript =
+        'const fs = require("node:fs"); fs.writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1_000);';
+      const parentScript =
+        'const { spawn } = require("node:child_process"); const fs = require("node:fs"); process.on("SIGTERM", () => {}); fs.writeFileSync(process.argv[1], String(process.pid)); spawn(process.execPath, ["-e", process.argv[3], process.argv[2]], { stdio: "inherit" }); setInterval(() => {}, 1_000);';
+      const directChildScript =
+        'const fs = require("node:fs"); process.on("SIGTERM", () => {}); fs.writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1_000);';
       const execution = Effect.scoped(
         Effect.gen(function* () {
           const processService = yield* ProcessService;
           return yield* processService.run({
             command: process.execPath,
-            args: [
-              "-e",
-              'const fs = require("node:fs"); process.on("SIGTERM", () => {}); fs.writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1_000);',
-              pidPath,
-            ],
+            args:
+              process.platform === "win32"
+                ? ["-e", directChildScript, parentPidPath]
+                : [
+                    "-e",
+                    parentScript,
+                    parentPidPath,
+                    workerPidPath,
+                    workerScript,
+                  ],
             cwd: directory,
           });
         }),
       ).pipe(Effect.provide(nodeFoundationLayer));
       const fiber = Effect.runFork(execution);
-      childPid = Number(await waitForTextFile(pidPath));
+      childPid = Number(await waitForTextFile(parentPidPath));
+      if (process.platform !== "win32") {
+        workerPid = Number(await waitForTextFile(workerPidPath));
+      }
       await Effect.runPromise(Fiber.interrupt(fiber));
       expect(() => process.kill(childPid as number, 0)).toThrow();
+      if (workerPid !== undefined) {
+        expect(() => process.kill(workerPid as number, 0)).toThrow();
+      }
     } finally {
-      if (childPid !== undefined) {
+      for (const pid of [workerPid, childPid]) {
+        if (pid === undefined) {
+          continue;
+        }
         try {
-          process.kill(childPid, "SIGKILL");
+          process.kill(pid, "SIGKILL");
         } catch {
-          // The scoped finalizer already reaped the expected child process.
+          // The scoped finalizer already terminated the expected process tree.
         }
       }
       await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("supervises child stdin errors inside the process Effect", async () => {
+    const outcome = await Effect.runPromise(
+      Effect.either(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            return yield* processService.run({
+              command: process.execPath,
+              args: [
+                "-e",
+                "process.stdin.destroy(); setTimeout(() => {}, 100);",
+              ],
+              cwd: process.cwd(),
+              stdin: "x".repeat(8 * 1024 * 1024),
+            });
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      ),
+    );
+    if (outcome._tag === "Left") {
+      expect(outcome.left).toBeInstanceOf(ProcessExecutionError);
+    } else {
+      expect(typeof outcome.right.exitCode).toBe("number");
     }
   });
 

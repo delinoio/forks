@@ -41,6 +41,8 @@ const gracefulTerminationTimeoutMilliseconds = 1_000;
 interface ScopedChildProcess {
   readonly child: ChildProcessWithoutNullStreams;
   readonly closed: Promise<void>;
+  readonly isClosed: () => boolean;
+  readonly processGroupId: number | undefined;
 }
 
 const makeChildEnvironment = (
@@ -60,6 +62,29 @@ const makeChildEnvironment = (
 const isChildRunning = (child: ChildProcessWithoutNullStreams): boolean =>
   child.exitCode === null && child.signalCode === null;
 
+const isNoSuchProcessError = (cause: unknown): boolean =>
+  typeof cause === "object" &&
+  cause !== null &&
+  "code" in cause &&
+  cause.code === "ESRCH";
+
+const signalChildProcess = (
+  { child, processGroupId }: ScopedChildProcess,
+  signal: NodeJS.Signals,
+): void => {
+  if (processGroupId !== undefined) {
+    try {
+      process.kill(-processGroupId, signal);
+    } catch (cause) {
+      if (!isNoSuchProcessError(cause)) {
+        throw cause;
+      }
+    }
+  } else if (isChildRunning(child)) {
+    child.kill(signal);
+  }
+};
+
 const waitForCloseUntil = (
   closed: Promise<void>,
   timeoutMilliseconds: number,
@@ -75,16 +100,19 @@ const waitForCloseUntil = (
 const terminateChild = ({
   child,
   closed,
+  isClosed,
+  processGroupId,
 }: ScopedChildProcess): Effect.Effect<void> =>
   Effect.promise(async () => {
-    if (isChildRunning(child)) {
-      child.kill("SIGTERM");
+    const scopedChild = { child, closed, isClosed, processGroupId };
+    if (!isClosed()) {
+      signalChildProcess(scopedChild, "SIGTERM");
       const closedGracefully = await waitForCloseUntil(
         closed,
         gracefulTerminationTimeoutMilliseconds,
       );
-      if (!closedGracefully && isChildRunning(child)) {
-        child.kill("SIGKILL");
+      if (!closedGracefully && !isClosed()) {
+        signalChildProcess(scopedChild, "SIGKILL");
       }
     }
     await closed;
@@ -129,21 +157,47 @@ const processLayer = Layer.succeed(ProcessService, {
   run: (request) =>
     Effect.acquireUseRelease(
       Effect.sync(() => {
+        const ownsProcessGroup = process.platform !== "win32";
         const child = spawn(request.command, [...request.args], {
           cwd: request.cwd,
+          detached: ownsProcessGroup,
           env: makeChildEnvironment(request.env),
           shell: false,
           stdio: "pipe",
         });
+        let childClosed = false;
         const closed = new Promise<void>((resolve) => {
-          child.once("close", () => resolve());
+          child.once("close", () => {
+            childClosed = true;
+            resolve();
+          });
         });
-        return { child, closed };
+        return {
+          child,
+          closed,
+          isClosed: () => childClosed,
+          processGroupId: ownsProcessGroup ? child.pid : undefined,
+        };
       }),
       ({ child }) =>
         Effect.async((resume) => {
+          let settled = false;
           let stdout = "";
           let stderr = "";
+          const fail = (cause: unknown) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            resume(
+              Effect.fail(
+                new ProcessExecutionError({
+                  command: request.command,
+                  message: String(cause),
+                }),
+              ),
+            );
+          };
           child.stdout.setEncoding("utf8");
           child.stderr.setEncoding("utf8");
           child.stdout.on("data", (chunk: string) => {
@@ -152,25 +206,21 @@ const processLayer = Layer.succeed(ProcessService, {
           child.stderr.on("data", (chunk: string) => {
             stderr += chunk;
           });
-          child.once("error", (cause) =>
-            resume(
-              Effect.fail(
-                new ProcessExecutionError({
-                  command: request.command,
-                  message: String(cause),
-                }),
-              ),
-            ),
-          );
-          child.once("close", (exitCode) =>
+          child.once("error", fail);
+          child.stdin.on("error", fail);
+          child.once("close", (exitCode) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
             resume(
               Effect.succeed({
                 exitCode: exitCode ?? 1,
                 stdout,
                 stderr,
               }),
-            ),
-          );
+            );
+          });
           if (request.stdin === undefined) {
             child.stdin.end();
           } else {

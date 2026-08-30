@@ -11,8 +11,13 @@ export interface ExternalOracle {
   ) => Effect.Effect<OracleResult, OracleError, never>;
 }
 
+export interface OracleLauncher {
+  readonly command: string;
+  readonly fixedArgs: ReadonlyArray<string>;
+}
+
 export const makeExternalOracle = (
-  executable: string,
+  launcher: OracleLauncher,
   verificationCwd: string,
 ): Effect.Effect<ExternalOracle, never, ProcessService> =>
   Effect.gen(function* () {
@@ -22,8 +27,8 @@ export const makeExternalOracle = (
       Effect.scoped(
         processService
           .run({
-            command: executable,
-            args: invocation.args,
+            command: launcher.command,
+            args: [...launcher.fixedArgs, ...invocation.args],
             cwd: invocation.cwd,
             env: invocation.env,
             stdin: invocation.stdin,
@@ -51,5 +56,5 @@ export const makeExternalOracle = (
       ),
     );
 
-    return { executable, execute, verify };
+    return { executable: launcher.command, execute, verify };
   });

@@ -7,10 +7,16 @@ export const validNullTasksRootType: RootSchema = { tasks: null };
 export const validRootType: RootSchema = {
   tasks: {
     build: {
-      cache: true,
-      outputLogs: "errors-only",
+      cache: null,
+      inputs: [
+        {},
+        { mode: null, globs: null },
+        { mode: "future-mode", withDefaults: null },
+      ],
+      outputLogs: null,
     },
   },
+  remoteCache: null,
 };
 
 export const validWorkspaceType: WorkspaceSchema = {
@@ -18,7 +24,7 @@ export const validWorkspaceType: WorkspaceSchema = {
 };
 
 export const validNullTasksWorkspaceType: WorkspaceSchema = {
-  extends: ["//"],
+  extends: null,
   tasks: null,
 };
 

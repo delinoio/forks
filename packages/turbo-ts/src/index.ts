@@ -17,6 +17,8 @@ export type {
   RootSchema,
   Schema,
   StartupInput,
+  StructuredInput,
+  TaskInput,
   UI,
   WorkspaceSchema,
 } from "./generated/configuration.js";
