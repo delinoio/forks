@@ -12,6 +12,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it } from "@rstest/core";
 import { Effect } from "effect";
 import {
@@ -488,7 +489,9 @@ describe("cache interoperability and safety", () => {
         { TURBO_TELEMETRY_DISABLED: "1", NO_COLOR: "1" },
       );
       expect(official.exitCode).toBe(0);
-      expect(official.stdout).toContain("2 cached, 2 total");
+      expect(stripVTControlCharacters(official.stdout)).toContain(
+        "2 cached, 2 total",
+      );
       expect(
         await readFile(
           `${directory}/packages/app/.turbo/turbo-build.log`,
@@ -795,7 +798,9 @@ describe("cache interoperability and safety", () => {
         environment,
       );
       expect(download.exitCode).toBe(0);
-      expect(download.stdout).toContain("2 cached, 2 total");
+      expect(stripVTControlCharacters(download.stdout)).toContain(
+        "2 cached, 2 total",
+      );
       expect(
         await readFile(
           `${directory}/packages/app/.turbo/turbo-build.log`,
