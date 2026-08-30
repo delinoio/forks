@@ -28,6 +28,9 @@ bin/
 !packages/turbo-ts/src/bin/
 !packages/turbo-ts/src/bin/turbo-ts.ts
 generated/
+# This generated public type artifact is committed and checked for drift.
+!packages/turbo-ts/src/generated/
+!packages/turbo-ts/src/generated/configuration.ts
 *.pb.go
 *.connect.go
 !protos/**/*.pb.go
