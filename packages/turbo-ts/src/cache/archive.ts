@@ -78,7 +78,7 @@ const validateArchivePath = (path: string): string => {
 
 const splitArchivePath = (
   path: string,
-): { readonly name: string; readonly prefix: string } => {
+): { readonly name: string; readonly prefix: string } | undefined => {
   if (encodedLength(path) <= tarNameBytes) {
     return { name: path, prefix: "" };
   }
@@ -96,7 +96,7 @@ const splitArchivePath = (
       return { name, prefix };
     }
   }
-  throw new TypeError("tar path exceeds the ustar path limit");
+  return undefined;
 };
 
 const validateArchiveLinkTarget = (path: string, target: string): string => {
@@ -113,52 +113,131 @@ const validateArchiveLinkTarget = (path: string, target: string): string => {
   if (resolved === ".." || resolved.startsWith("../")) {
     throw new TypeError(`archive link target escapes repository: ${target}`);
   }
-  if (encodedLength(unix) > tarNameBytes) {
-    throw new TypeError("tar link target exceeds the ustar link limit");
-  }
   return unix;
+};
+
+const createHeader = (
+  path: string,
+  type: number,
+  size: number,
+  mode: number,
+  modifiedSeconds: number,
+  linkTarget = "",
+): Uint8Array => {
+  const pathFields = splitArchivePath(path);
+  if (pathFields === undefined) {
+    throw new TypeError("internal tar header path exceeds the ustar limit");
+  }
+  const header = new Uint8Array(blockSize);
+  writeText(header, 0, tarNameBytes, pathFields.name);
+  writeOctal(header, 100, 8, mode & 0o777);
+  writeOctal(header, 108, 8, 0);
+  writeOctal(header, 116, 8, 0);
+  writeOctal(header, 124, 12, size);
+  writeOctal(header, 136, 12, Math.max(0, Math.floor(modifiedSeconds)));
+  header[156] = type;
+  if (linkTarget !== "") writeText(header, 157, tarNameBytes, linkTarget);
+  writeText(header, 257, 6, "ustar\0");
+  writeText(header, 263, 2, "00");
+  writeOctal(header, 329, 8, 0);
+  writeOctal(header, 337, 8, 0);
+  writeText(header, 345, tarPrefixBytes, pathFields.prefix);
+  writeText(header, 148, 6, checksum(header).toString(8).padStart(6, "0"));
+  header[154] = 0;
+  header[155] = 0x20;
+  return header;
+};
+
+const paxRecord = (key: "linkpath" | "path", value: string): Uint8Array => {
+  let length = encodedLength(` ${key}=${value}\n`) + 1;
+  while (true) {
+    const record = `${length} ${key}=${value}\n`;
+    const actual = encodedLength(record);
+    if (actual === length) return new TextEncoder().encode(record);
+    length = actual;
+  }
+};
+
+const paxContents = (
+  values: Readonly<{ readonly path?: string; readonly linkpath?: string }>,
+): Uint8Array => {
+  const records = [
+    ...(values.path === undefined ? [] : [paxRecord("path", values.path)]),
+    ...(values.linkpath === undefined
+      ? []
+      : [paxRecord("linkpath", values.linkpath)]),
+  ];
+  const contents = new Uint8Array(
+    records.reduce((size, record) => size + record.length, 0),
+  );
+  let offset = 0;
+  for (const record of records) {
+    contents.set(record, offset);
+    offset += record.length;
+  }
+  return contents;
+};
+
+const pushArchiveRecord = (
+  chunks: Array<Uint8Array>,
+  header: Uint8Array,
+  contents: Uint8Array,
+): void => {
+  chunks.push(header, contents);
+  const padding = (blockSize - (contents.length % blockSize)) % blockSize;
+  if (padding > 0) chunks.push(new Uint8Array(padding));
 };
 
 export const createTarArchive = (
   entries: ReadonlyArray<ArchiveEntry>,
 ): Uint8Array => {
   const chunks: Array<Uint8Array> = [];
-  for (const entry of [...entries].sort((left, right) =>
+  const sorted = [...entries].sort((left, right) =>
     left.path.localeCompare(right.path),
-  )) {
+  );
+  for (const [index, entry] of sorted.entries()) {
     const path = validateArchivePath(entry.path);
     const pathFields = splitArchivePath(path);
-    const header = new Uint8Array(blockSize);
-    writeText(header, 0, tarNameBytes, pathFields.name);
-    writeOctal(header, 100, 8, entry.mode & 0o777);
-    writeOctal(header, 108, 8, 0);
-    writeOctal(header, 116, 8, 0);
     const symlink = entry.kind === "symlink";
     const contents = symlink ? new Uint8Array() : entry.contents;
-    writeOctal(header, 124, 12, contents.length);
-    writeOctal(header, 136, 12, Math.max(0, Math.floor(entry.modifiedSeconds)));
-    header[156] = symlink ? 0x32 : 0x30;
-    if (symlink) {
-      writeText(
-        header,
-        157,
-        tarNameBytes,
-        validateArchiveLinkTarget(path, entry.linkTarget),
+    const linkTarget = symlink
+      ? validateArchiveLinkTarget(path, entry.linkTarget)
+      : "";
+    const extensions = {
+      ...(pathFields === undefined ? { path } : {}),
+      ...(encodedLength(linkTarget) > tarNameBytes
+        ? { linkpath: linkTarget }
+        : {}),
+    };
+    if (extensions.path !== undefined || extensions.linkpath !== undefined) {
+      const extendedContents = paxContents(extensions);
+      pushArchiveRecord(
+        chunks,
+        createHeader(
+          `PaxHeaders/${index}`,
+          0x78,
+          extendedContents.length,
+          0o644,
+          0,
+        ),
+        extendedContents,
       );
     }
-    writeText(header, 257, 6, "ustar\0");
-    writeText(header, 263, 2, "00");
-    writeOctal(header, 329, 8, 0);
-    writeOctal(header, 337, 8, 0);
-    writeText(header, 345, tarPrefixBytes, pathFields.prefix);
-    writeText(header, 148, 6, checksum(header).toString(8).padStart(6, "0"));
-    header[154] = 0;
-    header[155] = 0x20;
-    chunks.push(header, contents);
-    const padding = (blockSize - (contents.length % blockSize)) % blockSize;
-    if (padding > 0) {
-      chunks.push(new Uint8Array(padding));
-    }
+    const storedPath = pathFields === undefined ? `PaxEntries/${index}` : path;
+    const storedLinkTarget =
+      encodedLength(linkTarget) > tarNameBytes ? "" : linkTarget;
+    pushArchiveRecord(
+      chunks,
+      createHeader(
+        storedPath,
+        symlink ? 0x32 : 0x30,
+        contents.length,
+        entry.mode,
+        entry.modifiedSeconds,
+        storedLinkTarget,
+      ),
+      contents,
+    );
   }
   chunks.push(new Uint8Array(blockSize * 2));
   const total = chunks.reduce((size, chunk) => size + chunk.length, 0);
@@ -194,14 +273,60 @@ const readOctal = (
   return value;
 };
 
+interface PaxValues {
+  readonly path?: string;
+  readonly linkpath?: string;
+}
+
+const parsePaxContents = (contents: Uint8Array): PaxValues => {
+  const values: { path?: string; linkpath?: string } = {};
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let offset = 0;
+  while (offset < contents.length) {
+    let separator = offset;
+    while (separator < contents.length && contents[separator] !== 0x20) {
+      separator += 1;
+    }
+    if (separator === offset || separator >= contents.length) {
+      throw new TypeError("invalid PAX record length");
+    }
+    const lengthText = decoder.decode(contents.subarray(offset, separator));
+    if (!/^\d+$/.test(lengthText)) {
+      throw new TypeError("invalid PAX record length");
+    }
+    const length = Number.parseInt(lengthText, 10);
+    const end = offset + length;
+    if (
+      !Number.isSafeInteger(length) ||
+      length <= separator - offset + 3 ||
+      end > contents.length ||
+      contents[end - 1] !== 0x0a
+    ) {
+      throw new TypeError("invalid PAX record boundary");
+    }
+    const body = contents.subarray(separator + 1, end - 1);
+    const equals = body.indexOf(0x3d);
+    if (equals <= 0) throw new TypeError("invalid PAX record");
+    const key = decoder.decode(body.subarray(0, equals));
+    const value = decoder.decode(body.subarray(equals + 1));
+    if (key === "path" || key === "linkpath") values[key] = value;
+    offset = end;
+  }
+  return values;
+};
+
 export const parseTarArchive = (
   archive: Uint8Array,
 ): ReadonlyArray<ArchiveEntry> => {
   const entries: Array<ArchiveEntry> = [];
+  let extended: PaxValues | undefined;
   let offset = 0;
   while (offset + blockSize <= archive.length) {
     const header = archive.subarray(offset, offset + blockSize);
     if (header.every((byte) => byte === 0)) {
+      if (extended !== undefined) {
+        throw new TypeError("PAX header is missing its archive entry");
+      }
       return entries;
     }
     const expectedChecksum = readOctal(header, 148, 8);
@@ -213,11 +338,11 @@ export const parseTarArchive = (
       readText(header, 257, 6) === "ustar" && readText(header, 263, 2) === "00"
         ? readText(header, 345, tarPrefixBytes)
         : "";
-    const path = validateArchivePath(
+    const headerPath = validateArchivePath(
       prefix === "" ? name : `${prefix}/${name}`,
     );
     const type = header[156];
-    if (type !== 0 && type !== 0x30 && type !== 0x32) {
+    if (type !== 0 && type !== 0x30 && type !== 0x32 && type !== 0x78) {
       throw new TypeError(
         `unsupported tar entry type: ${String.fromCharCode(type ?? 0)}`,
       );
@@ -228,9 +353,19 @@ export const parseTarArchive = (
     if (end > archive.length) {
       throw new TypeError("truncated tar entry");
     }
+    const contents = archive.slice(start, end);
+    if (type === 0x78) {
+      extended = { ...extended, ...parsePaxContents(contents) };
+      offset = start + Math.ceil(size / blockSize) * blockSize;
+      continue;
+    }
+    const path = validateArchivePath(extended?.path ?? headerPath);
+    if (extended?.linkpath !== undefined && type !== 0x32) {
+      throw new TypeError("PAX linkpath applies to a non-symlink entry");
+    }
     const common = {
       path,
-      contents: archive.slice(start, end),
+      contents,
       mode: readOctal(header, 100, 8),
       modifiedSeconds: readOctal(header, 136, 12),
     };
@@ -241,11 +376,12 @@ export const parseTarArchive = (
             kind: "symlink",
             linkTarget: validateArchiveLinkTarget(
               path,
-              readText(header, 157, tarNameBytes),
+              extended?.linkpath ?? readText(header, 157, tarNameBytes),
             ),
           }
         : common,
     );
+    extended = undefined;
     offset = start + Math.ceil(size / blockSize) * blockSize;
   }
   throw new TypeError("tar archive is missing its end marker");

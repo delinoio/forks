@@ -73,18 +73,24 @@ tested bidirectionally against the external official binary when addressed by
 an oracle-provided hash.
 
 Gate 2 selection resolves package-qualified tasks and explicit Git ranges,
-applies ordered workspace exclusions and brace/class-aware globs, and discovers
-the owning repository from nested working directories. Task hashes preserve
-Git symlink and dependency semantics, while scheduled `with` groups and cached
-outputs preserve scoped process and safe symlink behavior.
+fails closed when explicit revisions are invalid, applies ordered workspace
+exclusions and brace/class-aware globs, and discovers the owning repository
+from nested working directories. Task-input selection and hashes include `with`
+companions. Task hashes preserve Git symlink and dependency semantics, exclude
+the resolved cache directory, and use each task's owning ecosystem lockfile.
+Scheduled `with` groups preserve internal dependency order.
 
 Workspace task overrides merge with their effective package-qualified root
 definition and the merged task invariants are revalidated before execution.
 Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
 reject malformed entries. Companion task hashes participate in the owning
-task's cache key. Standalone uv tasks execute from their project directory. Unfiltered Cargo
-`test`, `check`, `lint`, and `format` tasks execute once per Cargo workspace;
-filtered and package-qualified runs retain package targeting.
+task's cache key. Local age eviction runs before cache restoration, and cache
+archives use PAX extensions for paths beyond ustar limits. Standalone uv tasks
+execute from their project directory. Unfiltered Cargo `test`, `check`, `lint`,
+and `format` tasks execute once per Cargo workspace; filtered and
+package-qualified runs retain package targeting. Cargo builds with pass-through
+arguments that select an alternate output layout bypass caching until those
+layouts are modeled explicitly.
 
 Gate 2 is not closed: the composed task-hash serializer does not yet reproduce
 the official 2.10.12 task hashes. Individual source-file hashes match Git and

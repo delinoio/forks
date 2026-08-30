@@ -1,6 +1,11 @@
 import { Effect } from "effect";
 import { matchesGlob, selectByGlobs } from "../core/glob.js";
-import { joinPath, relativePath } from "../core/path.js";
+import {
+  isPathContained,
+  joinPath,
+  parentPath,
+  relativePath,
+} from "../core/path.js";
 import { RepositoryError } from "../effect/errors.js";
 import {
   DigestService,
@@ -92,8 +97,10 @@ interface TaskInputFile {
 
 const turboRootInputPrefix = "$TURBO_ROOT$/";
 
-const isIgnoredInputPath = (path: string): boolean =>
-  path.includes("/.turbo/") || path.includes("/node_modules/");
+const isIgnoredInputPath = (path: string, cacheDirectory: string): boolean =>
+  path.includes("/.turbo/") ||
+  path.includes("/node_modules/") ||
+  isPathContained(cacheDirectory, path);
 
 type TaskInput = NonNullable<TaskNode["definition"]["inputs"]>[number];
 
@@ -141,15 +148,16 @@ const taskInputFiles = (
   packageFiles: ReadonlyArray<string>,
   repositoryFiles: ReadonlyArray<string>,
   inputs: ReadonlyArray<TaskInput>,
+  cacheDirectory: string,
 ): ReadonlyArray<TaskInputFile> => {
   const defaults = packageFiles
-    .filter((path) => !isIgnoredInputPath(path))
+    .filter((path) => !isIgnoredInputPath(path, cacheDirectory))
     .map((absolutePath) => {
       const relative = relativePath(node.package.directory, absolutePath);
       return { absolutePath, hashPath: relative, matchPath: relative };
     });
   const rootFiles = repositoryFiles
-    .filter((path) => !isIgnoredInputPath(path))
+    .filter((path) => !isIgnoredInputPath(path, cacheDirectory))
     .map((absolutePath) => {
       const relative = relativePath(repository.root, absolutePath);
       return {
@@ -204,6 +212,7 @@ export interface TaskHashResult {
 const discoverFiles = (
   repository: RepositoryModel,
   directory: string,
+  cacheDirectory: string,
 ): Effect.Effect<
   ReadonlyArray<string>,
   RepositoryError,
@@ -247,9 +256,50 @@ const discoverFiles = (
           ),
         { concurrency: 8 },
       );
-      return existing.filter((path): path is string => path !== undefined);
+      return existing.filter(
+        (path): path is string =>
+          path !== undefined && !isIgnoredInputPath(path, cacheDirectory),
+      );
     }
-    return yield* listRepositoryFiles(directory);
+    return (yield* listRepositoryFiles(directory)).filter(
+      (path) => !isIgnoredInputPath(path, cacheDirectory),
+    );
+  });
+
+const owningLockfile = (
+  repository: RepositoryModel,
+  node: TaskNode,
+): Effect.Effect<string | undefined, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    if (node.package.manager !== "cargo" && node.package.manager !== "uv") {
+      return repository.lockfile;
+    }
+    const fileSystem = yield* FileSystemService;
+    const exists = (path: string) =>
+      fileSystem
+        .exists(path)
+        .pipe(
+          Effect.mapError(
+            (error) => new RepositoryError({ path, message: error.message }),
+          ),
+        );
+    if (node.package.manager === "cargo") {
+      const directory =
+        node.package.workspaceDirectory ?? node.package.directory;
+      if (!isPathContained(repository.root, directory)) return undefined;
+      const path = joinPath(directory, "Cargo.lock");
+      return (yield* exists(path)) ? path : undefined;
+    }
+    let directory = node.package.directory;
+    while (isPathContained(repository.root, directory)) {
+      const path = joinPath(directory, "uv.lock");
+      if (yield* exists(path)) return path;
+      if (directory === repository.root) break;
+      const parent = parentPath(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
+    return undefined;
   });
 
 const activeGlobalSettings = (repository: RepositoryModel) => {
@@ -274,6 +324,7 @@ export const hashTask = (
   dependencyHashes: ReadonlyArray<string>,
   frameworkInference: boolean,
   passThroughArguments: ReadonlyArray<string>,
+  cacheDirectory: string,
 ): Effect.Effect<
   TaskHashResult,
   RepositoryError,
@@ -288,9 +339,10 @@ export const hashTask = (
     const packageFiles = yield* discoverFiles(
       repository,
       node.package.directory,
+      cacheDirectory,
     );
     const repositoryFiles = usesTurboRootInput(inputs)
-      ? yield* discoverFiles(repository, repository.root)
+      ? yield* discoverFiles(repository, repository.root, cacheDirectory)
       : [];
     const inputFiles = taskInputFiles(
       repository,
@@ -298,6 +350,7 @@ export const hashTask = (
       packageFiles,
       repositoryFiles,
       inputs,
+      cacheDirectory,
     );
     const hashFile = (path: string, relative: string) =>
       fileSystem.metadata(path).pipe(
@@ -339,15 +392,16 @@ export const hashTask = (
       ...(node.definition.env ?? []),
       ...(frameworkInference ? inferredEnvironmentPatterns(node) : []),
     ]);
+    const lockfilePath = yield* owningLockfile(repository, node);
     const lockfileHash =
-      repository.lockfile === undefined
+      lockfilePath === undefined
         ? null
-        : yield* fileSystem.readBytes(repository.lockfile).pipe(
+        : yield* fileSystem.readBytes(lockfilePath).pipe(
             Effect.map(xxhash64Hex),
             Effect.mapError(
               (error) =>
                 new RepositoryError({
-                  path: repository.lockfile!,
+                  path: lockfilePath,
                   message: error.message,
                 }),
             ),
@@ -361,9 +415,11 @@ export const hashTask = (
       globalDependencyPatterns.length === 0
         ? []
         : selectByGlobs(
-            (yield* discoverFiles(repository, repository.root)).map((path) =>
-              relativePath(repository.root, path),
-            ),
+            (yield* discoverFiles(
+              repository,
+              repository.root,
+              cacheDirectory,
+            )).map((path) => relativePath(repository.root, path)),
             globalDependencyPatterns,
           );
     const globalFileHashes = yield* Effect.forEach(
@@ -377,6 +433,10 @@ export const hashTask = (
     const hash = xxhash64Hex(
       canonicalStringify({
         packageManager: `${repository.manager}@${repository.managerVersion ?? ""}`,
+        lockfilePath:
+          lockfilePath === undefined
+            ? null
+            : relativePath(repository.root, lockfilePath),
         lockfileHash,
         package: node.package.relativeDirectory,
         task: node.task,

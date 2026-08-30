@@ -1,6 +1,7 @@
 import { Effect, Fiber } from "effect";
 import {
   type CacheWriteEntry,
+  evictLocalCache,
   restoreLocalCache,
   writeLocalCache,
 } from "../cache/local-cache.js";
@@ -411,6 +412,7 @@ const resolveOptions = (
 };
 
 interface GitRange {
+  readonly source: string;
   readonly base: string;
   readonly head: string;
 }
@@ -431,14 +433,14 @@ const parseGitRange = (selector: string): GitRange => {
       message: `invalid Git range filter: [${selector}]`,
     });
   }
-  return { base, head };
+  return { source: selector, base, head };
 };
 
 const findAffectedPackages = (
   repository: RepositoryModel,
   environment: Readonly<Record<string, string | undefined>>,
   range?: GitRange,
-): Effect.Effect<AffectedPackages, never, ProcessService> =>
+): Effect.Effect<AffectedPackages, ConfigurationError, ProcessService> =>
   Effect.gen(function* () {
     const processService = yield* ProcessService;
     const explicitBase = environment.TURBO_SCM_BASE;
@@ -467,6 +469,20 @@ const findAffectedPackages = (
       result = yield* diff(`origin/${githubBase}`);
     }
     if (result._tag === "Left" || result.right.exitCode !== 0) {
+      if (range !== undefined) {
+        const detail =
+          result._tag === "Left"
+            ? result.left.message
+            : result.right.stderr.trim();
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: "<arguments>",
+            message: `invalid Git range filter: [${range.source}]${
+              detail === "" ? "" : `: ${detail}`
+            }`,
+          }),
+        );
+      }
       return {
         packages: new Set(
           repository.packages.map((packageModel) => packageModel.name),
@@ -512,7 +528,7 @@ const resolveAffectedPackages = (
     readonly changedFiles: ReadonlyArray<string>;
     readonly rootChanged: boolean;
   },
-  never,
+  ConfigurationError,
   ProcessService
 > =>
   Effect.gen(function* () {
@@ -621,7 +637,7 @@ const selectAffectedTasks = (
       const node = graph.nodes.get(current);
       if (node === undefined) continue;
       if (taskMatchesChangedFiles(node, changedFiles)) return true;
-      pending.push(...node.dependencies);
+      pending.push(...node.dependencies, ...node.with);
     }
     return false;
   };
@@ -874,6 +890,29 @@ const shouldReplayOutput = (
 ): boolean =>
   mode === undefined || mode === "full" || (mode === "new-only" && !cacheHit);
 
+const cargoAlternateOutputFlags = [
+  "--artifact-dir",
+  "--out-dir",
+  "--profile",
+  "--target",
+  "--target-dir",
+] as const;
+
+const usesAlternateCargoBuildOutputs = (
+  node: TaskNode,
+  passThroughArguments: ReadonlyArray<string>,
+): boolean =>
+  node.package.manager === "cargo" &&
+  node.task === "build" &&
+  passThroughArguments.some(
+    (argument) =>
+      argument === "--release" ||
+      argument === "-r" ||
+      cargoAlternateOutputFlags.some(
+        (flag) => argument === flag || argument.startsWith(`${flag}=`),
+      ),
+  );
+
 const executeTask = (
   repository: RepositoryModel,
   node: TaskNode,
@@ -900,7 +939,9 @@ const executeTask = (
       outputMode !== "errors-only" ||
       repository.rootConfiguration.value.futureFlags?.errorsOnlyShowHash ===
         true;
-    const cacheable = node.definition.cache !== false;
+    const cacheable =
+      node.definition.cache !== false &&
+      !usesAlternateCargoBuildOutputs(node, options.passThroughArguments);
     const localOptions = {
       directory: options.cacheDirectory,
       maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
@@ -1074,6 +1115,7 @@ const computeTaskHashes = (
         upstreamIds.map((upstream) => hashes.get(upstream)!.hash),
         options.frameworkInference,
         options.passThroughArguments,
+        options.cacheDirectory,
       );
       hashes.set(id, result);
     }
@@ -1271,6 +1313,11 @@ export const executeRun = (
       configuration,
       availableParallelism,
     );
+    yield* evictLocalCache({
+      directory: options.cacheDirectory,
+      maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
+      maxSizeBytes: options.cacheMaxSizeBytes,
+    });
     const repository = yield* discoverRepository(options.root, configuration);
     const packageManagerCheckDisabled =
       parsed.dangerouslyDisablePackageManagerCheck ||
@@ -1373,28 +1420,22 @@ export const executeRun = (
           RunRequirements
         > => {
           const memberSet = new Set(members);
+          const groupOutcomes = new Map<string, TaskOutcome>();
           const runNode = (
             id: string,
           ): Effect.Effect<TaskOutcome, never, RunRequirements> => {
             const node = graph.nodes.get(id)!;
-            const dependencyOutcomes = options.parallel
-              ? []
-              : node.dependencies.flatMap((dependency) => {
-                  const outcome = outcomes.get(dependency);
-                  return outcome === undefined ? [] : [outcome];
-                });
-            const externalDependencyFailed = node.dependencies
-              .filter((dependency) => !memberSet.has(dependency))
-              .some((dependency) => {
-                const outcome = outcomes.get(dependency);
-                return (
-                  outcome !== undefined &&
-                  (outcome.exitCode !== 0 || outcome.skipped)
-                );
-              });
+            const dependencyFailed = node.dependencies.some((dependency) => {
+              const outcome =
+                groupOutcomes.get(dependency) ?? outcomes.get(dependency);
+              return (
+                outcome !== undefined &&
+                (outcome.exitCode !== 0 || outcome.skipped)
+              );
+            });
             if (
               !options.parallel &&
-              externalDependencyFailed &&
+              dependencyFailed &&
               options.continueMode !== "always"
             ) {
               return Effect.succeed({
@@ -1441,8 +1482,38 @@ export const executeRun = (
                 Effect.forkScoped(runNode(id)),
               );
               if (background.length > 0) yield* Effect.yieldNow();
-              const foregroundCompletion = Effect.forEach(foreground, runNode, {
-                concurrency: "unbounded",
+              const foregroundCompletion = Effect.gen(function* () {
+                const remaining = new Set(foreground);
+                const results: Array<TaskOutcome> = [];
+                while (remaining.size > 0) {
+                  const readyForeground = [...remaining].filter(
+                    (id) =>
+                      options.parallel ||
+                      graph.nodes
+                        .get(id)!
+                        .dependencies.filter((dependency) =>
+                          memberSet.has(dependency),
+                        )
+                        .every((dependency) => groupOutcomes.has(dependency)),
+                  );
+                  if (readyForeground.length === 0) {
+                    throw new RepositoryError({
+                      path: options.root,
+                      message: "scheduler deadlock inside with group",
+                    });
+                  }
+                  const completed = yield* Effect.forEach(
+                    readyForeground,
+                    runNode,
+                    { concurrency: "unbounded" },
+                  );
+                  for (const outcome of completed) {
+                    remaining.delete(outcome.id);
+                    groupOutcomes.set(outcome.id, outcome);
+                    results.push(outcome);
+                  }
+                }
+                return results;
               }).pipe(
                 Effect.map((results) => ({
                   _tag: "ForegroundComplete" as const,

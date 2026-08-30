@@ -616,6 +616,32 @@ describe("cache archive safety", () => {
     expect(parseTarArchive(createTarArchive([entry]))).toEqual([entry]);
   });
 
+  it("round trips PAX paths and link targets beyond ustar limits", () => {
+    const longName = `${"generated-output-".repeat(8)}artifact.txt`;
+    const file = {
+      path: `packages/app/dist/${longName}`,
+      contents: encoder.encode("PAX path"),
+      mode: 0o644,
+      modifiedSeconds: 4,
+    };
+    const symlink = {
+      kind: "symlink" as const,
+      path: "packages/app/dist/current.txt",
+      linkTarget: `${"nested/".repeat(18)}artifact.txt`,
+      contents: new Uint8Array(),
+      mode: 0o777,
+      modifiedSeconds: 5,
+    };
+    expect(new TextEncoder().encode(longName).length).toBeGreaterThan(100);
+    expect(new TextEncoder().encode(symlink.linkTarget).length).toBeGreaterThan(
+      100,
+    );
+    expect(parseTarArchive(createTarArchive([file, symlink]))).toEqual([
+      symlink,
+      file,
+    ]);
+  });
+
   it(evidenceId.coreSecurity, () => {
     for (const path of [
       "../escape",

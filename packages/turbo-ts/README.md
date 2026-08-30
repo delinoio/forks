@@ -68,6 +68,10 @@ symlink attacks, signatures, command-injection arguments, and concurrent cache
 writers. `futureFlags.experimentalCargoSccache: true` always fails before task
 execution with a branded unsupported-compatibility diagnostic.
 
+Cargo builds that receive pass-through arguments selecting release, profile,
+target, or another alternate artifact layout execute without cache reads or
+writes until those output layouts are modeled explicitly.
+
 ## License and Attribution
 
 The independent implementation is available under the Delino MIT license in
