@@ -45,7 +45,6 @@ const program = Effect.gen(function* () {
         }
       >
     >;
-    packages?: Readonly<Record<string, unknown>>;
     snapshots?: Readonly<
       Record<
         string,
@@ -56,20 +55,6 @@ const program = Effect.gen(function* () {
       >
     >;
   };
-  if (
-    Object.keys(lockDocument.packages ?? {}).some((name) =>
-      name.startsWith("msgpackr-extract@"),
-    )
-  ) {
-    return yield* Effect.fail(
-      new BoundaryError({
-        boundary: "runtime-dependencies",
-        message: "optional native msgpackr-extract is present in the lockfile",
-        retryable: false,
-      }),
-    );
-  }
-
   const importer = lockDocument.importers?.["packages/turbo-ts"];
   const snapshots = lockDocument.snapshots ?? {};
   const pending = Object.entries(importer?.dependencies ?? {}).map(

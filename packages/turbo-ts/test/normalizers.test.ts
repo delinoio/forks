@@ -4,6 +4,7 @@ import {
   normalizeOutput,
   normalizerIds,
 } from "../src/compatibility/normalizers.js";
+import { versionOutput } from "../src/version.js";
 
 describe("deterministic normalizers", () => {
   it(evidenceId.normalizersAllowlist, () => {
@@ -11,10 +12,17 @@ describe("deterministic normalizers", () => {
   });
 
   it(evidenceId.normalizersDeterministic, () => {
-    const input = "turbo-ts 0.1.0 /opt/tool /tmp/case nested\\path";
     const enabled = ["branding", "version"] as const;
-    const once = normalizeOutput(input, enabled);
-    expect(normalizeOutput(once, enabled)).toBe(once);
-    expect(once).toBe("<PRODUCT> <VERSION> /opt/tool /tmp/case nested\\path");
+    const candidate = normalizeOutput(`${versionOutput}\r\n`, enabled);
+    const reference = normalizeOutput("2.10.12\r\n", enabled);
+    expect(candidate).toBe("<VERSION>\r\n");
+    expect(reference).toBe(candidate);
+    expect(normalizeOutput(candidate, enabled)).toBe(candidate);
+  });
+
+  it("does not normalize branding in user-controlled output", () => {
+    const input =
+      "task turbo emitted turbo-ts /opt/turbo nested\\turbo-ts payload";
+    expect(normalizeOutput(input, ["branding"])).toBe(input);
   });
 });

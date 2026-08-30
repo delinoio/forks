@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Writable } from "node:stream";
 import { Cause, Effect, Exit, Layer, Option, Ref } from "effect";
 import { BoundaryError, ProcessExecutionError } from "./errors.js";
 import {
@@ -282,31 +283,47 @@ const environmentLayer = Layer.succeed(EnvironmentService, {
   entries: Effect.sync(() => ({ ...process.env })),
 });
 
+const terminalError = (cause: unknown): BoundaryError =>
+  new BoundaryError({
+    boundary: "terminal",
+    message: String(cause),
+    retryable: false,
+  });
+
+export const makeTerminalWriter =
+  (stream: Writable) =>
+  (text: string): Effect.Effect<void, BoundaryError> =>
+    Effect.async<void, BoundaryError>((resume) => {
+      let settled = false;
+      const fail = (cause: unknown) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resume(Effect.fail(terminalError(cause)));
+      };
+      const onError = (cause: Error) => {
+        fail(cause);
+      };
+      stream.once("error", onError);
+      try {
+        stream.write(text, (cause) => {
+          if (settled || (cause !== undefined && cause !== null)) {
+            return;
+          }
+          settled = true;
+          stream.off("error", onError);
+          resume(Effect.void);
+        });
+      } catch (cause) {
+        stream.off("error", onError);
+        fail(cause);
+      }
+    }).pipe(Effect.uninterruptible);
+
 const terminalLayer = Layer.succeed(TerminalService, {
-  writeStdout: (text) =>
-    Effect.try({
-      try: () => {
-        process.stdout.write(text);
-      },
-      catch: (cause) =>
-        new BoundaryError({
-          boundary: "terminal",
-          message: String(cause),
-          retryable: false,
-        }),
-    }),
-  writeStderr: (text) =>
-    Effect.try({
-      try: () => {
-        process.stderr.write(text);
-      },
-      catch: (cause) =>
-        new BoundaryError({
-          boundary: "terminal",
-          message: String(cause),
-          retryable: false,
-        }),
-    }),
+  writeStdout: makeTerminalWriter(process.stdout),
+  writeStderr: makeTerminalWriter(process.stderr),
   colorEnabled: Effect.sync(
     () => process.env.NO_COLOR === undefined && process.stdout.isTTY === true,
   ),

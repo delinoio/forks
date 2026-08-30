@@ -1,6 +1,10 @@
 import { Schema } from "effect";
 import { parse } from "yaml";
 import { LedgerError } from "../effect/errors.js";
+import {
+  ledgerCategories,
+  requiredLedgerVariants,
+} from "./required-variants.js";
 
 export const evidenceId = {
   cliVersion: "cli.version",
@@ -80,19 +84,7 @@ const evidenceIdValues = Object.values(evidenceId) as [
 
 export const EvidenceIdSchema = Schema.Literal(...evidenceIdValues);
 
-export const LedgerCategorySchema = Schema.Literal(
-  "command",
-  "option",
-  "environment",
-  "configuration",
-  "protocol",
-  "package-manager",
-  "success",
-  "failure",
-  "security",
-  "normalization",
-  "explicit-difference",
-);
+export const LedgerCategorySchema = Schema.Literal(...ledgerCategories);
 
 export const LedgerStatusSchema = Schema.Literal(
   "passing",
@@ -127,72 +119,6 @@ export type CompatibilityLedger = Schema.Schema.Type<
   typeof CompatibilityLedgerSchema
 >;
 
-const requiredCommands = [
-  "bin",
-  "get-mfe-port",
-  "boundaries",
-  "completion",
-  "daemon",
-  "devtools",
-  "docs",
-  "generate",
-  "telemetry",
-  "scan",
-  "config",
-  "ls",
-  "link",
-  "login",
-  "logout",
-  "info",
-  "prune",
-  "run",
-  "implicit-task",
-  "query",
-  "query affected",
-  "query ls",
-  "watch",
-  "unlink",
-] as const;
-
-const requiredCategories = [
-  "command",
-  "option",
-  "environment",
-  "configuration",
-  "protocol",
-  "package-manager",
-  "success",
-  "failure",
-  "security",
-  "normalization",
-  "explicit-difference",
-] as const;
-
-const requiredPackageManagers = [
-  "npm@8.0.0",
-  "npm@8.19.4",
-  "npm@9.9.4",
-  "npm@10.9.9",
-  "npm@11.19.1",
-  "npm@12.0.2",
-  "pnpm@8.0.0",
-  "pnpm@8.15.9",
-  "pnpm@9.15.9",
-  "pnpm@10.34.5",
-  "pnpm@11.25.0",
-  "pnpm@12.1.0",
-  "yarn@1.0.0",
-  "yarn@1.22.22",
-  "yarn@2.4.2",
-  "yarn@3.8.7",
-  "yarn@4.18.0",
-  "bun@1.2.0",
-  "bun@1.4.0",
-  "cargo@1.97.1",
-  "rustc@1.97.1",
-  "uv@0.12.7",
-] as const;
-
 export const parseCompatibilityLedger = (
   source: string,
 ): CompatibilityLedger => {
@@ -210,35 +136,26 @@ export const parseCompatibilityLedger = (
     }
   }
 
-  for (const category of requiredCategories) {
-    if (!decoded.rows.some((row) => row.category === category)) {
-      throw new LedgerError({
-        message: `missing ledger category: ${category}`,
-      });
+  for (const category of ledgerCategories) {
+    const actual = new Set(
+      decoded.rows
+        .filter((row) => row.category === category)
+        .flatMap((row) => row.variants ?? []),
+    );
+    for (const required of requiredLedgerVariants[category]) {
+      if (!actual.has(required)) {
+        throw new LedgerError({
+          message: `missing ledger variant: ${category}:${required}`,
+        });
+      }
     }
-  }
-
-  const commandVariants = new Set(
-    decoded.rows
-      .filter((row) => row.category === "command")
-      .flatMap((row) => row.variants ?? []),
-  );
-  for (const command of requiredCommands) {
-    if (!commandVariants.has(command)) {
-      throw new LedgerError({ message: `missing command: ${command}` });
-    }
-  }
-
-  const packageManagerVariants = new Set(
-    decoded.rows
-      .filter((row) => row.category === "package-manager")
-      .flatMap((row) => row.variants ?? []),
-  );
-  for (const packageManager of requiredPackageManagers) {
-    if (!packageManagerVariants.has(packageManager)) {
-      throw new LedgerError({
-        message: `missing package manager: ${packageManager}`,
-      });
+    const required = new Set<string>(requiredLedgerVariants[category]);
+    for (const variant of actual) {
+      if (!required.has(variant)) {
+        throw new LedgerError({
+          message: `unexpected ledger variant: ${category}:${variant}`,
+        });
+      }
     }
   }
   return decoded;

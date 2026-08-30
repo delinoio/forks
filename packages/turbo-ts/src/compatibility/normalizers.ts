@@ -1,3 +1,5 @@
+import { packageVersion, versionOutput } from "../version.js";
+
 export const normalizerIds = ["branding", "version"] as const;
 
 export type NormalizerId = (typeof normalizerIds)[number];
@@ -10,8 +12,15 @@ export const normalizeOutput = (
   let output = input;
   if (selected.has("branding")) {
     output = output
-      .replaceAll("turbo-ts", "<PRODUCT>")
-      .replaceAll("turbo", "<PRODUCT>");
+      .split("\n")
+      .map((line) => {
+        const carriageReturn = line.endsWith("\r") ? "\r" : "";
+        const contents = carriageReturn === "" ? line : line.slice(0, -1);
+        return contents === versionOutput
+          ? `${packageVersion}${carriageReturn}`
+          : line;
+      })
+      .join("\n");
   }
   if (selected.has("version")) {
     output = output

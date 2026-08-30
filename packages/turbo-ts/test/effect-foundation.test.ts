@@ -1,12 +1,14 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, it } from "@rstest/core";
 import { Effect, Fiber, Schedule, Schema } from "effect";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import {
+  makeTerminalWriter,
   makeWithTemporaryDirectory,
   nodeFoundationLayer,
 } from "../src/effect/node-layer.js";
@@ -81,6 +83,22 @@ describe("Effect foundation", () => {
     if (outcome._tag === "Left") {
       expect(outcome.left).toBeInstanceOf(BoundaryError);
       expect(outcome.left.boundary).toBe("filesystem");
+    }
+  });
+
+  it("reports asynchronous terminal stream failures as typed errors", async () => {
+    const stream = new Writable({
+      write: (_chunk, _encoding, callback) => {
+        callback(new Error("consumer closed the pipe"));
+      },
+    });
+    const outcome = await Effect.runPromise(
+      Effect.either(makeTerminalWriter(stream)("payload")),
+    );
+    expect(outcome._tag).toBe("Left");
+    if (outcome._tag === "Left") {
+      expect(outcome.left).toBeInstanceOf(BoundaryError);
+      expect(outcome.left.boundary).toBe("terminal");
     }
   });
 

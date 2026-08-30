@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "@rstest/core";
 import { Schema } from "effect";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
   evidenceId,
   evidenceRegistry,
@@ -11,6 +11,10 @@ import {
   parseCompatibilityLedger,
 } from "../src/compatibility/ledger.js";
 import { normalizerIds } from "../src/compatibility/normalizers.js";
+import {
+  ledgerCategories,
+  requiredLedgerVariants,
+} from "../src/compatibility/required-variants.js";
 import {
   RootSchemaSchema,
   TurboConfigurationSchema,
@@ -235,6 +239,35 @@ describe("configuration generation and compatibility ledger", () => {
         ),
       ),
     ).toThrow();
+
+    const ledgerDocument = parseYaml(ledgerSource) as {
+      rows: Array<{
+        category: string;
+        variants?: Array<string>;
+      }>;
+    };
+    for (const category of ledgerCategories) {
+      const variant = requiredLedgerVariants[category][0];
+      const missingVariant = structuredClone(ledgerDocument);
+      const row = missingVariant.rows.find(
+        (candidate) =>
+          candidate.category === category &&
+          candidate.variants?.includes(variant) === true,
+      );
+      if (row?.variants === undefined) {
+        throw new Error(`test setup cannot find ${category}:${variant}`);
+      }
+      row.variants = row.variants.filter((candidate) => candidate !== variant);
+      expect(() =>
+        parseCompatibilityLedger(stringifyYaml(missingVariant)),
+      ).toThrow(`missing ledger variant: ${category}:${variant}`);
+    }
+
+    const unexpectedVariant = structuredClone(ledgerDocument);
+    unexpectedVariant.rows[0]?.variants?.push("unexpected-surface");
+    expect(() =>
+      parseCompatibilityLedger(stringifyYaml(unexpectedVariant)),
+    ).toThrow("unexpected ledger variant: command:unexpected-surface");
   });
 
   it("wires ledger evidence to executed tests and package checks", async () => {
