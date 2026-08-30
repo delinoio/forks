@@ -7,6 +7,7 @@ import { loadPackageConfiguration, mergePipeline } from "../config/runtime.js";
 import { selectByGlobs } from "../core/glob.js";
 import {
   baseName,
+  isAbsolutePath,
   isPathContained,
   joinPath,
   normalizePath,
@@ -78,12 +79,18 @@ export interface RepositoryModel {
   readonly packagesByName: ReadonlyMap<string, RepositoryPackage>;
 }
 
-const ignoredDirectories = new Set([
+const workspaceTraversalIgnoredDirectories = new Set([
   ".git",
   ".turbo",
   "dist",
   "node_modules",
   "target",
+]);
+
+const fileTraversalIgnoredDirectories = new Set([
+  ".git",
+  ".turbo",
+  "node_modules",
 ]);
 
 const readJsonObject = (
@@ -312,7 +319,10 @@ const walkDirectories = (
           ),
         );
       for (const entry of entries) {
-        if (entry.kind !== "directory" || ignoredDirectories.has(entry.name)) {
+        if (
+          entry.kind !== "directory" ||
+          workspaceTraversalIgnoredDirectories.has(entry.name)
+        ) {
           continue;
         }
         const path = joinPath(directory, entry.name);
@@ -390,30 +400,54 @@ const dependencyEntries = (
 const dependencyNames = (manifest: PackageManifest): ReadonlyArray<string> =>
   [...new Set(dependencyEntries(manifest).map(([name]) => name))].sort();
 
-const referencesWorkspaceVersion = (
+const referencesWorkspacePackage = (
+  declaringDirectory: string,
   specification: string,
-  version: string | undefined,
+  target: {
+    readonly directory: string;
+    readonly manifest: PackageManifest;
+  },
 ): boolean => {
+  for (const protocol of ["file:", "link:"] as const) {
+    if (specification.startsWith(protocol)) {
+      const path = specification.slice(protocol.length);
+      if (path === "") return false;
+      const resolved = isAbsolutePath(path)
+        ? normalizePath(path)
+        : joinPath(declaringDirectory, path);
+      return resolved === normalizePath(target.directory);
+    }
+  }
   if (specification.startsWith("workspace:")) {
     const range = specification.slice("workspace:".length);
     if (range === "" || range === "*" || range === "^" || range === "~") {
       return true;
     }
-    return version !== undefined && satisfies(version, range);
+    return (
+      target.manifest.version !== undefined &&
+      satisfies(target.manifest.version, range)
+    );
   }
-  return version !== undefined && satisfies(version, specification);
+  return (
+    target.manifest.version !== undefined &&
+    satisfies(target.manifest.version, specification)
+  );
 };
 
 const javascriptInternalDependencies = (
+  declaringDirectory: string,
   manifest: PackageManifest,
-  packagesByName: ReadonlyMap<string, { readonly manifest: PackageManifest }>,
+  packagesByName: ReadonlyMap<
+    string,
+    { readonly directory: string; readonly manifest: PackageManifest }
+  >,
 ): ReadonlyArray<string> =>
   [
     ...new Set(
       dependencyEntries(manifest).flatMap(([name, specification]) => {
         const target = packagesByName.get(name);
         return target !== undefined &&
-          referencesWorkspaceVersion(specification, target.manifest.version)
+          referencesWorkspacePackage(declaringDirectory, specification, target)
           ? [name]
           : [];
       }),
@@ -949,6 +983,7 @@ export const discoverRepository = (
             : packageDraft.manager === "cargo"
               ? packageDraft.dependencyNames.filter((name) => names.has(name))
               : javascriptInternalDependencies(
+                  packageDraft.directory,
                   packageDraft.manifest,
                   draftsByName,
                 ),
@@ -970,6 +1005,7 @@ export const discoverRepository = (
       scripts: rootManifest.scripts ?? {},
       dependencyNames: dependencyNames(rootManifest),
       internalDependencies: javascriptInternalDependencies(
+        root,
         rootManifest,
         draftsByName,
       ),
@@ -1036,7 +1072,9 @@ export const listRepositoryFiles = (
       for (const entry of entries) {
         if (
           entry.kind === "directory" &&
-          !(options.ignoredDirectories ?? ignoredDirectories).has(entry.name)
+          !(options.ignoredDirectories ?? fileTraversalIgnoredDirectories).has(
+            entry.name,
+          )
         ) {
           pending.push(joinPath(current, entry.name));
         } else if (entry.kind === "file" || entry.kind === "symlink") {

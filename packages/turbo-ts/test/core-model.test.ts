@@ -37,6 +37,7 @@ import {
   packageManagerCommand,
   parseCacheSpecification,
   planCargoWorkspaceTasks,
+  taskScopeEnvironment,
 } from "../src/run/engine.js";
 import { parseConcurrency, parseRunArguments } from "../src/run/options.js";
 
@@ -401,6 +402,15 @@ describe("core repository model", () => {
     );
     expect(strictGraph.entrypoints).toEqual(["executable#test"]);
     expect(strictGraph.nodes.has("transit#test")).toBe(false);
+    const allCommandlessStrictGraph = buildTaskGraph(
+      model,
+      [transit],
+      ["test"],
+      false,
+      true,
+    );
+    expect(allCommandlessStrictGraph.entrypoints).toEqual([]);
+    expect(allCommandlessStrictGraph.nodes.size).toBe(0);
     expect(
       buildTaskGraph(model, model.packages, ["missing"], false).entrypoints,
     ).toEqual([]);
@@ -541,6 +551,37 @@ describe("core repository model", () => {
     });
     expect(isTaskScopeCacheable(workspaceNode, [], workspaceScope)).toBe(false);
 
+    if (workspaceScope.kind !== "cargo-workspace") {
+      throw new Error("expected a Cargo workspace scope");
+    }
+    const environmentScope = {
+      ...workspaceScope,
+      members: [
+        {
+          ...workspaceScope.members[0]!,
+          definition: { env: ["APP_ENV"] },
+        },
+        {
+          ...workspaceScope.members[1]!,
+          definition: { passThroughEnv: ["LIBRARY_ENV"] },
+        },
+      ],
+    } satisfies typeof workspaceScope;
+    expect(
+      taskScopeEnvironment(
+        model,
+        workspaceNode,
+        {
+          APP_ENV: "app",
+          LIBRARY_ENV: "library",
+          UNSELECTED_ENV: "hidden",
+        },
+        "strict",
+        false,
+        environmentScope,
+      ),
+    ).toEqual({ APP_ENV: "app", LIBRARY_ENV: "library" });
+
     const formatGraph = buildTaskGraph(
       model,
       model.packages,
@@ -603,6 +644,39 @@ describe("core repository model", () => {
       arguments: ["run", "--frozen", "--package", "python-app", "pytest", "."],
       cwd: "/repo/python/app",
     });
+  });
+
+  it("disables Cargo build caching for unmodeled target selectors", () => {
+    const cargoPackage: RepositoryPackage = {
+      ...packageModel("app", []),
+      manager: "cargo",
+      scripts: { build: "cargo build" },
+      tasks: { build: {} },
+    };
+    const node: TaskNode = {
+      id: "app#build",
+      package: cargoPackage,
+      task: "build",
+      command: "cargo build",
+      definition: {},
+      dependencies: [],
+      with: [],
+    };
+    for (const arguments_ of [
+      ["--lib"],
+      ["--bin", "tool"],
+      ["--bins"],
+      ["--example=demo"],
+      ["--examples"],
+      ["--test", "integration"],
+      ["--tests"],
+      ["--bench=throughput"],
+      ["--benches"],
+      ["--all-targets"],
+    ]) {
+      expect(isTaskScopeCacheable(node, arguments_)).toBe(false);
+    }
+    expect(isTaskScopeCacheable(node, ["--features=integration"])).toBe(true);
   });
 
   it("rejects unknown output log modes", () => {

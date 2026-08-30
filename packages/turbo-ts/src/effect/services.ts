@@ -2,6 +2,10 @@ import type { Scope } from "effect";
 import { Context, Effect, Layer, Schedule } from "effect";
 import type { BoundaryError, ProcessExecutionError } from "./errors.js";
 
+export type OutputChunkHandler =
+  | ((chunk: string) => void)
+  | ((chunk: string) => PromiseLike<void>);
+
 export interface ExecutionRequest {
   readonly command: string;
   readonly args: ReadonlyArray<string>;
@@ -10,7 +14,7 @@ export interface ExecutionRequest {
   readonly inheritEnvironment?: boolean;
   readonly stdin?: string;
   readonly stdio?: "capture" | "inherit";
-  readonly onOutputChunk?: (chunk: string) => void;
+  readonly onOutputChunk?: OutputChunkHandler;
   readonly maxCapturedOutputCharacters?: number;
 }
 

@@ -69,8 +69,15 @@ writers. `futureFlags.experimentalCargoSccache: true` always fails before task
 execution with a branded unsupported-compatibility diagnostic.
 
 Cargo builds that receive pass-through arguments selecting release, profile,
-target, or another alternate artifact layout execute without cache reads or
-writes until those output layouts are modeled explicitly.
+target, another alternate artifact layout, or an unmodeled library, binary,
+example, test, or benchmark target execute without cache reads or writes until
+those outputs are modeled explicitly. Unfiltered Cargo workspace commands merge
+the effective environments of every grouped member.
+
+Configured cache directories may be inside or outside the repository, but the
+repository root and its ancestors are rejected because treating them as cache
+content would exclude source files from task hashes. Explicit `dist/**` and
+`target/**` task inputs remain hashable when Git metadata is unavailable.
 
 ## License and Attribution
 

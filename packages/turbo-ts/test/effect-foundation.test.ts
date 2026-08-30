@@ -572,6 +572,51 @@ describe("Effect foundation", () => {
     expect(observed).toEqual(["stdout-123", "stderr-456"]);
   });
 
+  it("backpressures child output until an asynchronous sink catches up", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const observed: Array<string> = [];
+    let close: ((exitCode: number | null) => void) | undefined;
+    let releaseFirstChunk: (() => void) | undefined;
+    const firstChunkConsumed = new Promise<void>((resolve) => {
+      releaseFirstChunk = resolve;
+    });
+    const fiber = Effect.runFork(
+      collectChildProcessOutput(
+        {
+          stdin,
+          stdout,
+          stderr,
+          onceClose: (listener) => {
+            close = listener;
+          },
+          onceError: () => {
+            // The synthetic process exits through the close callback.
+          },
+        },
+        "synthetic-backpressured-output",
+        undefined,
+        false,
+        async (chunk) => {
+          observed.push(chunk);
+          if (observed.length === 1) await firstChunkConsumed;
+        },
+      ),
+    );
+    await Effect.runPromise(Effect.yieldNow());
+    stdout.write("first\n");
+    expect(stdout.isPaused()).toBe(true);
+    expect(stderr.isPaused()).toBe(true);
+    stderr.write("second\n");
+    close?.(0);
+    expect((await Effect.runPromise(Fiber.poll(fiber)))._tag).toBe("None");
+    releaseFirstChunk?.();
+    const result = await Effect.runPromise(Fiber.join(fiber));
+    expect(observed).toEqual(["first\n", "second\n"]);
+    expect(result.combinedOutput).toBe("first\nsecond\n");
+  });
+
   it("generates canonical lowercase UUID v7 identifiers", async () => {
     const identifier = await Effect.runPromise(
       RandomnessService.pipe(Effect.flatMap((service) => service.uuidV7)).pipe(

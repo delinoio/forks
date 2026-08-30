@@ -17,6 +17,7 @@ import {
 import { matchesGlob, selectByGlobs } from "../core/glob.js";
 import {
   isAbsolutePath,
+  isPathContained,
   joinPath,
   normalizePath,
   parentPath,
@@ -537,14 +538,17 @@ const findAffectedPackages = (
           ? []
           : (repository.rootConfiguration.value.global?.inputs ?? [])
         : (repository.rootConfiguration.value.globalDependencies ?? []);
+    const globalDependencyChanged =
+      selectByGlobs(changedFiles, globalDependencyPatterns).length > 0;
+    const ordinaryRootChanged = changedFiles.some(
+      (path) =>
+        !repository.packages.some((packageModel) =>
+          path.startsWith(`${packageModel.relativeDirectory}/`),
+        ),
+    );
     const rootChanged =
-      selectByGlobs(changedFiles, globalDependencyPatterns).length > 0 ||
-      changedFiles.some(
-        (path) =>
-          !repository.packages.some((packageModel) =>
-            path.startsWith(`${packageModel.relativeDirectory}/`),
-          ),
-      );
+      globalDependencyChanged ||
+      (!globalInputsAreTaskAware && ordinaryRootChanged);
     return {
       packages: rootChanged
         ? new Set(repository.packages.map((packageModel) => packageModel.name))
@@ -841,6 +845,22 @@ export type TaskCommandScope =
 
 const packageTaskCommandScope = { kind: "package" } as const;
 
+export const taskScopeEnvironment = (
+  repository: RepositoryModel,
+  node: TaskNode,
+  source: Readonly<Record<string, string | undefined>>,
+  mode: "loose" | "strict",
+  frameworkInference: boolean,
+  scope: TaskCommandScope = packageTaskCommandScope,
+): Readonly<Record<string, string | undefined>> =>
+  Object.assign(
+    {},
+    ...(scope.kind === "cargo-workspace" ? scope.members : [node]).map(
+      (member) =>
+        taskEnvironment(repository, member, source, mode, frameworkInference),
+    ),
+  );
+
 export const packageManagerCommand = (
   node: TaskNode,
   passThroughArguments: ReadonlyArray<string>,
@@ -1049,6 +1069,7 @@ type TaskOutputQueueEvent =
   | { readonly kind: "end" };
 
 const persistentOutputCaptureCharacters = 64 * 1024;
+const persistentOutputQueueCapacity = 16;
 
 const cargoAlternateOutputFlags = [
   "--artifact-dir",
@@ -1056,6 +1077,19 @@ const cargoAlternateOutputFlags = [
   "--profile",
   "--target",
   "--target-dir",
+] as const;
+
+const cargoUnmodeledTargetFlags = [
+  "--all-targets",
+  "--bench",
+  "--benches",
+  "--bin",
+  "--bins",
+  "--example",
+  "--examples",
+  "--lib",
+  "--test",
+  "--tests",
 ] as const;
 
 const usesAlternateCargoBuildOutputs = (
@@ -1068,7 +1102,7 @@ const usesAlternateCargoBuildOutputs = (
     (argument) =>
       argument === "--release" ||
       argument === "-r" ||
-      cargoAlternateOutputFlags.some(
+      [...cargoAlternateOutputFlags, ...cargoUnmodeledTargetFlags].some(
         (flag) => argument === flag || argument.startsWith(`${flag}=`),
       ),
   );
@@ -1236,12 +1270,13 @@ const executeTask = (
             ? undefined
             : persistentOutputCaptureCharacters,
         env: {
-          ...taskEnvironment(
+          ...taskScopeEnvironment(
             repository,
             node,
             sourceEnvironment,
             options.environmentMode,
             options.frameworkInference,
+            scope,
           ),
           TURBO_HASH: hash.hash,
         },
@@ -1258,7 +1293,9 @@ const executeTask = (
               joinPath(executionDirectory, ".turbo"),
             );
             yield* fileSystem.writeText(logPath, "");
-            const outputQueue = yield* Queue.unbounded<TaskOutputQueueEvent>();
+            const outputQueue = yield* Queue.bounded<TaskOutputQueueEvent>(
+              persistentOutputQueueCapacity,
+            );
             yield* Effect.addFinalizer(() => Queue.shutdown(outputQueue));
             const outputFiber = yield* Effect.forkScoped(
               Effect.gen(function* () {
@@ -1304,9 +1341,13 @@ const executeTask = (
               }),
             );
             const processResult = yield* Effect.raceFirst(
-              startProcess((output) => {
-                Queue.unsafeOffer(outputQueue, { kind: "chunk", output });
-              }),
+              startProcess((output) =>
+                Effect.runPromise(
+                  Queue.offer(outputQueue, { kind: "chunk", output }).pipe(
+                    Effect.asVoid,
+                  ),
+                ),
+              ),
               Fiber.join(outputFiber).pipe(Effect.flatMap(() => Effect.never)),
             );
             yield* Queue.offer(outputQueue, { kind: "end" });
@@ -1606,6 +1647,15 @@ export const executeRun = (
       configuration,
       availableParallelism,
     );
+    if (isPathContained(options.cacheDirectory, options.root)) {
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: options.cacheDirectory,
+          message:
+            "cache directory must not be the repository root or one of its ancestors",
+        }),
+      );
+    }
     if (options.cachePolicy.localRead || options.cachePolicy.localWrite) {
       yield* evictLocalCache({
         directory: options.cacheDirectory,
@@ -1705,6 +1755,9 @@ export const executeRun = (
     const groups = taskGroups(graph);
     const pending = new Map(groups.map((members) => [members[0]!, members]));
     const outcomes = new Map<string, TaskOutcome>();
+    const foregroundSemaphore = yield* Effect.makeSemaphore(
+      options.concurrency,
+    );
     while (pending.size > 0) {
       const ready = [...pending.entries()]
         .filter(([, members]) => {
@@ -1819,8 +1872,8 @@ export const executeRun = (
                   }
                   const completed = yield* Effect.forEach(
                     readyForeground,
-                    runNode,
-                    { concurrency: options.concurrency },
+                    (id) => foregroundSemaphore.withPermits(1)(runNode(id)),
+                    { concurrency: "unbounded" },
                   );
                   for (const outcome of completed) {
                     remaining.delete(outcome.id);

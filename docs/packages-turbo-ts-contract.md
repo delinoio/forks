@@ -78,20 +78,25 @@ from the resolved JavaScript package manager, applies ordered workspace
 exclusions and brace/class-aware globs, and discovers the owning repository
 from nested working directories, including explicit `--cwd` values. Only pnpm
 uses `pnpm-workspace.yaml`; other JavaScript managers use `package.json`
-workspaces. Every requested task must resolve before any task executes.
+workspaces. Every requested task must resolve before any task executes, and
+strict entrypoint selection removes configured tasks without an executable
+package script even when every selected entrypoint is commandless.
 Package-level affected selection treats legacy `globalDependencies` and, when
 task-aware selection is disabled, `global.inputs` as repository-global inputs.
 Task-input selection uses the same effective global and task inputs as hashing,
 evaluates task owners before Git-range package narrowing, applies negative Git
 ranges after positive task matches, and includes `with` companions. Task hashes
 preserve Git symlink and dependency semantics, exclude the resolved cache
-directory, and use each task's owning ecosystem lockfile. Scheduled `with`
-groups preserve internal dependency order, and non-interactive persistent task
-output streams to the terminal and task log while the process is running while
-retaining only a bounded diagnostic tail in memory. Persistent companions must
-remain alive until their foreground owners complete; any earlier natural exit
-fails the group, and foreground owners sharing a companion remain subject to
-the run's concurrency limit.
+directory, and use each task's owning ecosystem lockfile. Without Git, explicit
+task inputs under ordinary `dist` and `target` directories remain hashable.
+Cache directories equal to or containing the repository are rejected before
+cache access. Scheduled `with` groups preserve internal dependency order and
+share one run-wide foreground concurrency budget. Non-interactive persistent
+task output streams to the terminal and task log through bounded backpressure
+while retaining only a bounded diagnostic tail in memory. Persistent companions
+must remain alive until their foreground owners complete; any earlier natural
+exit fails the group, and foreground owners sharing a companion remain subject
+to the run's concurrency limit.
 
 Workspace task overrides merge with their effective package-qualified root
 definition and the merged task invariants are revalidated before execution.
@@ -109,20 +114,24 @@ exclusions; unrelated Python projects are ignored. Synthesized uv packages
 expose `build` and `test`, and implicit builds default to uncached unless task
 configuration explicitly enables caching. uv tasks execute from their project
 directory, and `uv.lock` is parsed as TOML. JavaScript package-graph edges
-require declared workspace or version-range compatibility with the local
-package. Unfiltered Cargo `test`,
+require declared workspace or version-range compatibility, or a `file:` or
+`link:` path that resolves to the named local package. Unfiltered Cargo `test`,
 `check`, `lint`, and `format` tasks execute once per Cargo workspace and bypass
 caching when any grouped member disables it; filtered and package-qualified
-runs retain package targeting. Cargo `run` and `dev` tasks are exposed only for
+runs retain package targeting. Grouped Cargo commands receive the union of all
+member task environments. Cargo `run` and `dev` tasks are exposed only for
 binary crates, and pass-through arguments are forwarded to Cargo without an
 implicit target-argument separator. Cargo builds with pass-through arguments
-that select an alternate output layout bypass caching until those layouts are
+that select an alternate output layout or an unmodeled library, binary,
+example, test, or benchmark target bypass caching until those outputs are
 modeled explicitly.
 
 Structured task input globs apply ordered inclusion and negation consistently
 to task hashing and task-aware affected selection. Task-aware Git filters
 preserve leading and trailing ellipses and traverse both task and package graphs
-in the requested dependent or dependency direction.
+in the requested dependent or dependency direction. Ordinary root-file changes
+select only tasks whose effective inputs match them; repository-global inputs
+and Git discovery failures retain the all-task fallback.
 
 Gate 2 is not closed: the composed task-hash serializer does not yet reproduce
 the official 2.10.12 task hashes. Individual source-file hashes match Git and

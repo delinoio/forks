@@ -269,10 +269,7 @@ export const buildTaskGraph = (
     });
   });
   let selectedEntrypoints = [...new Set(entrypoints)].sort();
-  if (
-    strictEntrypoints &&
-    selectedEntrypoints.some((id) => nodes.get(id)?.command !== undefined)
-  ) {
+  if (strictEntrypoints) {
     selectedEntrypoints = selectedEntrypoints.filter(
       (id) => nodes.get(id)?.command !== undefined,
     );

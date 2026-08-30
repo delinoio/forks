@@ -48,6 +48,7 @@ import {
   GitService,
   HttpService,
   ObservabilityService,
+  type OutputChunkHandler,
   PackageManagerService,
   ProcessService,
   RandomnessService,
@@ -411,7 +412,7 @@ export const collectChildProcessOutput = (
   command: string,
   stdin: string | undefined,
   inheritStdin = false,
-  onOutputChunk?: (chunk: string) => void,
+  onOutputChunk?: OutputChunkHandler,
   maxCapturedOutputCharacters?: number,
 ): Effect.Effect<
   {
@@ -424,6 +425,10 @@ export const collectChildProcessOutput = (
 > =>
   Effect.async((resume) => {
     let settled = false;
+    let closeReceived = false;
+    let closeExitCode: number | null = null;
+    let outputSinkPending = false;
+    let closeCompletionScheduled = false;
     let stdout = "";
     let stderr = "";
     let combinedOutput = "";
@@ -448,46 +453,85 @@ export const collectChildProcessOutput = (
       stopInheritedInput();
       resume(Effect.fail(processExecutionError(command, cause)));
     };
+    const completeClose = () => {
+      if (settled || !closeReceived || outputSinkPending) return;
+      settled = true;
+      stopInheritedInput();
+      resume(
+        Effect.succeed({
+          exitCode: closeExitCode ?? 1,
+          stdout,
+          stderr,
+          combinedOutput,
+        }),
+      );
+    };
+    const completeCloseAfterBufferedOutput = () => {
+      if (
+        settled ||
+        !closeReceived ||
+        outputSinkPending ||
+        closeCompletionScheduled
+      ) {
+        return;
+      }
+      closeCompletionScheduled = true;
+      setImmediate(() => {
+        closeCompletionScheduled = false;
+        completeClose();
+      });
+    };
+    const emitOutput = (chunk: string) => {
+      if (onOutputChunk === undefined) return;
+      try {
+        const completion: unknown = onOutputChunk(chunk);
+        if (
+          completion === null ||
+          (typeof completion !== "object" &&
+            typeof completion !== "function") ||
+          typeof (completion as PromiseLike<void>).then !== "function"
+        ) {
+          return;
+        }
+        outputSinkPending = true;
+        child.stdout.pause();
+        child.stderr.pause();
+        Promise.resolve(completion).then(() => {
+          outputSinkPending = false;
+          if (settled) return;
+          child.stdout.resume();
+          child.stderr.resume();
+          completeCloseAfterBufferedOutput();
+        }, fail);
+      } catch (cause) {
+        fail(cause);
+      }
+    };
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       if (settled) return;
       stdout = appendCapturedOutput(stdout, chunk);
       combinedOutput = appendCapturedOutput(combinedOutput, chunk);
-      try {
-        onOutputChunk?.(chunk);
-      } catch (cause) {
-        fail(cause);
-      }
+      emitOutput(chunk);
     });
     child.stderr.on("data", (chunk: string) => {
       if (settled) return;
       stderr = appendCapturedOutput(stderr, chunk);
       combinedOutput = appendCapturedOutput(combinedOutput, chunk);
-      try {
-        onOutputChunk?.(chunk);
-      } catch (cause) {
-        fail(cause);
-      }
+      emitOutput(chunk);
     });
     child.onceError(fail);
     child.stdin.on("error", fail);
     child.stdout.once("error", fail);
     child.stderr.once("error", fail);
     child.onceClose((exitCode) => {
-      if (settled) {
+      closeReceived = true;
+      closeExitCode = exitCode;
+      if (outputSinkPending) {
         return;
       }
-      settled = true;
-      stopInheritedInput();
-      resume(
-        Effect.succeed({
-          exitCode: exitCode ?? 1,
-          stdout,
-          stderr,
-          combinedOutput,
-        }),
-      );
+      completeClose();
     });
     if (inheritStdin) {
       process.stdin.pipe(child.stdin);
@@ -496,6 +540,12 @@ export const collectChildProcessOutput = (
     } else {
       child.stdin.end(stdin);
     }
+    return Effect.sync(() => {
+      settled = true;
+      stopInheritedInput();
+      child.stdout.pause();
+      child.stderr.pause();
+    });
   });
 
 const waitForInheritedChild = (
