@@ -37,7 +37,9 @@ const isTransientStatus = (status: number): boolean =>
   status === 408 || status === 429 || (status >= 500 && status <= 599);
 
 const artifactUrl = (options: RemoteCacheOptions, hash: string): string => {
-  const url = new URL(`/v8/artifacts/${hash}`, options.apiUrl);
+  const url = new URL(options.apiUrl);
+  url.pathname = `${url.pathname.replace(/\/+$/, "")}/v8/artifacts/${hash}`;
+  url.hash = "";
   if (options.teamId?.startsWith("team_") === true) {
     url.searchParams.set("teamId", options.teamId);
   } else if (options.teamSlug !== undefined) {

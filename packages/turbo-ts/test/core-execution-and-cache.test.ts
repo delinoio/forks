@@ -928,6 +928,22 @@ describe("core CLI execution", () => {
       expect(result.stdout).toContain("app build");
       expect(result.stdout).toContain("library build");
       expect(result.stdout).not.toContain("legacy build");
+      const explicit = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          `${directory}/packages/app`,
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(explicit.exitCode).toBe(0);
+      expect(explicit.stdout).toContain("app build");
+      expect(explicit.stdout).toContain("library build");
+      expect(explicit.stdout).not.toContain("legacy build");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1019,7 +1035,7 @@ describe("core CLI execution", () => {
         scripts: Record<string, string>;
       };
       manifest.scripts.serve =
-        "node -e \"const fs=require('node:fs'); fs.writeFileSync('serve.ready','1'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('owner.done')){clearInterval(timer)}else if(Date.now()-started>4000){process.exit(8)}},10)\"";
+        "node -e \"const fs=require('node:fs'); console.log('persistent server ready'); fs.writeFileSync('serve.ready','1'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('owner.done')){clearInterval(timer)}else if(Date.now()-started>4000){process.exit(8)}},10)\"";
       manifest.scripts.check =
         "node -e \"const fs=require('node:fs'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('serve.ready')){fs.writeFileSync('owner.done','1'); clearInterval(timer)}else if(Date.now()-started>3000){process.exit(7)}},10)\"";
       await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
@@ -1038,12 +1054,16 @@ describe("core CLI execution", () => {
         repositoryRoot,
       );
       expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("persistent server ready");
       expect(await readFile(`${packageDirectory}/serve.ready`, "utf8")).toBe(
         "1",
       );
       expect(await readFile(`${packageDirectory}/owner.done`, "utf8")).toBe(
         "1",
       );
+      expect(
+        await readFile(`${packageDirectory}/.turbo/turbo-serve.log`, "utf8"),
+      ).toContain("persistent server ready");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2070,6 +2090,72 @@ describe("core CLI execution", () => {
     }
   }, 20_000);
 
+  it("applies negative Git ranges after task-input selection", async () => {
+    await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
+    const directory = await mkdtemp(
+      join(repositoryRoot, ".turbo/turbo-ts-negative-range-"),
+    );
+    await cp(fixtureRoot, directory, { recursive: true });
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, unknown>;
+      };
+      configuration.futureFlags = { filterUsingTasks: true };
+      configuration.tasks.check = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      for (const packageName of ["app", "library"]) {
+        const packageDirectory = `${directory}/packages/${packageName}`;
+        const manifestPath = `${packageDirectory}/package.json`;
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          scripts: Record<string, string>;
+        };
+        manifest.scripts.check = `node -e "console.log('${packageName} check')"`;
+        await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+        await writeFile(`${packageDirectory}/source.txt`, "first\n");
+      }
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "fixture base"],
+      ]) {
+        const git = await run("git", args, directory);
+        expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
+      }
+      await writeFile(`${directory}/packages/app/source.txt`, "second\n");
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "app input"], directory)).exitCode,
+      ).toBe(0);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--filter=![HEAD~1]",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).not.toContain("app check");
+      expect(result.stdout).toContain("library check");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("retains an affected owner when only a with companion input changed", async () => {
     await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
     const directory = await mkdtemp(
@@ -2600,6 +2686,49 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("falls back to execution when remote cache restoration fails", async () => {
+    const directory = await makeFixture();
+    const server = createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        response.writeHead(200, {
+          "content-type": "application/octet-stream",
+        });
+        response.end("corrupt remote artifact");
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    try {
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--cache=remote:r",
+        ],
+        repositoryRoot,
+        { TURBO_API: `http://127.0.0.1:${address.port}` },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("library build");
+      expect(result.stderr).toContain("remote cache restore failed");
+      expect(result.stderr).toContain("executing task locally");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("rejects remote restoration before creating directories through escaping symlinks", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-remote-symlink-"));
@@ -2669,9 +2798,13 @@ describe("cache interoperability and safety", () => {
   it("round trips signed remote artifacts through a loopback service", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-remote-"));
     const linkedRoot = `${directory}-link`;
+    const requestPaths: Array<string> = [];
     let artifact = new Uint8Array();
     let tag = "";
     const server = createServer((request, response) => {
+      requestPaths.push(
+        new URL(request.url ?? "/", "http://127.0.0.1").pathname,
+      );
       const chunks: Array<Buffer> = [];
       request.on("data", (chunk: Buffer) => chunks.push(chunk));
       request.on("end", () => {
@@ -2697,7 +2830,7 @@ describe("cache interoperability and safety", () => {
       throw new Error("missing loopback address");
     }
     const options = {
-      apiUrl: `http://127.0.0.1:${address.port}`,
+      apiUrl: `http://127.0.0.1:${address.port}/cache/api`,
       timeoutMilliseconds: 5_000,
       uploadTimeoutMilliseconds: 5_000,
       preflight: false,
@@ -2746,6 +2879,11 @@ describe("cache interoperability and safety", () => {
           ),
         ),
       ).rejects.toThrow(/signature is invalid/);
+      expect(requestPaths).toEqual([
+        "/cache/api/v8/artifacts/0011223344556677",
+        "/cache/api/v8/artifacts/0011223344556677",
+        "/cache/api/v8/artifacts/0011223344556677",
+      ]);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(linkedRoot, { force: true });

@@ -496,6 +496,7 @@ describe("Effect foundation", () => {
     const stdin = new PassThrough();
     const stdout = new PassThrough();
     const stderr = new PassThrough();
+    const observed: Array<string> = [];
     let close: ((exitCode: number | null) => void) | undefined;
     const fiber = Effect.runFork(
       collectChildProcessOutput(
@@ -512,6 +513,8 @@ describe("Effect foundation", () => {
         },
         "synthetic-interleaved-output",
         undefined,
+        false,
+        (chunk) => observed.push(chunk),
       ),
     );
     await Effect.runPromise(Effect.yieldNow());
@@ -526,6 +529,7 @@ describe("Effect foundation", () => {
       stderr: "stderr-one\n",
       combinedOutput: "stdout-one\nstderr-one\nstdout-two\n",
     });
+    expect(observed).toEqual(["stdout-one\n", "stderr-one\n", "stdout-two\n"]);
   });
 
   it("generates canonical lowercase UUID v7 identifiers", async () => {

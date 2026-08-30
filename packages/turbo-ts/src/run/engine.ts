@@ -1,4 +1,4 @@
-import { Effect, Fiber } from "effect";
+import { Effect, Fiber, Queue } from "effect";
 import {
   type CacheWriteEntry,
   evictLocalCache,
@@ -559,8 +559,7 @@ const resolveAffectedPackages = (
   {
     readonly filters: ReadonlyArray<string>;
     readonly ranges: ReadonlyMap<string, ReadonlySet<string>>;
-    readonly changedFiles: ReadonlyArray<string>;
-    readonly rootChanged: boolean;
+    readonly affectedBySelector: ReadonlyMap<string, AffectedPackages>;
     readonly hasGitRangeFilter: boolean;
   },
   ConfigurationError,
@@ -568,7 +567,7 @@ const resolveAffectedPackages = (
 > =>
   Effect.gen(function* () {
     const ranges = new Map<string, ReadonlySet<string>>();
-    const results: Array<AffectedPackages> = [];
+    const affectedBySelector = new Map<string, AffectedPackages>();
     const selectors = [
       ...new Set(
         options.filters.flatMap((filter) => {
@@ -584,22 +583,19 @@ const resolveAffectedPackages = (
         parseGitRange(selector),
       );
       ranges.set(selector, affected.packages);
-      results.push(affected);
+      affectedBySelector.set(selector, affected);
     }
     if (options.affected) {
       const affected = yield* findAffectedPackages(repository, environment);
       ranges.set(defaultAffectedSelector, affected.packages);
-      results.push(affected);
+      affectedBySelector.set(defaultAffectedSelector, affected);
     }
     return {
       filters: options.affected
         ? [...options.filters, `...[${defaultAffectedSelector}]`]
         : options.filters,
       ranges,
-      changedFiles: [
-        ...new Set(results.flatMap((result) => result.changedFiles)),
-      ].sort(),
-      rootChanged: results.some((result) => result.rootChanged),
+      affectedBySelector,
       hasGitRangeFilter: selectors.length > 0,
     };
   });
@@ -655,13 +651,13 @@ const taskMatchesChangedFiles = (
   });
 };
 
-const selectAffectedTasks = (
+const affectedTaskEntrypoints = (
   repository: RepositoryModel,
   graph: TaskGraph,
   changedFiles: ReadonlyArray<string>,
   rootChanged: boolean,
-): TaskGraph => {
-  if (rootChanged) return graph;
+): ReadonlySet<string> => {
+  if (rootChanged) return new Set(graph.entrypoints);
   const entrypointUsesChangedInput = (id: string): boolean => {
     const visited = new Set<string>();
     const pending = [id];
@@ -676,9 +672,14 @@ const selectAffectedTasks = (
     }
     return false;
   };
-  const retained = new Set(
-    graph.entrypoints.filter(entrypointUsesChangedInput),
-  );
+  return new Set(graph.entrypoints.filter(entrypointUsesChangedInput));
+};
+
+const retainTaskEntrypoints = (
+  graph: TaskGraph,
+  entrypoints: ReadonlySet<string>,
+): TaskGraph => {
+  const retained = new Set(entrypoints);
   const pending = [...retained];
   while (pending.length > 0) {
     const node = graph.nodes.get(pending.pop()!);
@@ -693,9 +694,54 @@ const selectAffectedTasks = (
     }
   }
   return {
-    entrypoints: graph.entrypoints.filter((id) => retained.has(id)),
+    entrypoints: graph.entrypoints.filter((id) => entrypoints.has(id)),
     nodes: new Map([...graph.nodes].filter(([id]) => retained.has(id))),
   };
+};
+
+const selectAffectedTasks = (
+  repository: RepositoryModel,
+  graph: TaskGraph,
+  filters: ReadonlyArray<string>,
+  affectedBySelector: ReadonlyMap<string, AffectedPackages>,
+): TaskGraph => {
+  const rangeFilters = filters.flatMap((filter) => {
+    const selector = gitRangeSelector(filter);
+    const affected =
+      selector === undefined ? undefined : affectedBySelector.get(selector);
+    return selector === undefined || affected === undefined
+      ? []
+      : [{ filter, affected }];
+  });
+  const positiveFilters = rangeFilters.filter(
+    ({ filter }) => !filter.startsWith("!"),
+  );
+  const retainedEntrypoints = new Set(
+    positiveFilters.length === 0 ? graph.entrypoints : [],
+  );
+  for (const { affected } of positiveFilters) {
+    for (const id of affectedTaskEntrypoints(
+      repository,
+      graph,
+      affected.changedFiles,
+      affected.rootChanged,
+    )) {
+      retainedEntrypoints.add(id);
+    }
+  }
+  for (const { affected } of rangeFilters.filter(({ filter }) =>
+    filter.startsWith("!"),
+  )) {
+    for (const id of affectedTaskEntrypoints(
+      repository,
+      graph,
+      affected.changedFiles,
+      affected.rootChanged,
+    )) {
+      retainedEntrypoints.delete(id);
+    }
+  }
+  return retainTaskEntrypoints(graph, retainedEntrypoints);
 };
 
 export type TaskCommandScope =
@@ -936,6 +982,10 @@ const shouldReplayOutput = (
 ): boolean =>
   mode === undefined || mode === "full" || (mode === "new-only" && !cacheHit);
 
+type TaskOutputQueueEvent =
+  | { readonly kind: "chunk"; readonly output: string }
+  | { readonly kind: "end" };
+
 const cargoAlternateOutputFlags = [
   "--artifact-dir",
   "--out-dir",
@@ -984,6 +1034,9 @@ const executeTask = (
       options.outputLogs === "none" || !options.colorEnabled
         ? false
         : yield* terminal.stdoutColorEnabled;
+    const warningColor = options.colorEnabled
+      ? yield* terminal.stderrColorEnabled
+      : false;
     if (node.command === undefined) {
       return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
     }
@@ -1035,6 +1088,20 @@ const executeTask = (
         options.remote,
         hash.hash,
         pathsToClear,
+      ).pipe(
+        Effect.catchAll((error) =>
+          terminal
+            .writeStderr(
+              renderLogEvent(
+                {
+                  kind: "warning",
+                  message: `remote cache restore failed for ${taskLabel}; executing task locally: ${error.message}`,
+                },
+                warningColor,
+              ),
+            )
+            .pipe(Effect.ignore, Effect.as(false)),
+        ),
       );
     }
     const executionDirectory =
@@ -1092,13 +1159,14 @@ const executeTask = (
       scope,
     );
     const processService = yield* ProcessService;
-    const result = yield* Effect.scoped(
+    const startProcess = (onOutputChunk?: (chunk: string) => void) =>
       processService.run({
         command: invocation.command,
         args: invocation.arguments,
         cwd: invocation.cwd,
         inheritEnvironment: false,
         stdio: node.definition.interactive === true ? "inherit" : "capture",
+        onOutputChunk,
         env: {
           ...taskEnvironment(
             repository,
@@ -1109,13 +1177,83 @@ const executeTask = (
           ),
           TURBO_HASH: hash.hash,
         },
-      }),
-    );
+      });
+    const streamsPersistentOutput =
+      node.definition.persistent === true &&
+      node.definition.interactive !== true;
+    const displaysPersistentOutput =
+      streamsPersistentOutput && shouldReplayOutput(outputMode, false);
+    const result = streamsPersistentOutput
+      ? yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* fileSystem.makeDirectory(
+              joinPath(executionDirectory, ".turbo"),
+            );
+            yield* fileSystem.writeText(logPath, "");
+            const outputQueue = yield* Queue.unbounded<TaskOutputQueueEvent>();
+            yield* Effect.addFinalizer(() => Queue.shutdown(outputQueue));
+            const outputFiber = yield* Effect.forkScoped(
+              Effect.gen(function* () {
+                let pendingDisplay = "";
+                while (true) {
+                  const event = yield* Queue.take(outputQueue);
+                  if (event.kind === "end") {
+                    if (displaysPersistentOutput && pendingDisplay !== "") {
+                      yield* terminal.writeStdout(
+                        renderLogEvent(
+                          {
+                            kind: "task-output",
+                            task: taskLabel,
+                            output: pendingDisplay,
+                          },
+                          color,
+                        ),
+                      );
+                    }
+                    return;
+                  }
+                  yield* fileSystem.appendText(logPath, event.output);
+                  if (!displaysPersistentOutput) continue;
+                  pendingDisplay += event.output;
+                  const lastLineBreak = pendingDisplay.lastIndexOf("\n");
+                  if (lastLineBreak === -1) continue;
+                  const completeLines = pendingDisplay.slice(
+                    0,
+                    lastLineBreak + 1,
+                  );
+                  pendingDisplay = pendingDisplay.slice(lastLineBreak + 1);
+                  yield* terminal.writeStdout(
+                    renderLogEvent(
+                      {
+                        kind: "task-output",
+                        task: taskLabel,
+                        output: completeLines,
+                      },
+                      color,
+                    ),
+                  );
+                }
+              }),
+            );
+            const processResult = yield* Effect.raceFirst(
+              startProcess((output) => {
+                Queue.unsafeOffer(outputQueue, { kind: "chunk", output });
+              }),
+              Fiber.join(outputFiber).pipe(Effect.flatMap(() => Effect.never)),
+            );
+            yield* Queue.offer(outputQueue, { kind: "end" });
+            yield* Fiber.join(outputFiber);
+            return processResult;
+          }),
+        )
+      : yield* Effect.scoped(startProcess());
     const output = result.combinedOutput;
-    yield* fileSystem.makeDirectory(joinPath(executionDirectory, ".turbo"));
-    yield* fileSystem.writeText(logPath, output);
+    if (!streamsPersistentOutput) {
+      yield* fileSystem.makeDirectory(joinPath(executionDirectory, ".turbo"));
+      yield* fileSystem.writeText(logPath, output);
+    }
     if (
-      shouldReplayOutput(outputMode, false) ||
+      (!displaysPersistentOutput && shouldReplayOutput(outputMode, false)) ||
       (outputMode === "errors-only" && result.exitCode !== 0)
     ) {
       yield* terminal.writeStdout(
@@ -1362,10 +1500,9 @@ export const executeRun = (
         : isAbsolutePath(parsed.cwd)
           ? parsed.cwd
           : joinPath(processCwd, parsed.cwd);
-    const preliminaryRoot =
-      requestedRoot === undefined
-        ? yield* discoverRepositoryRoot(processCwd)
-        : normalizePath(requestedRoot);
+    const preliminaryRoot = yield* discoverRepositoryRoot(
+      requestedRoot ?? processCwd,
+    );
     const configuration = yield* loadRootConfiguration(
       preliminaryRoot,
       parsed.rootTurboJson === undefined
@@ -1462,8 +1599,8 @@ export const executeRun = (
       ? selectAffectedTasks(
           repository,
           unfilteredGraph,
-          affected.changedFiles,
-          affected.rootChanged,
+          affected.filters,
+          affected.affectedBySelector,
         )
       : unfilteredGraph;
     const cargoWorkspacePlan = planCargoWorkspaceTasks(

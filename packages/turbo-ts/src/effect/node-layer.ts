@@ -10,6 +10,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import {
+  appendFile,
   chmod,
   lstat,
   mkdir,
@@ -349,6 +350,11 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
       try: () => writeFile(path, contents, "utf8"),
       catch: filesystemError,
     }),
+  appendText: (path, contents) =>
+    Effect.tryPromise({
+      try: () => appendFile(path, contents, "utf8"),
+      catch: filesystemError,
+    }),
   writeBytes: (path, contents) =>
     Effect.tryPromise({
       try: () => writeFile(path, contents),
@@ -405,6 +411,7 @@ export const collectChildProcessOutput = (
   command: string,
   stdin: string | undefined,
   inheritStdin = false,
+  onOutputChunk?: (chunk: string) => void,
 ): Effect.Effect<
   {
     readonly exitCode: number;
@@ -435,12 +442,24 @@ export const collectChildProcessOutput = (
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
+      if (settled) return;
       stdout += chunk;
       combinedOutput += chunk;
+      try {
+        onOutputChunk?.(chunk);
+      } catch (cause) {
+        fail(cause);
+      }
     });
     child.stderr.on("data", (chunk: string) => {
+      if (settled) return;
       stderr += chunk;
       combinedOutput += chunk;
+      try {
+        onOutputChunk?.(chunk);
+      } catch (cause) {
+        fail(cause);
+      }
     });
     child.onceError(fail);
     child.stdin.on("error", fail);
@@ -559,6 +578,8 @@ const processLayer = Layer.succeed(ProcessService, {
           },
           request.command,
           request.stdin,
+          false,
+          request.onOutputChunk,
         );
       },
       terminateChild,

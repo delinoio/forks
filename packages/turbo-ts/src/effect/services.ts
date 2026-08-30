@@ -10,6 +10,7 @@ export interface ExecutionRequest {
   readonly inheritEnvironment?: boolean;
   readonly stdin?: string;
   readonly stdio?: "capture" | "inherit";
+  readonly onOutputChunk?: (chunk: string) => void;
 }
 
 export interface ExecutionResult {
@@ -38,6 +39,10 @@ export interface FileSystemOperations {
     contents: string,
   ) => Effect.Effect<boolean, BoundaryError>;
   readonly writeText: (
+    path: string,
+    contents: string,
+  ) => Effect.Effect<void, BoundaryError>;
+  readonly appendText: (
     path: string,
     contents: string,
   ) => Effect.Effect<void, BoundaryError>;
