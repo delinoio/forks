@@ -20,6 +20,7 @@ import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it } from "@rstest/core";
 import { Effect } from "effect";
 import {
+  evictLocalCache,
   restoreLocalCache,
   writeLocalCache,
 } from "../src/cache/local-cache.js";
@@ -95,6 +96,31 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("rejects every unresolved requested task before execution", async () => {
+    const directory = await makeFixture();
+    try {
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "verify",
+          "--cwd",
+          directory,
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("task not found: verify");
+      expect(result.stdout).not.toContain("library build");
+      expect(result.stdout).not.toContain("app build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("writes and restores local cache entries", async () => {
     const directory = await makeFixture();
@@ -180,6 +206,38 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("accepts the documented week unit for cache age", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.cacheMaxAge = "2w";
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("library build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("evicts expired cache entries before read-only restores", async () => {
     const directory = await makeFixture();
@@ -1897,6 +1955,121 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
+  it("selects cross-workspace owners from effective task inputs", async () => {
+    await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
+    const directory = await mkdtemp(
+      join(repositoryRoot, ".turbo/turbo-ts-cross-workspace-affected-"),
+    );
+    await cp(fixtureRoot, directory, { recursive: true });
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        global?: Record<string, unknown>;
+        tasks: Record<string, unknown>;
+      };
+      configuration.futureFlags = {
+        affectedUsingTaskInputs: true,
+        filterUsingTasks: true,
+        globalConfiguration: true,
+      };
+      configuration.global = { inputs: ["packages/app/config/**"] };
+      configuration.tasks.check = {
+        cache: false,
+        inputs: ["local-only/**"],
+      };
+      configuration.tasks.negated = {
+        cache: false,
+        inputs: ["!$TURBO_ROOT$/packages/app/config/**"],
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      for (const packageName of ["app", "library"]) {
+        const manifestPath = `${directory}/packages/${packageName}/package.json`;
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          scripts: Record<string, string>;
+        };
+        manifest.scripts.check = `node -e "console.log('${packageName} check')"`;
+        manifest.scripts.negated = `node -e "console.log('${packageName} negated')"`;
+        await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      }
+      await mkdir(`${directory}/packages/app/config`, { recursive: true });
+      await writeFile(`${directory}/packages/app/config/value.txt`, "first\n");
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "fixture base"],
+      ]) {
+        const git = await run("git", args, directory);
+        expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
+      }
+      await writeFile(`${directory}/packages/app/config/value.txt`, "second\n");
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "shared input"], directory))
+          .exitCode,
+      ).toBe(0);
+      const affected = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--affected",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(affected.exitCode).toBe(0);
+      expect(affected.stdout).toContain("app check");
+      expect(affected.stdout).toContain("library check");
+      const filtered = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--filter=[HEAD~1]",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(filtered.exitCode).toBe(0);
+      expect(filtered.stdout).toContain("app check");
+      expect(filtered.stdout).toContain("library check");
+      const negated = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "negated",
+          "--cwd",
+          directory,
+          "--affected",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(negated.exitCode).toBe(0);
+      expect(negated.stdout).not.toContain("app negated");
+      expect(negated.stdout).not.toContain("library negated");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
   it("retains an affected owner when only a with companion input changed", async () => {
     await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
     const directory = await mkdtemp(
@@ -2087,6 +2260,59 @@ describe("core CLI execution", () => {
 });
 
 describe("cache interoperability and safety", () => {
+  it("counts cache sidecars and orphaned sidecars during size eviction", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-size-"));
+    const cacheDirectory = `${directory}/cache`;
+    const hash = "0123456789abcdef";
+    try {
+      await Effect.runPromise(
+        writeLocalCache(
+          { directory: cacheDirectory },
+          hash,
+          [
+            {
+              path: "packages/app/out.txt",
+              contents: new TextEncoder().encode("cached"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+          ],
+          1,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const archivePath = `${cacheDirectory}/${hash}.tar.zst`;
+      const manifestPath = `${cacheDirectory}/${hash}-manifest.json`;
+      const metadataPath = `${cacheDirectory}/${hash}-meta.json`;
+      const archiveSize = (await lstat(archivePath)).size;
+      const sidecarSize =
+        (await lstat(manifestPath)).size + (await lstat(metadataPath)).size;
+      await Effect.runPromise(
+        evictLocalCache({
+          directory: cacheDirectory,
+          maxSizeBytes: archiveSize + sidecarSize - 1,
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      await expect(lstat(archivePath)).rejects.toThrow();
+      await expect(lstat(manifestPath)).rejects.toThrow();
+      await expect(lstat(metadataPath)).rejects.toThrow();
+
+      const orphanHash = "fedcba9876543210";
+      const orphanManifest = `${cacheDirectory}/${orphanHash}-manifest.json`;
+      const orphanMetadata = `${cacheDirectory}/${orphanHash}-meta.json`;
+      await writeFile(orphanManifest, "manifest");
+      await writeFile(orphanMetadata, "metadata");
+      await Effect.runPromise(
+        evictLocalCache({ directory: cacheDirectory, maxSizeBytes: 1 }).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      await expect(lstat(orphanManifest)).rejects.toThrow();
+      await expect(lstat(orphanMetadata)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("reads official Turbo local archives", async () => {
     const directory = await makeFixture();
     try {

@@ -34,6 +34,15 @@ const cachePaths = (directory: string, hash: string) => ({
   metadata: joinPath(directory, `${hash}-meta.json`),
 });
 
+const cacheFileSuffixes = [".tar.zst", "-manifest.json", "-meta.json"] as const;
+
+const cacheFileHash = (name: string): string | undefined => {
+  const suffix = cacheFileSuffixes.find(
+    (candidate) => name.length > candidate.length && name.endsWith(candidate),
+  );
+  return suffix === undefined ? undefined : name.slice(0, -suffix.length);
+};
+
 const removeEntry = (
   directory: string,
   hash: string,
@@ -335,22 +344,25 @@ export const evictLocalCache = (
     if (!exists) {
       return;
     }
-    const entries = yield* fileSystem
+    const directoryEntries = yield* fileSystem
       .list(options.directory)
       .pipe(
         Effect.mapError((error) =>
           cacheError(options.directory, error.message),
         ),
       );
-    const archives = yield* Effect.forEach(
-      entries.filter(
-        (entry) => entry.kind === "file" && entry.name.endsWith(".tar.zst"),
-      ),
+    const cacheFiles = yield* Effect.forEach(
+      directoryEntries.flatMap((entry) => {
+        const hash =
+          entry.kind === "file" ? cacheFileHash(entry.name) : undefined;
+        return hash === undefined ? [] : [{ hash, name: entry.name }];
+      }),
       (entry) => {
         const path = joinPath(options.directory, entry.name);
         return fileSystem.metadata(path).pipe(
           Effect.map((metadata) => ({
-            hash: entry.name.slice(0, -".tar.zst".length),
+            hash: entry.hash,
+            archive: entry.name.endsWith(".tar.zst"),
             modified: metadata.modifiedMilliseconds,
             size: metadata.size,
           })),
@@ -358,9 +370,34 @@ export const evictLocalCache = (
         );
       },
     );
-    let total = archives.reduce((size, entry) => size + entry.size, 0);
+    const grouped = new Map<
+      string,
+      {
+        readonly hash: string;
+        readonly size: number;
+        readonly modified: number;
+        readonly archiveModified?: number;
+      }
+    >();
+    for (const file of cacheFiles) {
+      const current = grouped.get(file.hash);
+      grouped.set(file.hash, {
+        hash: file.hash,
+        size: (current?.size ?? 0) + file.size,
+        modified: Math.max(current?.modified ?? 0, file.modified),
+        archiveModified: file.archive
+          ? file.modified
+          : current?.archiveModified,
+      });
+    }
+    const cacheEntries = [...grouped.values()].map((entry) => ({
+      hash: entry.hash,
+      size: entry.size,
+      modified: entry.archiveModified ?? entry.modified,
+    }));
+    let total = cacheEntries.reduce((size, entry) => size + entry.size, 0);
     const now = yield* clock.now;
-    for (const entry of [...archives].sort(
+    for (const entry of cacheEntries.sort(
       (left, right) => left.modified - right.modified,
     )) {
       const expired =

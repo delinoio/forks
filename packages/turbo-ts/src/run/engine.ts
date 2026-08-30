@@ -46,6 +46,7 @@ import {
   topologicalOrder,
 } from "../graph/task-graph.js";
 import {
+  effectiveTaskInputs,
   hashTask,
   type TaskHashResult,
   taskEnvironment,
@@ -385,7 +386,15 @@ const resolveOptions = (
       : joinPath(root, cacheDirectoryValue),
     cacheMaxAgeMilliseconds: parseQuantity(
       value.cacheMaxAge ?? global?.cacheMaxAge,
-      { "": 1, ms: 1, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 },
+      {
+        "": 1,
+        ms: 1,
+        s: 1_000,
+        m: 60_000,
+        h: 3_600_000,
+        d: 86_400_000,
+        w: 604_800_000,
+      },
     ),
     cacheMaxSizeBytes: parseQuantity(
       value.cacheMaxSize ?? global?.cacheMaxSize,
@@ -596,6 +605,7 @@ const resolveAffectedPackages = (
   });
 
 const taskMatchesChangedFiles = (
+  repository: RepositoryModel,
   node: TaskNode,
   changedFiles: ReadonlyArray<string>,
 ): boolean => {
@@ -604,16 +614,13 @@ const taskMatchesChangedFiles = (
   const packagePrefix = isRootPackage
     ? ""
     : `${node.package.relativeDirectory}/`;
-  const inputs = node.definition.inputs;
+  const inputs = effectiveTaskInputs(repository, node);
   return changedFiles.some((repositoryRelativeFile) => {
     const packageRelativeFile = isRootPackage
       ? repositoryRelativeFile
       : repositoryRelativeFile.startsWith(packagePrefix)
         ? repositoryRelativeFile.slice(packagePrefix.length)
         : undefined;
-    if (inputs === undefined || inputs === null || inputs.length === 0) {
-      return packageRelativeFile !== undefined;
-    }
     const matchesInput = (pattern: string): boolean => {
       const rootRelative = pattern.startsWith(rootRelativeInputPrefix);
       const file = rootRelative ? repositoryRelativeFile : packageRelativeFile;
@@ -649,6 +656,7 @@ const taskMatchesChangedFiles = (
 };
 
 const selectAffectedTasks = (
+  repository: RepositoryModel,
   graph: TaskGraph,
   changedFiles: ReadonlyArray<string>,
   rootChanged: boolean,
@@ -663,7 +671,7 @@ const selectAffectedTasks = (
       visited.add(current);
       const node = graph.nodes.get(current);
       if (node === undefined) continue;
-      if (taskMatchesChangedFiles(node, changedFiles)) return true;
+      if (taskMatchesChangedFiles(repository, node, changedFiles)) return true;
       pending.push(...node.dependencies, ...node.with);
     }
     return false;
@@ -951,6 +959,15 @@ const usesAlternateCargoBuildOutputs = (
       ),
   );
 
+export const isTaskScopeCacheable = (
+  node: TaskNode,
+  passThroughArguments: ReadonlyArray<string>,
+  scope: TaskCommandScope = packageTaskCommandScope,
+): boolean =>
+  (scope.kind === "cargo-workspace" ? scope.members : [node]).every(
+    (member) => member.definition.cache !== false,
+  ) && !usesAlternateCargoBuildOutputs(node, passThroughArguments);
+
 const executeTask = (
   repository: RepositoryModel,
   node: TaskNode,
@@ -977,16 +994,18 @@ const executeTask = (
       outputMode !== "errors-only" ||
       repository.rootConfiguration.value.futureFlags?.errorsOnlyShowHash ===
         true;
-    const cacheable =
-      node.definition.cache !== false &&
-      !usesAlternateCargoBuildOutputs(node, options.passThroughArguments);
+    const cacheNodes =
+      scope.kind === "cargo-workspace" ? scope.members : [node];
+    const cacheable = isTaskScopeCacheable(
+      node,
+      options.passThroughArguments,
+      scope,
+    );
     const localOptions = {
       directory: options.cacheDirectory,
       maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
       maxSizeBytes: options.cacheMaxSizeBytes,
     };
-    const cacheNodes =
-      scope.kind === "cargo-workspace" ? scope.members : [node];
     const pathsToClear =
       cacheable &&
       !options.force &&
@@ -1395,12 +1414,20 @@ export const executeRun = (
       options,
       environment,
     );
+    const flags = repository.rootConfiguration.value.futureFlags;
+    const useTaskInputs =
+      (options.affected && flags?.affectedUsingTaskInputs === true) ||
+      (affected.hasGitRangeFilter && flags?.filterUsingTasks === true);
+    const packageFilters = useTaskInputs
+      ? affected.filters.filter(
+          (filter) => gitRangeSelector(filter) === undefined,
+        )
+      : affected.filters;
     const packages = selectPackages(
       repository,
-      affected.filters,
+      packageFilters,
       affected.ranges,
     );
-    const flags = repository.rootConfiguration.value.futureFlags;
     const unfilteredGraph = buildTaskGraph(
       repository,
       packages,
@@ -1408,19 +1435,32 @@ export const executeRun = (
       options.only,
       flags?.strictTaskEntrypointSelection === true,
     );
-    if (unfilteredGraph.entrypoints.length === 0) {
+    const entrypointIds = new Set(unfilteredGraph.entrypoints);
+    const entrypointTasks = new Set(
+      unfilteredGraph.entrypoints.map(
+        (entrypoint) => unfilteredGraph.nodes.get(entrypoint)!.task,
+      ),
+    );
+    const unresolvedTasks = [
+      ...new Set(
+        options.tasks.filter((task) =>
+          task.startsWith("//#") || task.includes("#")
+            ? !entrypointIds.has(task)
+            : !entrypointTasks.has(task),
+        ),
+      ),
+    ];
+    if (unresolvedTasks.length > 0) {
       return yield* Effect.fail(
         new RepositoryError({
           path: options.root,
-          message: `task not found: ${options.tasks.join(", ")}`,
+          message: `task not found: ${unresolvedTasks.join(", ")}`,
         }),
       );
     }
-    const useTaskInputs =
-      (options.affected && flags?.affectedUsingTaskInputs === true) ||
-      (affected.hasGitRangeFilter && flags?.filterUsingTasks === true);
     const selectedGraph = useTaskInputs
       ? selectAffectedTasks(
+          repository,
           unfilteredGraph,
           affected.changedFiles,
           affected.rootChanged,

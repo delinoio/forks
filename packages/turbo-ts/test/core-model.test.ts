@@ -33,6 +33,7 @@ import {
 } from "../src/repository/model.js";
 import {
   cargoWorkspaceHash,
+  isTaskScopeCacheable,
   packageManagerCommand,
   parseCacheSpecification,
   planCargoWorkspaceTasks,
@@ -490,7 +491,10 @@ describe("core repository model", () => {
       tasks: { format: {}, test: {} },
     });
     const app = cargoPackage("app");
-    const library = cargoPackage("library");
+    const library = {
+      ...cargoPackage("library"),
+      tasks: { format: {}, test: { cache: false } },
+    };
     const model = repository([app, library]);
     const graph = buildTaskGraph(model, model.packages, ["test"], false);
     const workspacePlan = planCargoWorkspaceTasks(graph, ["test"], true);
@@ -502,6 +506,7 @@ describe("core repository model", () => {
       arguments: ["test", "--workspace", "--locked"],
       cwd: "/repo",
     });
+    expect(isTaskScopeCacheable(workspaceNode, [], workspaceScope)).toBe(false);
 
     const formatGraph = buildTaskGraph(
       model,

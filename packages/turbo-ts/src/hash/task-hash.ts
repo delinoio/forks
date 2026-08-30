@@ -113,7 +113,7 @@ const rootInputPattern = (pattern: string): string => {
   return negative ? `!${rooted}` : rooted;
 };
 
-const effectiveTaskInputs = (
+export const effectiveTaskInputs = (
   repository: RepositoryModel,
   node: TaskNode,
 ): ReadonlyArray<TaskInput> => {
