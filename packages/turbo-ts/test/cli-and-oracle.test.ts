@@ -1,7 +1,9 @@
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "@rstest/core";
 import { Effect } from "effect";
+import { renderUnsupportedCompatibilityError } from "../src/cli/compatibility-renderer.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
+import { UnsupportedCompatibilityError } from "../src/effect/errors.js";
 import { nodeFoundationLayer } from "../src/effect/node-layer.js";
 import { ProcessService } from "../src/effect/services.js";
 import {
@@ -35,6 +37,21 @@ const makeOfficialOracleLauncher = (
 };
 
 describe("CLI and external oracle", () => {
+  it("renders unsupported diagnostics according to terminal color policy", () => {
+    const error = new UnsupportedCompatibilityError({
+      surface: "root invocation",
+      targetGate: 2,
+    });
+    const message =
+      "turbo-ts: root invocation is not implemented in compatibility gate 2";
+    expect(renderUnsupportedCompatibilityError(error, false)).toBe(
+      `${message}\n`,
+    );
+    expect(renderUnsupportedCompatibilityError(error, true)).toBe(
+      `\u001B[31m${message}\u001B[0m\n`,
+    );
+  });
+
   it(evidenceId.cliVersion, async () => {
     const result = await Effect.runPromise(
       Effect.scoped(

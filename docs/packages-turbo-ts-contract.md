@@ -28,9 +28,10 @@ The compatibility ledger is the exhaustive inventory of commands, options,
 environment variables, configuration, protocols, package managers, success
 paths, and failures. A row can be marked passing only with automated evidence.
 Normalizers are limited to approved compatibility differences or repeated-run
-evidence of reference nondeterminism. Gate 1 approves only branding and version
-normalization; path normalization remains disabled until supported by repeated
-black-box evidence.
+evidence of reference nondeterminism. Gate 1 approves branding and version
+normalization only for exact CLI identity and version diagnostics; arbitrary
+output and paths are not rewritten. Path normalization remains disabled until
+supported by repeated black-box evidence.
 
 ## Runtime and Architecture
 

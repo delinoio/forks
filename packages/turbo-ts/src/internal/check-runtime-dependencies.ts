@@ -4,7 +4,12 @@ import { parse } from "yaml";
 import { BoundaryError } from "../effect/errors.js";
 import { nodeFoundationLayer } from "../effect/node-layer.js";
 import { EnvironmentService, FileSystemService } from "../effect/services.js";
-import { isForbiddenProductionDependency } from "./runtime-dependency-policy.js";
+import {
+  haveExactProductionDependencySections,
+  isForbiddenProductionDependency,
+  type ProductionDependencySections,
+  productionDependencyEntries,
+} from "./runtime-dependency-policy.js";
 
 const expectedRuntimeDependencies = {
   "@effect/cli": "0.77.0",
@@ -16,15 +21,24 @@ const expectedRuntimeDependencies = {
   yaml: "2.8.3",
 } as const;
 
+const expectedProductionDependencySections = {
+  dependencies: expectedRuntimeDependencies,
+  optionalDependencies: {},
+} as const;
+
 const program = Effect.gen(function* () {
   const fileSystem = yield* FileSystemService;
   const environment = yield* EnvironmentService;
   const cwd = yield* environment.cwd;
   const packageDocument = JSON.parse(
     yield* fileSystem.readText(`${cwd}/package.json`),
-  ) as { dependencies?: Record<string, string> };
-  const actual = packageDocument.dependencies ?? {};
-  if (JSON.stringify(actual) !== JSON.stringify(expectedRuntimeDependencies)) {
+  ) as ProductionDependencySections<string>;
+  if (
+    !haveExactProductionDependencySections(
+      packageDocument,
+      expectedProductionDependencySections,
+    )
+  ) {
     return yield* Effect.fail(
       new BoundaryError({
         boundary: "runtime-dependencies",
@@ -38,12 +52,7 @@ const program = Effect.gen(function* () {
   const lockText = yield* fileSystem.readText(`${cwd}/../../pnpm-lock.yaml`);
   const lockDocument = parse(lockText) as {
     importers?: Readonly<
-      Record<
-        string,
-        {
-          dependencies?: Readonly<Record<string, { readonly version: string }>>;
-        }
-      >
+      Record<string, ProductionDependencySections<{ readonly version: string }>>
     >;
     snapshots?: Readonly<
       Record<
@@ -57,7 +66,7 @@ const program = Effect.gen(function* () {
   };
   const importer = lockDocument.importers?.["packages/turbo-ts"];
   const snapshots = lockDocument.snapshots ?? {};
-  const pending = Object.entries(importer?.dependencies ?? {}).map(
+  const pending = productionDependencyEntries(importer).map(
     ([name, dependency]) => `${name}@${dependency.version}`,
   );
   const productionClosure = new Set<string>();

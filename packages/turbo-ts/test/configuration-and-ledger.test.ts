@@ -96,6 +96,29 @@ describe("configuration generation and compatibility ledger", () => {
     ).toEqual({ tags: ["app"] });
   });
 
+  it("inventories every distributed global configuration field", async () => {
+    const distributedSchema = JSON.parse(
+      await readFile(`${packageRoot}/schema.json`, "utf8"),
+    ) as {
+      definitions: {
+        GlobalConfig: { properties: Record<string, unknown> };
+      };
+    };
+    const expected = Object.keys(
+      distributedSchema.definitions.GlobalConfig.properties,
+    )
+      .map((field) => `global.${field}`)
+      .sort();
+    const actual = requiredLedgerVariants.configuration
+      .filter(
+        (variant) =>
+          variant.startsWith("global.") &&
+          !variant.slice("global.".length).includes("."),
+      )
+      .sort();
+    expect(actual).toEqual(expected);
+  });
+
   it("rejects fractional remote-cache timeouts", () => {
     for (const field of ["timeout", "uploadTimeout"] as const) {
       expect(

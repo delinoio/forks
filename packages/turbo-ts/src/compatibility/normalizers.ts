@@ -1,8 +1,25 @@
-import { packageVersion, versionOutput } from "../version.js";
+import {
+  compatibilityVersion,
+  packageVersion,
+  versionOutput,
+} from "../version.js";
 
 export const normalizerIds = ["branding", "version"] as const;
 
 export type NormalizerId = (typeof normalizerIds)[number];
+
+const mapOutputLines = (
+  input: string,
+  transform: (contents: string) => string,
+): string =>
+  input
+    .split("\n")
+    .map((line) => {
+      const carriageReturn = line.endsWith("\r") ? "\r" : "";
+      const contents = carriageReturn === "" ? line : line.slice(0, -1);
+      return `${transform(contents)}${carriageReturn}`;
+    })
+    .join("\n");
 
 export const normalizeOutput = (
   input: string,
@@ -11,21 +28,19 @@ export const normalizeOutput = (
   const selected = new Set(enabled);
   let output = input;
   if (selected.has("branding")) {
-    output = output
-      .split("\n")
-      .map((line) => {
-        const carriageReturn = line.endsWith("\r") ? "\r" : "";
-        const contents = carriageReturn === "" ? line : line.slice(0, -1);
-        return contents === versionOutput
-          ? `${packageVersion}${carriageReturn}`
-          : line;
-      })
-      .join("\n");
+    output = mapOutputLines(output, (contents) =>
+      contents === versionOutput ? packageVersion : contents,
+    );
   }
   if (selected.has("version")) {
-    output = output
-      .replaceAll("0.1.0", "<VERSION>")
-      .replaceAll("2.10.12", "<VERSION>");
+    output = mapOutputLines(output, (contents) => {
+      if (contents === packageVersion || contents === compatibilityVersion) {
+        return "<VERSION>";
+      }
+      return contents === versionOutput
+        ? "turbo-ts <VERSION> (compatible with turbo <VERSION>)"
+        : contents;
+    });
   }
   return output;
 };

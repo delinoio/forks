@@ -240,6 +240,16 @@ rows:
       - global.inputs
       - global.env
       - global.passThroughEnv
+      - global.remoteCache
+      - global.ui
+      - global.concurrency
+      - global.dangerouslyDisablePackageManagerCheck
+      - global.cacheDir
+      - global.cacheMaxAge
+      - global.cacheMaxSize
+      - global.daemon
+      - global.envMode
+      - global.noUpdateNotifier
       - tasks.*.cache
       - tasks.*.dependsOn
       - tasks.*.description

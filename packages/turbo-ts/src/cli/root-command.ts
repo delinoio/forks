@@ -11,7 +11,10 @@ export const rootCommand = Command.make("turbo-ts", {}, () =>
       surface: "root invocation",
       targetGate: 2,
     });
-    yield* terminal.writeStderr(renderUnsupportedCompatibilityError(error));
+    const colorEnabled = yield* terminal.colorEnabled;
+    yield* terminal.writeStderr(
+      renderUnsupportedCompatibilityError(error, colorEnabled),
+    );
     return yield* Effect.fail(error);
   }),
 );

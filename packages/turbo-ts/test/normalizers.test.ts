@@ -25,4 +25,16 @@ describe("deterministic normalizers", () => {
       "task turbo emitted turbo-ts /opt/turbo nested\\turbo-ts payload";
     expect(normalizeOutput(input, ["branding"])).toBe(input);
   });
+
+  it("does not normalize versions in user-controlled output or paths", () => {
+    const input =
+      "task emitted release 0.1.0 from /artifacts/turbo/2.10.12/output";
+    expect(normalizeOutput(input, ["version"])).toBe(input);
+  });
+
+  it("normalizes the complete candidate identity line only when selected", () => {
+    expect(normalizeOutput(`${versionOutput}\n`, ["version"])).toBe(
+      "turbo-ts <VERSION> (compatible with turbo <VERSION>)\n",
+    );
+  });
 });

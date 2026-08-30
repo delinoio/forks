@@ -12,7 +12,11 @@ import {
   makeWithTemporaryDirectory,
   nodeFoundationLayer,
 } from "../src/effect/node-layer.js";
-import { ProcessService, RandomnessService } from "../src/effect/services.js";
+import {
+  ProcessService,
+  RandomnessService,
+  TerminalService,
+} from "../src/effect/services.js";
 
 const waitForTextFile = async (path: string): Promise<string> => {
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -102,6 +106,26 @@ describe("Effect foundation", () => {
     }
   });
 
+  it("disables terminal color when NO_COLOR is set", async () => {
+    const previousValue = process.env.NO_COLOR;
+    process.env.NO_COLOR = "1";
+    try {
+      const colorEnabled = await Effect.runPromise(
+        TerminalService.pipe(
+          Effect.flatMap((terminal) => terminal.colorEnabled),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(colorEnabled).toBe(false);
+    } finally {
+      if (previousValue === undefined) {
+        delete process.env.NO_COLOR;
+      } else {
+        process.env.NO_COLOR = previousValue;
+      }
+    }
+  });
+
   it("removes undefined environment overrides before spawning", async () => {
     const environmentName = "TURBO_TS_UNDEFINED_OVERRIDE_TEST";
     const previousValue = process.env[environmentName];
@@ -130,6 +154,29 @@ describe("Effect foundation", () => {
       } else {
         process.env[environmentName] = previousValue;
       }
+    }
+  });
+
+  it("reports synchronous spawn failures as typed errors", async () => {
+    const command = `${process.execPath}\u0000`;
+    const outcome = await Effect.runPromise(
+      Effect.either(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            return yield* processService.run({
+              command,
+              args: [],
+              cwd: process.cwd(),
+            });
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      ),
+    );
+    expect(outcome._tag).toBe("Left");
+    if (outcome._tag === "Left") {
+      expect(outcome.left).toBeInstanceOf(ProcessExecutionError);
+      expect(outcome.left.command).toBe(command);
     }
   });
 

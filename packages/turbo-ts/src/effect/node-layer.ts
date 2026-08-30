@@ -47,6 +47,15 @@ const filesystemError = (cause: unknown): BoundaryError =>
     retryable: false,
   });
 
+const processExecutionError = (
+  command: string,
+  cause: unknown,
+): ProcessExecutionError =>
+  new ProcessExecutionError({
+    command,
+    message: String(cause),
+  });
+
 const effectFromExit = <A, E>(exit: Exit.Exit<A, E>): Effect.Effect<A, E> =>
   Exit.isSuccess(exit)
     ? Effect.succeed(exit.value)
@@ -201,28 +210,31 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
 const processLayer = Layer.succeed(ProcessService, {
   run: (request) =>
     Effect.acquireUseRelease(
-      Effect.sync(() => {
-        const ownsProcessGroup = process.platform !== "win32";
-        const child = spawn(request.command, [...request.args], {
-          cwd: request.cwd,
-          detached: ownsProcessGroup,
-          env: makeChildEnvironment(request.env),
-          shell: false,
-          stdio: "pipe",
-        });
-        let childClosed = false;
-        const closed = new Promise<void>((resolve) => {
-          child.once("close", () => {
-            childClosed = true;
-            resolve();
+      Effect.try({
+        try: () => {
+          const ownsProcessGroup = process.platform !== "win32";
+          const child = spawn(request.command, [...request.args], {
+            cwd: request.cwd,
+            detached: ownsProcessGroup,
+            env: makeChildEnvironment(request.env),
+            shell: false,
+            stdio: "pipe",
           });
-        });
-        return {
-          child,
-          closed,
-          isClosed: () => childClosed,
-          processGroupId: ownsProcessGroup ? child.pid : undefined,
-        };
+          let childClosed = false;
+          const closed = new Promise<void>((resolve) => {
+            child.once("close", () => {
+              childClosed = true;
+              resolve();
+            });
+          });
+          return {
+            child,
+            closed,
+            isClosed: () => childClosed,
+            processGroupId: ownsProcessGroup ? child.pid : undefined,
+          };
+        },
+        catch: (cause) => processExecutionError(request.command, cause),
       }),
       ({ child }) =>
         Effect.async((resume) => {
@@ -234,14 +246,7 @@ const processLayer = Layer.succeed(ProcessService, {
               return;
             }
             settled = true;
-            resume(
-              Effect.fail(
-                new ProcessExecutionError({
-                  command: request.command,
-                  message: String(cause),
-                }),
-              ),
-            );
+            resume(Effect.fail(processExecutionError(request.command, cause)));
           };
           child.stdout.setEncoding("utf8");
           child.stderr.setEncoding("utf8");
