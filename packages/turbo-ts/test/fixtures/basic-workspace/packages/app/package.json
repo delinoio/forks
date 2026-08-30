@@ -1,0 +1,12 @@
+{
+  "name": "synthetic-app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "synthetic-library": "workspace:*"
+  },
+  "scripts": {
+    "build": "node -e \"console.log('app build')\"",
+    "fail": "node -e \"process.exitCode = 7\""
+  }
+}

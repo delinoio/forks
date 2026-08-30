@@ -1,0 +1,5 @@
+id: basic-workspace
+provenance: independently-authored
+sources:
+  - public Turborepo configuration documentation
+purpose: package discovery, dependency graph, and deterministic task output

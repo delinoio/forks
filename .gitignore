@@ -24,6 +24,9 @@ target/
 
 bin/
 .bin/
+# This is authored CLI source, not a generated language-toolchain bin directory.
+!packages/turbo-ts/src/bin/
+!packages/turbo-ts/src/bin/turbo-ts.ts
 generated/
 *.pb.go
 *.connect.go
