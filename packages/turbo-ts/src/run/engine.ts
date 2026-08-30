@@ -458,6 +458,16 @@ const gitRangeSelector = (rawFilter: string): string | undefined => {
     : undefined;
 };
 
+const filterTraversal = (
+  rawFilter: string,
+): { readonly dependencies: boolean; readonly dependents: boolean } => {
+  const filter = rawFilter.startsWith("!") ? rawFilter.slice(1) : rawFilter;
+  return {
+    dependents: filter.startsWith("..."),
+    dependencies: filter.endsWith("..."),
+  };
+};
+
 const findAffectedPackages = (
   repository: RepositoryModel,
   environment: Readonly<Record<string, string | undefined>>,
@@ -636,8 +646,12 @@ const taskMatchesChangedFiles = (
         if (input.withDefaults !== false && packageRelativeFile !== undefined) {
           selected = true;
         }
-        if ((input.globs ?? []).some(matchesInput)) {
-          selected = true;
+        for (const glob of input.globs ?? []) {
+          if (glob.startsWith("!")) {
+            if (matchesInput(glob.slice(1))) selected = false;
+          } else if (matchesInput(glob)) {
+            selected = true;
+          }
         }
       } else if (input === "$TURBO_DEFAULT$") {
         if (packageRelativeFile !== undefined) selected = true;
@@ -656,23 +670,84 @@ const affectedTaskEntrypoints = (
   graph: TaskGraph,
   changedFiles: ReadonlyArray<string>,
   rootChanged: boolean,
+  filter: string,
 ): ReadonlySet<string> => {
   if (rootChanged) return new Set(graph.entrypoints);
-  const entrypointUsesChangedInput = (id: string): boolean => {
-    const visited = new Set<string>();
-    const pending = [id];
+  const matchingNodes = new Set(
+    [...graph.nodes]
+      .filter(([, node]) =>
+        taskMatchesChangedFiles(repository, node, changedFiles),
+      )
+      .map(([id]) => id),
+  );
+  const traversal = filterTraversal(filter);
+  const selectedNodes = new Set(matchingNodes);
+  const expandNodes = (
+    initial: ReadonlySet<string>,
+    adjacent: (id: string) => ReadonlyArray<string>,
+  ): void => {
+    const pending = [...initial];
     while (pending.length > 0) {
       const current = pending.pop()!;
-      if (visited.has(current)) continue;
-      visited.add(current);
-      const node = graph.nodes.get(current);
-      if (node === undefined) continue;
-      if (taskMatchesChangedFiles(repository, node, changedFiles)) return true;
-      pending.push(...node.dependencies, ...node.with);
+      for (const id of adjacent(current)) {
+        if (!selectedNodes.has(id)) {
+          selectedNodes.add(id);
+          pending.push(id);
+        }
+      }
     }
-    return false;
   };
-  return new Set(graph.entrypoints.filter(entrypointUsesChangedInput));
+  if (traversal.dependencies) {
+    expandNodes(matchingNodes, (id) => [
+      ...(graph.nodes.get(id)?.dependencies ?? []),
+      ...(graph.nodes.get(id)?.with ?? []),
+    ]);
+  }
+  if (traversal.dependents) {
+    const reverseEdges = new Map<string, Array<string>>();
+    for (const node of graph.nodes.values()) {
+      for (const adjacent of [...node.dependencies, ...node.with]) {
+        const dependents = reverseEdges.get(adjacent) ?? [];
+        dependents.push(node.id);
+        reverseEdges.set(adjacent, dependents);
+      }
+    }
+    expandNodes(matchingNodes, (id) => reverseEdges.get(id) ?? []);
+  }
+  const selectedEntrypoints = new Set(
+    graph.entrypoints.filter((id) => selectedNodes.has(id)),
+  );
+  if (traversal.dependencies || traversal.dependents) {
+    const matchingPackageNames = new Set(
+      [...matchingNodes].flatMap((id) => {
+        const name = graph.nodes.get(id)?.package.name;
+        return name === undefined || name === "//" ? [] : [name];
+      }),
+    );
+    const prefix = traversal.dependents ? "..." : "";
+    const suffix = traversal.dependencies ? "..." : "";
+    const expandedPackageNames = new Set(
+      matchingPackageNames.size === 0
+        ? []
+        : selectPackages(
+            repository,
+            [...matchingPackageNames].map(
+              (name) => `${prefix}${name}${suffix}`,
+            ),
+          ).map((packageModel) => packageModel.name),
+    );
+    for (const name of matchingPackageNames) expandedPackageNames.delete(name);
+    for (const id of graph.entrypoints) {
+      const node = graph.nodes.get(id)!;
+      if (
+        node.command !== undefined &&
+        expandedPackageNames.has(node.package.name)
+      ) {
+        selectedEntrypoints.add(id);
+      }
+    }
+  }
+  return selectedEntrypoints;
 };
 
 const retainTaskEntrypoints = (
@@ -719,17 +794,18 @@ const selectAffectedTasks = (
   const retainedEntrypoints = new Set(
     positiveFilters.length === 0 ? graph.entrypoints : [],
   );
-  for (const { affected } of positiveFilters) {
+  for (const { filter, affected } of positiveFilters) {
     for (const id of affectedTaskEntrypoints(
       repository,
       graph,
       affected.changedFiles,
       affected.rootChanged,
+      filter,
     )) {
       retainedEntrypoints.add(id);
     }
   }
-  for (const { affected } of rangeFilters.filter(({ filter }) =>
+  for (const { filter, affected } of rangeFilters.filter(({ filter }) =>
     filter.startsWith("!"),
   )) {
     for (const id of affectedTaskEntrypoints(
@@ -737,6 +813,7 @@ const selectAffectedTasks = (
       graph,
       affected.changedFiles,
       affected.rootChanged,
+      filter,
     )) {
       retainedEntrypoints.delete(id);
     }
@@ -804,25 +881,6 @@ export const packageManagerCommand = (
           command: "uv",
           arguments: [
             "build",
-            `--package=${node.package.name}`,
-            ...passThroughArguments,
-          ],
-          cwd: node.package.directory,
-        };
-      }
-      if (node.task === "format") {
-        return {
-          command: "uv",
-          arguments: ["format", ...passThroughArguments, "--", "."],
-          cwd: node.package.directory,
-        };
-      }
-      if (node.task === "check") {
-        return {
-          command: "uv",
-          arguments: [
-            "check",
-            "--frozen",
             `--package=${node.package.name}`,
             ...passThroughArguments,
           ],
@@ -979,6 +1037,8 @@ const shouldReplayOutput = (
 type TaskOutputQueueEvent =
   | { readonly kind: "chunk"; readonly output: string }
   | { readonly kind: "end" };
+
+const persistentOutputCaptureCharacters = 64 * 1024;
 
 const cargoAlternateOutputFlags = [
   "--artifact-dir",
@@ -1161,6 +1221,10 @@ const executeTask = (
         inheritEnvironment: false,
         stdio: node.definition.interactive === true ? "inherit" : "capture",
         onOutputChunk,
+        maxCapturedOutputCharacters:
+          onOutputChunk === undefined
+            ? undefined
+            : persistentOutputCaptureCharacters,
         env: {
           ...taskEnvironment(
             repository,
@@ -1276,7 +1340,26 @@ const executeTask = (
         yield* writeLocalCache(localOptions, hash.hash, entries, duration);
       }
       if (options.cachePolicy.remoteWrite && options.remote !== undefined) {
-        yield* writeRemoteCache(options.remote, hash.hash, entries, duration);
+        yield* writeRemoteCache(
+          options.remote,
+          hash.hash,
+          entries,
+          duration,
+        ).pipe(
+          Effect.catchAll((error) =>
+            terminal
+              .writeStderr(
+                renderLogEvent(
+                  {
+                    kind: "warning",
+                    message: `remote cache upload failed for ${taskLabel}; preserving successful task result: ${error.message}`,
+                  },
+                  warningColor,
+                ),
+              )
+              .pipe(Effect.ignore),
+          ),
+        );
       }
     }
     return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
@@ -1725,7 +1808,7 @@ export const executeRun = (
                   const completed = yield* Effect.forEach(
                     readyForeground,
                     runNode,
-                    { concurrency: "unbounded" },
+                    { concurrency: options.concurrency },
                   );
                   for (const outcome of completed) {
                     remaining.delete(outcome.id);

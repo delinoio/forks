@@ -463,8 +463,21 @@ describe("core CLI execution", () => {
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
       );
+      await writeFile(
+        `${directory}/pyproject.toml`,
+        `[project]\n` +
+          `name = "python-root"\n` +
+          `version = "0.1.0"\n` +
+          `dependencies = []\n` +
+          `\n` +
+          `[tool.uv.workspace]\n` +
+          `members = ["python/*"]\n` +
+          `exclude = ["python/excluded"]\n`,
+      );
       await mkdir(`${directory}/python/app`, { recursive: true });
       await mkdir(`${directory}/python/library`, { recursive: true });
+      await mkdir(`${directory}/python/excluded`, { recursive: true });
+      await mkdir(`${directory}/examples/unrelated`, { recursive: true });
       await writeFile(
         `${directory}/python/app/pyproject.toml`,
         `[tool.uv]\n` +
@@ -489,6 +502,14 @@ describe("core CLI execution", () => {
         `${directory}/python/library/pyproject.toml`,
         `[project]\nname = "my_util"\ndependencies = []\n`,
       );
+      await writeFile(
+        `${directory}/python/excluded/pyproject.toml`,
+        `[project]\nname = "excluded-project"\ndependencies = []\n`,
+      );
+      await writeFile(
+        `${directory}/examples/unrelated/pyproject.toml`,
+        `[project]\nname = "unrelated-project"\ndependencies = []\n`,
+      );
       const model = await Effect.runPromise(
         Effect.gen(function* () {
           const rootConfiguration = yield* loadRootConfiguration(directory);
@@ -506,11 +527,35 @@ describe("core CLI execution", () => {
       ]);
       expect(app?.internalDependencies).toEqual(["my_util"]);
       expect(model.packagesByName.has("internal")).toBe(false);
+      expect(model.packagesByName.has("python-root")).toBe(true);
+      expect(model.packagesByName.has("excluded-project")).toBe(false);
+      expect(model.packagesByName.has("unrelated-project")).toBe(false);
+      expect(Object.keys(app?.scripts ?? {}).sort()).toEqual(["build", "test"]);
+      expect(app?.tasks.build).toMatchObject({ cache: false });
       expect(
         [
           ...buildTaskGraph(model, [app!], ["build"], false).nodes.keys(),
         ].sort(),
       ).toEqual(["app#build", "my_util#build"]);
+
+      configuration.tasks.build = {
+        cache: true,
+        dependsOn: ["^build"],
+        outputs: ["dist/**"],
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const explicitlyCached = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(
+        explicitlyCached.packagesByName.get("app")?.tasks.build,
+      ).toMatchObject({ cache: true, outputs: ["dist/**"] });
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -530,12 +575,16 @@ describe("core CLI execution", () => {
         experimentalCargoWorkspaces: true,
         experimentalPythonWorkspaces: true,
       };
-      configuration.tasks.check = {
+      configuration.tasks.test = {
         inputs: ["Cargo.toml", "pyproject.toml"],
       };
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await writeFile(
+        `${directory}/pyproject.toml`,
+        `[tool.uv.workspace]\nmembers = ["python/*"]\n`,
       );
       await mkdir(`${directory}/rust/tool/src`, { recursive: true });
       await writeFile(
@@ -566,7 +615,7 @@ describe("core CLI execution", () => {
         `${directory}/python/app/pyproject.toml`,
         '[project]\nname = "python-app"\nversion = "0.1.0"\ndependencies = []\n',
       );
-      const uvLockfile = `${directory}/python/uv.lock`;
+      const uvLockfile = `${directory}/uv.lock`;
       await writeFile(uvLockfile, "version = 1\nrevision = 1\n");
       await writeFile(
         `${directory}/pnpm-lock.yaml`,
@@ -583,7 +632,7 @@ describe("core CLI execution", () => {
       const graph = buildTaskGraph(
         model,
         [cargoPackage, uvPackage],
-        ["check"],
+        ["test"],
         false,
       );
       const compute = (id: string) =>
@@ -597,19 +646,19 @@ describe("core CLI execution", () => {
             `${directory}/.turbo/cache`,
           ).pipe(Effect.provide(nodeFoundationLayer)),
         );
-      const cargoBefore = await compute("rust-tool#check");
-      const uvBefore = await compute("python-app#check");
+      const cargoBefore = await compute("rust-tool#test");
+      const uvBefore = await compute("python-app#test");
       const cargoLockfile = `${directory}/rust/Cargo.lock`;
       await writeFile(
         cargoLockfile,
         `${await readFile(cargoLockfile, "utf8")}# changed\n`,
       );
-      const cargoAfter = await compute("rust-tool#check");
-      const uvAfterCargoChange = await compute("python-app#check");
+      const cargoAfter = await compute("rust-tool#test");
+      const uvAfterCargoChange = await compute("python-app#test");
       expect(cargoAfter.hash).not.toBe(cargoBefore.hash);
       expect(uvAfterCargoChange.hash).toBe(uvBefore.hash);
       await writeFile(uvLockfile, "version = 1\nrevision = 2\n");
-      expect((await compute("python-app#check")).hash).not.toBe(uvBefore.hash);
+      expect((await compute("python-app#test")).hash).not.toBe(uvBefore.hash);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1135,6 +1184,54 @@ describe("core CLI execution", () => {
       expect(
         await readFile(`${packageDirectory}/.turbo/turbo-serve.log`, "utf8"),
       ).toContain("persistent server ready");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("limits foreground owners that share a persistent companion", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.check = {
+        cache: false,
+        with: ["synthetic-library#serve"],
+      };
+      configuration.tasks.serve = { cache: false, persistent: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      for (const packageName of ["app", "library"]) {
+        const manifestPath = `${directory}/packages/${packageName}/package.json`;
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          scripts: Record<string, string>;
+        };
+        manifest.scripts.check = `node -e "const fs=require('node:fs'); const path='../../foreground.lock'; let handle; try { handle=fs.openSync(path,'wx'); } catch { process.exit(9); } setTimeout(() => { fs.closeSync(handle); fs.unlinkSync(path); console.log('${packageName} check'); }, 200);"`;
+        if (packageName === "library") {
+          manifest.scripts.serve = 'node -e "setInterval(() => {}, 1000)"';
+        }
+        await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      }
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--concurrency=1",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("app check");
+      expect(result.stdout).toContain("library check");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2115,6 +2212,150 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
+  it("applies ordered negations in structured task inputs", async () => {
+    const directory = await mkdtemp(join(packageRoot, "turbo-ts-inputs-"));
+    await cp(fixtureRoot, directory, { recursive: true });
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, unknown>;
+      };
+      configuration.futureFlags = { affectedUsingTaskInputs: true };
+      configuration.tasks.build = {
+        inputs: [
+          {
+            globs: ["**", "!generated/**"],
+            withDefaults: false,
+          },
+        ],
+        outputs: ["dist/**"],
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const packageDirectory = `${directory}/packages/library`;
+      await mkdir(`${packageDirectory}/generated`, { recursive: true });
+      await writeFile(`${packageDirectory}/source.txt`, "first\n");
+      await writeFile(`${packageDirectory}/generated/value.txt`, "first\n");
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "fixture base"],
+      ]) {
+        const git = await run("git", args, directory);
+        expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
+      }
+      const computeHash = async () => {
+        const model = await Effect.runPromise(
+          Effect.gen(function* () {
+            const rootConfiguration = yield* loadRootConfiguration(directory);
+            return yield* discoverRepository(directory, rootConfiguration);
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+        const library = model.packagesByName.get("synthetic-library")!;
+        const graph = buildTaskGraph(model, [library], ["build"], false);
+        return Effect.runPromise(
+          hashTask(
+            model,
+            graph.nodes.get("synthetic-library#build")!,
+            [],
+            true,
+            [],
+            `${directory}/.turbo/cache`,
+          ).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      };
+      const initialHash = await computeHash();
+      expect(initialHash.inputFiles).toContain("source.txt");
+      expect(initialHash.inputFiles).not.toContain("generated/value.txt");
+      const cachedArgs = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      expect(
+        (await run(process.execPath, cachedArgs, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      await writeFile(`${packageDirectory}/generated/value.txt`, "second\n");
+      expect(
+        (
+          await run(
+            "git",
+            ["add", "packages/library/generated/value.txt"],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "generated output"], directory))
+          .exitCode,
+      ).toBe(0);
+      expect((await computeHash()).hash).toBe(initialHash.hash);
+      expect(
+        (await run(process.execPath, cachedArgs, repositoryRoot)).stdout,
+      ).toContain("cache hit");
+      const excludedAffected = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--affected",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(excludedAffected.exitCode).toBe(0);
+      expect(excludedAffected.stdout).not.toContain("library build");
+      expect(excludedAffected.stdout).not.toContain("app build");
+
+      await writeFile(`${packageDirectory}/source.txt`, "second\n");
+      expect(
+        (await run("git", ["add", "packages/library/source.txt"], directory))
+          .exitCode,
+      ).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "source input"], directory))
+          .exitCode,
+      ).toBe(0);
+      expect((await computeHash()).hash).not.toBe(initialHash.hash);
+      expect(
+        (await run(process.execPath, cachedArgs, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      const includedAffected = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--affected",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(includedAffected.exitCode).toBe(0);
+      expect(includedAffected.stdout).toContain("library build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
   it("selects cross-workspace owners from effective task inputs", async () => {
     await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
     const directory = await mkdtemp(
@@ -2225,6 +2466,94 @@ describe("core CLI execution", () => {
       expect(negated.exitCode).toBe(0);
       expect(negated.stdout).not.toContain("app negated");
       expect(negated.stdout).not.toContain("library negated");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
+  it("preserves ellipsis traversal in task-aware Git filters", async () => {
+    await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
+    const directory = await mkdtemp(
+      join(repositoryRoot, ".turbo/turbo-ts-task-filter-traversal-"),
+    );
+    await cp(fixtureRoot, directory, { recursive: true });
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, unknown>;
+      };
+      configuration.futureFlags = { filterUsingTasks: true };
+      configuration.tasks.check = {
+        cache: false,
+        inputs: ["source.txt"],
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      for (const packageName of ["app", "library"]) {
+        const packageDirectory = `${directory}/packages/${packageName}`;
+        const manifestPath = `${packageDirectory}/package.json`;
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          scripts: Record<string, string>;
+        };
+        manifest.scripts.check = `node -e "console.log('${packageName} check')"`;
+        await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+        await writeFile(`${packageDirectory}/source.txt`, "first\n");
+      }
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "fixture base"],
+      ]) {
+        const git = await run("git", args, directory);
+        expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
+      }
+      const execute = (filter: string) =>
+        run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "check",
+            "--cwd",
+            directory,
+            `--filter=${filter}`,
+            "--only",
+            "--no-cache",
+          ],
+          repositoryRoot,
+        );
+
+      await writeFile(`${directory}/packages/library/source.txt`, "second\n");
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "library input"], directory))
+          .exitCode,
+      ).toBe(0);
+      const plain = await execute("[HEAD~1]");
+      expect(plain.exitCode).toBe(0);
+      expect(plain.stdout).toContain("library check");
+      expect(plain.stdout).not.toContain("app check");
+      const dependents = await execute("...[HEAD~1]");
+      expect(dependents.exitCode).toBe(0);
+      expect(dependents.stdout).toContain("library check");
+      expect(dependents.stdout).toContain("app check");
+
+      await writeFile(`${directory}/packages/app/source.txt`, "second\n");
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "app input"], directory)).exitCode,
+      ).toBe(0);
+      const dependencies = await execute("[HEAD~1]...");
+      expect(dependencies.exitCode).toBe(0);
+      expect(dependencies.stdout).toContain("app check");
+      expect(dependencies.stdout).toContain("library check");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2863,6 +3192,50 @@ describe("cache interoperability and safety", () => {
       expect(result.stdout).toContain("library build");
       expect(result.stderr).toContain("remote cache restore failed");
       expect(result.stderr).toContain("executing task locally");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("preserves task success when remote cache upload fails", async () => {
+    const directory = await makeFixture();
+    let uploads = 0;
+    const server = createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        uploads += 1;
+        response.writeHead(403);
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    try {
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--cache=remote:w",
+          "--output-logs=hash-only",
+        ],
+        repositoryRoot,
+        { TURBO_API: `http://127.0.0.1:${address.port}` },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(uploads).toBe(1);
+      expect(result.stderr).toContain("remote cache upload failed");
+      expect(result.stderr).toContain("preserving successful task result");
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(directory, { force: true, recursive: true });

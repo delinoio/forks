@@ -532,6 +532,46 @@ describe("Effect foundation", () => {
     expect(observed).toEqual(["stdout-one\n", "stderr-one\n", "stdout-two\n"]);
   });
 
+  it("bounds captured output while preserving streamed chunks", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const observed: Array<string> = [];
+    let close: ((exitCode: number | null) => void) | undefined;
+    const fiber = Effect.runFork(
+      collectChildProcessOutput(
+        {
+          stdin,
+          stdout,
+          stderr,
+          onceClose: (listener) => {
+            close = listener;
+          },
+          onceError: () => {
+            // The synthetic process exits through the close callback.
+          },
+        },
+        "synthetic-bounded-output",
+        undefined,
+        false,
+        (chunk) => observed.push(chunk),
+        8,
+      ),
+    );
+    await Effect.runPromise(Effect.yieldNow());
+    stdout.write("stdout-123");
+    stderr.write("stderr-456");
+    close?.(0);
+    const result = await Effect.runPromise(Fiber.join(fiber));
+    expect(result).toEqual({
+      exitCode: 0,
+      stdout: "dout-123",
+      stderr: "derr-456",
+      combinedOutput: "derr-456",
+    });
+    expect(observed).toEqual(["stdout-123", "stderr-456"]);
+  });
+
   it("generates canonical lowercase UUID v7 identifiers", async () => {
     const identifier = await Effect.runPromise(
       RandomnessService.pipe(Effect.flatMap((service) => service.uuidV7)).pipe(

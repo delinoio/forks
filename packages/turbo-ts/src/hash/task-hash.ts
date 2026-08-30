@@ -181,11 +181,17 @@ const taskInputFiles = (
   };
   for (const input of inputs) {
     if (typeof input !== "string") {
-      for (const glob of input.globs ?? []) {
-        include(matchingFiles(glob));
-      }
       if (input.withDefaults !== false) {
         include(defaults);
+      }
+      for (const glob of input.globs ?? []) {
+        if (glob.startsWith("!")) {
+          for (const file of matchingFiles(glob.slice(1))) {
+            selected.delete(file.absolutePath);
+          }
+        } else {
+          include(matchingFiles(glob));
+        }
       }
       continue;
     }

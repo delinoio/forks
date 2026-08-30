@@ -215,8 +215,16 @@ describe("core repository model", () => {
       parseLockfile("/repo/nub.lock", encoder.encode("packages: {}\n")).format,
     ).toBe("nub");
     expect(
-      parseLockfile("/repo/uv.lock", encoder.encode("package: []\n")).format,
-    ).toBe("uv");
+      parseLockfile(
+        "/repo/uv.lock",
+        encoder.encode(
+          'version = 1\n\n[[package]]\nname = "python-package"\nversion = "1.2.3"\nsource = { registry = "https://example.test/simple" }\n',
+        ),
+      ),
+    ).toMatchObject({
+      format: "uv",
+      packages: [{ name: "python-package", version: "1.2.3" }],
+    });
     expect(() =>
       parseLockfile("/repo/pnpm-lock.yaml", new Uint8Array([0])),
     ).toThrow(/NUL/);
@@ -579,8 +587,8 @@ describe("core repository model", () => {
       directory: "/repo/python/app",
       relativeDirectory: "python/app",
       manager: "uv" as const,
-      scripts: { format: "uv format", test: "uv run --frozen pytest" },
-      tasks: { format: {}, test: {} },
+      scripts: { test: "uv run --frozen pytest" },
+      tasks: { test: {} },
     } satisfies RepositoryPackage;
     const graph = buildTaskGraph(
       repository([uvPackage]),

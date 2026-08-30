@@ -1,3 +1,4 @@
+import { parse as parseToml } from "smol-toml";
 import { parse as parseYaml } from "yaml";
 import { baseName } from "../core/path.js";
 
@@ -188,7 +189,7 @@ export const parseLockfile = (
   if (name === "uv.lock") {
     return {
       format: "uv",
-      packages: collectPackages(parseYamlDocument(source)),
+      packages: collectPackages(parseToml(source)),
     };
   }
   if (name === "aube.lock") {

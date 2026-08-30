@@ -11,6 +11,7 @@ export interface ExecutionRequest {
   readonly stdin?: string;
   readonly stdio?: "capture" | "inherit";
   readonly onOutputChunk?: (chunk: string) => void;
+  readonly maxCapturedOutputCharacters?: number;
 }
 
 export interface ExecutionResult {

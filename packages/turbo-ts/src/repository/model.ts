@@ -434,8 +434,6 @@ const polyglotScripts = (
       }
     : {
         build: "uv build",
-        check: "uv check",
-        format: "uv format",
         test: "uv run --frozen pytest",
       };
 
@@ -551,6 +549,10 @@ const cargoPackageMetadata = (
 interface PythonProjectMetadata {
   readonly name?: string;
   readonly dependencyNames: ReadonlyArray<string>;
+  readonly workspace?: {
+    readonly members: ReadonlyArray<string>;
+    readonly exclude: ReadonlyArray<string>;
+  };
 }
 
 const recordValue = (
@@ -575,6 +577,7 @@ const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
   const dependencyGroups = recordValue(document?.["dependency-groups"]);
   const tool = recordValue(document?.tool);
   const uv = recordValue(tool?.uv);
+  const workspace = recordValue(uv?.workspace);
   const requirements = [
     ...stringArrayValue(project?.dependencies),
     ...Object.values(optionalDependencies ?? {}).flatMap(stringArrayValue),
@@ -589,7 +592,34 @@ const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
   return {
     name: typeof project?.name === "string" ? project.name : undefined,
     dependencyNames: [...names].sort(),
+    ...(workspace === undefined
+      ? {}
+      : {
+          workspace: {
+            members: stringArrayValue(workspace.members),
+            exclude: stringArrayValue(workspace.exclude),
+          },
+        }),
   };
+};
+
+const uvTasks = (
+  packageName: string,
+  configured: Readonly<Record<string, Pipeline>>,
+): Readonly<Record<string, Pipeline>> => {
+  const buildDefaults: Pipeline = { cache: false };
+  const tasks: Record<string, Pipeline> = {
+    ...configured,
+    build: mergePipeline(buildDefaults, configured.build ?? {}),
+  };
+  const qualifiedBuild = `${packageName}#build`;
+  if (configured[qualifiedBuild] !== undefined) {
+    tasks[qualifiedBuild] = mergePipeline(
+      buildDefaults,
+      configured[qualifiedBuild],
+    );
+  }
+  return tasks;
 };
 
 const cargoTasks = (
@@ -729,6 +759,60 @@ export const discoverRepository = (
     const pythonEnabled =
       rootConfiguration.value.futureFlags?.experimentalPythonWorkspaces ===
       true;
+    const pythonWorkspaceDirectories = new Set<string>();
+    if (pythonEnabled) {
+      const fileSystem = yield* FileSystemService;
+      const rootPythonProjectPath = joinPath(root, "pyproject.toml");
+      if (
+        yield* fileSystem.exists(rootPythonProjectPath).pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({
+                path: rootPythonProjectPath,
+                message: error.message,
+              }),
+          ),
+        )
+      ) {
+        const source = yield* fileSystem.readText(rootPythonProjectPath).pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({
+                path: rootPythonProjectPath,
+                message: error.message,
+              }),
+          ),
+        );
+        let metadata: PythonProjectMetadata;
+        try {
+          metadata = parsePythonProjectMetadata(source);
+        } catch (cause) {
+          return yield* Effect.fail(
+            new RepositoryError({
+              path: rootPythonProjectPath,
+              message: String(cause),
+            }),
+          );
+        }
+        if (metadata.workspace !== undefined) {
+          pythonWorkspaceDirectories.add(root);
+          const memberDirectories = selectByGlobs(
+            directories
+              .map((directory) => relativePath(root, directory))
+              .filter((relative) => relative !== "."),
+            metadata.workspace.members,
+          );
+          const excludedDirectories = new Set(
+            selectByGlobs(memberDirectories, metadata.workspace.exclude),
+          );
+          for (const relative of memberDirectories) {
+            if (!excludedDirectories.has(relative)) {
+              pythonWorkspaceDirectories.add(joinPath(root, relative));
+            }
+          }
+        }
+      }
+    }
     const polyglotDrafts = yield* Effect.forEach(
       directories.filter((directory) => !javascriptDirectories.has(directory)),
       (directory) =>
@@ -738,7 +822,7 @@ export const discoverRepository = (
             ...(cargoEnabled
               ? [{ file: "Cargo.toml", manager: "cargo" as const }]
               : []),
-            ...(pythonEnabled
+            ...(pythonWorkspaceDirectories.has(directory)
               ? [{ file: "pyproject.toml", manager: "uv" as const }]
               : []),
           ];
@@ -804,7 +888,7 @@ export const discoverRepository = (
               tasks:
                 candidate.manager === "cargo"
                   ? cargoTasks(root, name, cargoMetadata, configuredTasks)
-                  : configuredTasks,
+                  : uvTasks(name, configuredTasks),
               manifest: { name, private: true } satisfies PackageManifest,
             };
           }

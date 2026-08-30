@@ -412,6 +412,7 @@ export const collectChildProcessOutput = (
   stdin: string | undefined,
   inheritStdin = false,
   onOutputChunk?: (chunk: string) => void,
+  maxCapturedOutputCharacters?: number,
 ): Effect.Effect<
   {
     readonly exitCode: number;
@@ -426,6 +427,14 @@ export const collectChildProcessOutput = (
     let stdout = "";
     let stderr = "";
     let combinedOutput = "";
+    const appendCapturedOutput = (current: string, chunk: string): string => {
+      const output = current + chunk;
+      return maxCapturedOutputCharacters === undefined
+        ? output
+        : output.slice(
+            Math.max(0, output.length - maxCapturedOutputCharacters),
+          );
+    };
     const stopInheritedInput = () => {
       if (inheritStdin) {
         process.stdin.unpipe(child.stdin);
@@ -443,8 +452,8 @@ export const collectChildProcessOutput = (
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       if (settled) return;
-      stdout += chunk;
-      combinedOutput += chunk;
+      stdout = appendCapturedOutput(stdout, chunk);
+      combinedOutput = appendCapturedOutput(combinedOutput, chunk);
       try {
         onOutputChunk?.(chunk);
       } catch (cause) {
@@ -453,8 +462,8 @@ export const collectChildProcessOutput = (
     });
     child.stderr.on("data", (chunk: string) => {
       if (settled) return;
-      stderr += chunk;
-      combinedOutput += chunk;
+      stderr = appendCapturedOutput(stderr, chunk);
+      combinedOutput = appendCapturedOutput(combinedOutput, chunk);
       try {
         onOutputChunk?.(chunk);
       } catch (cause) {
@@ -580,6 +589,7 @@ const processLayer = Layer.succeed(ProcessService, {
           request.stdin,
           false,
           request.onOutputChunk,
+          request.maxCapturedOutputCharacters,
         );
       },
       terminateChild,
