@@ -56,13 +56,33 @@ checks. The runtime `Schema` type preserves the complete nondiscriminated
 distributed configuration shape, while `RootSchema` and `WorkspaceSchema`
 remain narrower named projections.
 
-## Gate 1 and Later Work
+## Compatibility Gate Status
 
 Gate 1 establishes identity, version behavior, schemas and types, Effect
 boundaries, the external oracle, synthetic fixtures, mock hosted services,
-normalizers, nondeterminism evidence, and the exhaustive ledger. Unimplemented
-Gate 2 through Gate 5 behavior remains recorded as planned and must not be
-described as passing.
+normalizers, nondeterminism evidence, and the exhaustive ledger.
+
+Gate 2 work implements root and package JSON/JSONC configuration, inheritance,
+repository and lockfile discovery, package and task graphs, filters, affected
+selection, Git-compatible file hashing, environment selection, framework
+inference, scheduling, subprocess cleanup, `run`, implicit task invocation,
+and local and remote cache archives. npm, pnpm, Yarn Classic and Berry/PnP,
+Bun, Aube, Nub, Cargo, and uv identities are represented by the repository
+model. Gate 2 cache archives and Vercel-compatible artifact transport are
+tested bidirectionally against the external official binary when addressed by
+an oracle-provided hash.
+
+Gate 2 is not closed: the composed task-hash serializer does not yet reproduce
+the official 2.10.12 task hashes. Individual source-file hashes match Git and
+the oracle, but the official binary does not distribute the serialization
+contract that combines global and task inputs. End-to-end cache-key
+interoperability therefore remains planned; archive and HTTP interoperability
+must not be presented as evidence that task hashes match.
+
+Only Gate 2 behavior with automated ledger evidence is a compatibility claim.
+Gate 3 through Gate 5 commands, UI and profile formats, daemon/watch/query
+protocols, hosted authentication workflows, and platform matrices remain
+planned.
 
 The approved compatibility differences are branding and version, Node-only
 distribution, hosted identity, default-disabled updates, V8 heap/trace output,
@@ -70,12 +90,18 @@ no internal LSP or embedded sccache dispatch, an unsupported error for
 `experimentalCargoSccache`, Node's documented Windows signal limitation,
 visibility-only benchmarks, and manual ARM64 smoke testing.
 
+`futureFlags.experimentalCargoSccache: true` is rejected immediately after
+configuration resolution and before repository discovery, cache access,
+network requests, or task execution. Schema-hidden and deprecated runtime
+configuration stays internal and does not change the distributed schema or
+generated public types.
+
 ## Operations and Maintenance
 
 The package is repository-only and must not be published or deployed. Opt-in
 invocation keeps official Turbo available side by side. Rollback is stopping
-`turbo-ts` invocation; there is no migration or cleanup because later gates
-must preserve official shared-state formats.
+`turbo-ts` invocation; there is no migration or cleanup because implemented
+and later gates preserve official shared-state formats.
 
 Package validation consists of lint, type-check, Rstest, build, generated-file
 verification, production dependency auditing, and repository `pnpm check`.

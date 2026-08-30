@@ -8,11 +8,19 @@ Turborepo 2.10.12.
 
 ## Status
 
-Compatibility Gate 1 is implemented: package identity, configuration schema and
-types, Effect boundaries, external-oracle infrastructure, synthetic fixtures,
-mock hosted services, deterministic normalizers, and the exhaustive
-compatibility ledger. Features assigned to later gates are deliberately marked
-as planned and are not yet compatibility claims.
+Compatibility Gate 1 and substantial Gate 2 surfaces are implemented. In
+addition to the identity,
+schema, Effect, oracle, fixture, hosted-mock, normalizer, and ledger foundation,
+`turbo-ts` now models JavaScript, Cargo, and uv workspaces; loads root and
+package JSON/JSONC configuration; builds package and task graphs; selects
+filters and affected packages; executes explicit or implicit tasks; controls
+task environments and concurrency; and reads and writes compatible local and
+remote cache archives. Only passing automated ledger rows are compatibility
+claims; later commands and protocols remain planned. Gate 2 is not closed
+because the independent composed task-hash serializer does not yet match the
+official 2.10.12 keys. The bidirectional cache tests prove archive and artifact
+transport compatibility using oracle-provided hashes, not end-to-end cache-key
+identity.
 
 Official `turbo@2.10.12` remains the repository task runner and black-box test
 oracle. No upstream source, tests, fixtures, or diffs are included.
@@ -23,6 +31,8 @@ oracle. No upstream source, tests, fixtures, or diffs are included.
 pnpm --filter @delino/turbo-ts build
 pnpm exec turbo --version
 pnpm exec turbo-ts --version
+pnpm exec turbo-ts run build
+pnpm exec turbo-ts build --filter=@scope/package
 ```
 
 The expected output is:
@@ -50,6 +60,13 @@ The tests use only independently authored fixtures and external black-box
 executions. Mock hosted services bind to loopback addresses and tests use dummy
 credentials. Tokens, unrestricted environments, and task payloads must never be
 written to logs or committed evidence.
+
+The core suite includes bidirectional official/Turbo TS local and remote cache
+archive consumption, malformed configuration and lockfiles, graph failures,
+filters and environments, process interruption, corrupt caches, traversal and
+symlink attacks, signatures, command-injection arguments, and concurrent cache
+writers. `futureFlags.experimentalCargoSccache: true` always fails before task
+execution with a branded unsupported-compatibility diagnostic.
 
 ## License and Attribution
 

@@ -1,0 +1,646 @@
+import { Effect } from "effect";
+import { parse as parseYaml } from "yaml";
+import type { LoadedRootConfiguration } from "../config/runtime.js";
+import { loadPackageConfiguration } from "../config/runtime.js";
+import { matchesGlob } from "../core/glob.js";
+import { baseName, joinPath, relativePath } from "../core/path.js";
+import { RepositoryError } from "../effect/errors.js";
+import { FileSystemService } from "../effect/services.js";
+import type { Pipeline } from "../generated/configuration.js";
+import { type ParsedLockfile, parseLockfile } from "./lockfiles.js";
+
+export const packageManagerNames = [
+  "npm",
+  "pnpm",
+  "yarn",
+  "bun",
+  "aube",
+  "nub",
+  "cargo",
+  "uv",
+] as const;
+
+export type PackageManagerName = (typeof packageManagerNames)[number];
+
+export interface PackageManifest {
+  readonly name?: string;
+  readonly version?: string;
+  readonly private?: boolean;
+  readonly packageManager?: string;
+  readonly devEngines?: {
+    readonly packageManager?: {
+      readonly name?: string;
+      readonly version?: string;
+    };
+  };
+  readonly workspaces?:
+    | ReadonlyArray<string>
+    | { readonly packages?: ReadonlyArray<string> };
+  readonly scripts?: Readonly<Record<string, string>>;
+  readonly dependencies?: Readonly<Record<string, string>>;
+  readonly devDependencies?: Readonly<Record<string, string>>;
+  readonly optionalDependencies?: Readonly<Record<string, string>>;
+  readonly peerDependencies?: Readonly<Record<string, string>>;
+}
+
+export interface RepositoryPackage {
+  readonly name: string;
+  readonly directory: string;
+  readonly relativeDirectory: string;
+  readonly manager: PackageManagerName;
+  readonly scripts: Readonly<Record<string, string>>;
+  readonly dependencyNames: ReadonlyArray<string>;
+  readonly internalDependencies: ReadonlyArray<string>;
+  readonly tasks: Readonly<Record<string, Pipeline>>;
+  readonly manifest: PackageManifest;
+}
+
+export interface RepositoryModel {
+  readonly root: string;
+  readonly manager: PackageManagerName;
+  readonly managerVersion?: string;
+  readonly rootManifest: PackageManifest;
+  readonly rootConfiguration: LoadedRootConfiguration;
+  readonly lockfile?: string;
+  readonly lockfileData?: ParsedLockfile;
+  readonly packages: ReadonlyArray<RepositoryPackage>;
+  readonly packagesByName: ReadonlyMap<string, RepositoryPackage>;
+}
+
+const ignoredDirectories = new Set([
+  ".git",
+  ".turbo",
+  "dist",
+  "node_modules",
+  "target",
+]);
+
+const readJsonObject = (
+  path: string,
+): Effect.Effect<Record<string, unknown>, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const source = yield* fileSystem
+      .readText(path)
+      .pipe(
+        Effect.mapError(
+          (error) => new RepositoryError({ path, message: error.message }),
+        ),
+      );
+    try {
+      const value = JSON.parse(source) as unknown;
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new TypeError("manifest must be an object");
+      }
+      return value as Record<string, unknown>;
+    } catch (cause) {
+      return yield* Effect.fail(
+        new RepositoryError({ path, message: String(cause) }),
+      );
+    }
+  });
+
+const decodeManifest = (value: Record<string, unknown>): PackageManifest => ({
+  name: typeof value.name === "string" ? value.name : undefined,
+  version: typeof value.version === "string" ? value.version : undefined,
+  private: typeof value.private === "boolean" ? value.private : undefined,
+  packageManager:
+    typeof value.packageManager === "string" ? value.packageManager : undefined,
+  devEngines:
+    typeof value.devEngines === "object" &&
+    value.devEngines !== null &&
+    !Array.isArray(value.devEngines)
+      ? {
+          packageManager: (() => {
+            const packageManager = (
+              value.devEngines as { readonly packageManager?: unknown }
+            ).packageManager;
+            if (
+              typeof packageManager !== "object" ||
+              packageManager === null ||
+              Array.isArray(packageManager)
+            ) {
+              return undefined;
+            }
+            const descriptor = packageManager as Record<string, unknown>;
+            return {
+              name:
+                typeof descriptor.name === "string"
+                  ? descriptor.name
+                  : undefined,
+              version:
+                typeof descriptor.version === "string"
+                  ? descriptor.version
+                  : undefined,
+            };
+          })(),
+        }
+      : undefined,
+  workspaces: Array.isArray(value.workspaces)
+    ? value.workspaces.filter(
+        (entry): entry is string => typeof entry === "string",
+      )
+    : typeof value.workspaces === "object" && value.workspaces !== null
+      ? {
+          packages: Array.isArray(
+            (value.workspaces as { readonly packages?: unknown }).packages,
+          )
+            ? (
+                value.workspaces as {
+                  readonly packages: ReadonlyArray<unknown>;
+                }
+              ).packages.filter(
+                (entry): entry is string => typeof entry === "string",
+              )
+            : undefined,
+        }
+      : undefined,
+  scripts: stringRecord(value.scripts),
+  dependencies: stringRecord(value.dependencies),
+  devDependencies: stringRecord(value.devDependencies),
+  optionalDependencies: stringRecord(value.optionalDependencies),
+  peerDependencies: stringRecord(value.peerDependencies),
+});
+
+const stringRecord = (
+  value: unknown,
+): Readonly<Record<string, string>> | undefined =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? Object.fromEntries(
+        Object.entries(value).filter(
+          (entry): entry is [string, string] => typeof entry[1] === "string",
+        ),
+      )
+    : undefined;
+
+export const managerFromIdentity = (
+  identity: string | undefined,
+): { readonly name: PackageManagerName; readonly version?: string } => {
+  const [name, version] = identity?.split("@") ?? [];
+  return packageManagerNames.includes(name as PackageManagerName)
+    ? { name: name as PackageManagerName, version }
+    : { name: "npm" };
+};
+
+const discoverManager = (
+  root: string,
+  identity: string | undefined,
+): Effect.Effect<
+  { readonly name: PackageManagerName; readonly version?: string },
+  RepositoryError,
+  FileSystemService
+> =>
+  Effect.gen(function* () {
+    if (identity !== undefined) return managerFromIdentity(identity);
+    const fileSystem = yield* FileSystemService;
+    const markers: ReadonlyArray<
+      readonly [PackageManagerName, ReadonlyArray<string>]
+    > = [
+      ["aube", ["aube.lock"]],
+      ["nub", ["nub.lock"]],
+      ["pnpm", ["pnpm-lock.yaml", "pnpm-workspace.yaml"]],
+      ["yarn", ["yarn.lock", ".pnp.cjs"]],
+      ["bun", ["bun.lock", "bun.lockb"]],
+      ["npm", ["package-lock.json", "npm-shrinkwrap.json"]],
+    ];
+    for (const [name, files] of markers) {
+      for (const file of files) {
+        const path = joinPath(root, file);
+        if (
+          yield* fileSystem
+            .exists(path)
+            .pipe(
+              Effect.mapError(
+                (error) =>
+                  new RepositoryError({ path, message: error.message }),
+              ),
+            )
+        ) {
+          return { name };
+        }
+      }
+    }
+    return { name: "npm" };
+  });
+
+const lockfilesByManager: Readonly<
+  Record<PackageManagerName, ReadonlyArray<string>>
+> = {
+  npm: ["package-lock.json", "npm-shrinkwrap.json"],
+  pnpm: ["pnpm-lock.yaml"],
+  yarn: ["yarn.lock", ".pnp.cjs"],
+  bun: ["bun.lock", "bun.lockb"],
+  aube: [
+    "aube.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lock",
+  ],
+  nub: [
+    "nub.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lock",
+  ],
+  cargo: ["Cargo.lock"],
+  uv: ["uv.lock"],
+};
+
+const findLockfile = (
+  root: string,
+  manager: PackageManagerName,
+): Effect.Effect<string | undefined, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    for (const name of lockfilesByManager[manager]) {
+      const path = joinPath(root, name);
+      const exists = yield* fileSystem
+        .exists(path)
+        .pipe(
+          Effect.mapError(
+            (error) => new RepositoryError({ path, message: error.message }),
+          ),
+        );
+      if (exists) {
+        return path;
+      }
+    }
+    return undefined;
+  });
+
+const walkDirectories = (
+  root: string,
+): Effect.Effect<ReadonlyArray<string>, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const directories: Array<string> = [root];
+    const pending: Array<string> = [root];
+    while (pending.length > 0) {
+      const directory = pending.pop()!;
+      const entries = yield* fileSystem
+        .list(directory)
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({ path: directory, message: error.message }),
+          ),
+        );
+      for (const entry of entries) {
+        if (entry.kind !== "directory" || ignoredDirectories.has(entry.name)) {
+          continue;
+        }
+        const path = joinPath(directory, entry.name);
+        directories.push(path);
+        pending.push(path);
+      }
+    }
+    return directories.sort();
+  });
+
+const workspacePatterns = (
+  root: string,
+  manifest: PackageManifest,
+): Effect.Effect<ReadonlyArray<string>, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const pnpmWorkspacePath = joinPath(root, "pnpm-workspace.yaml");
+    if (
+      yield* fileSystem.exists(pnpmWorkspacePath).pipe(
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({
+              path: pnpmWorkspacePath,
+              message: error.message,
+            }),
+        ),
+      )
+    ) {
+      const source = yield* fileSystem.readText(pnpmWorkspacePath).pipe(
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({
+              path: pnpmWorkspacePath,
+              message: error.message,
+            }),
+        ),
+      );
+      try {
+        const document = parseYaml(source) as { readonly packages?: unknown };
+        if (Array.isArray(document?.packages)) {
+          return document.packages.filter(
+            (entry): entry is string => typeof entry === "string",
+          );
+        }
+      } catch (cause) {
+        return yield* Effect.fail(
+          new RepositoryError({
+            path: pnpmWorkspacePath,
+            message: String(cause),
+          }),
+        );
+      }
+    }
+    if (Array.isArray(manifest.workspaces)) {
+      return manifest.workspaces;
+    }
+    return manifest.workspaces !== undefined &&
+      typeof manifest.workspaces === "object" &&
+      "packages" in manifest.workspaces
+      ? (manifest.workspaces.packages ?? [])
+      : [];
+  });
+
+const dependencyNames = (manifest: PackageManifest): ReadonlyArray<string> =>
+  [
+    ...new Set([
+      ...Object.keys(manifest.dependencies ?? {}),
+      ...Object.keys(manifest.devDependencies ?? {}),
+      ...Object.keys(manifest.optionalDependencies ?? {}),
+      ...Object.keys(manifest.peerDependencies ?? {}),
+    ]),
+  ].sort();
+
+const polyglotScripts = (
+  manager: "cargo" | "uv",
+): Readonly<Record<string, string>> =>
+  manager === "cargo"
+    ? {
+        build: "cargo build",
+        check: "cargo check",
+        dev: "cargo run",
+        format: "cargo fmt",
+        lint: "cargo clippy",
+        run: "cargo run",
+        test: "cargo test",
+      }
+    : {
+        build: "uv build",
+        check: "uv check",
+        format: "uv format",
+        test: "uv run --frozen pytest",
+      };
+
+const cargoDependencyNames = (source: string): ReadonlyArray<string> => {
+  const names = new Set<string>();
+  let dependencies = false;
+  for (const line of source.split(/\r?\n/)) {
+    const section = /^\s*\[([^\]]+)\]\s*$/.exec(line)?.[1];
+    if (section !== undefined) {
+      dependencies = /(?:^|\.)(?:build-|dev-)?dependencies$/.test(section);
+      continue;
+    }
+    if (dependencies) {
+      const name = /^\s*([A-Za-z0-9_-]+)\s*=/.exec(line)?.[1];
+      if (name !== undefined) names.add(name);
+    }
+  }
+  return [...names].sort();
+};
+
+const pythonDependencyNames = (source: string): ReadonlyArray<string> => {
+  const names = new Set<string>();
+  for (const match of source.matchAll(
+    /["']([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?(?:[ <>=!~;]|["'])/g,
+  )) {
+    const name = match[1];
+    if (name !== undefined)
+      names.add(name.toLowerCase().replace(/[_.]+/g, "-"));
+  }
+  return [...names].sort();
+};
+
+export const discoverRepository = (
+  root: string,
+  rootConfiguration: LoadedRootConfiguration,
+): Effect.Effect<RepositoryModel, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const rootManifestPath = joinPath(root, "package.json");
+    const rootManifest = decodeManifest(
+      yield* readJsonObject(rootManifestPath),
+    );
+    const devEngineManager = rootManifest.devEngines?.packageManager;
+    const declaredManager =
+      devEngineManager?.name === undefined
+        ? rootManifest.packageManager
+        : `${devEngineManager.name}${
+            devEngineManager.version === undefined
+              ? ""
+              : `@${devEngineManager.version}`
+          }`;
+    const managerIdentity = yield* discoverManager(root, declaredManager);
+    const patterns = yield* workspacePatterns(root, rootManifest);
+    const directories = yield* walkDirectories(root);
+    const candidateDirectories = directories.filter((directory) => {
+      const relative = relativePath(root, directory);
+      return (
+        relative !== "." &&
+        patterns.some((pattern) => matchesGlob(relative, pattern))
+      );
+    });
+    const packageDrafts = yield* Effect.forEach(
+      candidateDirectories,
+      (directory) =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const manifestPath = joinPath(directory, "package.json");
+          if (
+            !(yield* fileSystem.exists(manifestPath).pipe(
+              Effect.mapError(
+                (error) =>
+                  new RepositoryError({
+                    path: manifestPath,
+                    message: error.message,
+                  }),
+              ),
+            ))
+          ) {
+            return undefined;
+          }
+          const manifest = decodeManifest(yield* readJsonObject(manifestPath));
+          const name = manifest.name ?? baseName(directory);
+          const tasks = yield* loadPackageConfiguration(
+            directory,
+            rootConfiguration,
+          ).pipe(
+            Effect.mapError(
+              (error) =>
+                new RepositoryError({
+                  path: error.path,
+                  message: error.message,
+                }),
+            ),
+          );
+          return {
+            name,
+            directory,
+            relativeDirectory: relativePath(root, directory),
+            manager: managerIdentity.name,
+            scripts: manifest.scripts ?? {},
+            dependencyNames: dependencyNames(manifest),
+            tasks,
+            manifest,
+          };
+        }),
+      { concurrency: 1 },
+    );
+    const javascriptDrafts = packageDrafts.filter(
+      (entry): entry is NonNullable<typeof entry> => entry !== undefined,
+    );
+    const javascriptDirectories = new Set(
+      javascriptDrafts.map((entry) => entry.directory),
+    );
+    const cargoEnabled =
+      rootConfiguration.value.futureFlags?.experimentalCargoWorkspaces === true;
+    const pythonEnabled =
+      rootConfiguration.value.futureFlags?.experimentalPythonWorkspaces ===
+      true;
+    const polyglotDrafts = yield* Effect.forEach(
+      directories.filter((directory) => !javascriptDirectories.has(directory)),
+      (directory) =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const candidates = [
+            ...(cargoEnabled
+              ? [{ file: "Cargo.toml", manager: "cargo" as const }]
+              : []),
+            ...(pythonEnabled
+              ? [{ file: "pyproject.toml", manager: "uv" as const }]
+              : []),
+          ];
+          for (const candidate of candidates) {
+            const path = joinPath(directory, candidate.file);
+            if (
+              !(yield* fileSystem
+                .exists(path)
+                .pipe(
+                  Effect.mapError(
+                    (error) =>
+                      new RepositoryError({ path, message: error.message }),
+                  ),
+                ))
+            ) {
+              continue;
+            }
+            const source = yield* fileSystem
+              .readText(path)
+              .pipe(
+                Effect.mapError(
+                  (error) =>
+                    new RepositoryError({ path, message: error.message }),
+                ),
+              );
+            const name =
+              candidate.manager === "cargo"
+                ? /^name\s*=\s*"([^"]+)"/m.exec(source)?.[1]
+                : /^name\s*=\s*["']([^"']+)["']/m.exec(source)?.[1];
+            if (name === undefined) {
+              continue;
+            }
+            return {
+              name,
+              directory,
+              relativeDirectory: relativePath(root, directory),
+              manager: candidate.manager,
+              scripts: polyglotScripts(candidate.manager),
+              dependencyNames:
+                candidate.manager === "cargo"
+                  ? cargoDependencyNames(source)
+                  : pythonDependencyNames(source),
+              tasks: (rootConfiguration.value.tasks ?? {}) as Readonly<
+                Record<string, Pipeline>
+              >,
+              manifest: { name, private: true } satisfies PackageManifest,
+            };
+          }
+          return undefined;
+        }),
+      { concurrency: 1 },
+    );
+    const drafts = [
+      ...javascriptDrafts,
+      ...polyglotDrafts.filter(
+        (entry): entry is NonNullable<typeof entry> => entry !== undefined,
+      ),
+    ];
+    const names = new Set<string>();
+    for (const packageDraft of drafts) {
+      if (names.has(packageDraft.name)) {
+        return yield* Effect.fail(
+          new RepositoryError({
+            path: packageDraft.directory,
+            message: `duplicate package name: ${packageDraft.name}`,
+          }),
+        );
+      }
+      names.add(packageDraft.name);
+    }
+    const packages: ReadonlyArray<RepositoryPackage> = drafts
+      .map((packageDraft) => ({
+        ...packageDraft,
+        internalDependencies: packageDraft.dependencyNames.filter((name) =>
+          names.has(name),
+        ),
+      }))
+      .sort((left, right) => left.name.localeCompare(right.name));
+    const lockfile = yield* findLockfile(root, managerIdentity.name);
+    let lockfileData: ParsedLockfile | undefined;
+    if (lockfile !== undefined) {
+      const fileSystem = yield* FileSystemService;
+      const contents = yield* fileSystem
+        .readBytes(lockfile)
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({ path: lockfile, message: error.message }),
+          ),
+        );
+      try {
+        lockfileData = parseLockfile(lockfile, contents);
+      } catch (cause) {
+        return yield* Effect.fail(
+          new RepositoryError({ path: lockfile, message: String(cause) }),
+        );
+      }
+    }
+    return {
+      root,
+      manager: managerIdentity.name,
+      managerVersion: managerIdentity.version,
+      rootManifest,
+      rootConfiguration,
+      lockfile,
+      lockfileData,
+      packages,
+      packagesByName: new Map(packages.map((entry) => [entry.name, entry])),
+    };
+  });
+
+export const listRepositoryFiles = (
+  directory: string,
+): Effect.Effect<ReadonlyArray<string>, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const files: Array<string> = [];
+    const pending = [directory];
+    while (pending.length > 0) {
+      const current = pending.pop()!;
+      const entries = yield* fileSystem
+        .list(current)
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({ path: current, message: error.message }),
+          ),
+        );
+      for (const entry of entries) {
+        if (entry.kind === "directory" && !ignoredDirectories.has(entry.name)) {
+          pending.push(joinPath(current, entry.name));
+        } else if (entry.kind === "file") {
+          files.push(joinPath(current, entry.name));
+        }
+      }
+    }
+    return files.sort();
+  });

@@ -1,17 +1,39 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  createHash,
+  createHmac,
+  randomBytes,
+  timingSafeEqual,
+} from "node:crypto";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
+import { promisify } from "node:util";
+import { zstdCompress, zstdDecompress } from "node:zlib";
 import { Cause, Effect, Exit, Layer, Option, Ref } from "effect";
 import { BoundaryError, ProcessExecutionError } from "./errors.js";
 import {
   CacheService,
   ClockService,
+  CompressionService,
   ConcurrencyService,
   CredentialService,
   DaemonService,
+  DigestService,
   deterministicRetryLayer,
   EnvironmentService,
   type FileSystemOperations,
@@ -23,6 +45,7 @@ import {
   ProcessService,
   RandomnessService,
   SignalService,
+  SigningService,
   TelemetryService,
   type TerminalOperations,
   TerminalService,
@@ -47,6 +70,23 @@ const filesystemError = (cause: unknown): BoundaryError =>
     message: String(cause),
     retryable: false,
   });
+
+const isMissingFileError = (cause: unknown): boolean =>
+  typeof cause === "object" &&
+  cause !== null &&
+  "code" in cause &&
+  cause.code === "ENOENT";
+
+const metadataKind = (
+  metadata: Awaited<ReturnType<typeof lstat>>,
+): "directory" | "file" | "symlink" | "other" =>
+  metadata.isDirectory()
+    ? "directory"
+    : metadata.isFile()
+      ? "file"
+      : metadata.isSymbolicLink()
+        ? "symlink"
+        : "other";
 
 const processExecutionError = (
   command: string,
@@ -202,9 +242,114 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
       try: () => readFile(path, "utf8"),
       catch: filesystemError,
     }),
+  readBytes: (path) =>
+    Effect.tryPromise({
+      try: async () => new Uint8Array(await readFile(path)),
+      catch: filesystemError,
+    }),
+  exists: (path) =>
+    Effect.tryPromise({
+      try: async () => {
+        try {
+          await lstat(path);
+          return true;
+        } catch (cause) {
+          if (isMissingFileError(cause)) {
+            return false;
+          }
+          throw cause;
+        }
+      },
+      catch: filesystemError,
+    }),
+  list: (path) =>
+    Effect.tryPromise({
+      try: async () =>
+        (await readdir(path, { withFileTypes: true })).map((entry) => ({
+          name: entry.name,
+          kind: entry.isDirectory()
+            ? ("directory" as const)
+            : entry.isFile()
+              ? ("file" as const)
+              : entry.isSymbolicLink()
+                ? ("symlink" as const)
+                : ("other" as const),
+        })),
+      catch: filesystemError,
+    }),
+  metadata: (path) =>
+    Effect.tryPromise({
+      try: async () => {
+        const metadata = await lstat(path);
+        return {
+          kind: metadataKind(metadata),
+          mode: metadata.mode & 0o777,
+          modifiedMilliseconds: metadata.mtimeMs,
+          size: metadata.size,
+        };
+      },
+      catch: filesystemError,
+    }),
+  makeDirectory: (path) =>
+    Effect.tryPromise({
+      try: async () => {
+        await mkdir(path, { recursive: true });
+      },
+      catch: filesystemError,
+    }),
+  createExclusiveFile: (path) =>
+    Effect.tryPromise({
+      try: async () => {
+        try {
+          const handle = await open(path, "wx", 0o600);
+          await handle.close();
+          return true;
+        } catch (cause) {
+          if (
+            typeof cause === "object" &&
+            cause !== null &&
+            "code" in cause &&
+            cause.code === "EEXIST"
+          ) {
+            return false;
+          }
+          throw cause;
+        }
+      },
+      catch: filesystemError,
+    }),
   writeText: (path, contents) =>
     Effect.tryPromise({
       try: () => writeFile(path, contents, "utf8"),
+      catch: filesystemError,
+    }),
+  writeBytes: (path, contents) =>
+    Effect.tryPromise({
+      try: () => writeFile(path, contents),
+      catch: filesystemError,
+    }),
+  setFileMetadata: (path, mode, modifiedMilliseconds) =>
+    Effect.tryPromise({
+      try: async () => {
+        await chmod(path, mode & 0o777);
+        const modified = new Date(modifiedMilliseconds);
+        await utimes(path, modified, modified);
+      },
+      catch: filesystemError,
+    }),
+  rename: (source, destination) =>
+    Effect.tryPromise({
+      try: () => rename(source, destination),
+      catch: filesystemError,
+    }),
+  remove: (path) =>
+    Effect.tryPromise({
+      try: () => rm(path, { force: true, recursive: true }),
+      catch: filesystemError,
+    }),
+  realPath: (path) =>
+    Effect.tryPromise({
+      try: () => realpath(path),
       catch: filesystemError,
     }),
   // Effect finalizers cannot fail in the typed error channel. Own the scope and
@@ -228,6 +373,7 @@ export const collectChildProcessOutput = (
   child: ChildProcessIo,
   command: string,
   stdin: string | undefined,
+  inheritStdin = false,
 ): Effect.Effect<
   {
     readonly exitCode: number;
@@ -240,11 +386,17 @@ export const collectChildProcessOutput = (
     let settled = false;
     let stdout = "";
     let stderr = "";
+    const stopInheritedInput = () => {
+      if (inheritStdin) {
+        process.stdin.unpipe(child.stdin);
+      }
+    };
     const fail = (cause: unknown) => {
       if (settled) {
         return;
       }
       settled = true;
+      stopInheritedInput();
       resume(Effect.fail(processExecutionError(command, cause)));
     };
     child.stdout.setEncoding("utf8");
@@ -264,6 +416,7 @@ export const collectChildProcessOutput = (
         return;
       }
       settled = true;
+      stopInheritedInput();
       resume(
         Effect.succeed({
           exitCode: exitCode ?? 1,
@@ -272,7 +425,9 @@ export const collectChildProcessOutput = (
         }),
       );
     });
-    if (stdin === undefined) {
+    if (inheritStdin) {
+      process.stdin.pipe(child.stdin);
+    } else if (stdin === undefined) {
       child.stdin.end();
     } else {
       child.stdin.end(stdin);
@@ -289,7 +444,7 @@ const processLayer = Layer.succeed(ProcessService, {
             cwd: request.cwd,
             detached: ownsProcessGroup,
             env: makeChildEnvironment(
-              process.env,
+              request.inheritEnvironment === false ? {} : process.env,
               request.env,
               process.platform,
             ),
@@ -327,6 +482,7 @@ const processLayer = Layer.succeed(ProcessService, {
           },
           request.command,
           request.stdin,
+          request.stdio === "inherit",
         ),
       terminateChild,
     ),
@@ -443,6 +599,109 @@ const randomnessLayer = Layer.succeed(RandomnessService, {
   }),
 });
 
+const compressionError = (cause: unknown): BoundaryError =>
+  new BoundaryError({
+    boundary: "compression",
+    message: String(cause),
+    retryable: false,
+  });
+
+const compressionLayer = Layer.succeed(CompressionService, {
+  compressZstd: (contents) =>
+    Effect.tryPromise({
+      try: async () =>
+        new Uint8Array(await promisify(zstdCompress)(Buffer.from(contents))),
+      catch: compressionError,
+    }),
+  decompressZstd: (contents) =>
+    Effect.tryPromise({
+      try: async () =>
+        new Uint8Array(await promisify(zstdDecompress)(Buffer.from(contents))),
+      catch: compressionError,
+    }),
+});
+
+const httpLayer = Layer.succeed(HttpService, {
+  request: (request) =>
+    Effect.tryPromise({
+      try: async () => {
+        const controller = new AbortController();
+        const timeout =
+          request.timeoutMilliseconds === undefined
+            ? undefined
+            : setTimeout(() => controller.abort(), request.timeoutMilliseconds);
+        try {
+          const response = await fetch(request.url, {
+            method: request.method,
+            headers: request.headers,
+            body:
+              request.body === undefined
+                ? undefined
+                : typeof request.body === "string"
+                  ? request.body
+                  : Buffer.from(request.body),
+            redirect: "follow",
+            signal: controller.signal,
+          });
+          return {
+            status: response.status,
+            headers: Object.fromEntries(response.headers.entries()),
+            body: new Uint8Array(await response.arrayBuffer()),
+          };
+        } finally {
+          if (timeout !== undefined) {
+            clearTimeout(timeout);
+          }
+        }
+      },
+      catch: (cause) =>
+        new BoundaryError({
+          boundary: "http",
+          message: String(cause),
+          retryable: true,
+        }),
+    }),
+});
+
+const signingLayer = Layer.succeed(SigningService, {
+  hmacSha256: (key, contents) =>
+    Effect.try({
+      try: () => createHmac("sha256", key).update(contents).digest("hex"),
+      catch: (cause) =>
+        new BoundaryError({
+          boundary: "signing",
+          message: String(cause),
+          retryable: false,
+        }),
+    }),
+  equal: (left, right) =>
+    Effect.sync(() => {
+      const leftBytes = Buffer.from(left);
+      const rightBytes = Buffer.from(right);
+      return (
+        leftBytes.length === rightBytes.length &&
+        timingSafeEqual(leftBytes, rightBytes)
+      );
+    }),
+});
+
+const digestLayer = Layer.succeed(DigestService, {
+  gitBlobSha1: (contents) =>
+    Effect.try({
+      try: () =>
+        createHash("sha1")
+          .update(`blob ${contents.length}\0`)
+          .update(contents)
+          .digest("hex"),
+      catch: (cause) =>
+        new BoundaryError({
+          boundary: "digest",
+          message: String(cause),
+          retryable: false,
+        }),
+    }),
+});
+
 export const nodeFoundationLayer = Layer.mergeAll(
   fileSystemLayer,
   processLayer,
@@ -450,11 +709,14 @@ export const nodeFoundationLayer = Layer.mergeAll(
   terminalLayer,
   clockLayer,
   randomnessLayer,
+  compressionLayer,
+  httpLayer,
+  signingLayer,
+  digestLayer,
   Layer.succeed(GitService, boundaryFailure("git")),
   Layer.succeed(PackageManagerService, boundaryFailure("package-manager")),
   Layer.succeed(SignalService, boundaryFailure("signals")),
   Layer.succeed(ConcurrencyService, boundaryFailure("concurrency")),
-  Layer.succeed(HttpService, boundaryFailure("http")),
   Layer.succeed(CredentialService, boundaryFailure("credentials")),
   Layer.succeed(CacheService, boundaryFailure("cache")),
   Layer.succeed(DaemonService, boundaryFailure("daemon")),

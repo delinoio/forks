@@ -7,7 +7,9 @@ export interface ExecutionRequest {
   readonly args: ReadonlyArray<string>;
   readonly cwd: string;
   readonly env?: Readonly<Record<string, string | undefined>>;
+  readonly inheritEnvironment?: boolean;
   readonly stdin?: string;
+  readonly stdio?: "capture" | "inherit";
 }
 
 export interface ExecutionResult {
@@ -18,13 +20,54 @@ export interface ExecutionResult {
 
 export interface FileSystemOperations {
   readonly readText: (path: string) => Effect.Effect<string, BoundaryError>;
+  readonly readBytes: (
+    path: string,
+  ) => Effect.Effect<Uint8Array, BoundaryError>;
+  readonly exists: (path: string) => Effect.Effect<boolean, BoundaryError>;
+  readonly list: (
+    path: string,
+  ) => Effect.Effect<ReadonlyArray<DirectoryEntry>, BoundaryError>;
+  readonly metadata: (
+    path: string,
+  ) => Effect.Effect<FileMetadata, BoundaryError>;
+  readonly makeDirectory: (path: string) => Effect.Effect<void, BoundaryError>;
+  readonly createExclusiveFile: (
+    path: string,
+  ) => Effect.Effect<boolean, BoundaryError>;
   readonly writeText: (
     path: string,
     contents: string,
   ) => Effect.Effect<void, BoundaryError>;
+  readonly writeBytes: (
+    path: string,
+    contents: Uint8Array,
+  ) => Effect.Effect<void, BoundaryError>;
+  readonly setFileMetadata: (
+    path: string,
+    mode: number,
+    modifiedMilliseconds: number,
+  ) => Effect.Effect<void, BoundaryError>;
+  readonly rename: (
+    source: string,
+    destination: string,
+  ) => Effect.Effect<void, BoundaryError>;
+  readonly remove: (path: string) => Effect.Effect<void, BoundaryError>;
+  readonly realPath: (path: string) => Effect.Effect<string, BoundaryError>;
   readonly withTemporaryDirectory: <A, E, R>(
     use: (path: string) => Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E | BoundaryError, R>;
+}
+
+export interface DirectoryEntry {
+  readonly name: string;
+  readonly kind: "directory" | "file" | "symlink" | "other";
+}
+
+export interface FileMetadata {
+  readonly kind: "directory" | "file" | "symlink" | "other";
+  readonly mode: number;
+  readonly modifiedMilliseconds: number;
+  readonly size: number;
 }
 
 export class FileSystemService extends Context.Tag(
@@ -101,9 +144,29 @@ export class SignalService extends Context.Tag("turbo-ts/SignalService")<
 export class ConcurrencyService extends Context.Tag(
   "turbo-ts/ConcurrencyService",
 )<ConcurrencyService, BoundaryOperations>() {}
+export interface HttpRequest {
+  readonly url: string;
+  readonly method: "GET" | "HEAD" | "OPTIONS" | "POST" | "PUT";
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly body?: Uint8Array | string;
+  readonly timeoutMilliseconds?: number;
+}
+
+export interface HttpResponse {
+  readonly status: number;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly body: Uint8Array;
+}
+
+export interface HttpOperations {
+  readonly request: (
+    request: HttpRequest,
+  ) => Effect.Effect<HttpResponse, BoundaryError>;
+}
+
 export class HttpService extends Context.Tag("turbo-ts/HttpService")<
   HttpService,
-  BoundaryOperations
+  HttpOperations
 >() {}
 export class CredentialService extends Context.Tag(
   "turbo-ts/CredentialService",
@@ -111,6 +174,40 @@ export class CredentialService extends Context.Tag(
 export class CacheService extends Context.Tag("turbo-ts/CacheService")<
   CacheService,
   BoundaryOperations
+>() {}
+export interface CompressionOperations {
+  readonly compressZstd: (
+    contents: Uint8Array,
+  ) => Effect.Effect<Uint8Array, BoundaryError>;
+  readonly decompressZstd: (
+    contents: Uint8Array,
+  ) => Effect.Effect<Uint8Array, BoundaryError>;
+}
+
+export class CompressionService extends Context.Tag(
+  "turbo-ts/CompressionService",
+)<CompressionService, CompressionOperations>() {}
+export interface SigningOperations {
+  readonly hmacSha256: (
+    key: string,
+    contents: Uint8Array,
+  ) => Effect.Effect<string, BoundaryError>;
+  readonly equal: (left: string, right: string) => Effect.Effect<boolean>;
+}
+
+export class SigningService extends Context.Tag("turbo-ts/SigningService")<
+  SigningService,
+  SigningOperations
+>() {}
+export interface DigestOperations {
+  readonly gitBlobSha1: (
+    contents: Uint8Array,
+  ) => Effect.Effect<string, BoundaryError>;
+}
+
+export class DigestService extends Context.Tag("turbo-ts/DigestService")<
+  DigestService,
+  DigestOperations
 >() {}
 export class DaemonService extends Context.Tag("turbo-ts/DaemonService")<
   DaemonService,

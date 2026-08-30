@@ -42,3 +42,50 @@ export class UnsupportedCompatibilityError extends Schema.TaggedError<Unsupporte
   surface: Schema.String,
   targetGate: Schema.Number,
 }) {}
+
+export class ConfigurationError extends Schema.TaggedError<ConfigurationError>(
+  "ConfigurationError",
+)("ConfigurationError", {
+  path: Schema.String,
+  message: Schema.String,
+}) {}
+
+export class RepositoryError extends Schema.TaggedError<RepositoryError>(
+  "RepositoryError",
+)("RepositoryError", {
+  path: Schema.String,
+  message: Schema.String,
+}) {}
+
+export class GraphError extends Schema.TaggedError<GraphError>("GraphError")(
+  "GraphError",
+  {
+    task: Schema.String,
+    message: Schema.String,
+  },
+) {}
+
+export class FilterError extends Schema.TaggedError<FilterError>("FilterError")(
+  "FilterError",
+  {
+    filter: Schema.String,
+    message: Schema.String,
+  },
+) {}
+
+export class CacheError extends Schema.TaggedError<CacheError>("CacheError")(
+  "CacheError",
+  {
+    path: Schema.String,
+    message: Schema.String,
+    retryable: Schema.Boolean,
+  },
+) {}
+
+export class TaskExecutionError extends Schema.TaggedError<TaskExecutionError>(
+  "TaskExecutionError",
+)("TaskExecutionError", {
+  task: Schema.String,
+  exitCode: Schema.Number,
+  message: Schema.String,
+}) {}
