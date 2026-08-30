@@ -701,13 +701,17 @@ const compressionLayer = Layer.succeed(CompressionService, {
 const httpLayer = Layer.succeed(HttpService, {
   request: (request) =>
     Effect.tryPromise({
-      try: async () => {
+      try: async (interruptionSignal) => {
         const controller = new AbortController();
         const timeout =
           request.timeoutMilliseconds === undefined ||
           request.timeoutMilliseconds === 0
             ? undefined
             : setTimeout(() => controller.abort(), request.timeoutMilliseconds);
+        const signal =
+          timeout === undefined
+            ? interruptionSignal
+            : AbortSignal.any([interruptionSignal, controller.signal]);
         try {
           const response = await fetch(request.url, {
             method: request.method,
@@ -719,7 +723,7 @@ const httpLayer = Layer.succeed(HttpService, {
                   ? request.body
                   : Buffer.from(request.body),
             redirect: "follow",
-            signal: controller.signal,
+            signal,
           });
           return {
             status: response.status,

@@ -209,6 +209,54 @@ describe("Effect foundation", () => {
     }
   });
 
+  it("aborts HTTP requests when their Effect is interrupted", async () => {
+    let markRequestStarted: (() => void) | undefined;
+    const requestStarted = new Promise<void>((resolve) => {
+      markRequestStarted = resolve;
+    });
+    let markRequestClosed: (() => void) | undefined;
+    const requestClosed = new Promise<void>((resolve) => {
+      markRequestClosed = resolve;
+    });
+    const server = createServer((request, response) => {
+      markRequestStarted?.();
+      request.on("aborted", () => markRequestClosed?.());
+      response.on("close", () => markRequestClosed?.());
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    try {
+      const fiber = Effect.runFork(
+        HttpService.pipe(
+          Effect.flatMap((http) =>
+            http.request({
+              url: `http://127.0.0.1:${address.port}`,
+              method: "GET",
+              timeoutMilliseconds: 0,
+            }),
+          ),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      await requestStarted;
+      await Effect.runPromise(Fiber.interrupt(fiber));
+      await Promise.race([
+        requestClosed,
+        delay(1_000).then(() => {
+          throw new Error("interrupted request remained open");
+        }),
+      ]);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("removes undefined environment overrides before spawning", async () => {
     const environmentName = "TURBO_TS_UNDEFINED_OVERRIDE_TEST";
     const previousValue = process.env[environmentName];

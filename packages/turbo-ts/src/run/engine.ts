@@ -328,7 +328,7 @@ const resolveOptions = (
   const remoteUploadTimeoutSeconds =
     parsed.remoteCacheTimeoutSeconds ??
     Number(
-      environment.TURBO_REMOTE_CACHE_TIMEOUT ??
+      environment.TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT ??
         remoteConfiguration?.uploadTimeout ??
         remoteConfiguration?.timeout ??
         30,
@@ -552,27 +552,48 @@ const taskMatchesChangedFiles = (
   node: TaskNode,
   changedFiles: ReadonlyArray<string>,
 ): boolean => {
-  const packagePrefix = `${node.package.relativeDirectory}/`;
-  const relativeFiles = changedFiles
-    .filter((path) => path.startsWith(packagePrefix))
-    .map((path) => path.slice(packagePrefix.length));
+  const rootRelativeInputPrefix = "$TURBO_ROOT$/";
+  const isRootPackage = node.package.relativeDirectory === ".";
+  const packagePrefix = isRootPackage
+    ? ""
+    : `${node.package.relativeDirectory}/`;
   const inputs = node.definition.inputs;
-  if (inputs === undefined || inputs === null || inputs.length === 0) {
-    return relativeFiles.length > 0;
-  }
-  return relativeFiles.some((file) => {
+  return changedFiles.some((repositoryRelativeFile) => {
+    const packageRelativeFile = isRootPackage
+      ? repositoryRelativeFile
+      : repositoryRelativeFile.startsWith(packagePrefix)
+        ? repositoryRelativeFile.slice(packagePrefix.length)
+        : undefined;
+    if (inputs === undefined || inputs === null || inputs.length === 0) {
+      return packageRelativeFile !== undefined;
+    }
+    const matchesInput = (pattern: string): boolean => {
+      const rootRelative = pattern.startsWith(rootRelativeInputPrefix);
+      const file = rootRelative ? repositoryRelativeFile : packageRelativeFile;
+      return (
+        file !== undefined &&
+        matchesGlob(
+          file,
+          rootRelative
+            ? pattern.slice(rootRelativeInputPrefix.length)
+            : pattern,
+        )
+      );
+    };
     let selected = false;
     for (const input of inputs) {
       if (typeof input !== "string") {
-        if (input.withDefaults !== false) selected = true;
-        if ((input.globs ?? []).some((glob) => matchesGlob(file, glob))) {
+        if (input.withDefaults !== false && packageRelativeFile !== undefined) {
+          selected = true;
+        }
+        if ((input.globs ?? []).some(matchesInput)) {
           selected = true;
         }
       } else if (input === "$TURBO_DEFAULT$") {
-        selected = true;
+        if (packageRelativeFile !== undefined) selected = true;
       } else if (input.startsWith("!")) {
-        if (matchesGlob(file, input.slice(1))) selected = false;
-      } else if (matchesGlob(file, input)) {
+        if (matchesInput(input.slice(1))) selected = false;
+      } else if (matchesInput(input)) {
         selected = true;
       }
     }
@@ -1378,16 +1399,12 @@ export const executeRun = (
               ),
             );
           };
-          const owners = new Set(
-            members.filter((id) => graph.nodes.get(id)!.with.length > 0),
-          );
           const targets = new Set(
             members.flatMap((id) => graph.nodes.get(id)!.with),
           );
           const background = members.filter(
             (id) =>
               targets.has(id) &&
-              !owners.has(id) &&
               graph.nodes.get(id)!.definition.persistent === true,
           );
           const foreground = members.filter((id) => !background.includes(id));

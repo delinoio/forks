@@ -19,6 +19,7 @@ const expectedRuntimeDependencies = {
   "@effect/printer-ansi": "0.51.0",
   effect: "3.22.1",
   minimatch: "10.2.6",
+  "smol-toml": "1.8.0",
   yaml: "2.8.3",
 } as const;
 

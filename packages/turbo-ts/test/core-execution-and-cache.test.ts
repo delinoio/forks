@@ -29,6 +29,7 @@ import { evidenceId } from "../src/compatibility/ledger.js";
 import { loadRootConfiguration } from "../src/config/runtime.js";
 import { nodeFoundationLayer } from "../src/effect/node-layer.js";
 import { ProcessService } from "../src/effect/services.js";
+import { buildTaskGraph } from "../src/graph/task-graph.js";
 import { discoverRepository } from "../src/repository/model.js";
 
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -210,6 +211,75 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("reads uv project names and dependencies from their TOML sections", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, unknown>;
+      };
+      configuration.futureFlags = { experimentalPythonWorkspaces: true };
+      configuration.tasks.build = { dependsOn: ["^build"] };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${directory}/python/app`, { recursive: true });
+      await mkdir(`${directory}/python/library`, { recursive: true });
+      await writeFile(
+        `${directory}/python/app/pyproject.toml`,
+        `[tool.uv]\n` +
+          `dev-dependencies = ["types-requests>=2"]\n` +
+          `\n` +
+          `[[tool.uv.index]]\n` +
+          `name = "internal"\n` +
+          `url = "https://example.test/simple"\n` +
+          `\n` +
+          `[project]\n` +
+          `name = "app"\n` +
+          `dependencies = ["library>=1", "requests>=2"]\n` +
+          `\n` +
+          `[project.optional-dependencies]\n` +
+          `test = ["pytest>=8"]\n` +
+          `\n` +
+          `[dependency-groups]\n` +
+          `dev = ["ruff>=1", { include-group = "lint" }]\n` +
+          `lint = ["mypy>=1"]\n`,
+      );
+      await writeFile(
+        `${directory}/python/library/pyproject.toml`,
+        `[project]\nname = "library"\ndependencies = []\n`,
+      );
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const app = model.packagesByName.get("app");
+      expect(app?.dependencyNames).toEqual([
+        "library",
+        "mypy",
+        "pytest",
+        "requests",
+        "ruff",
+        "types-requests",
+      ]);
+      expect(app?.internalDependencies).toEqual(["library"]);
+      expect(model.packagesByName.has("internal")).toBe(false);
+      expect(
+        [
+          ...buildTaskGraph(model, [app!], ["build"], false).nodes.keys(),
+        ].sort(),
+      ).toEqual(["app#build", "library#build"]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("includes pass-through arguments in task hashes", async () => {
     const directory = await makeFixture();
@@ -568,6 +638,65 @@ describe("core CLI execution", () => {
         "1",
       );
       expect(await readFile(`${packageDirectory}/owner.done`, "utf8")).toBe(
+        "1",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("backgrounds persistent companions that own nested companions", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.check = { cache: false, with: ["serve"] };
+      configuration.tasks.serve = {
+        cache: false,
+        persistent: true,
+        with: ["database"],
+      };
+      configuration.tasks.database = { cache: false, persistent: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.database =
+        "node -e \"require('node:fs').writeFileSync('database.ready','1'); setTimeout(()=>process.exit(9),3000); setInterval(()=>{},1000)\"";
+      manifest.scripts.serve =
+        "node -e \"const fs=require('node:fs'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('database.ready')){fs.writeFileSync('serve.ready','1'); clearInterval(timer); setInterval(()=>{},1000)}else if(Date.now()-started>2000){process.exit(8)}},10); setTimeout(()=>process.exit(8),3000)\"";
+      manifest.scripts.check =
+        "node -e \"const fs=require('node:fs'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('database.ready')&&fs.existsSync('serve.ready')){fs.writeFileSync('check.done','1'); clearInterval(timer)}else if(Date.now()-started>2000){process.exit(7)}},10)\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--concurrency=1",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(await readFile(`${packageDirectory}/database.ready`, "utf8")).toBe(
+        "1",
+      );
+      expect(await readFile(`${packageDirectory}/serve.ready`, "utf8")).toBe(
+        "1",
+      );
+      expect(await readFile(`${packageDirectory}/check.done`, "utf8")).toBe(
         "1",
       );
     } finally {
@@ -1118,9 +1247,22 @@ describe("core CLI execution", () => {
       };
       configuration.futureFlags = { affectedUsingTaskInputs: true };
       configuration.tasks.build!.inputs = ["$TURBO_DEFAULT$", "!README.md"];
+      configuration.tasks["//#root-check"] = {
+        inputs: ["$TURBO_ROOT$/packages/**"],
+      };
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const rootManifestPath = `${directory}/package.json`;
+      const rootManifest = JSON.parse(
+        await readFile(rootManifestPath, "utf8"),
+      ) as { scripts: Record<string, string> };
+      rootManifest.scripts["root-check"] =
+        "node -e \"console.log('root affected check')\"";
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, null, 2)}\n`,
       );
       await writeFile(`${directory}/packages/library/README.md`, "first\n");
       for (const args of [
@@ -1154,6 +1296,22 @@ describe("core CLI execution", () => {
       expect(result.exitCode).toBe(0);
       expect(result.stdout).not.toContain("library build");
       expect(result.stdout).not.toContain("app build");
+      const rootResult = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "//#root-check",
+          "--cwd",
+          directory,
+          "--affected",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(rootResult.exitCode).toBe(0);
+      expect(rootResult.stdout).toContain("root affected check");
       await writeFile(
         `${directory}/packages/library/source.txt`,
         "changed library input\n",
@@ -1737,6 +1895,53 @@ describe("cache interoperability and safety", () => {
       await rm(directory, { force: true, recursive: true });
     }
   });
+
+  it("reads the upload-specific remote cache timeout environment variable", async () => {
+    const directory = await makeFixture();
+    let uploads = 0;
+    const server = createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        uploads += 1;
+        setTimeout(() => {
+          response.writeHead(201);
+          response.end();
+        }, 40);
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    try {
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--cache=remote:w",
+        ],
+        repositoryRoot,
+        {
+          TURBO_API: `http://127.0.0.1:${address.port}`,
+          TURBO_REMOTE_CACHE_TIMEOUT: "0.01",
+          TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: "1",
+        },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(uploads).toBe(1);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
 
   it(evidenceId.coreDifferential, async () => {
     const directory = await makeFixture();

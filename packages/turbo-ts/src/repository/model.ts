@@ -1,4 +1,5 @@
 import { Effect } from "effect";
+import { parse as parseToml } from "smol-toml";
 import { parse as parseYaml } from "yaml";
 import type { LoadedRootConfiguration } from "../config/runtime.js";
 import { loadPackageConfiguration } from "../config/runtime.js";
@@ -491,16 +492,46 @@ const cargoPackageMetadata = (
     }
   });
 
-const pythonDependencyNames = (source: string): ReadonlyArray<string> => {
+interface PythonProjectMetadata {
+  readonly name?: string;
+  readonly dependencyNames: ReadonlyArray<string>;
+}
+
+const recordValue = (
+  value: unknown,
+): Readonly<Record<string, unknown>> | undefined =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Readonly<Record<string, unknown>>)
+    : undefined;
+
+const stringArrayValue = (value: unknown): ReadonlyArray<string> =>
+  Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string")
+    : [];
+
+const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
+  const document = recordValue(parseToml(source));
+  const project = recordValue(document?.project);
+  const optionalDependencies = recordValue(project?.["optional-dependencies"]);
+  const dependencyGroups = recordValue(document?.["dependency-groups"]);
+  const tool = recordValue(document?.tool);
+  const uv = recordValue(tool?.uv);
+  const requirements = [
+    ...stringArrayValue(project?.dependencies),
+    ...Object.values(optionalDependencies ?? {}).flatMap(stringArrayValue),
+    ...Object.values(dependencyGroups ?? {}).flatMap(stringArrayValue),
+    ...stringArrayValue(uv?.["dev-dependencies"]),
+  ];
   const names = new Set<string>();
-  for (const match of source.matchAll(
-    /["']([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?(?:[ <>=!~;]|["'])/g,
-  )) {
-    const name = match[1];
+  for (const requirement of requirements) {
+    const name = /^([A-Za-z0-9][A-Za-z0-9_.-]*)/.exec(requirement.trim())?.[1];
     if (name !== undefined)
       names.add(name.toLowerCase().replace(/[_.]+/g, "-"));
   }
-  return [...names].sort();
+  return {
+    name: typeof project?.name === "string" ? project.name : undefined,
+    dependencyNames: [...names].sort(),
+  };
 };
 
 export const discoverRepository = (
@@ -636,10 +667,20 @@ export const discoverRepository = (
               candidate.manager === "cargo"
                 ? yield* cargoPackageMetadata(path)
                 : undefined;
+            let pythonMetadata: PythonProjectMetadata | undefined;
+            if (candidate.manager === "uv") {
+              try {
+                pythonMetadata = parsePythonProjectMetadata(source);
+              } catch (cause) {
+                return yield* Effect.fail(
+                  new RepositoryError({ path, message: String(cause) }),
+                );
+              }
+            }
             const name =
               candidate.manager === "cargo"
                 ? cargoMetadata?.name
-                : /^name\s*=\s*["']([^"']+)["']/m.exec(source)?.[1];
+                : pythonMetadata?.name;
             if (name === undefined) {
               continue;
             }
@@ -653,7 +694,7 @@ export const discoverRepository = (
               dependencyNames:
                 candidate.manager === "cargo"
                   ? (cargoMetadata?.dependencyNames ?? [])
-                  : pythonDependencyNames(source),
+                  : (pythonMetadata?.dependencyNames ?? []),
               tasks: (rootConfiguration.value.tasks ?? {}) as Readonly<
                 Record<string, Pipeline>
               >,
