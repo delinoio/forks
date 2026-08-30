@@ -13,7 +13,7 @@ import {
   createTarArchive,
   parseTarArchive,
 } from "./archive.js";
-import { restoreArchiveEntries } from "./restore.js";
+import { type CacheRestoreScope, restoreArchiveEntries } from "./restore.js";
 
 export interface RemoteCacheOptions {
   readonly apiUrl: string;
@@ -96,7 +96,7 @@ export const restoreRemoteCache = (
   root: string,
   options: RemoteCacheOptions,
   hash: string,
-  pathsToClear: ReadonlyArray<string> = [],
+  scope: CacheRestoreScope,
 ): Effect.Effect<
   boolean,
   CacheError,
@@ -168,7 +168,7 @@ export const restoreRemoteCache = (
     } catch (cause) {
       return yield* Effect.fail(remoteError(url, cause));
     }
-    yield* restoreArchiveEntries(root, entries, pathsToClear);
+    yield* restoreArchiveEntries(root, entries, scope);
     return true;
   });
 

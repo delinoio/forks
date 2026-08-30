@@ -475,10 +475,22 @@ const polyglotScripts = (
 
 interface CargoPackageMetadata {
   readonly name: string;
+  readonly dependencies: ReadonlyArray<CargoDependencyMetadata>;
   readonly dependencyNames: ReadonlyArray<string>;
   readonly entrypointNames: ReadonlyArray<string>;
   readonly targetDirectory?: string;
   readonly workspaceDirectory?: string;
+}
+
+interface CargoDependencyMetadata {
+  readonly name: string;
+  readonly path?: string;
+  readonly source?: string;
+}
+
+interface RepositoryPackageDraft
+  extends Omit<RepositoryPackage, "internalDependencies"> {
+  readonly cargoDependencies: ReadonlyArray<CargoDependencyMetadata>;
 }
 
 export const parseCargoMetadata = (
@@ -491,7 +503,11 @@ export const parseCargoMetadata = (
     readonly packages?: ReadonlyArray<{
       readonly name?: unknown;
       readonly manifest_path?: unknown;
-      readonly dependencies?: ReadonlyArray<{ readonly name?: unknown }>;
+      readonly dependencies?: ReadonlyArray<{
+        readonly name?: unknown;
+        readonly path?: unknown;
+        readonly source?: unknown;
+      }>;
       readonly targets?: ReadonlyArray<{
         readonly kind?: unknown;
         readonly name?: unknown;
@@ -509,14 +525,37 @@ export const parseCargoMetadata = (
   ) {
     return undefined;
   }
+  const dependencies = [
+    ...new Map(
+      (packageMetadata.dependencies ?? []).flatMap((dependency) => {
+        if (typeof dependency.name !== "string") return [];
+        const value: CargoDependencyMetadata = {
+          name: dependency.name,
+          ...(typeof dependency.path === "string"
+            ? { path: normalizePath(dependency.path) }
+            : {}),
+          ...(typeof dependency.source === "string"
+            ? { source: dependency.source }
+            : {}),
+        };
+        return [
+          [
+            `${value.name}\0${value.source ?? ""}\0${value.path ?? ""}`,
+            value,
+          ] as const,
+        ];
+      }),
+    ).values(),
+  ].sort((left, right) =>
+    `${left.name}\0${left.source ?? ""}\0${left.path ?? ""}`.localeCompare(
+      `${right.name}\0${right.source ?? ""}\0${right.path ?? ""}`,
+    ),
+  );
   return {
     name: packageMetadata.name,
+    dependencies,
     dependencyNames: [
-      ...new Set(
-        (packageMetadata.dependencies ?? []).flatMap((dependency) =>
-          typeof dependency.name === "string" ? [dependency.name] : [],
-        ),
-      ),
+      ...new Set(dependencies.map((dependency) => dependency.name)),
     ].sort(),
     entrypointNames: [
       ...new Set(
@@ -781,6 +820,8 @@ export const discoverRepository = (
             relativeDirectory: relativePath(root, directory),
             manager: managerIdentity.name,
             scripts: manifest.scripts ?? {},
+            cargoDependencies:
+              [] satisfies ReadonlyArray<CargoDependencyMetadata>,
             dependencyNames: dependencyNames(manifest),
             tasks,
             manifest,
@@ -921,6 +962,7 @@ export const discoverRepository = (
                 candidate.manager,
                 cargoMetadata?.entrypointNames ?? [],
               ),
+              cargoDependencies: cargoMetadata?.dependencies ?? [],
               dependencyNames:
                 candidate.manager === "cargo"
                   ? (cargoMetadata?.dependencyNames ?? [])
@@ -936,7 +978,7 @@ export const discoverRepository = (
         }),
       { concurrency: 1 },
     );
-    const drafts = [
+    const drafts: ReadonlyArray<RepositoryPackageDraft> = [
       ...javascriptDrafts,
       ...polyglotDrafts.filter(
         (entry): entry is NonNullable<typeof entry> => entry !== undefined,
@@ -971,8 +1013,16 @@ export const discoverRepository = (
     const draftsByName = new Map(
       drafts.map((packageDraft) => [packageDraft.name, packageDraft] as const),
     );
+    const cargoDraftsByDirectory = new Map(
+      drafts
+        .filter((packageDraft) => packageDraft.manager === "cargo")
+        .map(
+          (packageDraft) =>
+            [normalizePath(packageDraft.directory), packageDraft] as const,
+        ),
+    );
     const packages: ReadonlyArray<RepositoryPackage> = drafts
-      .map((packageDraft) => ({
+      .map(({ cargoDependencies, ...packageDraft }) => ({
         ...packageDraft,
         internalDependencies:
           packageDraft.manager === "uv"
@@ -981,7 +1031,22 @@ export const discoverRepository = (
                 return resolved === undefined ? [] : [resolved];
               })
             : packageDraft.manager === "cargo"
-              ? packageDraft.dependencyNames.filter((name) => names.has(name))
+              ? cargoDependencies.flatMap((dependency) => {
+                  if (
+                    dependency.source !== undefined ||
+                    dependency.path === undefined
+                  ) {
+                    return [];
+                  }
+                  const target = cargoDraftsByDirectory.get(dependency.path);
+                  return target !== undefined &&
+                    target.name === dependency.name &&
+                    packageDraft.workspaceDirectory !== undefined &&
+                    target.workspaceDirectory ===
+                      packageDraft.workspaceDirectory
+                    ? [target.name]
+                    : [];
+                })
               : javascriptInternalDependencies(
                   packageDraft.directory,
                   packageDraft.manifest,

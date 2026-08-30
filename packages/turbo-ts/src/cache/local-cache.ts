@@ -12,7 +12,7 @@ import {
   createTarArchive,
   parseTarArchive,
 } from "./archive.js";
-import { restoreArchiveEntries } from "./restore.js";
+import { type CacheRestoreScope, restoreArchiveEntries } from "./restore.js";
 
 export type CacheWriteEntry = ArchiveEntry;
 
@@ -62,7 +62,7 @@ export const restoreLocalCache = (
   root: string,
   options: LocalCacheOptions,
   hash: string,
-  pathsToClear: ReadonlyArray<string> = [],
+  scope: CacheRestoreScope,
 ): Effect.Effect<boolean, CacheError, FileSystemService | CompressionService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -98,7 +98,7 @@ export const restoreLocalCache = (
         } catch (cause) {
           return yield* Effect.fail(cacheError(paths.archive, cause));
         }
-        yield* restoreArchiveEntries(root, entries, pathsToClear);
+        yield* restoreArchiveEntries(root, entries, scope);
       }),
     );
     if (outcome._tag === "Left") {

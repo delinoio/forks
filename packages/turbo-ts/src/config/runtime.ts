@@ -617,7 +617,11 @@ export const loadPackageConfiguration = (
         path,
       ) as WorkspaceSchema;
     });
-    if (workspace.extends === null || !workspace.extends.includes("//")) {
+    if (
+      workspace.extends === null ||
+      workspace.extends.length !== 1 ||
+      workspace.extends[0] !== "//"
+    ) {
       return yield* Effect.fail(
         new ConfigurationError({
           path,

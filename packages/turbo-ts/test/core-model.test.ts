@@ -347,6 +347,7 @@ describe("core repository model", () => {
       ),
     ).toEqual({
       name: "app",
+      dependencies: [{ name: "util" }],
       dependencyNames: ["util"],
       entrypointNames: ["app"],
       targetDirectory: "/repo/target",

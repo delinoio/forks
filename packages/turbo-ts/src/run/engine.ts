@@ -10,6 +10,7 @@ import {
   restoreRemoteCache,
   writeRemoteCache,
 } from "../cache/remote-cache.js";
+import type { CacheRestoreScope } from "../cache/restore.js";
 import {
   type LoadedRootConfiguration,
   loadRootConfiguration,
@@ -1058,6 +1059,46 @@ const collectCacheEntries = (
     );
   });
 
+const cacheRestoreScope = (
+  repository: RepositoryModel,
+  nodes: ReadonlyArray<TaskNode>,
+  logPath: string,
+  pathsToClear: ReadonlyArray<string>,
+): CacheRestoreScope => {
+  const rootOutputPrefix = "$TURBO_ROOT$/";
+  const allowedPathGroups = nodes.flatMap((node) => {
+    const outputPatterns = node.definition.outputs ?? [];
+    const packagePatterns = outputPatterns.filter(
+      (pattern) => !pattern.replace(/^!/, "").startsWith(rootOutputPrefix),
+    );
+    const rootPatterns = outputPatterns.flatMap((pattern) => {
+      const negative = pattern.startsWith("!");
+      const value = negative ? pattern.slice(1) : pattern;
+      return value.startsWith(rootOutputPrefix)
+        ? [`${negative ? "!" : ""}${value.slice(rootOutputPrefix.length)}`]
+        : [];
+    });
+    return [
+      ...(packagePatterns.length === 0
+        ? []
+        : [
+            {
+              directory: relativePath(repository.root, node.package.directory),
+              patterns: packagePatterns,
+            },
+          ]),
+      ...(rootPatterns.length === 0
+        ? []
+        : [{ directory: ".", patterns: rootPatterns }]),
+    ];
+  });
+  allowedPathGroups.push({
+    directory: ".",
+    patterns: [relativePath(repository.root, logPath)],
+  });
+  return { pathsToClear, allowedPathGroups };
+};
+
 const shouldReplayOutput = (
   mode: OutputLogs | undefined,
   cacheHit: boolean,
@@ -1157,6 +1198,15 @@ const executeTask = (
       maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
       maxSizeBytes: options.cacheMaxSizeBytes,
     };
+    const executionDirectory =
+      scope.kind === "cargo-workspace"
+        ? scope.directory
+        : node.package.directory;
+    const logPath = joinPath(
+      executionDirectory,
+      ".turbo",
+      `turbo-${node.task}.log`,
+    );
     const pathsToClear =
       cacheable &&
       !options.force &&
@@ -1165,13 +1215,19 @@ const executeTask = (
             relativePath(repository.root, path),
           )
         : [];
+    const restoreScope = cacheRestoreScope(
+      repository,
+      cacheNodes,
+      logPath,
+      pathsToClear,
+    );
     let cacheHit = false;
     if (cacheable && !options.force && options.cachePolicy.localRead) {
       cacheHit = yield* restoreLocalCache(
         repository.root,
         localOptions,
         hash.hash,
-        pathsToClear,
+        restoreScope,
       );
     }
     if (
@@ -1185,7 +1241,7 @@ const executeTask = (
         repository.root,
         options.remote,
         hash.hash,
-        pathsToClear,
+        restoreScope,
       ).pipe(
         Effect.catchAll((error) =>
           terminal
@@ -1202,15 +1258,6 @@ const executeTask = (
         ),
       );
     }
-    const executionDirectory =
-      scope.kind === "cargo-workspace"
-        ? scope.directory
-        : node.package.directory;
-    const logPath = joinPath(
-      executionDirectory,
-      ".turbo",
-      `turbo-${node.task}.log`,
-    );
     if (cacheHit) {
       if (outputMode !== "none" && showHashEvent) {
         yield* terminal.writeStdout(
@@ -1843,95 +1890,131 @@ export const executeRun = (
               targets.has(id) &&
               graph.nodes.get(id)!.definition.persistent === true,
           );
+          const backgroundSet = new Set(background);
           const foreground = members.filter((id) => !background.includes(id));
           return Effect.scoped(
             Effect.gen(function* () {
-              const backgroundFibers = yield* Effect.forEach(background, (id) =>
-                Effect.forkScoped(runNode(id)),
-              );
-              if (background.length > 0) yield* Effect.yieldNow();
-              const foregroundCompletion = Effect.gen(function* () {
-                const remaining = new Set(foreground);
-                const results: Array<TaskOutcome> = [];
-                while (remaining.size > 0) {
-                  const readyForeground = [...remaining].filter(
-                    (id) =>
-                      options.parallel ||
-                      graph.nodes
-                        .get(id)!
-                        .dependencies.filter((dependency) =>
-                          memberSet.has(dependency),
-                        )
-                        .every((dependency) => groupOutcomes.has(dependency)),
-                  );
-                  if (readyForeground.length === 0) {
-                    throw new RepositoryError({
-                      path: options.root,
-                      message: "scheduler deadlock inside with group",
-                    });
-                  }
-                  const completed = yield* Effect.forEach(
-                    readyForeground,
-                    (id) => foregroundSemaphore.withPermits(1)(runNode(id)),
-                    { concurrency: "unbounded" },
-                  );
-                  for (const outcome of completed) {
-                    remaining.delete(outcome.id);
-                    groupOutcomes.set(outcome.id, outcome);
-                    results.push(outcome);
-                  }
-                }
-                return results;
-              }).pipe(
-                Effect.map((results) => ({
-                  _tag: "ForegroundComplete" as const,
-                  results,
-                })),
-              );
-              if (backgroundFibers.length === 0) {
-                return (yield* foregroundCompletion).results;
-              }
-              const backgroundFailures = backgroundFibers.map((fiber) =>
-                Fiber.join(fiber).pipe(
-                  Effect.map((outcome) => ({
-                    _tag: "BackgroundFailed" as const,
-                    outcome:
-                      outcome.exitCode === 0
-                        ? { ...outcome, exitCode: 1 }
-                        : outcome,
-                  })),
-                ),
-              );
-              const firstBackgroundFailure = backgroundFailures
-                .slice(1)
-                .reduce(
-                  (left, right) => Effect.race(left, right),
-                  backgroundFailures[0]!,
-                );
-              const completion = yield* Effect.race(
-                foregroundCompletion,
-                firstBackgroundFailure,
-              );
-              if (completion._tag === "BackgroundFailed") {
-                return members.map((id) =>
-                  id === completion.outcome.id
-                    ? completion.outcome
-                    : {
-                        id,
-                        exitCode: 1,
-                        skipped: true,
-                      },
-                );
-              }
-              return [
-                ...completion.results,
-                ...background.map((id) => ({
+              const backgroundFibers: Array<{
+                readonly id: string;
+                readonly fiber: Fiber.RuntimeFiber<TaskOutcome, never>;
+              }> = [];
+              const startedBackground = new Set<string>();
+              const remaining = new Set(foreground);
+              const results: Array<TaskOutcome> = [];
+              const hasStartedCompanions = (id: string): boolean =>
+                graph.nodes
+                  .get(id)!
+                  .with.filter((companion) => backgroundSet.has(companion))
+                  .every((companion) => startedBackground.has(companion));
+              const backgroundOutcomes = (): ReadonlyArray<TaskOutcome> =>
+                backgroundFibers.map(({ id }) => ({
                   id,
                   exitCode: 0,
                   hash: hashes.get(id)!.hash,
                   skipped: false,
-                })),
-              ];
+                }));
+              const firstBackgroundFailure = () => {
+                const failures = backgroundFibers.map(({ fiber }) =>
+                  Fiber.join(fiber).pipe(
+                    Effect.map((outcome) => ({
+                      _tag: "BackgroundFailed" as const,
+                      outcome:
+                        outcome.exitCode === 0
+                          ? { ...outcome, exitCode: 1 }
+                          : outcome,
+                    })),
+                  ),
+                );
+                return failures
+                  .slice(1)
+                  .reduce(
+                    (left, right) => Effect.race(left, right),
+                    failures[0]!,
+                  );
+              };
+              while (remaining.size > 0) {
+                while (true) {
+                  const readyBackground = background.filter((id) => {
+                    if (startedBackground.has(id)) return false;
+                    const node = graph.nodes.get(id)!;
+                    return (
+                      node.dependencies
+                        .filter((dependency) => memberSet.has(dependency))
+                        .every((dependency) => groupOutcomes.has(dependency)) &&
+                      hasStartedCompanions(id)
+                    );
+                  });
+                  if (readyBackground.length === 0) break;
+                  const started = yield* Effect.forEach(
+                    readyBackground,
+                    (id) =>
+                      Effect.forkScoped(runNode(id)).pipe(
+                        Effect.map((fiber) => ({ id, fiber })),
+                      ),
+                    { concurrency: "unbounded" },
+                  );
+                  backgroundFibers.push(...started);
+                  for (const { id } of started) startedBackground.add(id);
+                  yield* Effect.yieldNow();
+                }
+                const readyForeground = [...remaining].filter((id) => {
+                  const dependenciesReady =
+                    options.parallel ||
+                    graph.nodes
+                      .get(id)!
+                      .dependencies.filter((dependency) =>
+                        memberSet.has(dependency),
+                      )
+                      .every((dependency) => groupOutcomes.has(dependency));
+                  return dependenciesReady && hasStartedCompanions(id);
+                });
+                if (readyForeground.length === 0) {
+                  throw new RepositoryError({
+                    path: options.root,
+                    message: "scheduler deadlock inside with group",
+                  });
+                }
+                const foregroundCompletion = Effect.forEach(
+                  readyForeground.slice(0, options.concurrency),
+                  (id) => foregroundSemaphore.withPermits(1)(runNode(id)),
+                  { concurrency: "unbounded" },
+                ).pipe(
+                  Effect.map((outcome) => ({
+                    _tag: "ForegroundComplete" as const,
+                    outcomes: outcome,
+                  })),
+                );
+                const completion =
+                  backgroundFibers.length === 0
+                    ? yield* foregroundCompletion
+                    : yield* Effect.race(
+                        foregroundCompletion,
+                        firstBackgroundFailure(),
+                      );
+                if (completion._tag === "BackgroundFailed") {
+                  return members.map((id) =>
+                    id === completion.outcome.id
+                      ? completion.outcome
+                      : {
+                          id,
+                          exitCode: 1,
+                          skipped: true,
+                        },
+                  );
+                }
+                for (const outcome of completion.outcomes) {
+                  remaining.delete(outcome.id);
+                  groupOutcomes.set(outcome.id, outcome);
+                  results.push(outcome);
+                }
+                if (
+                  options.continueMode === "never" &&
+                  completion.outcomes.some((outcome) => outcome.exitCode !== 0)
+                ) {
+                  return [...results, ...backgroundOutcomes()];
+                }
+              }
+              return [...results, ...backgroundOutcomes()];
             }),
           );
         },

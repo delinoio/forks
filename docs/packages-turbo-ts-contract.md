@@ -100,10 +100,14 @@ to the run's concurrency limit.
 
 Workspace task overrides merge with their effective package-qualified root
 definition and the merged task invariants are revalidated before execution.
+Workspace configuration inheritance accepts only the exact `["//"]` parent
+list.
 Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
 reject malformed entries. Remote artifact routes preserve configured API path
 prefixes, remote restoration failures warn and fall back to task execution, and
 remote upload failures warn without changing a successful task outcome.
+Cache restoration validates every archive entry against the current task's
+declared output globs or exact log path before clearing or writing files.
 Companion task hashes participate in the owning task's cache key. Local eviction
 accepts week-based ages, runs before cache restoration only when local cache
 reads or writes are enabled, and counts archive and sidecar bytes, including
@@ -119,12 +123,14 @@ require declared workspace or version-range compatibility, or a `file:` or
 `check`, `lint`, and `format` tasks execute once per Cargo workspace and bypass
 caching when any grouped member disables it; filtered and package-qualified
 runs retain package targeting. Grouped Cargo commands receive the union of all
-member task environments. Cargo `run` and `dev` tasks are exposed only for
-binary crates, and pass-through arguments are forwarded to Cargo without an
-implicit target-argument separator. Cargo builds with pass-through arguments
-that select an alternate output layout or an unmodeled library, binary,
-example, test, or benchmark target bypass caching until those outputs are
-modeled explicitly.
+member task environments. Cargo package-graph edges require a source-free
+metadata dependency path that resolves to the named member in the same
+workspace; registry and Git dependencies remain external. Cargo `run` and
+`dev` tasks are exposed only for binary crates, and pass-through arguments are
+forwarded to Cargo without an implicit target-argument separator. Cargo builds
+with pass-through arguments that select an alternate output layout or an
+unmodeled library, binary, example, test, or benchmark target bypass caching
+until those outputs are modeled explicitly.
 
 Structured task input globs apply ordered inclusion and negation consistently
 to task hashing and task-aware affected selection. Task-aware Git filters

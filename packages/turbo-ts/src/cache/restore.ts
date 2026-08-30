@@ -1,4 +1,5 @@
 import { Effect } from "effect";
+import { selectByGlobs } from "../core/glob.js";
 import {
   isPathContained,
   joinPath,
@@ -11,6 +12,31 @@ import type { ArchiveEntry } from "./archive.js";
 
 const restoreError = (path: string, cause: unknown): CacheError =>
   new CacheError({ path, message: String(cause), retryable: false });
+
+export interface CacheRestorePathGroup {
+  readonly directory: string;
+  readonly patterns: ReadonlyArray<string>;
+}
+
+export interface CacheRestoreScope {
+  readonly pathsToClear: ReadonlyArray<string>;
+  readonly allowedPathGroups: ReadonlyArray<CacheRestorePathGroup>;
+}
+
+const isAllowedEntry = (
+  root: string,
+  destination: string,
+  groups: ReadonlyArray<CacheRestorePathGroup>,
+): boolean =>
+  groups.some((group) => {
+    const directory = joinPath(root, group.directory);
+    return (
+      isPathContained(root, directory) &&
+      isPathContained(directory, destination) &&
+      selectByGlobs([relativePath(directory, destination)], group.patterns)
+        .length > 0
+    );
+  });
 
 const prepareParentDirectory = (
   root: string,
@@ -48,7 +74,7 @@ const prepareParentDirectory = (
 export const restoreArchiveEntries = (
   root: string,
   entries: ReadonlyArray<ArchiveEntry>,
-  pathsToClear: ReadonlyArray<string> = [],
+  scope: CacheRestoreScope,
 ): Effect.Effect<void, CacheError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -62,8 +88,16 @@ export const restoreArchiveEntries = (
           restoreError(destination, "archive path escapes repository"),
         );
       }
+      if (!isAllowedEntry(root, destination, scope.allowedPathGroups)) {
+        return yield* Effect.fail(
+          restoreError(
+            destination,
+            "archive path is not a declared task output",
+          ),
+        );
+      }
     }
-    for (const path of pathsToClear) {
+    for (const path of scope.pathsToClear) {
       const destination = joinPath(root, path);
       if (path === "" || path === "." || !isPathContained(root, destination)) {
         return yield* Effect.fail(
