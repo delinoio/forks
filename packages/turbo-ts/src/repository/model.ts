@@ -61,6 +61,7 @@ export interface RepositoryModel {
   readonly managerVersion?: string;
   readonly rootManifest: PackageManifest;
   readonly rootConfiguration: LoadedRootConfiguration;
+  readonly rootPackage: RepositoryPackage;
   readonly lockfile?: string;
   readonly lockfileData?: ParsedLockfile;
   readonly packages: ReadonlyArray<RepositoryPackage>;
@@ -174,12 +175,14 @@ const stringRecord = (
     : undefined;
 
 export const managerFromIdentity = (
-  identity: string | undefined,
-): { readonly name: PackageManagerName; readonly version?: string } => {
-  const [name, version] = identity?.split("@") ?? [];
+  identity: string,
+):
+  | { readonly name: PackageManagerName; readonly version?: string }
+  | undefined => {
+  const [name, version] = identity.split("@");
   return packageManagerNames.includes(name as PackageManagerName)
     ? { name: name as PackageManagerName, version }
-    : { name: "npm" };
+    : undefined;
 };
 
 const discoverManager = (
@@ -191,7 +194,18 @@ const discoverManager = (
   FileSystemService
 > =>
   Effect.gen(function* () {
-    if (identity !== undefined) return managerFromIdentity(identity);
+    if (identity !== undefined) {
+      const manager = managerFromIdentity(identity);
+      if (manager === undefined) {
+        return yield* Effect.fail(
+          new RepositoryError({
+            path: joinPath(root, "package.json"),
+            message: `unsupported package manager identity: ${identity}`,
+          }),
+        );
+      }
+      return manager;
+    }
     const fileSystem = yield* FileSystemService;
     const markers: ReadonlyArray<
       readonly [PackageManagerName, ReadonlyArray<string>]
@@ -584,6 +598,27 @@ export const discoverRepository = (
         ),
       }))
       .sort((left, right) => left.name.localeCompare(right.name));
+    const rootTasks = Object.fromEntries(
+      Object.entries(rootConfiguration.value.tasks ?? {}).flatMap(
+        ([name, definition]) =>
+          name.startsWith("//#") && name.length > 3
+            ? [[name.slice(3), definition] as const]
+            : [],
+      ),
+    );
+    const rootPackage: RepositoryPackage = {
+      name: "//",
+      directory: root,
+      relativeDirectory: ".",
+      manager: managerIdentity.name,
+      scripts: rootManifest.scripts ?? {},
+      dependencyNames: dependencyNames(rootManifest),
+      internalDependencies: dependencyNames(rootManifest).filter((name) =>
+        names.has(name),
+      ),
+      tasks: rootTasks,
+      manifest: rootManifest,
+    };
     const lockfile = yield* findLockfile(root, managerIdentity.name);
     let lockfileData: ParsedLockfile | undefined;
     if (lockfile !== undefined) {
@@ -610,15 +645,22 @@ export const discoverRepository = (
       managerVersion: managerIdentity.version,
       rootManifest,
       rootConfiguration,
+      rootPackage,
       lockfile,
       lockfileData,
       packages,
-      packagesByName: new Map(packages.map((entry) => [entry.name, entry])),
+      packagesByName: new Map<string, RepositoryPackage>([
+        [rootPackage.name, rootPackage],
+        ...packages.map((entry) => [entry.name, entry] as const),
+      ]),
     };
   });
 
 export const listRepositoryFiles = (
   directory: string,
+  options: {
+    readonly ignoredDirectories?: ReadonlySet<string>;
+  } = {},
 ): Effect.Effect<ReadonlyArray<string>, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -635,7 +677,10 @@ export const listRepositoryFiles = (
           ),
         );
       for (const entry of entries) {
-        if (entry.kind === "directory" && !ignoredDirectories.has(entry.name)) {
+        if (
+          entry.kind === "directory" &&
+          !(options.ignoredDirectories ?? ignoredDirectories).has(entry.name)
+        ) {
           pending.push(joinPath(current, entry.name));
         } else if (entry.kind === "file") {
           files.push(joinPath(current, entry.name));

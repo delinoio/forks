@@ -1,4 +1,8 @@
-import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import {
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+  spawn,
+} from "node:child_process";
 import {
   createHash,
   createHmac,
@@ -149,10 +153,11 @@ export const makeWithTemporaryDirectory =
     );
 
 interface ScopedChildProcess {
-  readonly child: ChildProcessWithoutNullStreams;
+  readonly child: ChildProcess;
   readonly closed: Promise<void>;
   readonly isClosed: () => boolean;
   readonly processGroupId: number | undefined;
+  readonly capturesOutput: boolean;
 }
 
 export const makeChildEnvironment = (
@@ -177,7 +182,7 @@ export const makeChildEnvironment = (
   return environment;
 };
 
-const isChildRunning = (child: ChildProcessWithoutNullStreams): boolean =>
+const isChildRunning = (child: ChildProcess): boolean =>
   child.exitCode === null && child.signalCode === null;
 
 const isNoSuchProcessError = (cause: unknown): boolean =>
@@ -220,9 +225,16 @@ const terminateChild = ({
   closed,
   isClosed,
   processGroupId,
+  capturesOutput,
 }: ScopedChildProcess): Effect.Effect<void> =>
   Effect.promise(async () => {
-    const scopedChild = { child, closed, isClosed, processGroupId };
+    const scopedChild = {
+      child,
+      closed,
+      isClosed,
+      processGroupId,
+      capturesOutput,
+    };
     if (!isClosed()) {
       signalChildProcess(scopedChild, "SIGTERM");
       const closedGracefully = await waitForCloseUntil(
@@ -297,14 +309,21 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
       },
       catch: filesystemError,
     }),
-  createExclusiveFile: (path) =>
+  createExclusiveFile: (path, contents) =>
     Effect.tryPromise({
       try: async () => {
+        let handle: Awaited<ReturnType<typeof open>> | undefined;
         try {
-          const handle = await open(path, "wx", 0o600);
+          handle = await open(path, "wx", 0o600);
+          await handle.writeFile(contents, "utf8");
           await handle.close();
+          handle = undefined;
           return true;
         } catch (cause) {
+          if (handle !== undefined) {
+            await handle.close().catch(() => undefined);
+            await rm(path, { force: true }).catch(() => undefined);
+          }
           if (
             typeof cause === "object" &&
             cause !== null &&
@@ -434,12 +453,40 @@ export const collectChildProcessOutput = (
     }
   });
 
+const waitForInheritedChild = (
+  child: Pick<ChildProcessIo, "onceClose" | "onceError">,
+  command: string,
+): Effect.Effect<
+  {
+    readonly exitCode: number;
+    readonly stdout: string;
+    readonly stderr: string;
+  },
+  ProcessExecutionError
+> =>
+  Effect.async((resume) => {
+    let settled = false;
+    child.onceError((cause) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(processExecutionError(command, cause)));
+    });
+    child.onceClose((exitCode) => {
+      if (settled) return;
+      settled = true;
+      resume(
+        Effect.succeed({ exitCode: exitCode ?? 1, stdout: "", stderr: "" }),
+      );
+    });
+  });
+
 const processLayer = Layer.succeed(ProcessService, {
   run: (request) =>
     Effect.acquireUseRelease(
       Effect.try({
         try: () => {
           const ownsProcessGroup = process.platform !== "win32";
+          const capturesOutput = request.stdio !== "inherit";
           const child = spawn(request.command, [...request.args], {
             cwd: request.cwd,
             detached: ownsProcessGroup,
@@ -449,7 +496,7 @@ const processLayer = Layer.succeed(ProcessService, {
               process.platform,
             ),
             shell: false,
-            stdio: "pipe",
+            stdio: capturesOutput ? "pipe" : "inherit",
           });
           let childClosed = false;
           const closed = new Promise<void>((resolve) => {
@@ -463,27 +510,34 @@ const processLayer = Layer.succeed(ProcessService, {
             closed,
             isClosed: () => childClosed,
             processGroupId: ownsProcessGroup ? child.pid : undefined,
+            capturesOutput,
           };
         },
         catch: (cause) => processExecutionError(request.command, cause),
       }),
-      ({ child }) =>
-        collectChildProcessOutput(
+      ({ child, capturesOutput }) => {
+        const lifecycle = {
+          onceClose: (listener: (exitCode: number | null) => void) => {
+            child.once("close", listener);
+          },
+          onceError: (listener: (cause: Error) => void) => {
+            child.once("error", listener);
+          },
+        };
+        if (!capturesOutput) {
+          return waitForInheritedChild(lifecycle, request.command);
+        }
+        return collectChildProcessOutput(
           {
-            stdin: child.stdin,
-            stdout: child.stdout,
-            stderr: child.stderr,
-            onceClose: (listener) => {
-              child.once("close", listener);
-            },
-            onceError: (listener) => {
-              child.once("error", listener);
-            },
+            stdin: child.stdin!,
+            stdout: child.stdout!,
+            stderr: child.stderr!,
+            ...lifecycle,
           },
           request.command,
           request.stdin,
-          request.stdio === "inherit",
-        ),
+        );
+      },
       terminateChild,
     ),
 });

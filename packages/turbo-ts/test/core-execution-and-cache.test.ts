@@ -6,6 +6,7 @@ import {
   readFile,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -114,7 +115,133 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  });
+  }, 10_000);
+
+  it("hashes global dependency contents and restores declared dist outputs", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        globalDependencies?: Array<string>;
+        tasks: Record<string, { outputs?: Array<string> }>;
+      };
+      configuration.globalDependencies = ["global.txt"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${directory}/packages/library/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs = require('node:fs'); fs.mkdirSync('dist', { recursive: true }); fs.writeFileSync('dist/value.txt', fs.readFileSync('../../global.txt', 'utf8')); console.log('built dist')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      await writeFile(`${directory}/global.txt`, "first\n");
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter",
+        "synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      await rm(`${directory}/packages/library/dist`, {
+        force: true,
+        recursive: true,
+      });
+      await rm(`${directory}/packages/library/.turbo`, {
+        force: true,
+        recursive: true,
+      });
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache hit");
+      expect(
+        await readFile(`${directory}/packages/library/dist/value.txt`, "utf8"),
+      ).toBe("first\n");
+      expect(
+        await readFile(
+          `${directory}/packages/library/.turbo/turbo-build.log`,
+          "utf8",
+        ),
+      ).toContain("built dist");
+      await writeFile(`${directory}/global.txt`, "second\n");
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      expect(
+        await readFile(`${directory}/packages/library/dist/value.txt`, "utf8"),
+      ).toBe("second\n");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("uses future global configuration environment settings", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.futureFlags = { globalConfiguration: true };
+      configuration.global = {
+        inputs: ["global.txt"],
+        env: ["HASHED_VALUE"],
+        passThroughEnv: ["PASSED_VALUE"],
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await writeFile(`${directory}/global.txt`, "global\n");
+      const manifestPath = `${directory}/packages/library/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"console.log(String(process.env.HASHED_VALUE) + ':' + String(process.env.PASSED_VALUE))\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter",
+        "synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      const first = await run(process.execPath, args, repositoryRoot, {
+        HASHED_VALUE: "one",
+        PASSED_VALUE: "visible",
+      });
+      const second = await run(process.execPath, args, repositoryRoot, {
+        HASHED_VALUE: "two",
+        PASSED_VALUE: "visible",
+      });
+      expect(first.exitCode).toBe(0);
+      expect(first.stdout).toContain("cache miss");
+      expect(second.exitCode).toBe(0);
+      expect(second.stdout).toContain("cache miss");
+      expect(
+        await readFile(
+          `${directory}/packages/library/.turbo/turbo-build.log`,
+          "utf8",
+        ),
+      ).toContain("two:visible");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
 
   it("honors NO_COLOR and rejects Cargo sccache before task execution", async () => {
     const directory = await makeFixture();
@@ -209,7 +336,7 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  });
+  }, 10_000);
 
   it("requires a package-manager declaration unless inference is enabled", async () => {
     const directory = await makeFixture();
@@ -240,6 +367,78 @@ describe("core CLI execution", () => {
       );
       expect(inferred.exitCode).toBe(0);
       expect(inferred.stdout).toContain("library build");
+      manifest.packageManager = "pnpmn@10";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const invalid = await run(process.execPath, common, repositoryRoot);
+      expect(invalid.exitCode).not.toBe(0);
+      expect(invalid.stderr).toContain(
+        "unsupported package manager identity: pnpmn@10",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("executes root tasks through the //# namespace", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks["//#root-build"] = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${directory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts["root-build"] =
+        "node -e \"console.log('root namespace build')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "//#root-build",
+          "--cwd",
+          directory,
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("root namespace build");
+      expect(result.stdout).not.toContain("app build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("runs dependency graphs without reading unfinished outcomes in parallel mode", async () => {
+    const directory = await makeFixture();
+    try {
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--parallel",
+          "--concurrency=2",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("library build");
+      expect(result.stdout).toContain("app build");
+      expect(result.stderr).not.toContain("TypeError");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -281,7 +480,7 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  });
+  }, 10_000);
 
   it("uses task inputs for affected selection when the future flag is enabled", async () => {
     await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
@@ -553,6 +752,96 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("reclaims cache writer locks left by terminated writers", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-stale-lock-"));
+    const cacheDirectory = `${directory}/cache`;
+    const hash = "1111222233334444";
+    try {
+      await mkdir(cacheDirectory, { recursive: true });
+      const lockPath = `${cacheDirectory}/${hash}.turbo-ts.lock`;
+      await writeFile(
+        lockPath,
+        JSON.stringify({
+          owner: "00000000-0000-7000-8000-000000000000",
+          createdAt: 0,
+        }),
+      );
+      const staleTime = new Date(Date.now() - 10 * 60 * 1_000);
+      await utimes(lockPath, staleTime, staleTime);
+      await Effect.runPromise(
+        writeLocalCache(
+          { directory: cacheDirectory },
+          hash,
+          [
+            {
+              path: "packages/app/out.txt",
+              contents: new TextEncoder().encode("recovered"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+          ],
+          1,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(
+        await Effect.runPromise(
+          restoreLocalCache(
+            directory,
+            { directory: cacheDirectory },
+            hash,
+          ).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).toBe(true);
+      expect(await readFile(`${directory}/packages/app/out.txt`, "utf8")).toBe(
+        "recovered",
+      );
+      await expect(lstat(lockPath)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("restores local cache entries through a symlinked repository root", async () => {
+    if (process.platform === "win32") return;
+    const container = await mkdtemp(join(tmpdir(), "turbo-ts-root-link-"));
+    const directory = `${container}/repository`;
+    const linkedRoot = `${container}/linked-repository`;
+    const cacheDirectory = `${container}/cache`;
+    try {
+      await mkdir(directory, { recursive: true });
+      await Effect.runPromise(
+        writeLocalCache(
+          { directory: cacheDirectory },
+          "2222333344445555",
+          [
+            {
+              path: "packages/app/out.txt",
+              contents: new TextEncoder().encode("linked"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+          ],
+          1,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      await symlink(directory, linkedRoot);
+      expect(
+        await Effect.runPromise(
+          restoreLocalCache(
+            linkedRoot,
+            { directory: cacheDirectory },
+            "2222333344445555",
+          ).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).toBe(true);
+      expect(await readFile(`${directory}/packages/app/out.txt`, "utf8")).toBe(
+        "linked",
+      );
+    } finally {
+      await rm(container, { force: true, recursive: true });
+    }
+  });
+
   it("rejects restoration through escaping symlinks", async () => {
     if (process.platform === "win32") {
       return;
@@ -595,6 +884,7 @@ describe("cache interoperability and safety", () => {
 
   it("round trips signed remote artifacts through a loopback service", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-remote-"));
+    const linkedRoot = `${directory}-link`;
     let artifact = new Uint8Array();
     let tag = "";
     const server = createServer((request, response) => {
@@ -625,6 +915,7 @@ describe("cache interoperability and safety", () => {
     const options = {
       apiUrl: `http://127.0.0.1:${address.port}`,
       timeoutMilliseconds: 5_000,
+      uploadTimeoutMilliseconds: 5_000,
       preflight: false,
       requireSignature: true,
       signatureKey: "0123456789abcdef0123456789abcdef",
@@ -649,9 +940,13 @@ describe("cache interoperability and safety", () => {
       );
       expect(artifact.length).toBeGreaterThan(0);
       expect(tag).toMatch(/^[0-9a-f]{64}$/);
+      const restoreRoot = process.platform === "win32" ? directory : linkedRoot;
+      if (process.platform !== "win32") {
+        await symlink(directory, linkedRoot);
+      }
       expect(
         await Effect.runPromise(
-          restoreRemoteCache(directory, options, "0011223344556677").pipe(
+          restoreRemoteCache(restoreRoot, options, "0011223344556677").pipe(
             Effect.provide(nodeFoundationLayer),
           ),
         ),
@@ -662,11 +957,51 @@ describe("cache interoperability and safety", () => {
       tag = "0".repeat(64);
       await expect(
         Effect.runPromise(
-          restoreRemoteCache(directory, options, "0011223344556677").pipe(
+          restoreRemoteCache(restoreRoot, options, "0011223344556677").pipe(
             Effect.provide(nodeFoundationLayer),
           ),
         ),
       ).rejects.toThrow(/signature is invalid/);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(linkedRoot, { force: true });
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("uses the upload timeout independently from the download timeout", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-upload-timeout-"));
+    const server = createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        setTimeout(() => {
+          response.writeHead(200);
+          response.end();
+        }, 40);
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    try {
+      await Effect.runPromise(
+        writeRemoteCache(
+          {
+            apiUrl: `http://127.0.0.1:${address.port}`,
+            timeoutMilliseconds: 1,
+            uploadTimeoutMilliseconds: 500,
+            preflight: false,
+            requireSignature: false,
+          },
+          "3333444455556666",
+          [],
+          1,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(directory, { force: true, recursive: true });
@@ -733,6 +1068,7 @@ describe("cache interoperability and safety", () => {
     const candidateRemoteOptions = {
       apiUrl,
       timeoutMilliseconds: 5_000,
+      uploadTimeoutMilliseconds: 5_000,
       preflight: false,
       requireSignature: false,
       token: "dummy-token",

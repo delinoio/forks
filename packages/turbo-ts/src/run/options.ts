@@ -1,4 +1,7 @@
+import { Schema } from "effect";
+import { OutputLogsSchema } from "../config/schema.js";
 import { ConfigurationError } from "../effect/errors.js";
+import type { OutputLogs } from "../generated/configuration.js";
 
 export type ContinueMode = "always" | "dependencies-successful" | "never";
 export type EnvironmentMode = "loose" | "strict";
@@ -19,7 +22,7 @@ export interface ParsedRunOptions {
   readonly remoteCacheReadOnly: boolean;
   readonly noCache: boolean;
   readonly frameworkInference?: boolean;
-  readonly outputLogs?: string;
+  readonly outputLogs?: OutputLogs;
   readonly only: boolean;
   readonly parallel: boolean;
   readonly apiUrl?: string;
@@ -100,7 +103,7 @@ export const parseRunArguments = (
   let remoteCacheReadOnly = false;
   let noCache = false;
   let frameworkInference: boolean | undefined;
-  let outputLogs: string | undefined;
+  let outputLogs: OutputLogs | undefined;
   let only = false;
   let parallel = false;
   let apiUrl: string | undefined;
@@ -186,9 +189,18 @@ export const parseRunArguments = (
       case "--framework-inference":
         frameworkInference = !argument.endsWith("=false");
         break;
-      case "--output-logs":
-        [outputLogs, index] = optionValue(arguments_, index, name);
+      case "--output-logs": {
+        let value: string;
+        [value, index] = optionValue(arguments_, index, name);
+        if (!Schema.is(OutputLogsSchema)(value)) {
+          throw new ConfigurationError({
+            path: "<arguments>",
+            message: `invalid output log mode: ${value}`,
+          });
+        }
+        outputLogs = value;
         break;
+      }
       case "--only":
         only = true;
         break;

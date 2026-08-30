@@ -141,6 +141,14 @@ const parseYarnClassic = (source: string): ReadonlyArray<LockfilePackage> => {
   return packages.sort((left, right) => left.name.localeCompare(right.name));
 };
 
+const isYarnBerry = (source: string): boolean => {
+  const firstKey = source
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line !== "" && !line.startsWith("#") && line !== "---");
+  return /^__metadata\s*:/.test(firstKey ?? "");
+};
+
 export const parseLockfile = (
   path: string,
   contents: Uint8Array,
@@ -167,7 +175,7 @@ export const parseLockfile = (
     };
   }
   if (name === "yarn.lock") {
-    return source.startsWith("__metadata:")
+    return isYarnBerry(source)
       ? {
           format: "yarn-berry",
           packages: collectPackages(parseYamlDocument(source)),

@@ -227,23 +227,33 @@ export const buildTaskGraph = (
     return id;
   };
 
-  const entrypoints = packages.flatMap((packageModel) =>
-    tasks.flatMap((task) => {
-      const explicitSeparator = task.indexOf("#");
-      if (explicitSeparator !== -1) {
-        const explicitPackage = repository.packagesByName.get(
-          task.slice(0, explicitSeparator),
-        );
-        if (explicitPackage === undefined || explicitPackage !== packageModel) {
-          return [];
-        }
-        const id = addNode(explicitPackage, task.slice(explicitSeparator + 1));
-        return id === undefined ? [] : [id];
+  const selectedPackageNames = new Set(
+    packages.map((packageModel) => packageModel.name),
+  );
+  const entrypoints = tasks.flatMap((task) => {
+    if (task.startsWith("//#")) {
+      const id = addNode(repository.rootPackage, task.slice(3));
+      return id === undefined ? [] : [id];
+    }
+    const explicitSeparator = task.indexOf("#");
+    if (explicitSeparator !== -1) {
+      const explicitPackage = repository.packagesByName.get(
+        task.slice(0, explicitSeparator),
+      );
+      if (
+        explicitPackage === undefined ||
+        !selectedPackageNames.has(explicitPackage.name)
+      ) {
+        return [];
       }
+      const id = addNode(explicitPackage, task.slice(explicitSeparator + 1));
+      return id === undefined ? [] : [id];
+    }
+    return packages.flatMap((packageModel) => {
       const id = addNode(packageModel, task);
       return id === undefined ? [] : [id];
-    }),
-  );
+    });
+  });
   let selectedEntrypoints = [...new Set(entrypoints)].sort();
   if (
     strictEntrypoints &&

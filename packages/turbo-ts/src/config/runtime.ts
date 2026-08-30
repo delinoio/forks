@@ -22,6 +22,42 @@ export interface LoadedRootConfiguration {
   readonly hiddenFutureFlags: Readonly<Record<string, boolean>>;
 }
 
+const stripTrailingCommas = (source: string): string => {
+  let output = "";
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index]!;
+    if (inString) {
+      output += character;
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      output += character;
+      continue;
+    }
+    if (character === ",") {
+      let nextIndex = index + 1;
+      while (/\s/.test(source[nextIndex] ?? "")) {
+        nextIndex += 1;
+      }
+      if (source[nextIndex] === "}" || source[nextIndex] === "]") {
+        continue;
+      }
+    }
+    output += character;
+  }
+  return output;
+};
+
 const stripJsonComments = (source: string): string => {
   let output = "";
   let inString = false;
@@ -66,7 +102,7 @@ const stripJsonComments = (source: string): string => {
     }
     output += character;
   }
-  return output.replace(/,\s*([}\]])/g, "$1");
+  return stripTrailingCommas(output);
 };
 
 export const parseJsonConfiguration = (

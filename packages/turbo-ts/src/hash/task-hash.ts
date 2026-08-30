@@ -1,5 +1,5 @@
 import { Effect } from "effect";
-import { matchesGlob } from "../core/glob.js";
+import { matchesGlob, selectByGlobs } from "../core/glob.js";
 import { joinPath, relativePath } from "../core/path.js";
 import { RepositoryError } from "../effect/errors.js";
 import {
@@ -141,9 +141,9 @@ export interface TaskHashResult {
   readonly inputFiles: ReadonlyArray<string>;
 }
 
-const discoverInputFiles = (
+const discoverFiles = (
   repository: RepositoryModel,
-  node: TaskNode,
+  directory: string,
 ): Effect.Effect<
   ReadonlyArray<string>,
   RepositoryError,
@@ -151,10 +151,7 @@ const discoverInputFiles = (
 > =>
   Effect.gen(function* () {
     const processService = yield* ProcessService;
-    const relativeDirectory = relativePath(
-      repository.root,
-      node.package.directory,
-    );
+    const relativeDirectory = relativePath(repository.root, directory);
     const git = yield* Effect.either(
       Effect.scoped(
         processService.run({
@@ -179,8 +176,24 @@ const discoverInputFiles = (
         .map((path) => joinPath(repository.root, path))
         .sort();
     }
-    return yield* listRepositoryFiles(node.package.directory);
+    return yield* listRepositoryFiles(directory);
   });
+
+const activeGlobalSettings = (repository: RepositoryModel) => {
+  const root = repository.rootConfiguration.value;
+  if (root.futureFlags?.globalConfiguration === true) {
+    return {
+      inputs: root.global?.inputs,
+      env: root.global?.env,
+      passThroughEnv: root.global?.passThroughEnv,
+    };
+  }
+  return {
+    inputs: root.globalDependencies,
+    env: root.globalEnv,
+    passThroughEnv: root.globalPassThroughEnv,
+  };
+};
 
 export const hashTask = (
   repository: RepositoryModel,
@@ -197,7 +210,7 @@ export const hashTask = (
     const digest = yield* DigestService;
     const environmentService = yield* EnvironmentService;
     const environment = yield* environmentService.entries;
-    const allFiles = yield* discoverInputFiles(repository, node);
+    const allFiles = yield* discoverFiles(repository, node.package.directory);
     const inputFiles = taskInputFiles(node, allFiles);
     const fileHashes = yield* Effect.forEach(
       inputFiles,
@@ -215,9 +228,9 @@ export const hashTask = (
         ),
       { concurrency: 8 },
     );
-    const root = repository.rootConfiguration.value;
+    const globalSettings = activeGlobalSettings(repository);
     const hashedEnvironment = selectEnvironment(environment, [
-      ...(root.globalEnv ?? []),
+      ...(globalSettings.env ?? []),
       ...(node.definition.env ?? []),
       ...(frameworkInference ? inferredEnvironmentPatterns(node) : []),
     ]);
@@ -234,6 +247,32 @@ export const hashTask = (
                 }),
             ),
           );
+    const globalDependencyPatterns = globalSettings.inputs ?? [];
+    const globalInputFiles =
+      globalDependencyPatterns.length === 0
+        ? []
+        : selectByGlobs(
+            (yield* discoverFiles(repository, repository.root)).map((path) =>
+              relativePath(repository.root, path),
+            ),
+            globalDependencyPatterns,
+          );
+    const globalFileHashes = yield* Effect.forEach(
+      globalInputFiles,
+      (relative) =>
+        fileSystem.readBytes(joinPath(repository.root, relative)).pipe(
+          Effect.flatMap((bytes) => digest.gitBlobSha1(bytes)),
+          Effect.map((hash) => [relative, hash] as const),
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({
+                path: joinPath(repository.root, relative),
+                message: error.message,
+              }),
+          ),
+        ),
+      { concurrency: 8 },
+    );
     const hash = xxhash64Hex(
       canonicalStringify({
         packageManager: `${repository.manager}@${repository.managerVersion ?? ""}`,
@@ -245,7 +284,8 @@ export const hashTask = (
         files: fileHashes,
         environment: hashedEnvironment,
         dependencies: [...dependencyHashes].sort(),
-        globalDependencies: root.globalDependencies ?? [],
+        globalDependencies: globalDependencyPatterns,
+        globalFiles: globalFileHashes,
       }),
     );
     return { hash, environment: hashedEnvironment, inputFiles };
@@ -280,11 +320,11 @@ export const taskEnvironment = (
   if (mode === "loose") {
     return source;
   }
-  const root = repository.rootConfiguration.value;
+  const globalSettings = activeGlobalSettings(repository);
   return selectEnvironment(source, [
     ...strictBaselineEnvironment,
-    ...(root.globalEnv ?? []),
-    ...(root.globalPassThroughEnv ?? []),
+    ...(globalSettings.env ?? []),
+    ...(globalSettings.passThroughEnv ?? []),
     ...(node.definition.env ?? []),
     ...(node.definition.passThroughEnv ?? []),
     ...(frameworkInference ? inferredEnvironmentPatterns(node) : []),

@@ -8,6 +8,10 @@ export interface ArchiveEntry {
 }
 
 const blockSize = 512;
+const tarNameBytes = 100;
+const tarPrefixBytes = 155;
+const encodedLength = (value: string): number =>
+  new TextEncoder().encode(value).length;
 
 const writeText = (
   target: Uint8Array,
@@ -60,6 +64,29 @@ const validateArchivePath = (path: string): string => {
   return normalized;
 };
 
+const splitArchivePath = (
+  path: string,
+): { readonly name: string; readonly prefix: string } => {
+  if (encodedLength(path) <= tarNameBytes) {
+    return { name: path, prefix: "" };
+  }
+  for (
+    let separator = path.lastIndexOf("/");
+    separator > 0;
+    separator = path.lastIndexOf("/", separator - 1)
+  ) {
+    const prefix = path.slice(0, separator);
+    const name = path.slice(separator + 1);
+    if (
+      encodedLength(prefix) <= tarPrefixBytes &&
+      encodedLength(name) <= tarNameBytes
+    ) {
+      return { name, prefix };
+    }
+  }
+  throw new TypeError("tar path exceeds the ustar path limit");
+};
+
 export const createTarArchive = (
   entries: ReadonlyArray<ArchiveEntry>,
 ): Uint8Array => {
@@ -68,17 +95,20 @@ export const createTarArchive = (
     left.path.localeCompare(right.path),
   )) {
     const path = validateArchivePath(entry.path);
+    const pathFields = splitArchivePath(path);
     const header = new Uint8Array(blockSize);
-    writeText(header, 0, 100, path);
+    writeText(header, 0, tarNameBytes, pathFields.name);
     writeOctal(header, 100, 8, entry.mode & 0o777);
     writeOctal(header, 108, 8, 0);
     writeOctal(header, 116, 8, 0);
     writeOctal(header, 124, 12, entry.contents.length);
     writeOctal(header, 136, 12, Math.max(0, Math.floor(entry.modifiedSeconds)));
     header[156] = 0x30;
-    writeText(header, 257, 8, "ustar  \0");
+    writeText(header, 257, 6, "ustar\0");
+    writeText(header, 263, 2, "00");
     writeOctal(header, 329, 8, 0);
     writeOctal(header, 337, 8, 0);
+    writeText(header, 345, tarPrefixBytes, pathFields.prefix);
     writeText(header, 148, 6, checksum(header).toString(8).padStart(6, "0"));
     header[154] = 0;
     header[155] = 0x20;
@@ -137,7 +167,14 @@ export const parseTarArchive = (
     if (checksum(header) !== expectedChecksum) {
       throw new TypeError("invalid tar checksum");
     }
-    const path = validateArchivePath(readText(header, 0, 100));
+    const name = readText(header, 0, tarNameBytes);
+    const prefix =
+      readText(header, 257, 6) === "ustar" && readText(header, 263, 2) === "00"
+        ? readText(header, 345, tarPrefixBytes)
+        : "";
+    const path = validateArchivePath(
+      prefix === "" ? name : `${prefix}/${name}`,
+    );
     const type = header[156];
     if (type !== 0 && type !== 0x30) {
       throw new TypeError(

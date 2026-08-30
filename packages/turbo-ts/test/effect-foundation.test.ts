@@ -1,3 +1,4 @@
+import { fstatSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -243,6 +244,37 @@ describe("Effect foundation", () => {
     if (outcome._tag === "Left") {
       expect(outcome.left).toBeInstanceOf(ProcessExecutionError);
       expect(outcome.left.command).toBe(command);
+    }
+  });
+
+  it("inherits all three parent descriptors for interactive processes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-inherit-test-"));
+    const resultPath = join(directory, "descriptors.json");
+    const descriptorIdentity = (descriptor: number): string => {
+      const metadata = fstatSync(descriptor, { bigint: true });
+      return `${metadata.dev}:${metadata.ino}`;
+    };
+    const expected = [0, 1, 2].map(descriptorIdentity);
+    const script =
+      'const fs = require("node:fs"); const actual = [0, 1, 2].map((fd) => { const value = fs.fstatSync(fd, { bigint: true }); return String(value.dev) + ":" + String(value.ino); }); fs.writeFileSync(process.argv[1], JSON.stringify(actual));';
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            return yield* processService.run({
+              command: process.execPath,
+              args: ["-e", script, resultPath],
+              cwd: directory,
+              stdio: "inherit",
+            });
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+      expect(JSON.parse(await readFile(resultPath, "utf8"))).toEqual(expected);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
     }
   });
 

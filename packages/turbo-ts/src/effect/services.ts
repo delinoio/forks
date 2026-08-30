@@ -33,6 +33,7 @@ export interface FileSystemOperations {
   readonly makeDirectory: (path: string) => Effect.Effect<void, BoundaryError>;
   readonly createExclusiveFile: (
     path: string,
+    contents: string,
   ) => Effect.Effect<boolean, BoundaryError>;
   readonly writeText: (
     path: string,

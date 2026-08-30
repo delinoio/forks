@@ -29,6 +29,7 @@ import {
   SigningService,
   TerminalService,
 } from "../effect/services.js";
+import type { OutputLogs } from "../generated/configuration.js";
 import {
   buildTaskGraph,
   selectPackages,
@@ -66,7 +67,7 @@ interface ResolvedRunOptions {
   readonly cachePolicy: CachePolicy;
   readonly force: boolean;
   readonly frameworkInference: boolean;
-  readonly outputLogs?: string;
+  readonly outputLogs?: OutputLogs;
   readonly only: boolean;
   readonly parallel: boolean;
   readonly remote?: RemoteCacheOptions;
@@ -213,6 +214,21 @@ const resolveOptions = (
     undefined;
   const token = parsed.token ?? environment.TURBO_TOKEN;
   const signatureKey = environment.TURBO_REMOTE_CACHE_SIGNATURE_KEY;
+  const remoteTimeoutSeconds =
+    parsed.remoteCacheTimeoutSeconds ??
+    Number(
+      environment.TURBO_REMOTE_CACHE_TIMEOUT ??
+        remoteConfiguration?.timeout ??
+        30,
+    );
+  const remoteUploadTimeoutSeconds =
+    parsed.remoteCacheTimeoutSeconds ??
+    Number(
+      environment.TURBO_REMOTE_CACHE_TIMEOUT ??
+        remoteConfiguration?.uploadTimeout ??
+        remoteConfiguration?.timeout ??
+        30,
+    );
   if (
     value.futureFlags?.longerSignatureKey === true &&
     remoteConfiguration?.signature === true &&
@@ -236,14 +252,8 @@ const resolveOptions = (
             environment.TURBO_TEAM ??
             remoteConfiguration?.teamSlug ??
             undefined,
-          timeoutMilliseconds:
-            1_000 *
-            (parsed.remoteCacheTimeoutSeconds ??
-              Number(
-                environment.TURBO_REMOTE_CACHE_TIMEOUT ??
-                  remoteConfiguration?.timeout ??
-                  30,
-              )),
+          timeoutMilliseconds: 1_000 * remoteTimeoutSeconds,
+          uploadTimeoutMilliseconds: 1_000 * remoteUploadTimeoutSeconds,
           preflight:
             parsed.preflight || remoteConfiguration?.preflight === true,
           signatureKey,
@@ -524,7 +534,12 @@ const collectCacheEntries = (
 > =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
-    const files = yield* listRepositoryFiles(node.package.directory);
+    const files = [
+      ...(yield* listRepositoryFiles(node.package.directory, {
+        ignoredDirectories: new Set([".git", ".turbo", "node_modules"]),
+      })),
+      logPath,
+    ];
     const outputPatterns = node.definition.outputs ?? [];
     const selected = files.filter((path) => {
       if (path === logPath) {
@@ -574,7 +589,7 @@ const collectCacheEntries = (
   });
 
 const shouldReplayOutput = (
-  mode: string | undefined,
+  mode: OutputLogs | undefined,
   cacheHit: boolean,
 ): boolean =>
   mode === undefined || mode === "full" || (mode === "new-only" && !cacheHit);
@@ -855,9 +870,9 @@ export const executeRun = (
         batch,
         (id): Effect.Effect<TaskOutcome, never, RunRequirements> => {
           const node = graph.nodes.get(id)!;
-          const dependencyOutcomes = node.dependencies.map(
-            (dependency) => outcomes.get(dependency)!,
-          );
+          const dependencyOutcomes = options.parallel
+            ? []
+            : node.dependencies.map((dependency) => outcomes.get(dependency)!);
           const dependencyFailed = dependencyOutcomes.some(
             (outcome) => outcome.exitCode !== 0 || outcome.skipped,
           );

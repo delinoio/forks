@@ -21,6 +21,7 @@ export interface RemoteCacheOptions {
   readonly teamId?: string;
   readonly teamSlug?: string;
   readonly timeoutMilliseconds: number;
+  readonly uploadTimeoutMilliseconds: number;
   readonly preflight: boolean;
   readonly signatureKey?: string;
   readonly requireSignature: boolean;
@@ -98,6 +99,9 @@ export const restoreRemoteCache = (
     const fileSystem = yield* FileSystemService;
     const retry = yield* RetryScheduleService;
     const signing = yield* SigningService;
+    const canonicalRoot = yield* fileSystem
+      .realPath(root)
+      .pipe(Effect.mapError((error) => remoteError(root, error.message)));
     const url = artifactUrl(options, hash);
     yield* preflight(url, options);
     const response = yield* http
@@ -161,7 +165,7 @@ export const restoreRemoteCache = (
         .pipe(
           Effect.mapError((error) => remoteError(destination, error.message)),
         );
-      if (!isPathContained(root, resolvedParent)) {
+      if (!isPathContained(canonicalRoot, resolvedParent)) {
         return yield* Effect.fail(
           remoteError(destination, "archive parent is an escaping symlink"),
         );
@@ -247,7 +251,7 @@ export const writeRemoteCache = (
         method: "PUT",
         headers,
         body: compressed,
-        timeoutMilliseconds: options.timeoutMilliseconds,
+        timeoutMilliseconds: options.uploadTimeoutMilliseconds,
       })
       .pipe(
         Effect.mapError((error) => remoteError(url, error.message, true)),

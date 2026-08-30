@@ -56,6 +56,9 @@ export const restoreLocalCache = (
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const compression = yield* CompressionService;
+    const canonicalRoot = yield* fileSystem
+      .realPath(root)
+      .pipe(Effect.mapError((error) => cacheError(root, error.message)));
     const paths = cachePaths(options.directory, hash);
     const exists = yield* fileSystem
       .exists(paths.archive)
@@ -108,7 +111,7 @@ export const restoreLocalCache = (
                 cacheError(destination, error.message),
               ),
             );
-          if (!isPathContained(root, resolvedParent)) {
+          if (!isPathContained(canonicalRoot, resolvedParent)) {
             return yield* Effect.fail(
               cacheError(destination, "archive parent is an escaping symlink"),
             );
@@ -191,15 +194,88 @@ const writeAtomically = (
       .pipe(Effect.mapError((error) => cacheError(path, error.message)));
   });
 
+const staleLockMilliseconds = 5 * 60 * 1_000;
+
+const lockOwner = (contents: string): string => {
+  try {
+    const owner = (JSON.parse(contents) as { readonly owner?: unknown }).owner;
+    return typeof owner === "string" && /^[0-9a-f-]+$/.test(owner)
+      ? owner
+      : "invalid";
+  } catch {
+    return "invalid";
+  }
+};
+
+const isStaleFile = (
+  path: string,
+  now: number,
+): Effect.Effect<boolean, never, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const metadata = yield* Effect.either(fileSystem.metadata(path));
+    return (
+      metadata._tag === "Right" &&
+      now - metadata.right.modifiedMilliseconds >= staleLockMilliseconds
+    );
+  });
+
+const reclaimStaleLock = (
+  lockPath: string,
+  contenderContents: string,
+  now: number,
+): Effect.Effect<void, never, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const observed = yield* Effect.either(fileSystem.readText(lockPath));
+    if (observed._tag === "Left" || !(yield* isStaleFile(lockPath, now))) {
+      return;
+    }
+    // Serialize reclamation by the observed owner so concurrent contenders do
+    // not both remove a successor's lock. Reclaim the marker itself by age if
+    // the contender that created it was terminated.
+    const reclaimPath = `${lockPath}.${lockOwner(observed.right)}.reclaim`;
+    let claimed = yield* Effect.either(
+      fileSystem.createExclusiveFile(reclaimPath, contenderContents),
+    );
+    if (
+      claimed._tag === "Right" &&
+      !claimed.right &&
+      (yield* isStaleFile(reclaimPath, now))
+    ) {
+      yield* fileSystem.remove(reclaimPath).pipe(Effect.ignore);
+      claimed = yield* Effect.either(
+        fileSystem.createExclusiveFile(reclaimPath, contenderContents),
+      );
+    }
+    if (claimed._tag !== "Right" || !claimed.right) {
+      return;
+    }
+    const current = yield* Effect.either(fileSystem.readText(lockPath));
+    if (
+      current._tag === "Right" &&
+      current.right === observed.right &&
+      (yield* isStaleFile(lockPath, now))
+    ) {
+      yield* fileSystem.remove(lockPath).pipe(Effect.ignore);
+    }
+    yield* fileSystem.remove(reclaimPath).pipe(Effect.ignore);
+  });
+
 const withEntryLock = <A, E, R>(
   options: LocalCacheOptions,
   hash: string,
   use: Effect.Effect<A, E, R>,
-): Effect.Effect<A, E | CacheError, R | FileSystemService | ClockService> =>
+): Effect.Effect<
+  A,
+  E | CacheError,
+  R | FileSystemService | ClockService | RandomnessService
+> =>
   Effect.acquireUseRelease(
     Effect.gen(function* () {
       const fileSystem = yield* FileSystemService;
       const clock = yield* ClockService;
+      const randomness = yield* RandomnessService;
       yield* fileSystem
         .makeDirectory(options.directory)
         .pipe(
@@ -209,14 +285,20 @@ const withEntryLock = <A, E, R>(
         );
       const lockPath = joinPath(options.directory, `${hash}.turbo-ts.lock`);
       const started = yield* clock.now;
+      const owner = yield* randomness.uuidV7.pipe(
+        Effect.mapError((error) => cacheError(lockPath, error.message)),
+      );
+      const contents = JSON.stringify({ owner, createdAt: started });
       while (true) {
         const acquired = yield* fileSystem
-          .createExclusiveFile(lockPath)
+          .createExclusiveFile(lockPath, contents)
           .pipe(
             Effect.mapError((error) => cacheError(lockPath, error.message)),
           );
-        if (acquired) return lockPath;
-        if ((yield* clock.now) - started >= 5_000) {
+        if (acquired) return { path: lockPath, contents };
+        const now = yield* clock.now;
+        yield* reclaimStaleLock(lockPath, contents, now);
+        if (now - started >= 5_000) {
           return yield* Effect.fail(
             cacheError(lockPath, "timed out acquiring cache writer lock", true),
           );
@@ -225,10 +307,13 @@ const withEntryLock = <A, E, R>(
       }
     }),
     () => use,
-    (lockPath) =>
+    (lock) =>
       Effect.gen(function* () {
         const fileSystem = yield* FileSystemService;
-        yield* fileSystem.remove(lockPath).pipe(Effect.ignore);
+        const current = yield* Effect.either(fileSystem.readText(lock.path));
+        if (current._tag === "Right" && current.right === lock.contents) {
+          yield* fileSystem.remove(lock.path).pipe(Effect.ignore);
+        }
       }),
   );
 
