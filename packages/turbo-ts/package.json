@@ -44,12 +44,14 @@
     "@effect/printer-ansi": "0.51.0",
     "effect": "3.22.1",
     "minimatch": "10.2.6",
+    "semver": "7.8.5",
     "smol-toml": "1.8.0",
     "yaml": "2.8.3"
   },
   "devDependencies": {
     "@rstest/core": "0.11.10",
     "@types/node": "24.13.3",
+    "@types/semver": "7.7.0",
     "typescript": "7.0.2"
   }
 }

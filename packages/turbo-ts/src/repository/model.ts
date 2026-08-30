@@ -1,4 +1,5 @@
 import { Effect } from "effect";
+import { satisfies } from "semver";
 import { parse as parseToml } from "smol-toml";
 import { parse as parseYaml } from "yaml";
 import type { LoadedRootConfiguration } from "../config/runtime.js";
@@ -375,27 +376,60 @@ const workspacePatterns = (
       : [];
   });
 
+const dependencyEntries = (
+  manifest: PackageManifest,
+): ReadonlyArray<readonly [string, string]> => [
+  ...Object.entries(manifest.dependencies ?? {}),
+  ...Object.entries(manifest.devDependencies ?? {}),
+  ...Object.entries(manifest.optionalDependencies ?? {}),
+  ...Object.entries(manifest.peerDependencies ?? {}),
+];
+
 const dependencyNames = (manifest: PackageManifest): ReadonlyArray<string> =>
+  [...new Set(dependencyEntries(manifest).map(([name]) => name))].sort();
+
+const referencesWorkspaceVersion = (
+  specification: string,
+  version: string | undefined,
+): boolean => {
+  if (specification.startsWith("workspace:")) {
+    const range = specification.slice("workspace:".length);
+    if (range === "" || range === "*" || range === "^" || range === "~") {
+      return true;
+    }
+    return version !== undefined && satisfies(version, range);
+  }
+  return version !== undefined && satisfies(version, specification);
+};
+
+const javascriptInternalDependencies = (
+  manifest: PackageManifest,
+  packagesByName: ReadonlyMap<string, { readonly manifest: PackageManifest }>,
+): ReadonlyArray<string> =>
   [
-    ...new Set([
-      ...Object.keys(manifest.dependencies ?? {}),
-      ...Object.keys(manifest.devDependencies ?? {}),
-      ...Object.keys(manifest.optionalDependencies ?? {}),
-      ...Object.keys(manifest.peerDependencies ?? {}),
-    ]),
+    ...new Set(
+      dependencyEntries(manifest).flatMap(([name, specification]) => {
+        const target = packagesByName.get(name);
+        return target !== undefined &&
+          referencesWorkspaceVersion(specification, target.manifest.version)
+          ? [name]
+          : [];
+      }),
+    ),
   ].sort();
 
 const polyglotScripts = (
   manager: "cargo" | "uv",
+  entrypointNames: ReadonlyArray<string>,
 ): Readonly<Record<string, string>> =>
   manager === "cargo"
     ? {
         build: "cargo build",
         check: "cargo check",
-        dev: "cargo run",
+        ...(entrypointNames.length > 0 ? { dev: "cargo run" } : {}),
         format: "cargo fmt",
         lint: "cargo clippy",
-        run: "cargo run",
+        ...(entrypointNames.length > 0 ? { run: "cargo run" } : {}),
         test: "cargo test",
       }
     : {
@@ -759,7 +793,10 @@ export const discoverRepository = (
               relativeDirectory: relativePath(root, directory),
               workspaceDirectory: cargoMetadata?.workspaceDirectory,
               manager: candidate.manager,
-              scripts: polyglotScripts(candidate.manager),
+              scripts: polyglotScripts(
+                candidate.manager,
+                cargoMetadata?.entrypointNames ?? [],
+              ),
               dependencyNames:
                 candidate.manager === "cargo"
                   ? (cargoMetadata?.dependencyNames ?? [])
@@ -807,16 +844,24 @@ export const discoverRepository = (
         uvNames.set(identity, packageDraft.name);
       }
     }
+    const draftsByName = new Map(
+      drafts.map((packageDraft) => [packageDraft.name, packageDraft] as const),
+    );
     const packages: ReadonlyArray<RepositoryPackage> = drafts
       .map((packageDraft) => ({
         ...packageDraft,
-        internalDependencies: packageDraft.dependencyNames.flatMap((name) => {
-          if (packageDraft.manager === "uv") {
-            const resolved = uvNames.get(normalizePythonPackageName(name));
-            return resolved === undefined ? [] : [resolved];
-          }
-          return names.has(name) ? [name] : [];
-        }),
+        internalDependencies:
+          packageDraft.manager === "uv"
+            ? packageDraft.dependencyNames.flatMap((name) => {
+                const resolved = uvNames.get(normalizePythonPackageName(name));
+                return resolved === undefined ? [] : [resolved];
+              })
+            : packageDraft.manager === "cargo"
+              ? packageDraft.dependencyNames.filter((name) => names.has(name))
+              : javascriptInternalDependencies(
+                  packageDraft.manifest,
+                  draftsByName,
+                ),
       }))
       .sort((left, right) => left.name.localeCompare(right.name));
     const rootTasks = Object.fromEntries(
@@ -834,8 +879,9 @@ export const discoverRepository = (
       manager: managerIdentity.name,
       scripts: rootManifest.scripts ?? {},
       dependencyNames: dependencyNames(rootManifest),
-      internalDependencies: dependencyNames(rootManifest).filter((name) =>
-        names.has(name),
+      internalDependencies: javascriptInternalDependencies(
+        rootManifest,
+        draftsByName,
       ),
       tasks: rootTasks,
       manifest: rootManifest,

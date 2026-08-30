@@ -789,15 +789,9 @@ export const packageManagerCommand = (
             ? ["--all"]
             : ["--workspace"]
           : [`--package=${node.package.name}`];
-      const passThrough =
-        passThroughArguments.length === 0
-          ? []
-          : cargoTask === "build" || cargoTask === "check"
-            ? passThroughArguments
-            : ["--", ...passThroughArguments];
       return {
         command: "cargo",
-        arguments: [cargoTask, ...target, ...locked, ...passThrough],
+        arguments: [cargoTask, ...target, ...locked, ...passThroughArguments],
         cwd:
           scope.kind === "cargo-workspace"
             ? scope.directory
@@ -1751,14 +1745,13 @@ export const executeRun = (
               }
               const backgroundFailures = backgroundFibers.map((fiber) =>
                 Fiber.join(fiber).pipe(
-                  Effect.flatMap((outcome) =>
-                    outcome.exitCode === 0
-                      ? Effect.never
-                      : Effect.succeed({
-                          _tag: "BackgroundFailed" as const,
-                          outcome,
-                        }),
-                  ),
+                  Effect.map((outcome) => ({
+                    _tag: "BackgroundFailed" as const,
+                    outcome:
+                      outcome.exitCode === 0
+                        ? { ...outcome, exitCode: 1 }
+                        : outcome,
+                  })),
                 ),
               );
               const firstBackgroundFailure = backgroundFailures

@@ -429,7 +429,7 @@ describe("core repository model", () => {
     ]);
   });
 
-  it("uses available parallelism for percentages and maps Cargo dev to run", () => {
+  it("uses available parallelism and preserves Cargo pass-through arguments", () => {
     expect(parseConcurrency("50%", 8)).toBe(4);
     expect(parseConcurrency("100%", 1)).toBe(1);
     const packageModel = {
@@ -455,6 +455,31 @@ describe("core repository model", () => {
     expect(packageManagerCommand(node, [])).toEqual({
       command: "cargo",
       arguments: ["run", "--package=app", "--locked"],
+      cwd: "/repo/crates/app",
+    });
+    expect(packageManagerCommand(node, ["--release"])).toEqual({
+      command: "cargo",
+      arguments: ["run", "--package=app", "--locked", "--release"],
+      cwd: "/repo/crates/app",
+    });
+    expect(packageManagerCommand(node, ["--", "--example=demo"])).toEqual({
+      command: "cargo",
+      arguments: ["run", "--package=app", "--locked", "--", "--example=demo"],
+      cwd: "/repo/crates/app",
+    });
+    expect(
+      packageManagerCommand(
+        { ...node, id: "app#test", task: "test", command: "cargo test" },
+        ["--features=integration"],
+      ),
+    ).toEqual({
+      command: "cargo",
+      arguments: [
+        "test",
+        "--package=app",
+        "--locked",
+        "--features=integration",
+      ],
       cwd: "/repo/crates/app",
     });
   });

@@ -334,10 +334,18 @@ describe("core CLI execution", () => {
         cache: false,
         outputs: ["qualified/**"],
       };
+      configuration.tasks["synthetic-app#fail"] = { persistent: true };
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
       );
+      const workspacePath = `${directory}/packages/app/turbo.json`;
+      const workspace = JSON.parse(await readFile(workspacePath, "utf8")) as {
+        tasks: Record<string, Record<string, unknown>>;
+      };
+      workspace.tasks.build!.interactive = true;
+      workspace.tasks.fail = { interruptible: true };
+      await writeFile(workspacePath, `${JSON.stringify(workspace, null, 2)}\n`);
       const model = await Effect.runPromise(
         Effect.gen(function* () {
           const rootConfiguration = yield* loadRootConfiguration(directory);
@@ -346,7 +354,14 @@ describe("core CLI execution", () => {
       );
       expect(
         model.packagesByName.get("synthetic-app")?.tasks["synthetic-app#build"],
-      ).toMatchObject({ cache: false, outputs: ["build/**"] });
+      ).toMatchObject({
+        cache: false,
+        interactive: true,
+        outputs: ["build/**"],
+      });
+      expect(
+        model.packagesByName.get("synthetic-app")?.tasks["synthetic-app#fail"],
+      ).toMatchObject({ interruptible: true, persistent: true });
 
       configuration.tasks["synthetic-app#build"] = {
         cache: false,
@@ -356,10 +371,6 @@ describe("core CLI execution", () => {
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
       );
-      const workspacePath = `${directory}/packages/app/turbo.json`;
-      const workspace = JSON.parse(await readFile(workspacePath, "utf8")) as {
-        tasks: Record<string, Record<string, unknown>>;
-      };
       workspace.tasks.build!.cache = true;
       await writeFile(workspacePath, `${JSON.stringify(workspace, null, 2)}\n`);
       const invalid = await run(
@@ -371,6 +382,66 @@ describe("core CLI execution", () => {
       expect(invalid.stderr).toContain(
         "interactive tasks must disable caching",
       );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("links JavaScript workspaces only when declared ranges match", async () => {
+    const directory = await makeFixture();
+    try {
+      const appManifestPath = `${directory}/packages/app/package.json`;
+      const libraryManifestPath = `${directory}/packages/library/package.json`;
+      const appManifest = JSON.parse(
+        await readFile(appManifestPath, "utf8"),
+      ) as {
+        dependencies: Record<string, string>;
+      };
+      const libraryManifest = JSON.parse(
+        await readFile(libraryManifestPath, "utf8"),
+      ) as { version: string };
+      appManifest.dependencies["synthetic-library"] = "^1.0.0";
+      libraryManifest.version = "2.0.0";
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, null, 2)}\n`,
+      );
+      await writeFile(
+        libraryManifestPath,
+        `${JSON.stringify(libraryManifest, null, 2)}\n`,
+      );
+      const discover = () =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const rootConfiguration = yield* loadRootConfiguration(directory);
+            return yield* discoverRepository(directory, rootConfiguration);
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      const incompatible = await discover();
+      const incompatibleApp = incompatible.packagesByName.get("synthetic-app")!;
+      expect(incompatibleApp.internalDependencies).toEqual([]);
+      expect(
+        buildTaskGraph(
+          incompatible,
+          [incompatibleApp],
+          ["build"],
+          false,
+        ).nodes.has("synthetic-library#build"),
+      ).toBe(false);
+
+      libraryManifest.version = "1.2.0";
+      await writeFile(
+        libraryManifestPath,
+        `${JSON.stringify(libraryManifest, null, 2)}\n`,
+      );
+      const compatible = await discover();
+      const compatibleApp = compatible.packagesByName.get("synthetic-app")!;
+      expect(compatibleApp.internalDependencies).toEqual(["synthetic-library"]);
+      expect(
+        buildTaskGraph(compatible, [compatibleApp], ["build"], false).nodes.has(
+          "synthetic-library#build",
+        ),
+      ).toBe(true);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1035,7 +1106,7 @@ describe("core CLI execution", () => {
         scripts: Record<string, string>;
       };
       manifest.scripts.serve =
-        "node -e \"const fs=require('node:fs'); console.log('persistent server ready'); fs.writeFileSync('serve.ready','1'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('owner.done')){clearInterval(timer)}else if(Date.now()-started>4000){process.exit(8)}},10)\"";
+        "node -e \"const fs=require('node:fs'); console.log('persistent server ready'); fs.writeFileSync('serve.ready','1'); setInterval(()=>{},1000)\"";
       manifest.scripts.check =
         "node -e \"const fs=require('node:fs'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('serve.ready')){fs.writeFileSync('owner.done','1'); clearInterval(timer)}else if(Date.now()-started>3000){process.exit(7)}},10)\"";
       await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
@@ -1227,6 +1298,51 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
+  it("fails when persistent companions exit successfully before owners", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.check = { cache: false, with: ["serve"] };
+      configuration.tasks.serve = { cache: false, persistent: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.serve = 'node -e "process.exit(0)"';
+      manifest.scripts.check =
+        "node -e \"setTimeout(() => require('node:fs').writeFileSync('owner.finished', '1'), 1000)\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--concurrency=1",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).not.toBe(0);
+      await expect(
+        readFile(`${packageDirectory}/owner.finished`, "utf8"),
+      ).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("includes companion task hashes in an owner's cache key", async () => {
     const directory = await makeFixture();
     const libraryDirectory = `${directory}/packages/library`;
@@ -1353,6 +1469,30 @@ describe("core CLI execution", () => {
       expect(
         model.packagesByName.get("synthetic-rust-tool")?.tasks.format,
       ).toMatchObject({ cache: false });
+      expect(
+        model.packagesByName.get("synthetic-rust-tool")?.scripts,
+      ).toMatchObject({ dev: "cargo run", run: "cargo run" });
+      expect(
+        model.packagesByName.get("synthetic-rust-library")?.scripts.run,
+      ).toBeUndefined();
+      expect(
+        model.packagesByName.get("synthetic-rust-library")?.scripts.dev,
+      ).toBeUndefined();
+      const libraryRun = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "run",
+          "--cwd",
+          directory,
+          "--filter=synthetic-rust-library",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(libraryRun.exitCode).not.toBe(0);
+      expect(libraryRun.stderr).toContain("task not found: run");
       const args = [
         candidateEntrypoint,
         "run",

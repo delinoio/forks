@@ -83,7 +83,9 @@ task matches, and includes `with` companions. Task hashes preserve Git symlink
 and dependency semantics, exclude the resolved cache directory, and use each
 task's owning ecosystem lockfile. Scheduled `with` groups preserve internal
 dependency order, and non-interactive persistent task output streams to the
-terminal and task log while the process is running.
+terminal and task log while the process is running. Persistent companions must
+remain alive until their foreground owners complete; any earlier natural exit
+fails the group.
 
 Workspace task overrides merge with their effective package-qualified root
 definition and the merged task invariants are revalidated before execution.
@@ -94,11 +96,15 @@ Companion task hashes participate in the owning task's cache key. Local eviction
 accepts week-based ages, runs before cache restoration, and counts archive and
 sidecar bytes, including orphaned sidecars. Cache archives use PAX extensions
 for paths beyond ustar limits. Standalone uv tasks execute from their project
-directory. Unfiltered Cargo `test`, `check`, `lint`, and `format` tasks execute
-once per Cargo workspace and bypass caching when any grouped member disables
-it; filtered and package-qualified runs retain package targeting. Cargo builds
-with pass-through arguments that select an alternate output layout bypass
-caching until those layouts are modeled explicitly.
+directory. JavaScript package-graph edges require declared workspace or
+version-range compatibility with the local package. Unfiltered Cargo `test`,
+`check`, `lint`, and `format` tasks execute once per Cargo workspace and bypass
+caching when any grouped member disables it; filtered and package-qualified
+runs retain package targeting. Cargo `run` and `dev` tasks are exposed only for
+binary crates, and pass-through arguments are forwarded to Cargo without an
+implicit target-argument separator. Cargo builds with pass-through arguments
+that select an alternate output layout bypass caching until those layouts are
+modeled explicitly.
 
 Gate 2 is not closed: the composed task-hash serializer does not yet reproduce
 the official 2.10.12 task hashes. Individual source-file hashes match Git and

@@ -259,7 +259,7 @@ const assertKnownKeys = (
   }
 };
 
-const validateTaskKeys = (value: unknown, path: string): void => {
+const validateTaskStructure = (value: unknown, path: string): void => {
   if (value === undefined || value === null) {
     return;
   }
@@ -284,6 +284,17 @@ const validateTaskKeys = (value: unknown, path: string): void => {
         }
       }
     }
+  }
+};
+
+const validateTaskInvariants = (value: unknown, path: string): void => {
+  if (value === undefined || value === null) {
+    return;
+  }
+  const tasks = expectObject(value, path);
+  for (const [name, definition] of Object.entries(tasks)) {
+    const taskPath = `${path}:tasks.${name}`;
+    const task = expectObject(definition, taskPath);
     if (task.interactive === true && task.cache !== false) {
       throw new ConfigurationError({
         path: taskPath,
@@ -441,7 +452,8 @@ export const loadRootConfiguration = (
       const document = expectObject(parseJsonConfiguration(source, path), path);
       assertKnownKeys(document, rootKeys, path);
       validateRootNestedKeys(document, path);
-      validateTaskKeys(document.tasks, path);
+      validateTaskStructure(document.tasks, path);
+      validateTaskInvariants(document.tasks, path);
       const futureFlags =
         document.futureFlags === null || document.futureFlags === undefined
           ? {}
@@ -598,7 +610,7 @@ export const loadPackageConfiguration = (
         `${path}:boundaries`,
         false,
       );
-      validateTaskKeys(workspaceDocument.tasks, path);
+      validateTaskStructure(workspaceDocument.tasks, path);
       return decodeConfiguration(
         WorkspaceSchemaSchema,
         workspaceDocument,
@@ -621,7 +633,8 @@ export const loadPackageConfiguration = (
       tasks[targetName] = mergePipeline(rootTasks[targetName], pipeline);
     }
     return yield* validateConfigurationEffect(path, () => {
-      validateTaskKeys(tasks, path);
+      validateTaskStructure(tasks, path);
+      validateTaskInvariants(tasks, path);
       return tasks;
     });
   });
