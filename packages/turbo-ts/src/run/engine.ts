@@ -472,6 +472,7 @@ const findAffectedPackages = (
   repository: RepositoryModel,
   environment: Readonly<Record<string, string | undefined>>,
   range?: GitRange,
+  globalInputsAreTaskAware = false,
 ): Effect.Effect<AffectedPackages, ConfigurationError, ProcessService> =>
   Effect.gen(function* () {
     const processService = yield* ProcessService;
@@ -532,7 +533,9 @@ const findAffectedPackages = (
     const globalDependencyPatterns =
       repository.rootConfiguration.value.futureFlags?.globalConfiguration ===
       true
-        ? []
+        ? globalInputsAreTaskAware
+          ? []
+          : (repository.rootConfiguration.value.global?.inputs ?? [])
         : (repository.rootConfiguration.value.globalDependencies ?? []);
     const rootChanged =
       selectByGlobs(changedFiles, globalDependencyPatterns).length > 0 ||
@@ -578,6 +581,7 @@ const resolveAffectedPackages = (
   Effect.gen(function* () {
     const ranges = new Map<string, ReadonlySet<string>>();
     const affectedBySelector = new Map<string, AffectedPackages>();
+    const flags = repository.rootConfiguration.value.futureFlags;
     const selectors = [
       ...new Set(
         options.filters.flatMap((filter) => {
@@ -591,12 +595,18 @@ const resolveAffectedPackages = (
         repository,
         environment,
         parseGitRange(selector),
+        flags?.filterUsingTasks === true,
       );
       ranges.set(selector, affected.packages);
       affectedBySelector.set(selector, affected);
     }
     if (options.affected) {
-      const affected = yield* findAffectedPackages(repository, environment);
+      const affected = yield* findAffectedPackages(
+        repository,
+        environment,
+        undefined,
+        flags?.affectedUsingTaskInputs === true,
+      );
       ranges.set(defaultAffectedSelector, affected.packages);
       affectedBySelector.set(defaultAffectedSelector, affected);
     }
@@ -1596,11 +1606,13 @@ export const executeRun = (
       configuration,
       availableParallelism,
     );
-    yield* evictLocalCache({
-      directory: options.cacheDirectory,
-      maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
-      maxSizeBytes: options.cacheMaxSizeBytes,
-    });
+    if (options.cachePolicy.localRead || options.cachePolicy.localWrite) {
+      yield* evictLocalCache({
+        directory: options.cacheDirectory,
+        maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
+        maxSizeBytes: options.cacheMaxSizeBytes,
+      });
+    }
     const repository = yield* discoverRepository(options.root, configuration);
     const packageManagerCheckDisabled =
       parsed.dangerouslyDisablePackageManagerCheck ||

@@ -73,21 +73,25 @@ tested bidirectionally against the external official binary when addressed by
 an oracle-provided hash.
 
 Gate 2 selection resolves package-qualified tasks and explicit Git ranges,
-fails closed when explicit revisions are invalid, applies ordered workspace
+fails closed when explicit revisions are invalid, reads workspace declarations
+from the resolved JavaScript package manager, applies ordered workspace
 exclusions and brace/class-aware globs, and discovers the owning repository
-from nested working directories, including explicit `--cwd` values. Every
-requested task must resolve before any task executes. Task-input selection uses
-the same effective global and task inputs as hashing, evaluates task owners
-before Git-range package narrowing, applies negative Git ranges after positive
-task matches, and includes `with` companions. Task hashes preserve Git symlink
-and dependency semantics, exclude the resolved cache directory, and use each
-task's owning ecosystem lockfile. Scheduled `with` groups preserve internal
-dependency order, and non-interactive persistent task output streams to the
-terminal and task log while the process is running while retaining only a
-bounded diagnostic tail in memory. Persistent companions must remain alive
-until their foreground owners complete; any earlier natural exit fails the
-group, and foreground owners sharing a companion remain subject to the run's
-concurrency limit.
+from nested working directories, including explicit `--cwd` values. Only pnpm
+uses `pnpm-workspace.yaml`; other JavaScript managers use `package.json`
+workspaces. Every requested task must resolve before any task executes.
+Package-level affected selection treats legacy `globalDependencies` and, when
+task-aware selection is disabled, `global.inputs` as repository-global inputs.
+Task-input selection uses the same effective global and task inputs as hashing,
+evaluates task owners before Git-range package narrowing, applies negative Git
+ranges after positive task matches, and includes `with` companions. Task hashes
+preserve Git symlink and dependency semantics, exclude the resolved cache
+directory, and use each task's owning ecosystem lockfile. Scheduled `with`
+groups preserve internal dependency order, and non-interactive persistent task
+output streams to the terminal and task log while the process is running while
+retaining only a bounded diagnostic tail in memory. Persistent companions must
+remain alive until their foreground owners complete; any earlier natural exit
+fails the group, and foreground owners sharing a companion remain subject to
+the run's concurrency limit.
 
 Workspace task overrides merge with their effective package-qualified root
 definition and the merged task invariants are revalidated before execution.
@@ -96,9 +100,10 @@ reject malformed entries. Remote artifact routes preserve configured API path
 prefixes, remote restoration failures warn and fall back to task execution, and
 remote upload failures warn without changing a successful task outcome.
 Companion task hashes participate in the owning task's cache key. Local eviction
-accepts week-based ages, runs before cache restoration, and counts archive and
-sidecar bytes, including orphaned sidecars. Cache archives use PAX extensions
-for paths beyond ustar limits. uv packages are discovered from the root
+accepts week-based ages, runs before cache restoration only when local cache
+reads or writes are enabled, and counts archive and sidecar bytes, including
+orphaned sidecars. Cache archives use PAX extensions for paths beyond ustar
+limits. uv packages are discovered from the root
 `pyproject.toml` workspace root and member globs after applying workspace
 exclusions; unrelated Python projects are ignored. Synthesized uv packages
 expose `build` and `test`, and implicit builds default to uncached unless task

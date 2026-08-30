@@ -239,6 +239,50 @@ describe("core CLI execution", () => {
     }
   });
 
+  it("skips local eviction when local caching is disabled", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.cacheDir = "blocked-cache";
+      configuration.cacheMaxAge = "1h";
+      configuration.cacheMaxSize = "1kb";
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const blockedCachePath = `${directory}/blocked-cache`;
+      await writeFile(blockedCachePath, "not a directory\n");
+      for (const cacheArguments of [
+        ["--no-cache"],
+        ["--remote-only"],
+        ["--cache=remote:rw"],
+      ]) {
+        const result = await run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "build",
+            "--cwd",
+            directory,
+            "--filter=synthetic-library",
+            ...cacheArguments,
+          ],
+          repositoryRoot,
+        );
+        expect(result.exitCode, result.stderr).toBe(0);
+        expect(await readFile(blockedCachePath, "utf8")).toBe(
+          "not a directory\n",
+        );
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("evicts expired cache entries before read-only restores", async () => {
     const directory = await makeFixture();
     const cacheDirectory = `${directory}/.turbo/cache`;
@@ -446,6 +490,31 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("uses workspace globs from the resolved package manager", async () => {
+    const directory = await makeFixture();
+    try {
+      const manifestPath = `${directory}/package.json`;
+      const manifest = JSON.parse(
+        await readFile(manifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      manifest.packageManager = "npm@11.6.0";
+      manifest.workspaces = ["packages/app"];
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(model.manager).toBe("npm");
+      expect(model.packages.map((packageModel) => packageModel.name)).toEqual([
+        "synthetic-app",
+      ]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("reads uv project names and dependencies from their TOML sections", async () => {
     const directory = await makeFixture();
@@ -1018,6 +1087,75 @@ describe("core CLI execution", () => {
       expect(global.exitCode).toBe(0);
       expect(global.stdout).toContain("app check");
       expect(global.stdout).toContain("library check");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("treats new global inputs as package-level affected paths", async () => {
+    await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
+    const directory = await mkdtemp(
+      join(repositoryRoot, ".turbo/turbo-ts-global-inputs-affected-"),
+    );
+    await cp(fixtureRoot, directory, { recursive: true });
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        global?: Record<string, unknown>;
+        tasks: Record<string, unknown>;
+      };
+      configuration.futureFlags = { globalConfiguration: true };
+      configuration.global = { inputs: ["./packages/app/global.txt"] };
+      configuration.tasks.check = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      for (const packageName of ["app", "library"]) {
+        const manifestPath = `${directory}/packages/${packageName}/package.json`;
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          scripts: Record<string, string>;
+        };
+        manifest.scripts.check = `node -e "console.log('${packageName} check')"`;
+        await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      }
+      await writeFile(`${directory}/packages/app/global.txt`, "first\n");
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "base"],
+      ]) {
+        const result = await run("git", args, directory);
+        expect(result.exitCode, `${args.join(" ")}: ${result.stderr}`).toBe(0);
+      }
+      await writeFile(`${directory}/packages/app/global.txt`, "second\n");
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "global input"], directory))
+          .exitCode,
+      ).toBe(0);
+      const affected = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--affected",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(affected.exitCode).toBe(0);
+      expect(affected.stdout).toContain("app check");
+      expect(affected.stdout).toContain("library check");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

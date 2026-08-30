@@ -325,13 +325,15 @@ const walkDirectories = (
 
 const workspacePatterns = (
   root: string,
+  manager: PackageManagerName,
   manifest: PackageManifest,
 ): Effect.Effect<ReadonlyArray<string>, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const pnpmWorkspacePath = joinPath(root, "pnpm-workspace.yaml");
     if (
-      yield* fileSystem.exists(pnpmWorkspacePath).pipe(
+      manager === "pnpm" &&
+      (yield* fileSystem.exists(pnpmWorkspacePath).pipe(
         Effect.mapError(
           (error) =>
             new RepositoryError({
@@ -339,7 +341,7 @@ const workspacePatterns = (
               message: error.message,
             }),
         ),
-      )
+      ))
     ) {
       const source = yield* fileSystem.readText(pnpmWorkspacePath).pipe(
         Effect.mapError(
@@ -688,7 +690,11 @@ export const discoverRepository = (
               : `@${devEngineManager.version}`
           }`;
     const managerIdentity = yield* discoverManager(root, declaredManager);
-    const patterns = yield* workspacePatterns(root, rootManifest);
+    const patterns = yield* workspacePatterns(
+      root,
+      managerIdentity.name,
+      rootManifest,
+    );
     const directories = yield* walkDirectories(root);
     const candidateDirectoryPaths = new Set(
       selectByGlobs(
