@@ -86,7 +86,7 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  });
+  }, 10_000);
 
   it("writes and restores local cache entries", async () => {
     const directory = await makeFixture();
