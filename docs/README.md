@@ -24,8 +24,13 @@ documents that connect its upstream provenance to its owned repository paths.
 
 ## Fork Project Catalog
 
-No fork projects are registered yet. Add each project index and its directly
-authoritative domain contracts here when the fork source is introduced.
+- [`docs/project-turbo-ts.md`](project-turbo-ts.md): project index for the
+  clean-room Turborepo compatibility implementation.
+
+## Package Contracts
+
+- [`docs/packages-turbo-ts-contract.md`](packages-turbo-ts-contract.md): package,
+  public type, runtime, and compatibility-oracle contract for `turbo-ts`.
 
 ## Adding a Contract
 

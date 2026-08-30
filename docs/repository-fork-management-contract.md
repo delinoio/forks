@@ -53,4 +53,5 @@ contracts, and catalogs remain synchronized in the same change.
 
 ## Current Projects
 
-No fork projects are currently registered.
+- [`turbo-ts`](project-turbo-ts.md): clean-room TypeScript and Effect
+  compatibility implementation for Turborepo 2.10.12.

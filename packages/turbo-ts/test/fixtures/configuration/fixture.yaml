@@ -1,0 +1,8 @@
+id: configuration
+provenance: independently-authored
+files:
+  - invalid-root.json
+  - valid-root.json
+sources:
+  - distributed turbo@2.10.12 JSON Schema
+purpose: accepted and rejected runtime configuration validation

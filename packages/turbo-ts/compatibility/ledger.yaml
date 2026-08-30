@@ -1,0 +1,565 @@
+version: 1
+baseline:
+  package: turbo
+  version: 2.10.12
+  commit: 53752d452049bdda47698354b16a83d7ce92ced0
+rows:
+  - id: cli.version
+    category: command
+    subject: exact branded version output
+    targetGate: 1
+    status: passing
+    variants: [--version]
+    tests: [cli.version]
+    source: issue-3
+  - id: cli.commands
+    category: command
+    subject: accepted command and implicit-task inventory
+    targetGate: 2
+    status: planned
+    variants:
+      - bin
+      - get-mfe-port
+      - boundaries
+      - completion
+      - daemon
+      - devtools
+      - docs
+      - generate
+      - telemetry
+      - scan
+      - config
+      - ls
+      - link
+      - login
+      - logout
+      - info
+      - prune
+      - run
+      - implicit-task
+      - query
+      - query affected
+      - query ls
+      - watch
+      - unlink
+    source: issue-3-and-black-box-help
+  - id: cli.global-options
+    category: option
+    subject: global options accepted by every applicable command
+    targetGate: 2
+    status: planned
+    variants:
+      - --version
+      - --skip-infer
+      - --no-update-notifier
+      - --api
+      - --color
+      - --cwd
+      - --heap
+      - --ui
+      - --login
+      - --no-color
+      - --preflight
+      - --remote-cache-timeout
+      - --team
+      - --token
+      - --trace
+      - --verbosity
+      - --experimental-otel-enabled
+      - --experimental-otel-protocol
+      - --experimental-otel-endpoint
+      - --experimental-otel-timeout-ms
+      - --experimental-otel-interval-ms
+      - --experimental-otel-header
+      - --experimental-otel-resource
+      - --experimental-otel-metrics-run-summary
+      - --experimental-otel-metrics-task-details
+      - --experimental-otel-use-remote-cache-token
+      - --dangerously-disable-package-manager-check
+      - --root-turbo-json
+      - --help
+      - -h
+    source: black-box-help
+  - id: cli.run-options
+    category: option
+    subject: run, watch, pass-through, cache, graph, output, and profile options
+    targetGate: 2
+    status: planned
+    variants:
+      - --cache
+      - --force
+      - --remote-only
+      - --remote-cache-read-only
+      - --no-cache
+      - --cache-workers
+      - --dry-run
+      - --graph
+      - --daemon
+      - --no-daemon
+      - --profile
+      - --anon-profile
+      - --summarize
+      - --parallel
+      - --cache-dir
+      - --concurrency
+      - --continue
+      - --single-package
+      - --framework-inference
+      - --global-deps
+      - --env-mode
+      - --filter
+      - -F
+      - --affected
+      - --output-logs
+      - --log-order
+      - --json
+      - --log-file
+      - --only
+      - --log-prefix
+      - --experimental-write-cache
+      - --
+    source: black-box-help-and-issue-3
+  - id: cli.secondary-options
+    category: option
+    subject: secondary, hidden, deprecated, and experimental command options
+    targetGate: 4
+    status: planned
+    variants:
+      - --ignore
+      - --reason
+      - --idle-time
+      - --turbo-json-path
+      - --port
+      - --no-open
+      - --docs-version
+      - --config
+      - -c
+      - --root
+      - -r
+      - --args
+      - -a
+      - --output
+      - --no-gitignore
+      - --scope
+      - --yes
+      - -y
+      - --sso-team
+      - --manual
+      - --invalidate
+      - --docker
+      - --production
+      - --out-dir
+      - --use-gitignore
+      - --variables
+      - -V
+      - --schema
+      - test-only-arguments
+    source: black-box-help-and-issue-3
+  - id: environment.turbo
+    category: environment
+    subject: Turbo configuration, cache, SCM, telemetry, update, and testing environment
+    targetGate: 2
+    status: planned
+    variants:
+      - TURBO_API
+      - TURBO_LOGIN
+      - TURBO_TEAM
+      - TURBO_TEAMID
+      - TURBO_TOKEN
+      - TURBO_CACHE
+      - TURBO_CACHE_DIR
+      - TURBO_CACHE_WORKERS
+      - TURBO_CONCURRENCY
+      - TURBO_DAEMON
+      - TURBO_FORCE
+      - TURBO_LOG_ORDER
+      - TURBO_LOG_PREFIX
+      - TURBO_REMOTE_ONLY
+      - TURBO_REMOTE_CACHE_READ_ONLY
+      - TURBO_REMOTE_CACHE_SIGNATURE_KEY
+      - TURBO_REMOTE_CACHE_TIMEOUT
+      - TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT
+      - TURBO_SCM_BASE
+      - TURBO_SCM_HEAD
+      - TURBO_TELEMETRY_DISABLED
+      - TURBO_TELEMETRY_MESSAGE_DISABLED
+      - TURBO_UI
+      - TURBO_ROOT_TURBO_JSON
+      - TURBO_DANGEROUSLY_DISABLE_PACKAGE_MANAGER_CHECK
+    source: public-documentation-and-black-box
+  - id: environment.platform
+    category: environment
+    subject: color, CI, package-manager, OpenTelemetry, and test control variables
+    targetGate: 4
+    status: planned
+    variants:
+      - NO_COLOR
+      - CI
+      - FORCE_COLOR
+      - npm_config_user_agent
+      - npm_config_cache
+      - PNPM_HOME
+      - YARN_CACHE_FOLDER
+      - BUN_INSTALL
+      - OTEL_EXPORTER_OTLP_ENDPOINT
+      - OTEL_EXPORTER_OTLP_PROTOCOL
+      - OTEL_EXPORTER_OTLP_HEADERS
+      - OTEL_EXPORTER_OTLP_TIMEOUT
+      - TURBO_TS_ORACLE_PATH
+    source: issue-3-and-public-documentation
+  - id: configuration.distributed
+    category: configuration
+    subject: distributed root and workspace schema keys
+    targetGate: 2
+    status: planned
+    variants:
+      - $schema
+      - boundaries
+      - cacheDir
+      - cacheMaxAge
+      - cacheMaxSize
+      - concurrency
+      - daemon
+      - dangerouslyDisablePackageManagerCheck
+      - envMode
+      - extends
+      - futureFlags
+      - global
+      - globalDependencies
+      - globalEnv
+      - globalPassThroughEnv
+      - noUpdateNotifier
+      - remoteCache
+      - tags
+      - tasks
+      - ui
+      - boundaries.dependencies
+      - boundaries.dependencies.allow
+      - boundaries.dependencies.deny
+      - boundaries.dependents
+      - boundaries.dependents.allow
+      - boundaries.dependents.deny
+      - boundaries.implicitDependencies
+      - boundaries.tags
+      - boundaries.tags.*.dependencies
+      - boundaries.tags.*.dependencies.allow
+      - boundaries.tags.*.dependencies.deny
+      - boundaries.tags.*.dependents
+      - boundaries.tags.*.dependents.allow
+      - boundaries.tags.*.dependents.deny
+      - futureFlags.affectedUsingTaskInputs
+      - futureFlags.errorsOnlyShowHash
+      - futureFlags.experimentalCargoWorkspaces
+      - futureFlags.experimentalObservability
+      - futureFlags.experimentalPythonWorkspaces
+      - futureFlags.filterUsingTasks
+      - futureFlags.githubActionsRemoteBaseRefFallback
+      - futureFlags.globalConfiguration
+      - futureFlags.longerSignatureKey
+      - futureFlags.pruneIncludesGlobalFiles
+      - futureFlags.strictTaskEntrypointSelection
+      - futureFlags.watchUsingTaskInputs
+      - global.inputs
+      - global.env
+      - global.passThroughEnv
+      - global.remoteCache
+      - global.remoteCache.apiUrl
+      - global.remoteCache.enabled
+      - global.remoteCache.loginUrl
+      - global.remoteCache.preflight
+      - global.remoteCache.signature
+      - global.remoteCache.teamId
+      - global.remoteCache.teamSlug
+      - global.remoteCache.timeout
+      - global.remoteCache.uploadTimeout
+      - global.ui
+      - global.concurrency
+      - global.dangerouslyDisablePackageManagerCheck
+      - global.cacheDir
+      - global.cacheMaxAge
+      - global.cacheMaxSize
+      - global.daemon
+      - global.envMode
+      - global.noUpdateNotifier
+      - tasks.*.cache
+      - tasks.*.dependsOn
+      - tasks.*.description
+      - tasks.*.env
+      - tasks.*.inputs
+      - tasks.*.inputs.*.from
+      - tasks.*.inputs.*.globs
+      - tasks.*.inputs.*.mode
+      - tasks.*.inputs.*.withDefaults
+      - tasks.*.interactive
+      - tasks.*.interruptible
+      - tasks.*.outputLogs
+      - tasks.*.outputs
+      - tasks.*.passThroughEnv
+      - tasks.*.persistent
+      - tasks.*.with
+      - remoteCache.apiUrl
+      - remoteCache.enabled
+      - remoteCache.loginUrl
+      - remoteCache.preflight
+      - remoteCache.signature
+      - remoteCache.teamId
+      - remoteCache.teamSlug
+      - remoteCache.timeout
+      - remoteCache.uploadTimeout
+    source: distributed-schema
+  - id: configuration.future-flags
+    category: configuration
+    subject: public and schema-hidden future flags
+    targetGate: 2
+    status: planned
+    variants:
+      - affectedUsingTaskInputs
+      - errorsOnlyShowHash
+      - experimentalCargoWorkspaces
+      - experimentalObservability
+      - experimentalPythonWorkspaces
+      - filterUsingTasks
+      - githubActionsRemoteBaseRefFallback
+      - globalConfiguration
+      - longerSignatureKey
+      - pruneIncludesGlobalFiles
+      - strictTaskEntrypointSelection
+      - watchUsingTaskInputs
+      - experimentalCargoSccache
+    source: distributed-schema-and-issue-3
+  - id: configuration.formats-and-precedence
+    category: configuration
+    subject: accepted documents, inheritance, deprecated keys, and precedence
+    targetGate: 2
+    status: planned
+    variants:
+      - turbo.json
+      - turbo.jsonc
+      - root-configuration
+      - package-configuration
+      - package-inheritance
+      - deprecated-accepted-keys
+      - schema-hidden-runtime-keys
+      - cli-over-environment-over-config
+      - unknown-fields
+      - invalid-combinations
+    source: issue-3
+  - id: protocol.cache-http-auth
+    category: protocol
+    subject: remote cache, auth, linking, and hosted request protocols
+    targetGate: 4
+    status: planned
+    variants:
+      - remote-cache-head
+      - remote-cache-get
+      - remote-cache-put
+      - remote-cache-events
+      - preflight
+      - redirects
+      - retry
+      - timeout
+      - signatures
+      - team-id
+      - team-slug
+      - tenant-isolation
+      - login
+      - link
+      - logout
+      - unlink
+      - update-check
+    source: issue-3-and-black-box-traffic
+  - id: protocol.daemon-query-watch
+    category: protocol
+    subject: daemon, GraphQL query, watch, devtools, telemetry, and observability
+    targetGate: 3
+    status: planned
+    variants:
+      - daemon-handshake
+      - daemon-package-discovery
+      - daemon-watch-changes
+      - daemon-status
+      - daemon-logs
+      - daemon-cleanup
+      - daemon-shutdown
+      - daemon-restart
+      - graphql-schema
+      - graphql-query
+      - graphql-server
+      - watch-events
+      - devtools-http
+      - telemetry
+      - otlp-http-json
+      - otlp-http-protobuf
+      - otlp-grpc
+    source: issue-3-and-black-box-traffic
+  - id: package-manager.node
+    category: package-manager
+    subject: JavaScript package-manager identities and versions
+    targetGate: 2
+    status: planned
+    variants:
+      - npm@8.0.0
+      - npm@8.19.4
+      - npm@9.9.4
+      - npm@10.9.9
+      - npm@11.19.1
+      - npm@12.0.2
+      - pnpm@8.0.0
+      - pnpm@8.15.9
+      - pnpm@9.15.9
+      - pnpm@10.34.5
+      - pnpm@11.25.0
+      - pnpm@12.1.0
+      - yarn@1.0.0
+      - yarn@1.22.22
+      - yarn@2.4.2
+      - yarn@3.8.7
+      - yarn@4.18.0
+      - yarn-pnp@2.4.2
+      - yarn-pnp@3.8.7
+      - yarn-pnp@4.18.0
+      - bun@1.2.0
+      - bun@1.4.0
+      - aube@2.2.0:native
+      - aube@2.2.0:npm
+      - aube@2.2.0:pnpm
+      - aube@2.2.0:yarn
+      - aube@2.2.0:bun
+      - nub@0.1.0:native
+      - nub@0.1.0:delegated
+    source: issue-3
+  - id: package-manager.experimental
+    category: package-manager
+    subject: experimental non-JavaScript workspaces
+    targetGate: 4
+    status: planned
+    variants: [cargo@1.97.1, rustc@1.97.1, uv@0.12.7]
+    source: issue-3
+  - id: success.core
+    category: success
+    subject: repository discovery, execution, cache, output, and workflow success paths
+    targetGate: 2
+    status: planned
+    variants:
+      - git-repository
+      - no-vcs-repository
+      - package-discovery
+      - lockfile-parse-and-prune
+      - package-graph
+      - task-graph
+      - filter-and-affected
+      - strict-environment
+      - loose-environment
+      - framework-inference
+      - scheduling
+      - persistent-task
+      - interactive-task
+      - interruptible-task
+      - local-cache-hit-and-miss
+      - remote-cache-hit-and-miss
+      - official-to-typescript-cache
+      - typescript-to-official-cache
+      - graph-formats
+      - profiles-and-summaries
+      - tui-stream-and-ndjson
+    source: issue-3
+  - id: success.foundation
+    category: success
+    subject: Gate 1 generated artifacts, oracle, mock services, and boundaries
+    targetGate: 1
+    status: passing
+    variants:
+      - generated-schema-and-types
+      - external-oracle
+      - synthetic-fixtures
+      - mock-hosted-services
+      - deterministic-normalizers
+      - scoped-effect-boundaries
+      - runtime-dependency-audit
+    tests:
+      - configuration.generated
+      - fixtures.synthetic
+      - oracle.external
+      - mock-hosted.scoped
+      - normalizers.deterministic
+      - effects.scoped
+      - dependencies.runtime
+    source: issue-3
+  - id: failure.validation-runtime
+    category: failure
+    subject: validation, process, filesystem, network, and recovery failures
+    targetGate: 2
+    status: planned
+    variants:
+      - malformed-input
+      - invalid-config
+      - unknown-option
+      - invalid-option-combination
+      - graph-cycle
+      - missing-task
+      - invalid-persistent-dependency
+      - timeout
+      - process-crash
+      - partial-failure
+      - cancellation
+      - duplicate-submission
+      - stale-file
+      - permission-change
+      - deleted-resource
+      - offline-dependency
+      - rate-limit
+      - invalid-credentials
+      - corrupt-cache
+      - missing-archive
+      - stale-daemon
+      - recovery-without-leaks
+    source: issue-3
+  - id: security.automated
+    category: security
+    subject: required adversarial and shared-state cases
+    targetGate: 5
+    status: planned
+    variants:
+      - archive-traversal
+      - escaping-symlink
+      - unsafe-glob
+      - unsafe-path
+      - command-injection
+      - malicious-lockfile
+      - invalid-signature
+      - credential-permissions
+      - credential-deletion
+      - secret-redaction
+      - cross-team-cache-isolation
+      - shared-state-race
+    source: issue-3
+  - id: normalization.approved
+    category: normalization
+    subject: approved deliberate and evidence-backed normalization dimensions
+    targetGate: 1
+    status: passing
+    variants:
+      - branding
+      - version
+    tests: [normalizers.allowlist, nondeterminism.evidence]
+    source: issue-3
+  - id: differences.approved
+    category: explicit-difference
+    subject: only compatibility differences approved by issue 3
+    targetGate: 1
+    status: documented-difference
+    variants:
+      - branding
+      - independent-version
+      - node-24-private-package
+      - no-native-platform-packages
+      - hosted-product-identity
+      - update-disabled-by-default
+      - v8-heap-and-trace
+      - no-internal-lsp
+      - no-embedded-sccache
+      - experimentalCargoSccache-unsupported
+      - windows-forceful-signals
+      - no-performance-gate
+      - manual-arm64-smoke
+    source: issue-3

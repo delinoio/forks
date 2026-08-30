@@ -35,8 +35,9 @@ The install step configures Lefthook for this checkout. See
 
 ## Fork Catalog
 
-No fork projects are registered yet. Add each fork to this section when its
-source and owning contracts are introduced.
+- [`turbo-ts`](docs/project-turbo-ts.md): a private, clean-room TypeScript and
+  Effect compatibility implementation targeting Turborepo 2.10.12. The
+  official `turbo` tool remains the repository task runner.
 
 ## Adding a Fork
 

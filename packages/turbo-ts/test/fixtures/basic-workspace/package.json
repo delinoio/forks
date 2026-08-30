@@ -1,0 +1,8 @@
+{
+  "name": "synthetic-basic-workspace",
+  "private": true,
+  "packageManager": "pnpm@10.34.5",
+  "scripts": {
+    "build": "node -e \"console.log('root build')\""
+  }
+}

@@ -1,5 +1,12 @@
 enableGlobalVirtualStore: true
 minimumReleaseAge: 2880
+ignoredOptionalDependencies:
+  # @effect/platform works without msgpackr's optional native accelerator.
+  - msgpackr-extract
+overrides:
+  # The default Effect Node filesystem does not import the optional Parcel
+  # watcher backend; remove its native dependency from the runtime closure.
+  "@effect/platform-node-shared@0.61.1>@parcel/watcher": "-"
 
 packages:
   - "apps/*"

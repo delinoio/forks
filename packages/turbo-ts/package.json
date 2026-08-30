@@ -1,0 +1,53 @@
+{
+  "name": "@delino/turbo-ts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Clean-room TypeScript compatibility implementation of Turborepo 2.10.12",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": "24"
+  },
+  "bin": {
+    "turbo-ts": "./dist/bin/turbo-ts.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./schema.json": "./schema.json"
+  },
+  "files": [
+    "dist",
+    "schema.json",
+    "README.md",
+    "LICENSE",
+    "UPSTREAM-LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "check": "pnpm lint && pnpm type-check && pnpm test && pnpm build && pnpm check:generated && pnpm check:runtime-dependencies",
+    "check:generated": "pnpm build && node dist/internal/generate-configuration.js --check",
+    "check:runtime-dependencies": "pnpm build && node dist/internal/check-runtime-dependencies.js",
+    "generate": "pnpm build && node dist/internal/generate-configuration.js --write",
+    "lint": "biome check .",
+    "test": "pnpm build && rstest run",
+    "type-check": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@effect/cli": "0.77.0",
+    "@effect/platform": "0.97.1",
+    "@effect/platform-node": "0.108.1",
+    "@effect/printer": "0.51.0",
+    "@effect/printer-ansi": "0.51.0",
+    "effect": "3.22.1",
+    "yaml": "2.8.3"
+  },
+  "devDependencies": {
+    "@rstest/core": "0.11.10",
+    "@types/node": "24.13.3",
+    "typescript": "7.0.2"
+  }
+}

@@ -8,11 +8,12 @@
   },
   "scripts": {
     "prepare": "./scripts/install-git-hooks.sh",
-    "check": "pnpm check:actions && pnpm check:biome && pnpm check:toml && pnpm check:go && pnpm check:rust",
+    "check": "pnpm check:actions && pnpm check:biome && pnpm check:toml && pnpm check:go && pnpm check:rust && pnpm check:packages",
     "check:actions": "node --test scripts/validate-github-action-pins.test.mjs && node scripts/validate-github-action-pins.mjs",
     "check:biome": "biome check .",
     "check:toml": "taplo fmt --check",
     "check:go": "./scripts/check-go.sh",
+    "check:packages": "turbo run check --filter=@delino/turbo-ts",
     "check:rust": "./scripts/check-rust.sh",
     "lint": "biome lint .",
     "lint:fix": "biome check --write --unsafe .",
@@ -22,9 +23,10 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.16",
+    "@delino/turbo-ts": "workspace:0.1.0",
     "@taplo/cli": "0.7.0",
     "lefthook": "1.13.6",
-    "turbo": "2.9.14",
+    "turbo": "2.10.12",
     "yaml": "2.8.3"
   },
   "pnpm": {

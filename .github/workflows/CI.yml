@@ -67,6 +67,9 @@ jobs:
       - name: Check Rust workspace
         run: pnpm check:rust
 
+      - name: Check TypeScript packages
+        run: pnpm check:packages
+
   ci-done:
     name: Ok
     needs:
