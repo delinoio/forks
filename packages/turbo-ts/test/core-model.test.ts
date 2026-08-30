@@ -219,12 +219,18 @@ describe("core repository model", () => {
     expect(() =>
       parseLockfile("/repo/pnpm-lock.yaml", new Uint8Array([0])),
     ).toThrow(/NUL/);
-    expect(() =>
+    expect(
       parseLockfile(
         "/repo/package-lock.json",
-        encoder.encode('{"__proto__":{"polluted":true}}'),
-      ),
-    ).toThrow(/prototype/);
+        encoder.encode(
+          '{"lockfileVersion":3,"dependencies":{"constructor":{"name":"constructor","version":"1.0.0"},"__proto__":{"name":"__proto__","version":"2.0.0","polluted":true}}}',
+        ),
+      ).packages,
+    ).toEqual([
+      { name: "__proto__", version: "2.0.0" },
+      { name: "constructor", version: "1.0.0" },
+    ]);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 
   it("accepts the complete core package-manager version matrix", () => {

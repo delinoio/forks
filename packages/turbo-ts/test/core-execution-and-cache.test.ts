@@ -736,6 +736,10 @@ describe("core CLI execution", () => {
           ],
           repositoryRoot,
         );
+      const characterClass = await execute("synthetic-[al]*");
+      expect(characterClass.exitCode).toBe(0);
+      expect(characterClass.stdout).toContain("app build");
+      expect(characterClass.stdout).toContain("library build");
       const sinceDevelop = await execute("[develop]");
       expect(sinceDevelop.stdout).toContain("app build");
       expect(sinceDevelop.stdout).not.toContain("library build");
@@ -749,6 +753,93 @@ describe("core CLI execution", () => {
       );
       expect(invalid.stdout).not.toContain("library build");
       expect(invalid.stdout).not.toContain("app build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("treats global dependencies and both rename paths as affected", async () => {
+    await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
+    const directory = await mkdtemp(
+      join(repositoryRoot, ".turbo/turbo-ts-affected-paths-"),
+    );
+    await cp(fixtureRoot, directory, { recursive: true });
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        globalDependencies?: Array<string>;
+        tasks: Record<string, unknown>;
+      };
+      configuration.globalDependencies = ["packages/app/global.txt"];
+      configuration.tasks.check = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      for (const packageName of ["app", "library"]) {
+        const manifestPath = `${directory}/packages/${packageName}/package.json`;
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          scripts: Record<string, string>;
+        };
+        manifest.scripts.check = `node -e "console.log('${packageName} check')"`;
+        await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      }
+      await writeFile(`${directory}/packages/library/moved.txt`, "shared\n");
+      await writeFile(`${directory}/packages/app/global.txt`, "first\n");
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "base"],
+      ]) {
+        const result = await run("git", args, directory);
+        expect(result.exitCode, `${args.join(" ")}: ${result.stderr}`).toBe(0);
+      }
+      expect(
+        (
+          await run(
+            "git",
+            ["mv", "packages/library/moved.txt", "packages/app/moved.txt"],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "move input"], directory)).exitCode,
+      ).toBe(0);
+      const executeAffected = () =>
+        run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "check",
+            "--cwd",
+            directory,
+            "--affected",
+            "--no-cache",
+          ],
+          repositoryRoot,
+          { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+        );
+      const renamed = await executeAffected();
+      expect(renamed.exitCode).toBe(0);
+      expect(renamed.stdout).toContain("app check");
+      expect(renamed.stdout).toContain("library check");
+
+      await writeFile(`${directory}/packages/app/global.txt`, "second\n");
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "global input"], directory))
+          .exitCode,
+      ).toBe(0);
+      const global = await executeAffected();
+      expect(global.exitCode).toBe(0);
+      expect(global.stdout).toContain("app check");
+      expect(global.stdout).toContain("library check");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1133,7 +1224,7 @@ describe("core CLI execution", () => {
         await readFile(configurationPath, "utf8"),
       ) as {
         futureFlags?: Record<string, boolean>;
-        tasks: Record<string, { outputs?: Array<string> }>;
+        tasks: Record<string, { cache?: boolean; outputs?: Array<string> }>;
       };
       configuration.futureFlags = { experimentalCargoWorkspaces: true };
       delete configuration.tasks.build?.outputs;
@@ -1180,6 +1271,9 @@ describe("core CLI execution", () => {
       );
       expect(
         model.packagesByName.get("synthetic-rust-library")?.tasks.build,
+      ).toMatchObject({ cache: false });
+      expect(
+        model.packagesByName.get("synthetic-rust-tool")?.tasks.format,
       ).toMatchObject({ cache: false });
       const args = [
         candidateEntrypoint,
@@ -1290,6 +1384,65 @@ describe("core CLI execution", () => {
       expect(
         await readFile(`${directory}/packages/library/dist/value.txt`, "utf8"),
       ).toBe("second\n");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("removes stale declared outputs before restoring a cache hit", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        tasks: Record<
+          string,
+          { inputs?: Array<string>; outputs?: Array<string> }
+        >;
+      };
+      configuration.tasks.build = {
+        inputs: ["input.txt"],
+        outputs: ["dist/**"],
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); const name=fs.readFileSync('input.txt','utf8').trim(); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/'+name+'.js',name)\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      await writeFile(`${packageDirectory}/input.txt`, "new\n");
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      await rm(`${packageDirectory}/dist`, { force: true, recursive: true });
+      await writeFile(`${packageDirectory}/input.txt`, "old\n");
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      await writeFile(`${packageDirectory}/input.txt`, "new\n");
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache hit");
+      expect(await readFile(`${packageDirectory}/dist/new.js`, "utf8")).toBe(
+        "new",
+      );
+      await expect(lstat(`${packageDirectory}/dist/old.js`)).rejects.toThrow();
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

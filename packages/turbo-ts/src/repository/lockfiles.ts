@@ -58,12 +58,6 @@ const collectPackages = (value: unknown): ReadonlyArray<LockfilePackage> => {
       continue;
     }
     const object = current as Record<string, unknown>;
-    if (
-      Object.hasOwn(object, "__proto__") ||
-      Object.hasOwn(object, "constructor")
-    ) {
-      throw new TypeError("lockfile contains a prototype-mutating key");
-    }
     if (typeof object.name === "string" && typeof object.version === "string") {
       packages.set(`${object.name}@${object.version}`, {
         name: object.name,

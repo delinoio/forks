@@ -53,6 +53,7 @@ export const restoreLocalCache = (
   root: string,
   options: LocalCacheOptions,
   hash: string,
+  pathsToClear: ReadonlyArray<string> = [],
 ): Effect.Effect<boolean, CacheError, FileSystemService | CompressionService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -88,7 +89,7 @@ export const restoreLocalCache = (
         } catch (cause) {
           return yield* Effect.fail(cacheError(paths.archive, cause));
         }
-        yield* restoreArchiveEntries(root, entries);
+        yield* restoreArchiveEntries(root, entries, pathsToClear);
       }),
     );
     if (outcome._tag === "Left") {

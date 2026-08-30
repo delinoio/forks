@@ -578,15 +578,24 @@ const cargoTasks = (
         ]);
   const buildDefaults: Pipeline =
     outputs.length === 0 ? { cache: false } : { outputs };
+  const formatDefaults: Pipeline = { cache: false };
   const tasks: Record<string, Pipeline> = {
     ...configured,
     build: mergePipeline(buildDefaults, configured.build ?? {}),
+    format: mergePipeline(formatDefaults, configured.format ?? {}),
   };
   const qualifiedBuild = `${packageName}#build`;
   if (configured[qualifiedBuild] !== undefined) {
     tasks[qualifiedBuild] = mergePipeline(
       buildDefaults,
       configured[qualifiedBuild],
+    );
+  }
+  const qualifiedFormat = `${packageName}#format`;
+  if (configured[qualifiedFormat] !== undefined) {
+    tasks[qualifiedFormat] = mergePipeline(
+      formatDefaults,
+      configured[qualifiedFormat],
     );
   }
   return tasks;

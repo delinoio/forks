@@ -48,6 +48,7 @@ const prepareParentDirectory = (
 export const restoreArchiveEntries = (
   root: string,
   entries: ReadonlyArray<ArchiveEntry>,
+  pathsToClear: ReadonlyArray<string> = [],
 ): Effect.Effect<void, CacheError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -61,6 +62,22 @@ export const restoreArchiveEntries = (
           restoreError(destination, "archive path escapes repository"),
         );
       }
+    }
+    for (const path of pathsToClear) {
+      const destination = joinPath(root, path);
+      if (path === "" || path === "." || !isPathContained(root, destination)) {
+        return yield* Effect.fail(
+          restoreError(destination, "cache output path escapes repository"),
+        );
+      }
+      yield* fileSystem
+        .remove(destination)
+        .pipe(
+          Effect.mapError((error) => restoreError(destination, error.message)),
+        );
+    }
+    for (const entry of entries) {
+      const destination = joinPath(root, entry.path);
       yield* prepareParentDirectory(root, canonicalRoot, destination);
       if (
         yield* fileSystem

@@ -94,6 +94,7 @@ export const restoreRemoteCache = (
   root: string,
   options: RemoteCacheOptions,
   hash: string,
+  pathsToClear: ReadonlyArray<string> = [],
 ): Effect.Effect<
   boolean,
   CacheError,
@@ -165,7 +166,7 @@ export const restoreRemoteCache = (
     } catch (cause) {
       return yield* Effect.fail(remoteError(url, cause));
     }
-    yield* restoreArchiveEntries(root, entries);
+    yield* restoreArchiveEntries(root, entries, pathsToClear);
     return true;
   });
 

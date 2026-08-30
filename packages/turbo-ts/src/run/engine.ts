@@ -14,7 +14,7 @@ import {
   type LoadedRootConfiguration,
   loadRootConfiguration,
 } from "../config/runtime.js";
-import { matchesGlob } from "../core/glob.js";
+import { matchesGlob, selectByGlobs } from "../core/glob.js";
 import {
   isAbsolutePath,
   joinPath,
@@ -436,6 +436,19 @@ const parseGitRange = (selector: string): GitRange => {
   return { source: selector, base, head };
 };
 
+const gitRangeSelector = (rawFilter: string): string | undefined => {
+  let filter = rawFilter.startsWith("!") ? rawFilter.slice(1) : rawFilter;
+  if (filter.startsWith("...")) {
+    filter = filter.slice(3);
+  }
+  if (filter.endsWith("...")) {
+    filter = filter.slice(0, -3);
+  }
+  return filter.startsWith("[") && filter.endsWith("]")
+    ? filter.slice(1, -1)
+    : undefined;
+};
+
 const findAffectedPackages = (
   repository: RepositoryModel,
   environment: Readonly<Record<string, string | undefined>>,
@@ -452,7 +465,12 @@ const findAffectedPackages = (
         Effect.scoped(
           processService.run({
             command: "git",
-            args: ["diff", "--name-only", `${baseReference}...${head}`],
+            args: [
+              "diff",
+              "--no-renames",
+              "--name-only",
+              `${baseReference}...${head}`,
+            ],
             cwd: repository.root,
           }),
         ),
@@ -492,12 +510,19 @@ const findAffectedPackages = (
       };
     }
     const changedFiles = result.right.stdout.split(/\r?\n/).filter(Boolean);
-    const rootChanged = changedFiles.some(
-      (path) =>
-        !repository.packages.some((packageModel) =>
-          path.startsWith(`${packageModel.relativeDirectory}/`),
-        ),
-    );
+    const globalDependencyPatterns =
+      repository.rootConfiguration.value.futureFlags?.globalConfiguration ===
+      true
+        ? []
+        : (repository.rootConfiguration.value.globalDependencies ?? []);
+    const rootChanged =
+      selectByGlobs(changedFiles, globalDependencyPatterns).length > 0 ||
+      changedFiles.some(
+        (path) =>
+          !repository.packages.some((packageModel) =>
+            path.startsWith(`${packageModel.relativeDirectory}/`),
+          ),
+      );
     return {
       packages: rootChanged
         ? new Set(repository.packages.map((packageModel) => packageModel.name))
@@ -527,6 +552,7 @@ const resolveAffectedPackages = (
     readonly ranges: ReadonlyMap<string, ReadonlySet<string>>;
     readonly changedFiles: ReadonlyArray<string>;
     readonly rootChanged: boolean;
+    readonly hasGitRangeFilter: boolean;
   },
   ConfigurationError,
   ProcessService
@@ -537,8 +563,8 @@ const resolveAffectedPackages = (
     const selectors = [
       ...new Set(
         options.filters.flatMap((filter) => {
-          const match = /\[([^\]]+)\]/.exec(filter);
-          return match?.[1] === undefined ? [] : [match[1]];
+          const selector = gitRangeSelector(filter);
+          return selector === undefined ? [] : [selector];
         }),
       ),
     ];
@@ -565,6 +591,7 @@ const resolveAffectedPackages = (
         ...new Set(results.flatMap((result) => result.changedFiles)),
       ].sort(),
       rootChanged: results.some((result) => result.rootChanged),
+      hasGitRangeFilter: selectors.length > 0,
     };
   });
 
@@ -780,17 +807,12 @@ export const packageManagerCommand = (
   }
 };
 
-const collectCacheEntries = (
+const collectOutputPaths = (
   repository: RepositoryModel,
   nodes: ReadonlyArray<TaskNode>,
-  logPath: string,
-): Effect.Effect<
-  ReadonlyArray<CacheWriteEntry>,
-  RepositoryError,
-  FileSystemService
-> =>
+): Effect.Effect<ReadonlyArray<string>, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
-    const selected = new Set<string>([logPath]);
+    const selected = new Set<string>();
     const rootOutputPrefix = "$TURBO_ROOT$/";
     const collectOutputs = (
       directory: string,
@@ -836,9 +858,25 @@ const collectCacheEntries = (
         yield* collectOutputs(repository.root, rootPatterns);
       }
     }
+    return [...selected].sort();
+  });
+
+const collectCacheEntries = (
+  repository: RepositoryModel,
+  nodes: ReadonlyArray<TaskNode>,
+  logPath: string,
+): Effect.Effect<
+  ReadonlyArray<CacheWriteEntry>,
+  RepositoryError,
+  FileSystemService
+> =>
+  Effect.gen(function* () {
+    const selected = [
+      ...new Set([logPath, ...(yield* collectOutputPaths(repository, nodes))]),
+    ].sort();
     const fileSystem = yield* FileSystemService;
     return yield* Effect.forEach(
-      [...selected].sort(),
+      selected,
       (path) =>
         Effect.gen(function* () {
           const metadata = yield* fileSystem
@@ -947,12 +985,23 @@ const executeTask = (
       maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
       maxSizeBytes: options.cacheMaxSizeBytes,
     };
+    const cacheNodes =
+      scope.kind === "cargo-workspace" ? scope.members : [node];
+    const pathsToClear =
+      cacheable &&
+      !options.force &&
+      (options.cachePolicy.localRead || options.cachePolicy.remoteRead)
+        ? (yield* collectOutputPaths(repository, cacheNodes)).map((path) =>
+            relativePath(repository.root, path),
+          )
+        : [];
     let cacheHit = false;
     if (cacheable && !options.force && options.cachePolicy.localRead) {
       cacheHit = yield* restoreLocalCache(
         repository.root,
         localOptions,
         hash.hash,
+        pathsToClear,
       );
     }
     if (
@@ -966,6 +1015,7 @@ const executeTask = (
         repository.root,
         options.remote,
         hash.hash,
+        pathsToClear,
       );
     }
     const executionDirectory =
@@ -1067,7 +1117,7 @@ const executeTask = (
     ) {
       const entries = yield* collectCacheEntries(
         repository,
-        scope.kind === "cargo-workspace" ? scope.members : [node],
+        cacheNodes,
         logPath,
       );
       const duration = (yield* clock.now) - started;
@@ -1368,8 +1418,7 @@ export const executeRun = (
     }
     const useTaskInputs =
       (options.affected && flags?.affectedUsingTaskInputs === true) ||
-      (options.filters.some((filter) => filter.includes("[")) &&
-        flags?.filterUsingTasks === true);
+      (affected.hasGitRangeFilter && flags?.filterUsingTasks === true);
     const selectedGraph = useTaskInputs
       ? selectAffectedTasks(
           unfilteredGraph,
