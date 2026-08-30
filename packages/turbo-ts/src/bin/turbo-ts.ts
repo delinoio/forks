@@ -17,12 +17,23 @@ const run = Command.run(rootCommand, {
 const program = Effect.gen(function* () {
   const environment = yield* EnvironmentService;
   const argv = yield* environment.argv;
-  if (argv.slice(2).includes("--version")) {
+  const commandArguments = argv.slice(2);
+  const passThroughIndex = commandArguments.indexOf("--");
+  const parsedArguments = commandArguments.slice(
+    0,
+    passThroughIndex === -1 ? undefined : passThroughIndex,
+  );
+  if (parsedArguments.includes("--version")) {
     const terminal = yield* TerminalService;
     yield* terminal.writeStdout(`${versionOutput}\n`);
     return;
   }
-  yield* run(argv);
+  // Effect CLI scans built-in flags after the pass-through delimiter. Gate 1
+  // does not execute task arguments, so omit that tail from its parser input.
+  // Remove this workaround when Gate 2 owns and forwards pass-through values.
+  const parserArgv =
+    passThroughIndex === -1 ? argv : argv.slice(0, passThroughIndex + 3);
+  yield* run(parserArgv);
 });
 
 program.pipe(

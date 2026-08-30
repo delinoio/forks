@@ -72,6 +72,23 @@ describe("CLI and external oracle", () => {
     });
   });
 
+  it("does not recognize version flags after the pass-through delimiter", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const processService = yield* ProcessService;
+          return yield* processService.run({
+            command: process.execPath,
+            args: [candidateEntrypoint, "run", "build", "--", "--version"],
+            cwd: packageRoot,
+          });
+        }),
+      ).pipe(Effect.provide(nodeFoundationLayer)),
+    );
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).not.toContain(versionOutput);
+  });
+
   it(evidenceId.oracleExternal, async () => {
     const result = await Effect.runPromise(
       Effect.gen(function* () {

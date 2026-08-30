@@ -1,8 +1,4 @@
 import { Schema } from "effect";
-import {
-  distributedSchemaBase64,
-  parseDistributedSchema,
-} from "./distributed-schema.js";
 
 export const OutputLogsSchema = Schema.Literal(
   "full",
@@ -213,6 +209,4 @@ export const TurboConfigurationSchema = Schema.extend(
     extends: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
     tags: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
   }),
-).annotations({
-  jsonSchema: parseDistributedSchema(distributedSchemaBase64),
-});
+);

@@ -9,6 +9,7 @@ import { evidenceId } from "../src/compatibility/ledger.js";
 import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import {
   collectChildProcessOutput,
+  makeChildEnvironment,
   makeTerminalOperations,
   makeTerminalWriter,
   makeWithTemporaryDirectory,
@@ -200,6 +201,26 @@ describe("Effect foundation", () => {
         process.env[environmentName] = previousValue;
       }
     }
+  });
+
+  it("matches Windows environment keys case-insensitively", () => {
+    expect(
+      makeChildEnvironment(
+        { KEEP: "yes", Path: "inherited" },
+        { PATH: undefined },
+        "win32",
+      ),
+    ).toEqual({ KEEP: "yes" });
+    expect(
+      makeChildEnvironment(
+        { KEEP: "yes", Path: "inherited" },
+        { PATH: "override" },
+        "win32",
+      ),
+    ).toEqual({ KEEP: "yes", PATH: "override" });
+    expect(
+      makeChildEnvironment({ Path: "inherited" }, { PATH: undefined }, "linux"),
+    ).toEqual({ Path: "inherited" });
   });
 
   it("reports synchronous spawn failures as typed errors", async () => {

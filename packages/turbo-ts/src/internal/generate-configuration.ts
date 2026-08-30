@@ -3,6 +3,7 @@ import { Effect, JSONSchema } from "effect";
 import { distributedSchemaBase64 } from "../config/distributed-schema.js";
 import { generatedConfigurationTypes } from "../config/generation.js";
 import { TurboConfigurationSchema } from "../config/schema.js";
+import { haveEquivalentConfigurationSchemas } from "../config/schema-compatibility.js";
 import { GeneratedFileError } from "../effect/errors.js";
 import { nodeFoundationLayer } from "../effect/node-layer.js";
 import { EnvironmentService, FileSystemService } from "../effect/services.js";
@@ -46,23 +47,31 @@ const program = Effect.gen(function* () {
     );
   }
 
-  const distributedDocument = JSON.parse(schemaContents) as unknown;
-  const generatedDocument = JSONSchema.make(TurboConfigurationSchema);
-  if (
-    JSON.stringify(generatedDocument) !== JSON.stringify(distributedDocument)
-  ) {
+  const schemasMatch = yield* Effect.try({
+    try: () =>
+      haveEquivalentConfigurationSchemas(
+        JSONSchema.make(TurboConfigurationSchema),
+        JSON.parse(schemaContents) as unknown,
+      ),
+    catch: (cause) =>
+      new GeneratedFileError({
+        path: "src/config/schema.ts",
+        message: `unable to compare Effect and distributed schemas: ${String(cause)}`,
+      }),
+  });
+  if (!schemasMatch) {
     return yield* Effect.fail(
       new GeneratedFileError({
         path: "src/config/schema.ts",
         message:
-          "Effect Schema JSON representation differs from the distributed schema",
+          "Effect Schema validation shape differs from the distributed schema",
       }),
     );
   }
 
   // The distributed artifact contains duplicate metadata keys, which a JSON
   // object cannot retain. Preserve its exact byte layout as the output template
-  // after proving that its parsed value equals the Effect Schema representation.
+  // after proving that its validation shape equals the Effect Schema output.
 
   if (mode === "--write") {
     yield* Effect.forEach(outputs, (output) =>

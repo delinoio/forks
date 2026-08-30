@@ -9,8 +9,12 @@ export interface ProductionDependencySections<Value> {
 const normalizeProductionDependencySections = <Value>(
   sections: ProductionDependencySections<Value> | undefined,
 ) => ({
-  dependencies: sections?.dependencies ?? {},
-  optionalDependencies: sections?.optionalDependencies ?? {},
+  dependencies: Object.entries(sections?.dependencies ?? {}).sort(
+    ([left], [right]) => (left < right ? -1 : left > right ? 1 : 0),
+  ),
+  optionalDependencies: Object.entries(
+    sections?.optionalDependencies ?? {},
+  ).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)),
 });
 
 export const haveExactProductionDependencySections = <Value>(

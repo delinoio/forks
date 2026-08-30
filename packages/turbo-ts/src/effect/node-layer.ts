@@ -115,14 +115,22 @@ interface ScopedChildProcess {
   readonly processGroupId: number | undefined;
 }
 
-const makeChildEnvironment = (
+export const makeChildEnvironment = (
+  inherited: NodeJS.ProcessEnv,
   overrides: Readonly<Record<string, string | undefined>> | undefined,
+  platform: NodeJS.Platform,
 ): NodeJS.ProcessEnv => {
-  const environment = { ...process.env };
+  const environment = { ...inherited };
   for (const [name, value] of Object.entries(overrides ?? {})) {
-    if (value === undefined) {
-      delete environment[name];
-    } else {
+    const normalizedName = platform === "win32" ? name.toLowerCase() : name;
+    for (const inheritedName of Object.keys(environment)) {
+      const normalizedInheritedName =
+        platform === "win32" ? inheritedName.toLowerCase() : inheritedName;
+      if (normalizedInheritedName === normalizedName) {
+        delete environment[inheritedName];
+      }
+    }
+    if (value !== undefined) {
       environment[name] = value;
     }
   }
@@ -280,7 +288,11 @@ const processLayer = Layer.succeed(ProcessService, {
           const child = spawn(request.command, [...request.args], {
             cwd: request.cwd,
             detached: ownsProcessGroup,
-            env: makeChildEnvironment(request.env),
+            env: makeChildEnvironment(
+              process.env,
+              request.env,
+              process.platform,
+            ),
             shell: false,
             stdio: "pipe",
           });

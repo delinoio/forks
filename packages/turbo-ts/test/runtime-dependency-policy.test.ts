@@ -40,6 +40,31 @@ describe("runtime dependency policy", () => {
     ).toBe(false);
   });
 
+  it("compares dependency maps independently of key order", () => {
+    const expected = {
+      dependencies: { effect: "3.22.1", yaml: "2.8.3" },
+      optionalDependencies: { alpha: "1.0.0", omega: "2.0.0" },
+    };
+    expect(
+      haveExactProductionDependencySections(
+        {
+          dependencies: { yaml: "2.8.3", effect: "3.22.1" },
+          optionalDependencies: { omega: "2.0.0", alpha: "1.0.0" },
+        },
+        expected,
+      ),
+    ).toBe(true);
+    expect(
+      haveExactProductionDependencySections(
+        {
+          dependencies: { yaml: "2.8.2", effect: "3.22.1" },
+          optionalDependencies: { omega: "2.0.0", alpha: "1.0.0" },
+        },
+        expected,
+      ),
+    ).toBe(false);
+  });
+
   it("seeds production traversal from optional importer dependencies", () => {
     expect(
       productionDependencyEntries({

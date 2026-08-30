@@ -3,7 +3,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "@rstest/core";
-import { Schema } from "effect";
+import { JSONSchema, Schema } from "effect";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
   evidenceId,
@@ -21,6 +21,7 @@ import {
   TurboConfigurationSchema,
   WorkspaceSchemaSchema,
 } from "../src/config/schema.js";
+import { haveEquivalentConfigurationSchemas } from "../src/config/schema-compatibility.js";
 
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
 
@@ -127,6 +128,59 @@ describe("configuration generation and compatibility ledger", () => {
     expect(createHash("sha256").update(contents).digest("hex")).toBe(
       "a1f4c1c64530290c12ad440966b2ead3150bd8758678d81afa2cb70666519c53",
     );
+  });
+
+  it("detects drift between runtime definitions and the distributed schema", async () => {
+    const distributedDocument = JSON.parse(
+      await readFile(`${packageRoot}/schema.json`, "utf8"),
+    ) as unknown;
+    const runtimeDocument = JSONSchema.make(TurboConfigurationSchema);
+    expect(
+      haveEquivalentConfigurationSchemas(runtimeDocument, distributedDocument),
+    ).toBe(true);
+
+    const missingField = structuredClone(runtimeDocument) as unknown as Record<
+      string,
+      unknown
+    >;
+    const missingFieldProperties = missingField.properties as Record<
+      string,
+      unknown
+    >;
+    delete missingFieldProperties.ui;
+    expect(
+      haveEquivalentConfigurationSchemas(missingField, distributedDocument),
+    ).toBe(false);
+
+    const incorrectNullability = structuredClone(
+      runtimeDocument,
+    ) as unknown as Record<string, unknown>;
+    const nullabilityProperties = incorrectNullability.properties as Record<
+      string,
+      Record<string, unknown>
+    >;
+    nullabilityProperties.ui!.anyOf = (
+      nullabilityProperties.ui!.anyOf as ReadonlyArray<Record<string, unknown>>
+    ).filter((member) => member.type !== "null");
+    expect(
+      haveEquivalentConfigurationSchemas(
+        incorrectNullability,
+        distributedDocument,
+      ),
+    ).toBe(false);
+
+    const narrowedEnum = structuredClone(runtimeDocument) as unknown as Record<
+      string,
+      unknown
+    >;
+    const definitions = narrowedEnum.$defs as Record<
+      string,
+      Record<string, unknown>
+    >;
+    definitions.OutputLogs!.enum = ["full"];
+    expect(
+      haveEquivalentConfigurationSchemas(narrowedEnum, distributedDocument),
+    ).toBe(false);
   });
 
   it("uses Effect Schema to accept valid configuration and reject invalid types", async () => {
