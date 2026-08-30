@@ -498,14 +498,6 @@ rows:
       - executable-path
       - temporary-path
       - path-separator
-      - pid
-      - port
-      - request-id
-      - session-id
-      - timestamp
-      - duration
-      - runtime-profile
-      - hosted-identity
     tests: [normalizers.allowlist, nondeterminism.evidence]
     source: issue-3
   - id: differences.approved

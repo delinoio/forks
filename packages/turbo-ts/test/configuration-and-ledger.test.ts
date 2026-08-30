@@ -5,10 +5,17 @@ import { describe, expect, it } from "@rstest/core";
 import { Schema } from "effect";
 import { parse as parseYaml } from "yaml";
 import {
+  evidenceId,
+  evidenceRegistry,
   expandLedgerRowIds,
   parseCompatibilityLedger,
 } from "../src/compatibility/ledger.js";
-import { TurboConfigurationSchema } from "../src/config/schema.js";
+import { normalizerIds } from "../src/compatibility/normalizers.js";
+import {
+  RootSchemaSchema,
+  TurboConfigurationSchema,
+  WorkspaceSchemaSchema,
+} from "../src/config/schema.js";
 
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
 
@@ -41,16 +48,66 @@ describe("configuration generation and compatibility ledger", () => {
     ).toThrow();
   });
 
-  it("validates and expands the exhaustive compatibility ledger", async () => {
-    const ledger = parseCompatibilityLedger(
-      await readFile(`${packageRoot}/compatibility/ledger.yaml`, "utf8"),
+  it("accepts omitted and null tasks in root and workspace schemas", () => {
+    expect(Schema.decodeUnknownSync(TurboConfigurationSchema)({})).toEqual({});
+    expect(Schema.decodeUnknownSync(RootSchemaSchema)({ tasks: null })).toEqual(
+      {
+        tasks: null,
+      },
     );
+    expect(
+      Schema.decodeUnknownSync(WorkspaceSchemaSchema)({ extends: ["//"] }),
+    ).toEqual({ extends: ["//"] });
+    expect(
+      Schema.decodeUnknownSync(WorkspaceSchemaSchema)({
+        extends: ["//"],
+        tasks: null,
+      }),
+    ).toEqual({ extends: ["//"], tasks: null });
+  });
+
+  it("validates and expands the exhaustive compatibility ledger", async () => {
+    const ledgerSource = await readFile(
+      `${packageRoot}/compatibility/ledger.yaml`,
+      "utf8",
+    );
+    const ledger = parseCompatibilityLedger(ledgerSource);
     const expanded = expandLedgerRowIds(ledger);
     expect(expanded.length).toBeGreaterThan(200);
     expect(new Set(expanded).size).toBe(expanded.length);
+    expect(
+      ledger.rows.find((row) => row.id === "normalization.approved")?.variants,
+    ).toEqual(normalizerIds);
+    expect(() =>
+      parseCompatibilityLedger(
+        ledgerSource.replace(
+          "tests: [cli.version]",
+          "tests: [unknown.evidence]",
+        ),
+      ),
+    ).toThrow();
   });
 
-  it("records ten stable reference executions before approving normalizers", async () => {
+  it("wires ledger evidence to executed tests and package checks", async () => {
+    const packageManifest = JSON.parse(
+      await readFile(`${packageRoot}/package.json`, "utf8"),
+    ) as { scripts: Record<string, string> };
+    for (const registration of Object.values(evidenceRegistry)) {
+      if (registration.kind === "package-script") {
+        expect(packageManifest.scripts.check).toContain(
+          `pnpm ${registration.script}`,
+        );
+      } else {
+        const testSource = await readFile(
+          `${packageRoot}/${registration.file}`,
+          "utf8",
+        );
+        expect(testSource).toContain(`it(evidenceId.${registration.binding},`);
+      }
+    }
+  });
+
+  it(evidenceId.nondeterminismEvidence, async () => {
     const evidence = parseYaml(
       await readFile(
         `${packageRoot}/compatibility/nondeterminism.yaml`,

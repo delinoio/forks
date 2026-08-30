@@ -1,5 +1,9 @@
 import type { RootSchema, WorkspaceSchema } from "../src/index.js";
 
+export const validEmptyRootType: RootSchema = {};
+
+export const validNullTasksRootType: RootSchema = { tasks: null };
+
 export const validRootType: RootSchema = {
   tasks: {
     build: {
@@ -11,7 +15,11 @@ export const validRootType: RootSchema = {
 
 export const validWorkspaceType: WorkspaceSchema = {
   extends: ["//"],
-  tasks: {},
+};
+
+export const validNullTasksWorkspaceType: WorkspaceSchema = {
+  extends: ["//"],
+  tasks: null,
 };
 
 export const invalidRootType: RootSchema = {

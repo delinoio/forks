@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -35,6 +35,60 @@ const boundaryFailure = (boundary: string) => ({
       }),
     ),
 });
+
+const gracefulTerminationTimeoutMilliseconds = 1_000;
+
+interface ScopedChildProcess {
+  readonly child: ChildProcessWithoutNullStreams;
+  readonly closed: Promise<void>;
+}
+
+const makeChildEnvironment = (
+  overrides: Readonly<Record<string, string | undefined>> | undefined,
+): NodeJS.ProcessEnv => {
+  const environment = { ...process.env };
+  for (const [name, value] of Object.entries(overrides ?? {})) {
+    if (value === undefined) {
+      delete environment[name];
+    } else {
+      environment[name] = value;
+    }
+  }
+  return environment;
+};
+
+const isChildRunning = (child: ChildProcessWithoutNullStreams): boolean =>
+  child.exitCode === null && child.signalCode === null;
+
+const waitForCloseUntil = (
+  closed: Promise<void>,
+  timeoutMilliseconds: number,
+): Promise<boolean> =>
+  new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(false), timeoutMilliseconds);
+    closed.then(() => {
+      clearTimeout(timeout);
+      resolve(true);
+    });
+  });
+
+const terminateChild = ({
+  child,
+  closed,
+}: ScopedChildProcess): Effect.Effect<void> =>
+  Effect.promise(async () => {
+    if (isChildRunning(child)) {
+      child.kill("SIGTERM");
+      const closedGracefully = await waitForCloseUntil(
+        closed,
+        gracefulTerminationTimeoutMilliseconds,
+      );
+      if (!closedGracefully && isChildRunning(child)) {
+        child.kill("SIGKILL");
+      }
+    }
+    await closed;
+  });
 
 const fileSystemLayer = Layer.succeed(FileSystemService, {
   readText: (path) =>
@@ -74,15 +128,19 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
 const processLayer = Layer.succeed(ProcessService, {
   run: (request) =>
     Effect.acquireUseRelease(
-      Effect.sync(() =>
-        spawn(request.command, [...request.args], {
+      Effect.sync(() => {
+        const child = spawn(request.command, [...request.args], {
           cwd: request.cwd,
-          env: { ...process.env, ...request.env },
+          env: makeChildEnvironment(request.env),
           shell: false,
           stdio: "pipe",
-        }),
-      ),
-      (child) =>
+        });
+        const closed = new Promise<void>((resolve) => {
+          child.once("close", () => resolve());
+        });
+        return { child, closed };
+      }),
+      ({ child }) =>
         Effect.async((resume) => {
           let stdout = "";
           let stderr = "";
@@ -119,12 +177,7 @@ const processLayer = Layer.succeed(ProcessService, {
             child.stdin.end(request.stdin);
           }
         }),
-      (child) =>
-        Effect.sync(() => {
-          if (child.exitCode === null && child.signalCode === null) {
-            child.kill("SIGTERM");
-          }
-        }),
+      terminateChild,
     ),
 });
 

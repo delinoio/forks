@@ -1,12 +1,13 @@
 import { describe, expect, it } from "@rstest/core";
 import { Effect } from "effect";
+import { evidenceId } from "../src/compatibility/ledger.js";
 import {
   MockHostedService,
   makeMockHostedLayer,
 } from "./support/mock-hosted-service.js";
 
 describe("mock hosted services", () => {
-  it("records scripted requests, redacts credentials, and releases its port", async () => {
+  it(evidenceId.mockHostedScoped, async () => {
     let baseUrl = "";
     const recorded = await Effect.runPromise(
       Effect.scoped(

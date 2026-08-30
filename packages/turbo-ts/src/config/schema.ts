@@ -158,7 +158,7 @@ export const TasksSchema = Schema.Record({
 
 export const BaseSchemaSchema = Schema.Struct({
   $schema: Schema.optional(Schema.String),
-  tasks: TasksSchema,
+  tasks: Schema.optional(Schema.NullOr(TasksSchema)),
 }).annotations({ identifier: "BaseSchema" });
 
 export const RootSchemaSchema = Schema.extend(

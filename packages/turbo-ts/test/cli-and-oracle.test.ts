@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "@rstest/core";
 import { Effect } from "effect";
+import { evidenceId } from "../src/compatibility/ledger.js";
 import { nodeFoundationLayer } from "../src/effect/node-layer.js";
 import { ProcessService } from "../src/effect/services.js";
 import { makeExternalOracle } from "../src/oracle/launcher.js";
@@ -21,7 +22,7 @@ const candidateEntrypoint = fileURLToPath(
 );
 
 describe("CLI and external oracle", () => {
-  it("prints the exact compatibility version", async () => {
+  it(evidenceId.cliVersion, async () => {
     const result = await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
@@ -41,7 +42,7 @@ describe("CLI and external oracle", () => {
     });
   });
 
-  it("launches and version-checks official Turbo as an external process", async () => {
+  it(evidenceId.oracleExternal, async () => {
     const result = await Effect.runPromise(
       Effect.gen(function* () {
         const oracle = yield* makeExternalOracle(

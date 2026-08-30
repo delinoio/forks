@@ -1,47 +1,40 @@
 import { describe, expect, it } from "@rstest/core";
+import { evidenceId } from "../src/compatibility/ledger.js";
 import {
   normalizeOutput,
   normalizerIds,
 } from "../src/compatibility/normalizers.js";
 
 describe("deterministic normalizers", () => {
-  it("has exactly the approved normalization identifiers", () => {
+  it(evidenceId.normalizersAllowlist, () => {
     expect(normalizerIds).toEqual([
       "branding",
       "version",
       "executable-path",
       "temporary-path",
       "path-separator",
-      "pid",
-      "port",
-      "request-id",
-      "session-id",
-      "timestamp",
-      "duration",
-      "runtime-profile",
-      "hosted-identity",
     ]);
   });
 
-  it("is idempotent and only replaces selected fields", () => {
-    const input =
-      "turbo-ts 0.1.0 pid=42 localhost:3210 /tmp/case request-id=abc";
+  it(evidenceId.normalizersDeterministic, () => {
+    const input = "turbo-ts 0.1.0 /opt/tool /tmp/case nested\\path";
     const enabled = [
       "branding",
       "version",
+      "executable-path",
       "temporary-path",
-      "pid",
-      "port",
-      "request-id",
+      "path-separator",
     ] as const;
     const once = normalizeOutput(input, enabled, {
+      executablePaths: ["/opt/tool"],
       temporaryPaths: ["/tmp/case"],
     });
     expect(
-      normalizeOutput(once, enabled, { temporaryPaths: ["/tmp/case"] }),
+      normalizeOutput(once, enabled, {
+        executablePaths: ["/opt/tool"],
+        temporaryPaths: ["/tmp/case"],
+      }),
     ).toBe(once);
-    expect(once).toBe(
-      "<PRODUCT> <VERSION> pid=<PID> localhost:<PORT> <TEMP> request-id=<REQUEST_ID>",
-    );
+    expect(once).toBe("<PRODUCT> <VERSION> <EXECUTABLE> <TEMP> nested/path");
   });
 });
