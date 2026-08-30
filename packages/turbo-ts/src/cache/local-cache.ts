@@ -1,5 +1,5 @@
 import { Effect } from "effect";
-import { isPathContained, joinPath, parentPath } from "../core/path.js";
+import { joinPath, parentPath } from "../core/path.js";
 import { CacheError } from "../effect/errors.js";
 import {
   ClockService,
@@ -12,6 +12,7 @@ import {
   createTarArchive,
   parseTarArchive,
 } from "./archive.js";
+import { restoreArchiveEntries } from "./restore.js";
 
 export type CacheWriteEntry = ArchiveEntry;
 
@@ -56,9 +57,6 @@ export const restoreLocalCache = (
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const compression = yield* CompressionService;
-    const canonicalRoot = yield* fileSystem
-      .realPath(root)
-      .pipe(Effect.mapError((error) => cacheError(root, error.message)));
     const paths = cachePaths(options.directory, hash);
     const exists = yield* fileSystem
       .exists(paths.archive)
@@ -90,101 +88,7 @@ export const restoreLocalCache = (
         } catch (cause) {
           return yield* Effect.fail(cacheError(paths.archive, cause));
         }
-        for (const entry of entries) {
-          const destination = joinPath(root, entry.path);
-          if (!isPathContained(root, destination)) {
-            return yield* Effect.fail(
-              cacheError(destination, "archive path escapes repository"),
-            );
-          }
-          yield* fileSystem
-            .makeDirectory(parentPath(destination))
-            .pipe(
-              Effect.mapError((error) =>
-                cacheError(destination, error.message),
-              ),
-            );
-          const resolvedParent = yield* fileSystem
-            .realPath(parentPath(destination))
-            .pipe(
-              Effect.mapError((error) =>
-                cacheError(destination, error.message),
-              ),
-            );
-          if (!isPathContained(canonicalRoot, resolvedParent)) {
-            return yield* Effect.fail(
-              cacheError(destination, "archive parent is an escaping symlink"),
-            );
-          }
-          if (
-            yield* fileSystem
-              .exists(destination)
-              .pipe(
-                Effect.mapError((error) =>
-                  cacheError(destination, error.message),
-                ),
-              )
-          ) {
-            const metadata = yield* fileSystem
-              .metadata(destination)
-              .pipe(
-                Effect.mapError((error) =>
-                  cacheError(destination, error.message),
-                ),
-              );
-            if (metadata.kind === "symlink" && entry.kind !== "symlink") {
-              return yield* Effect.fail(
-                cacheError(destination, "archive destination is a symlink"),
-              );
-            }
-            if (entry.kind === "symlink") {
-              yield* fileSystem
-                .remove(destination)
-                .pipe(
-                  Effect.mapError((error) =>
-                    cacheError(destination, error.message),
-                  ),
-                );
-            }
-          }
-          if (entry.kind === "symlink") {
-            const target = joinPath(parentPath(destination), entry.linkTarget);
-            if (!isPathContained(root, target)) {
-              return yield* Effect.fail(
-                cacheError(
-                  destination,
-                  "archive link target escapes repository",
-                ),
-              );
-            }
-            yield* fileSystem
-              .createSymlink(entry.linkTarget, destination)
-              .pipe(
-                Effect.mapError((error) =>
-                  cacheError(destination, error.message),
-                ),
-              );
-            continue;
-          }
-          yield* fileSystem
-            .writeBytes(destination, entry.contents)
-            .pipe(
-              Effect.mapError((error) =>
-                cacheError(destination, error.message),
-              ),
-            );
-          yield* fileSystem
-            .setFileMetadata(
-              destination,
-              entry.mode,
-              entry.modifiedSeconds * 1_000,
-            )
-            .pipe(
-              Effect.mapError((error) =>
-                cacheError(destination, error.message),
-              ),
-            );
-        }
+        yield* restoreArchiveEntries(root, entries);
       }),
     );
     if (outcome._tag === "Left") {

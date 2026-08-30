@@ -92,6 +92,9 @@ the oracle, but the official binary does not distribute the serialization
 contract that combines global and task inputs. End-to-end cache-key
 interoperability therefore remains planned; archive and HTTP interoperability
 must not be presented as evidence that task hashes match.
+Structured `dependencyOutputs` task inputs are rejected during configuration
+validation until their dependency graph and output-hash semantics are
+implemented; they are never treated as ordinary local globs.
 
 Only Gate 2 behavior with automated ledger evidence is a compatibility claim.
 Gate 3 through Gate 5 commands, UI and profile formats, daemon/watch/query

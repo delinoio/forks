@@ -95,8 +95,39 @@ const turboRootInputPrefix = "$TURBO_ROOT$/";
 const isIgnoredInputPath = (path: string): boolean =>
   path.includes("/.turbo/") || path.includes("/node_modules/");
 
-const usesTurboRootInput = (node: TaskNode): boolean =>
-  (node.definition.inputs ?? []).some((input) =>
+type TaskInput = NonNullable<TaskNode["definition"]["inputs"]>[number];
+
+const rootInputPattern = (pattern: string): string => {
+  const negative = pattern.startsWith("!");
+  const value = negative ? pattern.slice(1) : pattern;
+  const rooted = value.startsWith(turboRootInputPrefix)
+    ? value
+    : `${turboRootInputPrefix}${value.replace(/^\.\//, "")}`;
+  return negative ? `!${rooted}` : rooted;
+};
+
+const effectiveTaskInputs = (
+  repository: RepositoryModel,
+  node: TaskNode,
+): ReadonlyArray<TaskInput> => {
+  const configured = node.definition.inputs;
+  const taskInputs =
+    configured === undefined || configured === null || configured.length === 0
+      ? ["$TURBO_DEFAULT$"]
+      : configured;
+  return repository.rootConfiguration.value.futureFlags?.globalConfiguration ===
+    true
+    ? [
+        ...(repository.rootConfiguration.value.global?.inputs ?? []).map(
+          rootInputPattern,
+        ),
+        ...taskInputs,
+      ]
+    : taskInputs;
+};
+
+const usesTurboRootInput = (inputs: ReadonlyArray<TaskInput>): boolean =>
+  inputs.some((input) =>
     typeof input === "string"
       ? input.replace(/^!/, "").startsWith(turboRootInputPrefix)
       : (input.globs ?? []).some((glob) =>
@@ -109,6 +140,7 @@ const taskInputFiles = (
   node: TaskNode,
   packageFiles: ReadonlyArray<string>,
   repositoryFiles: ReadonlyArray<string>,
+  inputs: ReadonlyArray<TaskInput>,
 ): ReadonlyArray<TaskInputFile> => {
   const defaults = packageFiles
     .filter((path) => !isIgnoredInputPath(path))
@@ -126,12 +158,6 @@ const taskInputFiles = (
         matchPath: relative,
       };
     });
-  const inputs = node.definition.inputs;
-  if (inputs === undefined || inputs === null || inputs.length === 0) {
-    return defaults.sort((left, right) =>
-      left.hashPath.localeCompare(right.hashPath),
-    );
-  }
   const selected = new Map<string, TaskInputFile>();
   const matchingFiles = (pattern: string): ReadonlyArray<TaskInputFile> => {
     const rootRelative = pattern.startsWith(turboRootInputPrefix);
@@ -258,11 +284,12 @@ export const hashTask = (
     const digest = yield* DigestService;
     const environmentService = yield* EnvironmentService;
     const environment = yield* environmentService.entries;
+    const inputs = effectiveTaskInputs(repository, node);
     const packageFiles = yield* discoverFiles(
       repository,
       node.package.directory,
     );
-    const repositoryFiles = usesTurboRootInput(node)
+    const repositoryFiles = usesTurboRootInput(inputs)
       ? yield* discoverFiles(repository, repository.root)
       : [];
     const inputFiles = taskInputFiles(
@@ -270,18 +297,33 @@ export const hashTask = (
       node,
       packageFiles,
       repositoryFiles,
+      inputs,
     );
     const hashFile = (path: string, relative: string) =>
       fileSystem.metadata(path).pipe(
         Effect.flatMap((metadata) =>
-          metadata.kind === "symlink"
+          (metadata.kind === "symlink"
             ? fileSystem
                 .readLink(path)
                 .pipe(Effect.map((target) => new TextEncoder().encode(target)))
-            : fileSystem.readBytes(path),
+            : fileSystem.readBytes(path)
+          ).pipe(
+            Effect.map((bytes) => ({
+              bytes,
+              mode:
+                metadata.kind === "symlink"
+                  ? ("120000" as const)
+                  : (metadata.mode & 0o111) !== 0
+                    ? ("100755" as const)
+                    : ("100644" as const),
+            })),
+          ),
         ),
-        Effect.flatMap((bytes) => digest.gitBlobSha1(bytes)),
-        Effect.map((hash) => [relative, hash] as const),
+        Effect.flatMap(({ bytes, mode }) =>
+          digest
+            .gitBlobSha1(bytes)
+            .pipe(Effect.map((hash) => [relative, mode, hash] as const)),
+        ),
         Effect.mapError(
           (error) => new RepositoryError({ path, message: error.message }),
         ),
@@ -310,7 +352,11 @@ export const hashTask = (
                 }),
             ),
           );
-    const globalDependencyPatterns = globalSettings.inputs ?? [];
+    const globalDependencyPatterns =
+      repository.rootConfiguration.value.futureFlags?.globalConfiguration ===
+      true
+        ? []
+        : (globalSettings.inputs ?? []);
     const globalInputFiles =
       globalDependencyPatterns.length === 0
         ? []
@@ -337,6 +383,7 @@ export const hashTask = (
         command: node.command,
         passThroughArguments,
         definition: node.definition,
+        effectiveInputs: inputs,
         files: fileHashes,
         environment: hashedEnvironment,
         dependencies: [...dependencyHashes].sort(),

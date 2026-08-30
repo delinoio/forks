@@ -158,7 +158,8 @@ const parseQuantity = (
       message: `invalid quantity: ${value}`,
     });
   }
-  return Math.floor(Number(match[1]) * multiplier);
+  const quantity = Math.floor(Number(match[1]) * multiplier);
+  return quantity === 0 ? undefined : quantity;
 };
 
 const parseCachePolicy = (
@@ -350,7 +351,10 @@ const resolveOptions = (
       : {
           apiUrl,
           token,
-          teamId: remoteConfiguration?.teamId ?? environment.TURBO_TEAMID,
+          teamId:
+            environment.TURBO_TEAMID ??
+            remoteConfiguration?.teamId ??
+            undefined,
           teamSlug:
             parsed.team ??
             environment.TURBO_TEAM ??
@@ -770,30 +774,53 @@ const collectCacheEntries = (
   FileSystemService
 > =>
   Effect.gen(function* () {
-    const fileSystem = yield* FileSystemService;
     const selected = new Set<string>([logPath]);
-    for (const node of nodes) {
-      const files = yield* listRepositoryFiles(node.package.directory, {
-        ignoredDirectories: new Set([".git", ".turbo", "node_modules"]),
-      });
-      const outputPatterns = node.definition.outputs ?? [];
-      for (const path of files) {
-        const relative = relativePath(node.package.directory, path);
-        if (
-          outputPatterns.some(
-            (pattern) =>
-              !pattern.startsWith("!") && matchesGlob(relative, pattern),
-          ) &&
-          !outputPatterns.some(
-            (pattern) =>
-              pattern.startsWith("!") &&
-              matchesGlob(relative, pattern.slice(1)),
-          )
-        ) {
-          selected.add(path);
+    const rootOutputPrefix = "$TURBO_ROOT$/";
+    const collectOutputs = (
+      directory: string,
+      patterns: ReadonlyArray<string>,
+    ): Effect.Effect<void, RepositoryError, FileSystemService> =>
+      Effect.gen(function* () {
+        const files = yield* listRepositoryFiles(directory, {
+          ignoredDirectories: new Set([".git", ".turbo", "node_modules"]),
+        });
+        for (const path of files) {
+          const relative = relativePath(directory, path);
+          if (
+            patterns.some(
+              (pattern) =>
+                !pattern.startsWith("!") && matchesGlob(relative, pattern),
+            ) &&
+            !patterns.some(
+              (pattern) =>
+                pattern.startsWith("!") &&
+                matchesGlob(relative, pattern.slice(1)),
+            )
+          ) {
+            selected.add(path);
+          }
         }
+      });
+    for (const node of nodes) {
+      const outputPatterns = node.definition.outputs ?? [];
+      const packagePatterns = outputPatterns.filter(
+        (pattern) => !pattern.replace(/^!/, "").startsWith(rootOutputPrefix),
+      );
+      const rootPatterns = outputPatterns.flatMap((pattern) => {
+        const negative = pattern.startsWith("!");
+        const value = negative ? pattern.slice(1) : pattern;
+        return value.startsWith(rootOutputPrefix)
+          ? [`${negative ? "!" : ""}${value.slice(rootOutputPrefix.length)}`]
+          : [];
+      });
+      if (packagePatterns.length > 0) {
+        yield* collectOutputs(node.package.directory, packagePatterns);
+      }
+      if (rootPatterns.length > 0) {
+        yield* collectOutputs(repository.root, rootPatterns);
       }
     }
+    const fileSystem = yield* FileSystemService;
     return yield* Effect.forEach(
       [...selected].sort(),
       (path) =>

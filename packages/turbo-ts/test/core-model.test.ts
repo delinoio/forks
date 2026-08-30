@@ -319,14 +319,21 @@ describe("core repository model", () => {
               name: "app",
               manifest_path: "/repo/crates/app/Cargo.toml",
               dependencies: [{ name: "util", rename: "util_alias" }],
+              targets: [
+                { kind: ["bin"], name: "app" },
+                { kind: ["custom-build"], name: "build-script-build" },
+              ],
             },
           ],
+          target_directory: "/repo/target",
         }),
         "/repo/crates/app/Cargo.toml",
       ),
     ).toEqual({
       name: "app",
       dependencyNames: ["util"],
+      entrypointNames: ["app"],
+      targetDirectory: "/repo/target",
       workspaceDirectory: "/repo",
     });
   });

@@ -271,11 +271,16 @@ const validateTaskKeys = (value: unknown, path: string): void => {
     if (Array.isArray(task.inputs)) {
       for (const [index, input] of task.inputs.entries()) {
         if (typeof input === "object" && input !== null) {
-          assertKnownKeys(
-            expectObject(input, `${taskPath}.inputs[${index}]`),
-            structuredInputKeys,
-            `${taskPath}.inputs[${index}]`,
-          );
+          const inputPath = `${taskPath}.inputs[${index}]`;
+          const structuredInput = expectObject(input, inputPath);
+          assertKnownKeys(structuredInput, structuredInputKeys, inputPath);
+          if (structuredInput.mode === "dependencyOutputs") {
+            throw new ConfigurationError({
+              path: inputPath,
+              message:
+                "dependencyOutputs inputs are not implemented in compatibility gate 2",
+            });
+          }
         }
       }
     }

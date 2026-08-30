@@ -1,4 +1,5 @@
 import {
+  chmod,
   cp,
   lstat,
   mkdir,
@@ -116,6 +117,39 @@ describe("core CLI execution", () => {
           "utf8",
         ),
       ).toContain("app build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("treats zero cache eviction limits as disabled", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.cacheMaxAge = "0";
+      configuration.cacheMaxSize = "0";
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache hit");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -241,7 +275,7 @@ describe("core CLI execution", () => {
           `\n` +
           `[project]\n` +
           `name = "app"\n` +
-          `dependencies = ["library>=1", "requests>=2"]\n` +
+          `dependencies = ["my-util>=1", "requests>=2"]\n` +
           `\n` +
           `[project.optional-dependencies]\n` +
           `test = ["pytest>=8"]\n` +
@@ -252,7 +286,7 @@ describe("core CLI execution", () => {
       );
       await writeFile(
         `${directory}/python/library/pyproject.toml`,
-        `[project]\nname = "library"\ndependencies = []\n`,
+        `[project]\nname = "my_util"\ndependencies = []\n`,
       );
       const model = await Effect.runPromise(
         Effect.gen(function* () {
@@ -262,20 +296,20 @@ describe("core CLI execution", () => {
       );
       const app = model.packagesByName.get("app");
       expect(app?.dependencyNames).toEqual([
-        "library",
+        "my-util",
         "mypy",
         "pytest",
         "requests",
         "ruff",
         "types-requests",
       ]);
-      expect(app?.internalDependencies).toEqual(["library"]);
+      expect(app?.internalDependencies).toEqual(["my_util"]);
       expect(model.packagesByName.has("internal")).toBe(false);
       expect(
         [
           ...buildTaskGraph(model, [app!], ["build"], false).nodes.keys(),
         ].sort(),
-      ).toEqual(["app#build", "library#build"]);
+      ).toEqual(["app#build", "my_util#build"]);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -385,6 +419,49 @@ describe("core CLI execution", () => {
       await writeFile(sharedConfiguration, '{"value":"second"}\n');
       expect(
         (await run(process.execPath, command, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("includes Git file modes and kinds in task hashes", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const inputPath = `${packageDirectory}/input.txt`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["input.txt"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await writeFile(inputPath, "payload");
+      await chmod(inputPath, 0o644);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      await chmod(inputPath, 0o755);
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      await rm(inputPath);
+      await symlink("payload", inputPath);
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
       ).toContain("cache miss");
     } finally {
       await rm(directory, { force: true, recursive: true });
@@ -814,15 +891,20 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
-  it("runs a standalone Cargo package from its manifest directory", async () => {
+  it("restores implicit Cargo binary outputs and leaves libraries uncached", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/rust-tool`;
+    const libraryDirectory = `${directory}/packages/rust-library`;
     try {
       const configurationPath = `${directory}/turbo.json`;
       const configuration = JSON.parse(
         await readFile(configurationPath, "utf8"),
-      ) as { futureFlags?: Record<string, boolean> };
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, { outputs?: Array<string> }>;
+      };
       configuration.futureFlags = { experimentalCargoWorkspaces: true };
+      delete configuration.tasks.build?.outputs;
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
@@ -833,6 +915,12 @@ describe("core CLI execution", () => {
         '[package]\nname = "synthetic-rust-tool"\nversion = "0.1.0"\nedition = "2024"\n',
       );
       await writeFile(`${packageDirectory}/src/main.rs`, "fn main() {}\n");
+      await mkdir(`${libraryDirectory}/src`, { recursive: true });
+      await writeFile(
+        `${libraryDirectory}/Cargo.toml`,
+        '[package]\nname = "synthetic-rust-library"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(`${libraryDirectory}/src/lib.rs`, "pub fn value() {}\n");
       await cp(
         `${repositoryRoot}/rust-toolchain`,
         `${directory}/rust-toolchain`,
@@ -847,24 +935,45 @@ describe("core CLI execution", () => {
         packageDirectory,
       );
       expect(lockfile.exitCode, lockfile.stderr).toBe(0);
-      const result = await run(
-        process.execPath,
-        [
-          candidateEntrypoint,
-          "run",
-          "build",
-          "--cwd",
-          directory,
-          "--filter=synthetic-rust-tool",
-          "--no-cache",
-        ],
-        repositoryRoot,
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
       );
-      expect(result.exitCode).toBe(0);
+      expect(
+        model.packagesByName.get("synthetic-rust-tool")?.tasks.build?.outputs,
+      ).toContain(
+        "$TURBO_ROOT$/packages/rust-tool/target/debug/synthetic-rust-tool",
+      );
+      expect(
+        model.packagesByName.get("synthetic-rust-library")?.tasks.build,
+      ).toMatchObject({ cache: false });
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-rust-tool",
+        "--output-logs=hash-only",
+      ];
+      const cold = await run(process.execPath, args, repositoryRoot);
+      expect(cold.exitCode).toBe(0);
+      expect(cold.stdout).toContain("cache miss");
+      const executable = `${packageDirectory}/target/debug/synthetic-rust-tool${
+        process.platform === "win32" ? ".exe" : ""
+      }`;
+      expect((await lstat(executable)).isFile()).toBe(true);
+      await rm(`${packageDirectory}/target`, { force: true, recursive: true });
+      const warm = await run(process.execPath, args, repositoryRoot);
+      expect(warm.exitCode).toBe(0);
+      expect(warm.stdout).toContain("cache hit");
+      expect((await lstat(executable)).isFile()).toBe(true);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  }, 30_000);
+  }, 40_000);
 
   it("hashes global dependency contents and restores declared dist outputs", async () => {
     const directory = await makeFixture();
@@ -934,19 +1043,27 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
-  it("uses future global configuration environment settings", async () => {
+  it("uses future global configuration in per-task input and environment selection", async () => {
     const directory = await makeFixture();
     try {
       const configurationPath = `${directory}/turbo.json`;
       const configuration = JSON.parse(
         await readFile(configurationPath, "utf8"),
-      ) as Record<string, unknown>;
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        global?: Record<string, unknown>;
+        tasks: Record<string, { inputs?: Array<string> }>;
+      };
       configuration.futureFlags = { globalConfiguration: true };
       configuration.global = {
         inputs: ["global.txt"],
         env: ["HASHED_VALUE"],
         passThroughEnv: ["PASSED_VALUE"],
       };
+      configuration.tasks.build!.inputs = [
+        "$TURBO_DEFAULT$",
+        "!$TURBO_ROOT$/global.txt",
+      ];
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
@@ -981,6 +1098,37 @@ describe("core CLI execution", () => {
       expect(first.stdout).toContain("cache miss");
       expect(second.exitCode).toBe(0);
       expect(second.stdout).toContain("cache miss");
+      await writeFile(`${directory}/global.txt`, "excluded change\n");
+      expect(
+        (
+          await run(process.execPath, args, repositoryRoot, {
+            HASHED_VALUE: "two",
+            PASSED_VALUE: "visible",
+          })
+        ).stdout,
+      ).toContain("cache hit");
+      configuration.tasks.build!.inputs = ["$TURBO_DEFAULT$"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      expect(
+        (
+          await run(process.execPath, args, repositoryRoot, {
+            HASHED_VALUE: "two",
+            PASSED_VALUE: "visible",
+          })
+        ).stdout,
+      ).toContain("cache miss");
+      await writeFile(`${directory}/global.txt`, "included change\n");
+      expect(
+        (
+          await run(process.execPath, args, repositoryRoot, {
+            HASHED_VALUE: "two",
+            PASSED_VALUE: "visible",
+          })
+        ).stdout,
+      ).toContain("cache miss");
       expect(
         await readFile(
           `${directory}/packages/library/.turbo/turbo-build.log`,
@@ -990,7 +1138,7 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  }, 10_000);
+  }, 20_000);
 
   it("honors NO_COLOR and rejects Cargo sccache before task execution", async () => {
     const directory = await makeFixture();
@@ -1343,6 +1491,58 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
+  it("rejects dependency-output inputs in root and workspace configuration", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, Record<string, unknown>> };
+      configuration.tasks.build!.inputs = [
+        {
+          mode: "dependencyOutputs",
+          from: ["^build"],
+          globs: ["dist/**"],
+        },
+      ];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const args = [candidateEntrypoint, "run", "build", "--cwd", directory];
+      const rootResult = await run(process.execPath, args, repositoryRoot);
+      expect(rootResult.exitCode).not.toBe(0);
+      expect(rootResult.stderr).toContain(
+        "dependencyOutputs inputs are not implemented",
+      );
+
+      delete configuration.tasks.build!.inputs;
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const workspacePath = `${directory}/packages/app/turbo.json`;
+      const workspace = JSON.parse(await readFile(workspacePath, "utf8")) as {
+        tasks: Record<string, Record<string, unknown>>;
+      };
+      workspace.tasks.build!.inputs = [
+        {
+          mode: "dependencyOutputs",
+          from: ["^build"],
+          globs: ["dist/**"],
+        },
+      ];
+      await writeFile(workspacePath, `${JSON.stringify(workspace, null, 2)}\n`);
+      const workspaceResult = await run(process.execPath, args, repositoryRoot);
+      expect(workspaceResult.exitCode).not.toBe(0);
+      expect(workspaceResult.stderr).toContain(
+        "dependencyOutputs inputs are not implemented",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("rejects unknown configuration keys before execution", async () => {
     const directory = await makeFixture();
     try {
@@ -1679,8 +1879,74 @@ describe("cache interoperability and safety", () => {
           ).pipe(Effect.provide(nodeFoundationLayer)),
         ),
       ).toBe(false);
-      await expect(lstat(`${outside}/app/out.txt`)).rejects.toThrow();
+      await expect(lstat(`${outside}/app`)).rejects.toThrow();
     } finally {
+      await rm(directory, { force: true, recursive: true });
+      await rm(outside, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects remote restoration before creating directories through escaping symlinks", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-remote-symlink-"));
+    const outside = await mkdtemp(join(tmpdir(), "turbo-ts-remote-outside-"));
+    let artifact = new Uint8Array();
+    const server = createServer((request, response) => {
+      const chunks: Array<Buffer> = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        if (request.method === "PUT") {
+          artifact = new Uint8Array(Buffer.concat(chunks));
+          response.writeHead(201);
+        } else {
+          response.writeHead(200, {
+            "content-type": "application/octet-stream",
+          });
+        }
+        response.end(request.method === "PUT" ? undefined : artifact);
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    const options = {
+      apiUrl: `http://127.0.0.1:${address.port}`,
+      timeoutMilliseconds: 5_000,
+      uploadTimeoutMilliseconds: 5_000,
+      preflight: false,
+      requireSignature: false,
+    };
+    try {
+      await Effect.runPromise(
+        writeRemoteCache(
+          options,
+          "abcdefabcdefabcd",
+          [
+            {
+              path: "packages/app/out.txt",
+              contents: new TextEncoder().encode("escape"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+          ],
+          1,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      await symlink(outside, `${directory}/packages`);
+      await expect(
+        Effect.runPromise(
+          restoreRemoteCache(directory, options, "abcdefabcdefabcd").pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        ),
+      ).rejects.toThrow(/escaping symlink/);
+      await expect(lstat(`${outside}/app`)).rejects.toThrow();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(directory, { force: true, recursive: true });
       await rm(outside, { force: true, recursive: true });
     }
@@ -1937,6 +2203,63 @@ describe("cache interoperability and safety", () => {
       );
       expect(result.exitCode).toBe(0);
       expect(uploads).toBe(1);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("lets TURBO_TEAMID override the configured remote-cache team ID", async () => {
+    const directory = await makeFixture();
+    const teamIds: Array<string | null> = [];
+    const server = createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        teamIds.push(
+          new URL(request.url ?? "/", "http://127.0.0.1").searchParams.get(
+            "teamId",
+          ),
+        );
+        response.writeHead(201);
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.remoteCache = {
+        apiUrl: `http://127.0.0.1:${address.port}`,
+        teamId: "team_configured",
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--cache=remote:w",
+        ],
+        repositoryRoot,
+        { TURBO_TEAMID: "team_environment" },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(teamIds).toEqual(["team_environment"]);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(directory, { force: true, recursive: true });

@@ -2,10 +2,11 @@ import { Effect } from "effect";
 import { parse as parseToml } from "smol-toml";
 import { parse as parseYaml } from "yaml";
 import type { LoadedRootConfiguration } from "../config/runtime.js";
-import { loadPackageConfiguration } from "../config/runtime.js";
+import { loadPackageConfiguration, mergePipeline } from "../config/runtime.js";
 import { selectByGlobs } from "../core/glob.js";
 import {
   baseName,
+  isPathContained,
   joinPath,
   normalizePath,
   parentPath,
@@ -407,6 +408,8 @@ const polyglotScripts = (
 interface CargoPackageMetadata {
   readonly name: string;
   readonly dependencyNames: ReadonlyArray<string>;
+  readonly entrypointNames: ReadonlyArray<string>;
+  readonly targetDirectory?: string;
   readonly workspaceDirectory?: string;
 }
 
@@ -416,10 +419,15 @@ export const parseCargoMetadata = (
 ): CargoPackageMetadata | undefined => {
   const document = JSON.parse(source) as {
     readonly workspace_root?: unknown;
+    readonly target_directory?: unknown;
     readonly packages?: ReadonlyArray<{
       readonly name?: unknown;
       readonly manifest_path?: unknown;
       readonly dependencies?: ReadonlyArray<{ readonly name?: unknown }>;
+      readonly targets?: ReadonlyArray<{
+        readonly kind?: unknown;
+        readonly name?: unknown;
+      }>;
     }>;
   };
   const packageMetadata = document.packages?.find(
@@ -442,6 +450,20 @@ export const parseCargoMetadata = (
         ),
       ),
     ].sort(),
+    entrypointNames: [
+      ...new Set(
+        (packageMetadata.targets ?? []).flatMap((target) =>
+          Array.isArray(target.kind) &&
+          target.kind.includes("bin") &&
+          typeof target.name === "string"
+            ? [target.name]
+            : [],
+        ),
+      ),
+    ].sort(),
+    ...(typeof document.target_directory === "string"
+      ? { targetDirectory: normalizePath(document.target_directory) }
+      : {}),
     ...(typeof document.workspace_root === "string"
       ? { workspaceDirectory: normalizePath(document.workspace_root) }
       : {}),
@@ -509,6 +531,9 @@ const stringArrayValue = (value: unknown): ReadonlyArray<string> =>
     ? value.filter((entry): entry is string => typeof entry === "string")
     : [];
 
+const normalizePythonPackageName = (name: string): string =>
+  name.toLowerCase().replace(/[-_.]+/g, "-");
+
 const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
   const document = recordValue(parseToml(source));
   const project = recordValue(document?.project);
@@ -525,13 +550,46 @@ const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
   const names = new Set<string>();
   for (const requirement of requirements) {
     const name = /^([A-Za-z0-9][A-Za-z0-9_.-]*)/.exec(requirement.trim())?.[1];
-    if (name !== undefined)
-      names.add(name.toLowerCase().replace(/[_.]+/g, "-"));
+    if (name !== undefined) names.add(normalizePythonPackageName(name));
   }
   return {
     name: typeof project?.name === "string" ? project.name : undefined,
     dependencyNames: [...names].sort(),
   };
+};
+
+const cargoTasks = (
+  root: string,
+  packageName: string,
+  metadata: CargoPackageMetadata | undefined,
+  configured: Readonly<Record<string, Pipeline>>,
+): Readonly<Record<string, Pipeline>> => {
+  const outputPrefix =
+    metadata?.targetDirectory !== undefined &&
+    isPathContained(root, metadata.targetDirectory)
+      ? `$TURBO_ROOT$/${relativePath(root, metadata.targetDirectory)}/debug`
+      : undefined;
+  const outputs =
+    outputPrefix === undefined
+      ? []
+      : (metadata?.entrypointNames ?? []).flatMap((name) => [
+          `${outputPrefix}/${name}`,
+          `${outputPrefix}/${name}.exe`,
+        ]);
+  const buildDefaults: Pipeline =
+    outputs.length === 0 ? { cache: false } : { outputs };
+  const tasks: Record<string, Pipeline> = {
+    ...configured,
+    build: mergePipeline(buildDefaults, configured.build ?? {}),
+  };
+  const qualifiedBuild = `${packageName}#build`;
+  if (configured[qualifiedBuild] !== undefined) {
+    tasks[qualifiedBuild] = mergePipeline(
+      buildDefaults,
+      configured[qualifiedBuild],
+    );
+  }
+  return tasks;
 };
 
 export const discoverRepository = (
@@ -684,6 +742,8 @@ export const discoverRepository = (
             if (name === undefined) {
               continue;
             }
+            const configuredTasks = (rootConfiguration.value.tasks ??
+              {}) as Readonly<Record<string, Pipeline>>;
             return {
               name,
               directory,
@@ -695,9 +755,10 @@ export const discoverRepository = (
                 candidate.manager === "cargo"
                   ? (cargoMetadata?.dependencyNames ?? [])
                   : (pythonMetadata?.dependencyNames ?? []),
-              tasks: (rootConfiguration.value.tasks ?? {}) as Readonly<
-                Record<string, Pipeline>
-              >,
+              tasks:
+                candidate.manager === "cargo"
+                  ? cargoTasks(root, name, cargoMetadata, configuredTasks)
+                  : configuredTasks,
               manifest: { name, private: true } satisfies PackageManifest,
             };
           }
@@ -712,6 +773,7 @@ export const discoverRepository = (
       ),
     ];
     const names = new Set<string>();
+    const uvNames = new Map<string, string>();
     for (const packageDraft of drafts) {
       if (names.has(packageDraft.name)) {
         return yield* Effect.fail(
@@ -722,13 +784,30 @@ export const discoverRepository = (
         );
       }
       names.add(packageDraft.name);
+      if (packageDraft.manager === "uv") {
+        const identity = normalizePythonPackageName(packageDraft.name);
+        const existing = uvNames.get(identity);
+        if (existing !== undefined) {
+          return yield* Effect.fail(
+            new RepositoryError({
+              path: packageDraft.directory,
+              message: `duplicate uv package identity: ${existing} and ${packageDraft.name}`,
+            }),
+          );
+        }
+        uvNames.set(identity, packageDraft.name);
+      }
     }
     const packages: ReadonlyArray<RepositoryPackage> = drafts
       .map((packageDraft) => ({
         ...packageDraft,
-        internalDependencies: packageDraft.dependencyNames.filter((name) =>
-          names.has(name),
-        ),
+        internalDependencies: packageDraft.dependencyNames.flatMap((name) => {
+          if (packageDraft.manager === "uv") {
+            const resolved = uvNames.get(normalizePythonPackageName(name));
+            return resolved === undefined ? [] : [resolved];
+          }
+          return names.has(name) ? [name] : [];
+        }),
       }))
       .sort((left, right) => left.name.localeCompare(right.name));
     const rootTasks = Object.fromEntries(

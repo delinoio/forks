@@ -1,5 +1,4 @@
 import { Effect } from "effect";
-import { isPathContained, joinPath, parentPath } from "../core/path.js";
 import { CacheError } from "../effect/errors.js";
 import {
   CompressionService,
@@ -14,6 +13,7 @@ import {
   createTarArchive,
   parseTarArchive,
 } from "./archive.js";
+import { restoreArchiveEntries } from "./restore.js";
 
 export interface RemoteCacheOptions {
   readonly apiUrl: string;
@@ -106,12 +106,8 @@ export const restoreRemoteCache = (
   Effect.gen(function* () {
     const http = yield* HttpService;
     const compression = yield* CompressionService;
-    const fileSystem = yield* FileSystemService;
     const retry = yield* RetryScheduleService;
     const signing = yield* SigningService;
-    const canonicalRoot = yield* fileSystem
-      .realPath(root)
-      .pipe(Effect.mapError((error) => remoteError(root, error.message)));
     const url = artifactUrl(options, hash);
     yield* preflight(url, options);
     const response = yield* http
@@ -169,80 +165,7 @@ export const restoreRemoteCache = (
     } catch (cause) {
       return yield* Effect.fail(remoteError(url, cause));
     }
-    for (const entry of entries) {
-      const destination = joinPath(root, entry.path);
-      if (!isPathContained(root, destination)) {
-        return yield* Effect.fail(
-          remoteError(destination, "archive path escapes repository"),
-        );
-      }
-      yield* fileSystem
-        .makeDirectory(parentPath(destination))
-        .pipe(
-          Effect.mapError((error) => remoteError(destination, error.message)),
-        );
-      const resolvedParent = yield* fileSystem
-        .realPath(parentPath(destination))
-        .pipe(
-          Effect.mapError((error) => remoteError(destination, error.message)),
-        );
-      if (!isPathContained(canonicalRoot, resolvedParent)) {
-        return yield* Effect.fail(
-          remoteError(destination, "archive parent is an escaping symlink"),
-        );
-      }
-      if (
-        yield* fileSystem
-          .exists(destination)
-          .pipe(
-            Effect.mapError((error) => remoteError(destination, error.message)),
-          )
-      ) {
-        const metadata = yield* fileSystem
-          .metadata(destination)
-          .pipe(
-            Effect.mapError((error) => remoteError(destination, error.message)),
-          );
-        if (metadata.kind === "symlink" && entry.kind !== "symlink") {
-          return yield* Effect.fail(
-            remoteError(destination, "archive destination is a symlink"),
-          );
-        }
-        if (entry.kind === "symlink") {
-          yield* fileSystem
-            .remove(destination)
-            .pipe(
-              Effect.mapError((error) =>
-                remoteError(destination, error.message),
-              ),
-            );
-        }
-      }
-      if (entry.kind === "symlink") {
-        const target = joinPath(parentPath(destination), entry.linkTarget);
-        if (!isPathContained(root, target)) {
-          return yield* Effect.fail(
-            remoteError(destination, "archive link target escapes repository"),
-          );
-        }
-        yield* fileSystem
-          .createSymlink(entry.linkTarget, destination)
-          .pipe(
-            Effect.mapError((error) => remoteError(destination, error.message)),
-          );
-        continue;
-      }
-      yield* fileSystem
-        .writeBytes(destination, entry.contents)
-        .pipe(
-          Effect.mapError((error) => remoteError(destination, error.message)),
-        );
-      yield* fileSystem
-        .setFileMetadata(destination, entry.mode, entry.modifiedSeconds * 1_000)
-        .pipe(
-          Effect.mapError((error) => remoteError(destination, error.message)),
-        );
-    }
+    yield* restoreArchiveEntries(root, entries);
     return true;
   });
 
