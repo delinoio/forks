@@ -82,6 +82,13 @@ export class CacheError extends Schema.TaggedError<CacheError>("CacheError")(
   },
 ) {}
 
+export class CacheRollbackError extends Schema.TaggedError<CacheRollbackError>(
+  "CacheRollbackError",
+)("CacheRollbackError", {
+  path: Schema.String,
+  message: Schema.String,
+}) {}
+
 export class TaskExecutionError extends Schema.TaggedError<TaskExecutionError>(
   "TaskExecutionError",
 )("TaskExecutionError", {

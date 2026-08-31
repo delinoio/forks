@@ -17,7 +17,17 @@ interface ArchiveSymlinkEntry {
   readonly modifiedSeconds: number;
 }
 
-export type ArchiveEntry = ArchiveFileEntry | ArchiveSymlinkEntry;
+interface ArchiveDirectoryEntry {
+  readonly kind: "directory";
+  readonly path: string;
+  readonly mode: number;
+  readonly modifiedSeconds: number;
+}
+
+export type ArchiveEntry =
+  | ArchiveFileEntry
+  | ArchiveSymlinkEntry
+  | ArchiveDirectoryEntry;
 
 const blockSize = 512;
 const tarNameBytes = 100;
@@ -199,7 +209,8 @@ export const createTarArchive = (
     const path = validateArchivePath(entry.path);
     const pathFields = splitArchivePath(path);
     const symlink = entry.kind === "symlink";
-    const contents = symlink ? new Uint8Array() : entry.contents;
+    const directory = entry.kind === "directory";
+    const contents = symlink || directory ? new Uint8Array() : entry.contents;
     const linkTarget = symlink
       ? validateArchiveLinkTarget(path, entry.linkTarget)
       : "";
@@ -230,7 +241,7 @@ export const createTarArchive = (
       chunks,
       createHeader(
         storedPath,
-        symlink ? 0x32 : 0x30,
+        symlink ? 0x32 : directory ? 0x35 : 0x30,
         contents.length,
         entry.mode,
         entry.modifiedSeconds,
@@ -342,7 +353,13 @@ export const parseTarArchive = (
       prefix === "" ? name : `${prefix}/${name}`,
     );
     const type = header[156];
-    if (type !== 0 && type !== 0x30 && type !== 0x32 && type !== 0x78) {
+    if (
+      type !== 0 &&
+      type !== 0x30 &&
+      type !== 0x32 &&
+      type !== 0x35 &&
+      type !== 0x78
+    ) {
       throw new TypeError(
         `unsupported tar entry type: ${String.fromCharCode(type ?? 0)}`,
       );
@@ -363,9 +380,11 @@ export const parseTarArchive = (
     if (extended?.linkpath !== undefined && type !== 0x32) {
       throw new TypeError("PAX linkpath applies to a non-symlink entry");
     }
+    if (type === 0x35 && size !== 0) {
+      throw new TypeError("tar directory entry has contents");
+    }
     const common = {
       path,
-      contents,
       mode: readOctal(header, 100, 8),
       modifiedSeconds: readOctal(header, 136, 12),
     };
@@ -374,12 +393,15 @@ export const parseTarArchive = (
         ? {
             ...common,
             kind: "symlink",
+            contents,
             linkTarget: validateArchiveLinkTarget(
               path,
               extended?.linkpath ?? readText(header, 157, tarNameBytes),
             ),
           }
-        : common,
+        : type === 0x35
+          ? { ...common, kind: "directory" }
+          : { ...common, contents },
     );
     extended = undefined;
     offset = start + Math.ceil(size / blockSize) * blockSize;

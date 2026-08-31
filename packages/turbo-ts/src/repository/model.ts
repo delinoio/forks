@@ -482,6 +482,15 @@ interface CargoPackageMetadata {
   readonly workspaceDirectory?: string;
 }
 
+interface CargoWorkspacePackageMetadata extends CargoPackageMetadata {
+  readonly manifestPath: string;
+}
+
+interface CargoWorkspaceMetadata {
+  readonly directory: string;
+  readonly packages: ReadonlyArray<CargoWorkspacePackageMetadata>;
+}
+
 interface CargoDependencyMetadata {
   readonly name: string;
   readonly path?: string;
@@ -499,8 +508,10 @@ export const parseCargoMetadata = (
 ): CargoPackageMetadata | undefined => {
   const document = JSON.parse(source) as {
     readonly workspace_root?: unknown;
+    readonly workspace_members?: ReadonlyArray<unknown>;
     readonly target_directory?: unknown;
     readonly packages?: ReadonlyArray<{
+      readonly id?: unknown;
       readonly name?: unknown;
       readonly manifest_path?: unknown;
       readonly dependencies?: ReadonlyArray<{
@@ -514,85 +525,131 @@ export const parseCargoMetadata = (
       }>;
     }>;
   };
-  const packageMetadata = document.packages?.find(
-    (entry) =>
-      typeof entry.manifest_path === "string" &&
-      normalizePath(entry.manifest_path) === normalizePath(manifestPath),
+  const workspaceDirectory =
+    typeof document.workspace_root === "string"
+      ? normalizePath(document.workspace_root)
+      : parentPath(manifestPath);
+  const workspaceMembers = new Set(
+    (document.workspace_members ?? []).filter(
+      (member): member is string => typeof member === "string",
+    ),
   );
-  if (
-    packageMetadata === undefined ||
-    typeof packageMetadata.name !== "string"
-  ) {
+  const packages = (document.packages ?? []).flatMap((packageMetadata) => {
+    if (
+      typeof packageMetadata.name !== "string" ||
+      typeof packageMetadata.manifest_path !== "string" ||
+      (workspaceMembers.size > 0 &&
+        (typeof packageMetadata.id !== "string" ||
+          !workspaceMembers.has(packageMetadata.id)))
+    ) {
+      return [];
+    }
+    const dependencies = [
+      ...new Map(
+        (packageMetadata.dependencies ?? []).flatMap((dependency) => {
+          if (typeof dependency.name !== "string") return [];
+          const value: CargoDependencyMetadata = {
+            name: dependency.name,
+            ...(typeof dependency.path === "string"
+              ? { path: normalizePath(dependency.path) }
+              : {}),
+            ...(typeof dependency.source === "string"
+              ? { source: dependency.source }
+              : {}),
+          };
+          return [
+            [
+              `${value.name}\0${value.source ?? ""}\0${value.path ?? ""}`,
+              value,
+            ] as const,
+          ];
+        }),
+      ).values(),
+    ].sort((left, right) =>
+      `${left.name}\0${left.source ?? ""}\0${left.path ?? ""}`.localeCompare(
+        `${right.name}\0${right.source ?? ""}\0${right.path ?? ""}`,
+      ),
+    );
+    return [
+      {
+        name: packageMetadata.name,
+        manifestPath: normalizePath(packageMetadata.manifest_path),
+        dependencies,
+        dependencyNames: [
+          ...new Set(dependencies.map((dependency) => dependency.name)),
+        ].sort(),
+        entrypointNames: [
+          ...new Set(
+            (packageMetadata.targets ?? []).flatMap((target) =>
+              Array.isArray(target.kind) &&
+              target.kind.includes("bin") &&
+              typeof target.name === "string"
+                ? [target.name]
+                : [],
+            ),
+          ),
+        ].sort(),
+        hasLibraryTarget: (packageMetadata.targets ?? []).some(
+          (target) =>
+            Array.isArray(target.kind) &&
+            target.kind.some(
+              (kind) =>
+                typeof kind === "string" &&
+                (kind === "lib" ||
+                  kind === "proc-macro" ||
+                  kind.endsWith("lib")),
+            ),
+        ),
+        ...(typeof document.target_directory === "string"
+          ? { targetDirectory: normalizePath(document.target_directory) }
+          : {}),
+        workspaceDirectory,
+      } satisfies CargoWorkspacePackageMetadata,
+    ];
+  });
+  const packageMetadata = packages.find(
+    (entry) => entry.manifestPath === normalizePath(manifestPath),
+  );
+  if (packageMetadata === undefined) {
     return undefined;
   }
-  const dependencies = [
-    ...new Map(
-      (packageMetadata.dependencies ?? []).flatMap((dependency) => {
-        if (typeof dependency.name !== "string") return [];
-        const value: CargoDependencyMetadata = {
-          name: dependency.name,
-          ...(typeof dependency.path === "string"
-            ? { path: normalizePath(dependency.path) }
-            : {}),
-          ...(typeof dependency.source === "string"
-            ? { source: dependency.source }
-            : {}),
-        };
-        return [
-          [
-            `${value.name}\0${value.source ?? ""}\0${value.path ?? ""}`,
-            value,
-          ] as const,
-        ];
-      }),
-    ).values(),
-  ].sort((left, right) =>
-    `${left.name}\0${left.source ?? ""}\0${left.path ?? ""}`.localeCompare(
-      `${right.name}\0${right.source ?? ""}\0${right.path ?? ""}`,
-    ),
-  );
-  return {
-    name: packageMetadata.name,
-    dependencies,
-    dependencyNames: [
-      ...new Set(dependencies.map((dependency) => dependency.name)),
-    ].sort(),
-    entrypointNames: [
-      ...new Set(
-        (packageMetadata.targets ?? []).flatMap((target) =>
-          Array.isArray(target.kind) &&
-          target.kind.includes("bin") &&
-          typeof target.name === "string"
-            ? [target.name]
-            : [],
-        ),
-      ),
-    ].sort(),
-    hasLibraryTarget: (packageMetadata.targets ?? []).some(
-      (target) =>
-        Array.isArray(target.kind) &&
-        target.kind.some(
-          (kind) =>
-            typeof kind === "string" &&
-            (kind === "lib" || kind === "proc-macro" || kind.endsWith("lib")),
-        ),
-    ),
-    ...(typeof document.target_directory === "string"
-      ? { targetDirectory: normalizePath(document.target_directory) }
-      : {}),
-    ...(typeof document.workspace_root === "string"
-      ? { workspaceDirectory: normalizePath(document.workspace_root) }
-      : {}),
-  };
+  const { manifestPath: _manifestPath, ...metadata } = packageMetadata;
+  return metadata;
 };
 
-const cargoPackageMetadata = (
+const parseCargoWorkspaceMetadata = (
+  source: string,
+): CargoWorkspaceMetadata => {
+  const document = JSON.parse(source) as {
+    readonly workspace_root?: unknown;
+    readonly workspace_members?: ReadonlyArray<unknown>;
+    readonly packages?: ReadonlyArray<{
+      readonly id?: unknown;
+      readonly manifest_path?: unknown;
+    }>;
+  };
+  if (typeof document.workspace_root !== "string") {
+    throw new TypeError("cargo metadata is missing workspace_root");
+  }
+  const directory = normalizePath(document.workspace_root);
+  const packages = (document.packages ?? []).flatMap((entry) => {
+    if (typeof entry.manifest_path !== "string") return [];
+    const metadata = parseCargoMetadata(source, entry.manifest_path);
+    return metadata === undefined
+      ? []
+      : [
+          {
+            ...metadata,
+            manifestPath: normalizePath(entry.manifest_path),
+          } satisfies CargoWorkspacePackageMetadata,
+        ];
+  });
+  return { directory, packages };
+};
+
+const cargoWorkspaceMetadata = (
   manifestPath: string,
-): Effect.Effect<
-  CargoPackageMetadata | undefined,
-  RepositoryError,
-  ProcessService
-> =>
+): Effect.Effect<CargoWorkspaceMetadata, RepositoryError, ProcessService> =>
   Effect.gen(function* () {
     const processService = yield* ProcessService;
     const result = yield* Effect.scoped(
@@ -622,7 +679,7 @@ const cargoPackageMetadata = (
       );
     }
     try {
-      return parseCargoMetadata(result.stdout, manifestPath);
+      return parseCargoWorkspaceMetadata(result.stdout);
     } catch (cause) {
       return yield* Effect.fail(
         new RepositoryError({ path: manifestPath, message: String(cause) }),
@@ -905,93 +962,138 @@ export const discoverRepository = (
         }
       }
     }
-    const polyglotDrafts = yield* Effect.forEach(
-      directories.filter((directory) => !javascriptDirectories.has(directory)),
-      (directory) =>
-        Effect.gen(function* () {
-          const fileSystem = yield* FileSystemService;
-          const candidates = [
-            ...(cargoEnabled
-              ? [{ file: "Cargo.toml", manager: "cargo" as const }]
-              : []),
-            ...(pythonWorkspaceDirectories.has(directory)
-              ? [{ file: "pyproject.toml", manager: "uv" as const }]
-              : []),
-          ];
-          for (const candidate of candidates) {
-            const path = joinPath(directory, candidate.file);
-            if (
-              !(yield* fileSystem
+    const configuredTasks = (rootConfiguration.value.tasks ?? {}) as Readonly<
+      Record<string, Pipeline>
+    >;
+    const polyglotDirectories = directories.filter(
+      (directory) => !javascriptDirectories.has(directory),
+    );
+    const cargoManifestPaths = cargoEnabled
+      ? (yield* Effect.forEach(
+          polyglotDirectories,
+          (directory) =>
+            Effect.gen(function* () {
+              const fileSystem = yield* FileSystemService;
+              const path = joinPath(directory, "Cargo.toml");
+              const exists = yield* fileSystem
                 .exists(path)
                 .pipe(
                   Effect.mapError(
                     (error) =>
                       new RepositoryError({ path, message: error.message }),
                   ),
-                ))
-            ) {
-              continue;
-            }
-            const source = yield* fileSystem
-              .readText(path)
+                );
+              return exists ? path : undefined;
+            }),
+          { concurrency: 1 },
+        )).filter((path): path is string => path !== undefined)
+      : [];
+    const cargoManifestSet = new Set(
+      cargoManifestPaths.map((path) => normalizePath(path)),
+    );
+    const cargoPackages = new Map<string, CargoWorkspacePackageMetadata>();
+    const claimedCargoWorkspaceDirectories: Array<string> = [];
+    for (const manifestPath of cargoManifestPaths) {
+      if (
+        claimedCargoWorkspaceDirectories.some((directory) =>
+          isPathContained(directory, parentPath(manifestPath)),
+        )
+      ) {
+        continue;
+      }
+      const metadata = yield* cargoWorkspaceMetadata(manifestPath);
+      claimedCargoWorkspaceDirectories.push(metadata.directory);
+      for (const packageMetadata of metadata.packages) {
+        if (cargoManifestSet.has(packageMetadata.manifestPath)) {
+          cargoPackages.set(packageMetadata.manifestPath, packageMetadata);
+        }
+      }
+    }
+    const cargoDrafts: ReadonlyArray<RepositoryPackageDraft> = [
+      ...cargoPackages.values(),
+    ]
+      .sort((left, right) =>
+        left.manifestPath.localeCompare(right.manifestPath),
+      )
+      .map((metadata) => {
+        const directory = parentPath(metadata.manifestPath);
+        return {
+          name: metadata.name,
+          directory,
+          relativeDirectory: relativePath(root, directory),
+          workspaceDirectory: metadata.workspaceDirectory,
+          manager: "cargo" as const,
+          scripts: polyglotScripts("cargo", metadata.entrypointNames),
+          cargoDependencies: metadata.dependencies,
+          dependencyNames: metadata.dependencyNames,
+          tasks: cargoTasks(root, metadata.name, metadata, configuredTasks),
+          manifest: {
+            name: metadata.name,
+            private: true,
+          } satisfies PackageManifest,
+        };
+      });
+    const uvDrafts = yield* Effect.forEach(
+      polyglotDirectories.filter((directory) =>
+        pythonWorkspaceDirectories.has(directory),
+      ),
+      (directory) =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const path = joinPath(directory, "pyproject.toml");
+          if (
+            !(yield* fileSystem
+              .exists(path)
               .pipe(
                 Effect.mapError(
                   (error) =>
                     new RepositoryError({ path, message: error.message }),
                 ),
-              );
-            const cargoMetadata =
-              candidate.manager === "cargo"
-                ? yield* cargoPackageMetadata(path)
-                : undefined;
-            let pythonMetadata: PythonProjectMetadata | undefined;
-            if (candidate.manager === "uv") {
-              try {
-                pythonMetadata = parsePythonProjectMetadata(source);
-              } catch (cause) {
-                return yield* Effect.fail(
-                  new RepositoryError({ path, message: String(cause) }),
-                );
-              }
-            }
-            const name =
-              candidate.manager === "cargo"
-                ? cargoMetadata?.name
-                : pythonMetadata?.name;
-            if (name === undefined) {
-              continue;
-            }
-            const configuredTasks = (rootConfiguration.value.tasks ??
-              {}) as Readonly<Record<string, Pipeline>>;
-            return {
-              name,
-              directory,
-              relativeDirectory: relativePath(root, directory),
-              workspaceDirectory: cargoMetadata?.workspaceDirectory,
-              manager: candidate.manager,
-              scripts: polyglotScripts(
-                candidate.manager,
-                cargoMetadata?.entrypointNames ?? [],
-              ),
-              cargoDependencies: cargoMetadata?.dependencies ?? [],
-              dependencyNames:
-                candidate.manager === "cargo"
-                  ? (cargoMetadata?.dependencyNames ?? [])
-                  : (pythonMetadata?.dependencyNames ?? []),
-              tasks:
-                candidate.manager === "cargo"
-                  ? cargoTasks(root, name, cargoMetadata, configuredTasks)
-                  : uvTasks(name, configuredTasks),
-              manifest: { name, private: true } satisfies PackageManifest,
-            };
+              ))
+          ) {
+            return undefined;
           }
-          return undefined;
+          const source = yield* fileSystem
+            .readText(path)
+            .pipe(
+              Effect.mapError(
+                (error) =>
+                  new RepositoryError({ path, message: error.message }),
+              ),
+            );
+          let metadata: PythonProjectMetadata;
+          try {
+            metadata = parsePythonProjectMetadata(source);
+          } catch (cause) {
+            return yield* Effect.fail(
+              new RepositoryError({ path, message: String(cause) }),
+            );
+          }
+          if (metadata.name === undefined) {
+            return undefined;
+          }
+          return {
+            name: metadata.name,
+            directory,
+            relativeDirectory: relativePath(root, directory),
+            manager: "uv" as const,
+            scripts: polyglotScripts("uv", []),
+            cargoDependencies:
+              [] satisfies ReadonlyArray<CargoDependencyMetadata>,
+            dependencyNames: metadata.dependencyNames,
+            tasks: uvTasks(metadata.name, configuredTasks),
+            manifest: {
+              name: metadata.name,
+              private: true,
+            } satisfies PackageManifest,
+          };
         }),
       { concurrency: 1 },
     );
     const drafts: ReadonlyArray<RepositoryPackageDraft> = [
       ...javascriptDrafts,
-      ...polyglotDrafts.filter(
+      ...cargoDrafts,
+      ...uvDrafts.filter(
         (entry): entry is NonNullable<typeof entry> => entry !== undefined,
       ),
     ];
@@ -1109,6 +1211,7 @@ export const listRepositoryFiles = (
   directory: string,
   options: {
     readonly ignoredDirectories?: ReadonlySet<string>;
+    readonly includeDirectories?: boolean;
   } = {},
 ): Effect.Effect<ReadonlyArray<string>, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
@@ -1132,7 +1235,11 @@ export const listRepositoryFiles = (
             entry.name,
           )
         ) {
-          pending.push(joinPath(current, entry.name));
+          const path = joinPath(current, entry.name);
+          if (options.includeDirectories === true) {
+            files.push(path);
+          }
+          pending.push(path);
         } else if (entry.kind === "file" || entry.kind === "symlink") {
           files.push(joinPath(current, entry.name));
         }

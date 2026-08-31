@@ -1,6 +1,6 @@
 import { Effect } from "effect";
 import { joinPath, parentPath } from "../core/path.js";
-import { CacheError } from "../effect/errors.js";
+import { CacheError, CacheRollbackError } from "../effect/errors.js";
 import {
   ClockService,
   CompressionService,
@@ -63,7 +63,11 @@ export const restoreLocalCache = (
   options: LocalCacheOptions,
   hash: string,
   scope: CacheRestoreScope,
-): Effect.Effect<boolean, CacheError, FileSystemService | CompressionService> =>
+): Effect.Effect<
+  boolean,
+  CacheError | CacheRollbackError,
+  FileSystemService | CompressionService
+> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const compression = yield* CompressionService;
@@ -103,6 +107,9 @@ export const restoreLocalCache = (
     );
     if (outcome._tag === "Left") {
       yield* removeEntry(options.directory, hash);
+      if (outcome.left._tag === "CacheRollbackError") {
+        return yield* Effect.fail(outcome.left);
+      }
       return false;
     }
     return true;
@@ -307,10 +314,10 @@ export const writeLocalCache = (
         .map((entry) => [
           entry.path,
           {
-            size: entry.contents.length,
+            size: entry.kind === "directory" ? 0 : entry.contents.length,
             mtime_nanos: Math.floor(entry.modifiedSeconds * 1_000_000_000),
             mode: entry.mode,
-            is_dir: false,
+            is_dir: entry.kind === "directory",
           },
         ]),
     );

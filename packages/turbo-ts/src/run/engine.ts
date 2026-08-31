@@ -793,6 +793,7 @@ const selectAffectedTasks = (
   graph: TaskGraph,
   filters: ReadonlyArray<string>,
   affectedBySelector: ReadonlyMap<string, AffectedPackages>,
+  retainedPackageNames: ReadonlySet<string> = new Set(),
 ): TaskGraph => {
   const rangeFilters = filters.flatMap((filter) => {
     const selector = gitRangeSelector(filter);
@@ -806,7 +807,11 @@ const selectAffectedTasks = (
     ({ filter }) => !filter.startsWith("!"),
   );
   const retainedEntrypoints = new Set(
-    positiveFilters.length === 0 ? graph.entrypoints : [],
+    positiveFilters.length === 0
+      ? graph.entrypoints
+      : graph.entrypoints.filter((id) =>
+          retainedPackageNames.has(graph.nodes.get(id)!.package.name),
+        ),
   );
   for (const { filter, affected } of positiveFilters) {
     for (const id of affectedTaskEntrypoints(
@@ -955,20 +960,37 @@ const collectOutputPaths = (
       patterns: ReadonlyArray<string>,
     ): Effect.Effect<void, RepositoryError, FileSystemService> =>
       Effect.gen(function* () {
+        const fileSystem = yield* FileSystemService;
         const files = yield* listRepositoryFiles(directory, {
           ignoredDirectories: new Set([".git", ".turbo", "node_modules"]),
+          includeDirectories: true,
         });
         for (const path of files) {
           const relative = relativePath(directory, path);
+          const metadata = yield* fileSystem
+            .metadata(path)
+            .pipe(
+              Effect.mapError(
+                (error) =>
+                  new RepositoryError({ path, message: error.message }),
+              ),
+            );
+          const candidates =
+            metadata.kind === "directory"
+              ? [relative, `${relative}/`]
+              : [relative];
           if (
             patterns.some(
               (pattern) =>
-                !pattern.startsWith("!") && matchesGlob(relative, pattern),
+                !pattern.startsWith("!") &&
+                candidates.some((candidate) => matchesGlob(candidate, pattern)),
             ) &&
             !patterns.some(
               (pattern) =>
                 pattern.startsWith("!") &&
-                matchesGlob(relative, pattern.slice(1)),
+                candidates.some((candidate) =>
+                  matchesGlob(candidate, pattern.slice(1)),
+                ),
             )
           ) {
             selected.add(path);
@@ -1028,6 +1050,9 @@ const collectCacheEntries = (
             mode: metadata.mode,
             modifiedSeconds: metadata.modifiedMilliseconds / 1_000,
           };
+          if (metadata.kind === "directory") {
+            return { ...common, kind: "directory" as const };
+          }
           if (metadata.kind === "symlink") {
             const linkTarget = yield* fileSystem
               .readLink(path)
@@ -1264,7 +1289,7 @@ const executeTask = (
         hash.hash,
         restoreScope,
       ).pipe(
-        Effect.catchAll((error) =>
+        Effect.catchTag("CacheError", (error) =>
           terminal
             .writeStderr(
               renderLogEvent(
@@ -1349,12 +1374,10 @@ const executeTask = (
           TURBO_HASH: hash.hash,
         },
       });
-    const streamsPersistentOutput =
-      node.definition.persistent === true &&
-      node.definition.interactive !== true;
-    const displaysPersistentOutput =
-      streamsPersistentOutput && shouldReplayOutput(outputMode, false);
-    const result = streamsPersistentOutput
+    const streamsCapturedOutput = node.definition.interactive !== true;
+    const displaysStreamedOutput =
+      streamsCapturedOutput && shouldReplayOutput(outputMode, false);
+    const result = streamsCapturedOutput
       ? yield* Effect.scoped(
           Effect.gen(function* () {
             yield* fileSystem.makeDirectory(
@@ -1371,7 +1394,7 @@ const executeTask = (
                 while (true) {
                   const event = yield* Queue.take(outputQueue);
                   if (event.kind === "end") {
-                    if (displaysPersistentOutput && pendingDisplay !== "") {
+                    if (displaysStreamedOutput && pendingDisplay !== "") {
                       yield* terminal.writeStdout(
                         renderLogEvent(
                           {
@@ -1386,7 +1409,7 @@ const executeTask = (
                     return;
                   }
                   yield* fileSystem.appendText(logPath, event.output);
-                  if (!displaysPersistentOutput) continue;
+                  if (!displaysStreamedOutput) continue;
                   pendingDisplay += event.output;
                   while (pendingDisplay !== "") {
                     const display = takePersistentDisplayOutput(pendingDisplay);
@@ -1423,12 +1446,12 @@ const executeTask = (
         )
       : yield* Effect.scoped(startProcess());
     const output = result.combinedOutput;
-    if (!streamsPersistentOutput) {
+    if (!streamsCapturedOutput) {
       yield* fileSystem.makeDirectory(joinPath(executionDirectory, ".turbo"));
       yield* fileSystem.writeText(logPath, output);
     }
     if (
-      (!displaysPersistentOutput && shouldReplayOutput(outputMode, false)) ||
+      (!displaysStreamedOutput && shouldReplayOutput(outputMode, false)) ||
       (outputMode === "errors-only" && result.exitCode !== 0)
     ) {
       yield* terminal.writeStdout(
@@ -1614,31 +1637,61 @@ export const planCargoWorkspaceTasks = (
 };
 
 const applyCargoWorkspaceHashes = (
+  repository: RepositoryModel,
+  graph: TaskGraph,
   hashes: ReadonlyMap<string, TaskHashResult>,
   scopes: ReadonlyMap<string, TaskCommandScope>,
-): ReadonlyMap<string, TaskHashResult> => {
-  const combined = new Map(hashes);
-  for (const [id, scope] of scopes) {
-    if (scope.kind !== "cargo-workspace") continue;
-    const representative = hashes.get(id)!;
-    const members = scope.members.map((member) => {
-      const result = hashes.get(member.id)!;
-      return [member.id, result.hash] as const;
-    });
-    combined.set(id, {
-      ...representative,
-      hash: cargoWorkspaceHash(members),
-      inputFiles: [
-        ...new Set(
-          scope.members.flatMap(
-            (member) => hashes.get(member.id)?.inputFiles ?? [],
+  options: ResolvedRunOptions,
+): Effect.Effect<
+  ReadonlyMap<string, TaskHashResult>,
+  RepositoryError,
+  FileSystemService | EnvironmentService | DigestService | ProcessService
+> =>
+  Effect.gen(function* () {
+    const combined = new Map(hashes);
+    const changed = new Set<string>();
+    for (const [id, scope] of scopes) {
+      if (scope.kind !== "cargo-workspace") continue;
+      const representative = hashes.get(id)!;
+      const members = scope.members.map((member) => {
+        const result = hashes.get(member.id)!;
+        return [member.id, result.hash] as const;
+      });
+      combined.set(id, {
+        ...representative,
+        hash: cargoWorkspaceHash(members),
+        inputFiles: [
+          ...new Set(
+            scope.members.flatMap(
+              (member) => hashes.get(member.id)?.inputFiles ?? [],
+            ),
           ),
+        ].sort(),
+      });
+      changed.add(id);
+    }
+    for (const id of topologicalOrder(graph)) {
+      if (scopes.has(id)) continue;
+      const node = graph.nodes.get(id)!;
+      const upstreamIds = [
+        ...new Set([...node.dependencies, ...node.with]),
+      ].sort();
+      if (!upstreamIds.some((upstream) => changed.has(upstream))) continue;
+      combined.set(
+        id,
+        yield* hashTask(
+          repository,
+          node,
+          upstreamIds.map((upstream) => combined.get(upstream)!.hash),
+          options.frameworkInference,
+          options.passThroughArguments,
+          options.cacheDirectory,
         ),
-      ].sort(),
-    });
-  }
-  return combined;
-};
+      );
+      changed.add(id);
+    }
+    return combined;
+  });
 
 export const cargoWorkspaceHash = (
   members: ReadonlyArray<readonly [string, string]>,
@@ -1760,11 +1813,33 @@ export const executeRun = (
     const useTaskInputs =
       (options.affected && flags?.affectedUsingTaskInputs === true) ||
       (affected.hasGitRangeFilter && flags?.filterUsingTasks === true);
-    const packageFilters = useTaskInputs
-      ? affected.filters.filter(
-          (filter) => gitRangeSelector(filter) === undefined,
-        )
-      : affected.filters;
+    const nonRangeFilters = affected.filters.filter(
+      (filter) => gitRangeSelector(filter) === undefined,
+    );
+    const positivePackageFilters = nonRangeFilters.filter(
+      (filter) => !filter.startsWith("!"),
+    );
+    const negativePackageFilters = nonRangeFilters.filter((filter) =>
+      filter.startsWith("!"),
+    );
+    const hasPositiveRangeFilter = affected.filters.some(
+      (filter) =>
+        !filter.startsWith("!") && gitRangeSelector(filter) !== undefined,
+    );
+    const retainedPackageNames = new Set(
+      !useTaskInputs || positivePackageFilters.length === 0
+        ? []
+        : selectPackages(
+            repository,
+            [...positivePackageFilters, ...negativePackageFilters],
+            affected.ranges,
+          ).map((packageModel) => packageModel.name),
+    );
+    const packageFilters = !useTaskInputs
+      ? affected.filters
+      : hasPositiveRangeFilter
+        ? negativePackageFilters
+        : nonRangeFilters;
     const packages = selectPackages(
       repository,
       packageFilters,
@@ -1806,6 +1881,7 @@ export const executeRun = (
           unfilteredGraph,
           affected.filters,
           affected.affectedBySelector,
+          retainedPackageNames,
         )
       : unfilteredGraph;
     const cargoWorkspacePlan = planCargoWorkspaceTasks(
@@ -1814,9 +1890,12 @@ export const executeRun = (
       affected.filters.length === 0,
     );
     const graph = cargoWorkspacePlan.graph;
-    const hashes = applyCargoWorkspaceHashes(
+    const hashes = yield* applyCargoWorkspaceHashes(
+      repository,
+      graph,
       yield* computeTaskHashes(repository, selectedGraph, options),
       cargoWorkspacePlan.scopes,
+      options,
     );
     const groups = taskGroups(graph);
     const pending = new Map(groups.map((members) => [members[0]!, members]));

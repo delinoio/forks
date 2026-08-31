@@ -83,6 +83,8 @@ strict entrypoint selection removes configured tasks without an executable
 package script even when every selected entrypoint is commandless. Every
 explicit `with` reference must resolve to an existing package task before its
 owner can execute.
+Task-aware Git selectors retain union semantics with positive package
+selectors; negative Git selectors are applied after that union.
 Package-level affected selection treats legacy `globalDependencies` and, when
 task-aware selection is disabled, `global.inputs` as repository-global inputs.
 Task-input selection uses the same effective global and task inputs as hashing,
@@ -95,10 +97,10 @@ lockfile parsing and pruning remain Gate 3 work. Without Git, explicit task
 inputs under ordinary `dist` and `target` directories remain hashable.
 Cache directories equal to or containing the repository are rejected before
 cache access. Scheduled `with` groups preserve internal dependency order and
-share one run-wide foreground concurrency budget. Non-interactive persistent
-task output streams to the terminal and task log through bounded backpressure
-while retaining only a bounded diagnostic tail and incomplete display line in
-memory. Persistent companions must remain alive until their foreground owners
+share one run-wide foreground concurrency budget. All non-interactive task
+output streams to the task log through bounded backpressure while retaining
+only a bounded diagnostic tail and incomplete display line in memory.
+Persistent companions must remain alive until their foreground owners
 complete; any earlier natural exit fails the group, and foreground owners
 sharing a companion remain subject to the run's concurrency limit.
 
@@ -110,7 +112,8 @@ Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
 reject malformed entries. Remote artifact routes preserve configured API path
 prefixes, remote restoration failures warn and fall back to task execution, and
 remote upload failures warn without changing a successful task outcome. Remote
-downloads are limited to 256 MiB compressed and 1 GiB after decompression.
+downloads are limited to 256 MiB compressed and 1 GiB after decompression;
+preflight and upload response bodies have an independent 64 KiB limit.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact log path before clearing or writing files.
 Companion task hashes participate in the owning task's cache key. Local eviction
@@ -118,6 +121,9 @@ accepts week-based ages, runs before cache restoration only when local cache
 reads or writes are enabled, and counts archive and sidecar bytes, including
 orphaned sidecars. Cache archives use PAX extensions for paths beyond ustar
 limits, and interrupted or failed atomic writes remove their temporary files.
+Archives preserve empty declared output directories. Failed restoration removes
+every partially restored output before local execution, and rollback failure
+aborts execution instead of exposing partial cache state.
 uv packages are discovered from the root
 `pyproject.toml` workspace root and member globs after applying workspace
 exclusions; unrelated Python projects and `.venv` trees are ignored.
@@ -139,6 +145,9 @@ for mixed library and binary crates default to uncached. Builds with
 pass-through arguments that select an alternate output layout or an unmodeled
 library, binary, example, test, or benchmark target bypass caching until those
 outputs are modeled explicitly.
+Cargo discovery uses each metadata response's workspace-member list and does
+not probe excluded or unrelated nested manifests. Combined workspace task
+hashes are propagated into every downstream task hash.
 
 Structured task input globs apply ordered inclusion and negation consistently
 to task hashing and task-aware affected selection. Task-aware Git filters

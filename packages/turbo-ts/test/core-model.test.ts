@@ -803,6 +803,16 @@ describe("cache archive safety", () => {
     ).toThrow(/escapes repository/);
   });
 
+  it("round trips empty directory entries", () => {
+    const entry = {
+      kind: "directory" as const,
+      path: "packages/app/dist",
+      mode: 0o755,
+      modifiedSeconds: 2,
+    };
+    expect(parseTarArchive(createTarArchive([entry]))).toEqual([entry]);
+  });
+
   it("round trips ustar paths longer than the name field", () => {
     const path = `packages/app/${"nested-segment/".repeat(7)}dist/output.txt`;
     expect(new TextEncoder().encode(path).length).toBeGreaterThan(100);

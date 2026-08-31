@@ -1,5 +1,5 @@
-import { Effect } from "effect";
-import { CacheError } from "../effect/errors.js";
+import { Effect, Schedule } from "effect";
+import { CacheError, CacheRollbackError } from "../effect/errors.js";
 import {
   CompressionService,
   FileSystemService,
@@ -38,6 +38,11 @@ const isTransientStatus = (status: number): boolean =>
 
 const maximumRemoteArtifactBytes = 256 * 1024 * 1024;
 const maximumRemoteArchiveBytes = 1024 * 1024 * 1024;
+const maximumRemoteControlResponseBytes = 64 * 1024;
+
+const retryTransientCacheErrors = Schedule.whileInput((error: unknown) =>
+  error instanceof CacheError ? error.retryable : false,
+);
 
 const artifactUrl = (options: RemoteCacheOptions, hash: string): string => {
   const url = new URL(options.apiUrl);
@@ -76,9 +81,12 @@ const preflight = (
         method: "OPTIONS",
         headers: requestHeaders(options),
         timeoutMilliseconds: options.timeoutMilliseconds,
+        maxResponseBodyBytes: maximumRemoteControlResponseBytes,
       })
       .pipe(
-        Effect.mapError((error) => remoteError(url, error.message, true)),
+        Effect.mapError((error) =>
+          remoteError(url, error.message, error.retryable),
+        ),
         Effect.flatMap((response) =>
           isTransientStatus(response.status)
             ? Effect.fail(
@@ -86,7 +94,7 @@ const preflight = (
               )
             : Effect.succeed(response),
         ),
-        Effect.retry(retry.transient),
+        Effect.retry(retry.transient.pipe(retryTransientCacheErrors)),
       );
     if (response.status < 200 || response.status >= 300) {
       return yield* Effect.fail(
@@ -102,7 +110,7 @@ export const restoreRemoteCache = (
   scope: CacheRestoreScope,
 ): Effect.Effect<
   boolean,
-  CacheError,
+  CacheError | CacheRollbackError,
   | HttpService
   | CompressionService
   | FileSystemService
@@ -139,7 +147,7 @@ export const restoreRemoteCache = (
               )
             : Effect.succeed(response),
         ),
-        Effect.retry(retry.transient),
+        Effect.retry(retry.transient.pipe(retryTransientCacheErrors)),
       );
     if (response.status === 404) {
       return false;
@@ -228,9 +236,12 @@ export const writeRemoteCache = (
         headers,
         body: compressed,
         timeoutMilliseconds: options.uploadTimeoutMilliseconds,
+        maxResponseBodyBytes: maximumRemoteControlResponseBytes,
       })
       .pipe(
-        Effect.mapError((error) => remoteError(url, error.message, true)),
+        Effect.mapError((error) =>
+          remoteError(url, error.message, error.retryable),
+        ),
         Effect.flatMap((response) =>
           isTransientStatus(response.status)
             ? Effect.fail(
@@ -242,7 +253,7 @@ export const writeRemoteCache = (
               )
             : Effect.succeed(response),
         ),
-        Effect.retry(retry.transient),
+        Effect.retry(retry.transient.pipe(retryTransientCacheErrors)),
       );
     if (response.status < 200 || response.status >= 300) {
       return yield* Effect.fail(

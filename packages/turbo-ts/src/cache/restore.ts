@@ -6,7 +6,7 @@ import {
   parentPath,
   relativePath,
 } from "../core/path.js";
-import { CacheError } from "../effect/errors.js";
+import { CacheError, CacheRollbackError } from "../effect/errors.js";
 import { FileSystemService } from "../effect/services.js";
 import type { ArchiveEntry } from "./archive.js";
 
@@ -27,14 +27,18 @@ const isAllowedEntry = (
   root: string,
   destination: string,
   groups: ReadonlyArray<CacheRestorePathGroup>,
+  directoryEntry: boolean,
 ): boolean =>
   groups.some((group) => {
     const directory = joinPath(root, group.directory);
+    const relative = relativePath(directory, destination);
+    const candidates = directoryEntry ? [relative, `${relative}/`] : [relative];
     return (
       isPathContained(root, directory) &&
       isPathContained(directory, destination) &&
-      selectByGlobs([relativePath(directory, destination)], group.patterns)
-        .length > 0
+      candidates.some(
+        (candidate) => selectByGlobs([candidate], group.patterns).length > 0,
+      )
     );
   });
 
@@ -75,7 +79,7 @@ export const restoreArchiveEntries = (
   root: string,
   entries: ReadonlyArray<ArchiveEntry>,
   scope: CacheRestoreScope,
-): Effect.Effect<void, CacheError, FileSystemService> =>
+): Effect.Effect<void, CacheError | CacheRollbackError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const canonicalRoot = yield* fileSystem
@@ -88,7 +92,14 @@ export const restoreArchiveEntries = (
           restoreError(destination, "archive path escapes repository"),
         );
       }
-      if (!isAllowedEntry(root, destination, scope.allowedPathGroups)) {
+      if (
+        !isAllowedEntry(
+          root,
+          destination,
+          scope.allowedPathGroups,
+          entry.kind === "directory",
+        )
+      ) {
         return yield* Effect.fail(
           restoreError(
             destination,
@@ -104,71 +115,164 @@ export const restoreArchiveEntries = (
           restoreError(destination, "cache output path escapes repository"),
         );
       }
-      yield* fileSystem
-        .remove(destination)
-        .pipe(
-          Effect.mapError((error) => restoreError(destination, error.message)),
-        );
     }
-    for (const entry of entries) {
-      const destination = joinPath(root, entry.path);
-      yield* prepareParentDirectory(root, canonicalRoot, destination);
-      if (
+    const restoration = Effect.gen(function* () {
+      for (const path of scope.pathsToClear) {
+        const destination = joinPath(root, path);
         yield* fileSystem
+          .remove(destination)
+          .pipe(
+            Effect.mapError((error) =>
+              restoreError(destination, error.message),
+            ),
+          );
+      }
+      for (const entry of entries) {
+        const destination = joinPath(root, entry.path);
+        yield* prepareParentDirectory(root, canonicalRoot, destination);
+        let exists = yield* fileSystem
           .exists(destination)
           .pipe(
             Effect.mapError((error) =>
               restoreError(destination, error.message),
             ),
-          )
-      ) {
-        const metadata = yield* fileSystem
-          .metadata(destination)
-          .pipe(
-            Effect.mapError((error) =>
-              restoreError(destination, error.message),
-            ),
           );
-        if (metadata.kind === "symlink" && entry.kind !== "symlink") {
-          return yield* Effect.fail(
-            restoreError(destination, "archive destination is a symlink"),
-          );
-        }
-        if (entry.kind === "symlink") {
-          yield* fileSystem
-            .remove(destination)
+        if (exists) {
+          const metadata = yield* fileSystem
+            .metadata(destination)
             .pipe(
               Effect.mapError((error) =>
                 restoreError(destination, error.message),
               ),
             );
+          if (metadata.kind === "symlink" && entry.kind !== "symlink") {
+            return yield* Effect.fail(
+              restoreError(destination, "archive destination is a symlink"),
+            );
+          }
+          if (
+            entry.kind === "symlink" ||
+            (entry.kind === "directory" && metadata.kind !== "directory") ||
+            (entry.kind !== "directory" && metadata.kind === "directory")
+          ) {
+            yield* fileSystem
+              .remove(destination)
+              .pipe(
+                Effect.mapError((error) =>
+                  restoreError(destination, error.message),
+                ),
+              );
+            exists = false;
+          }
         }
-      }
-      if (entry.kind === "symlink") {
-        const target = joinPath(parentPath(destination), entry.linkTarget);
-        if (!isPathContained(root, target)) {
-          return yield* Effect.fail(
-            restoreError(destination, "archive link target escapes repository"),
-          );
+        if (entry.kind === "directory") {
+          if (!exists) {
+            yield* fileSystem
+              .makeDirectory(destination)
+              .pipe(
+                Effect.mapError((error) =>
+                  restoreError(destination, error.message),
+                ),
+              );
+          }
+          continue;
+        }
+        if (entry.kind === "symlink") {
+          const target = joinPath(parentPath(destination), entry.linkTarget);
+          if (!isPathContained(root, target)) {
+            return yield* Effect.fail(
+              restoreError(
+                destination,
+                "archive link target escapes repository",
+              ),
+            );
+          }
+          yield* fileSystem
+            .createSymlink(entry.linkTarget, destination)
+            .pipe(
+              Effect.mapError((error) =>
+                restoreError(destination, error.message),
+              ),
+            );
+          continue;
         }
         yield* fileSystem
-          .createSymlink(entry.linkTarget, destination)
+          .writeBytes(destination, entry.contents)
           .pipe(
             Effect.mapError((error) =>
               restoreError(destination, error.message),
             ),
           );
-        continue;
+        yield* fileSystem
+          .setFileMetadata(
+            destination,
+            entry.mode,
+            entry.modifiedSeconds * 1_000,
+          )
+          .pipe(
+            Effect.mapError((error) =>
+              restoreError(destination, error.message),
+            ),
+          );
       }
-      yield* fileSystem
-        .writeBytes(destination, entry.contents)
-        .pipe(
-          Effect.mapError((error) => restoreError(destination, error.message)),
+      const directories = entries
+        .filter(
+          (
+            entry,
+          ): entry is Extract<ArchiveEntry, { readonly kind: "directory" }> =>
+            entry.kind === "directory",
+        )
+        .sort(
+          (left, right) =>
+            right.path.split("/").length - left.path.split("/").length,
         );
-      yield* fileSystem
-        .setFileMetadata(destination, entry.mode, entry.modifiedSeconds * 1_000)
-        .pipe(
-          Effect.mapError((error) => restoreError(destination, error.message)),
-        );
+      for (const entry of directories) {
+        const destination = joinPath(root, entry.path);
+        yield* fileSystem
+          .setFileMetadata(
+            destination,
+            entry.mode,
+            entry.modifiedSeconds * 1_000,
+          )
+          .pipe(
+            Effect.mapError((error) =>
+              restoreError(destination, error.message),
+            ),
+          );
+      }
+    });
+    const outcome = yield* Effect.either(restoration);
+    if (outcome._tag === "Right") {
+      return;
     }
+    const rollbackPaths = [
+      ...new Set([
+        ...scope.pathsToClear,
+        ...entries.map((entry) => entry.path),
+      ]),
+    ].sort(
+      (left, right) =>
+        right.split("/").length - left.split("/").length ||
+        right.localeCompare(left),
+    );
+    const rollback = yield* Effect.either(
+      Effect.forEach(
+        rollbackPaths,
+        (path) =>
+          fileSystem.remove(joinPath(root, path)).pipe(
+            Effect.mapError(
+              (error) =>
+                new CacheRollbackError({
+                  path: joinPath(root, path),
+                  message: `cache restoration failed: ${outcome.left.message}; rollback failed: ${error.message}`,
+                }),
+            ),
+          ),
+        { concurrency: 1, discard: true },
+      ),
+    );
+    if (rollback._tag === "Left") {
+      return yield* Effect.fail(rollback.left);
+    }
+    return yield* Effect.fail(outcome.left);
   });
