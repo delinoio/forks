@@ -126,7 +126,7 @@ describe("Effect foundation", () => {
     expect(stream.listenerCount("error")).toBe(0);
   });
 
-  it("determines color support from each destination stream", async () => {
+  it("enables color for every destination unless NO_COLOR is set", async () => {
     const makeStream = (isTTY: boolean) =>
       Object.assign(
         new Writable({
@@ -143,7 +143,7 @@ describe("Effect foundation", () => {
       await Effect.runPromise(
         Effect.all([terminal.stdoutColorEnabled, terminal.stderrColorEnabled]),
       ),
-    ).toEqual([true, false]);
+    ).toEqual([true, true]);
 
     const noColorTerminal = makeTerminalOperations(stdout, stderr, () => "1");
     expect(

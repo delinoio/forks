@@ -500,6 +500,10 @@ interface CargoDependencyMetadata {
 interface RepositoryPackageDraft
   extends Omit<RepositoryPackage, "internalDependencies"> {
   readonly cargoDependencies: ReadonlyArray<CargoDependencyMetadata>;
+  readonly uvDependencySources?: ReadonlyMap<
+    string,
+    ReadonlyArray<PythonDependencySource>
+  >;
 }
 
 export const parseCargoMetadata = (
@@ -690,10 +694,19 @@ const cargoWorkspaceMetadata = (
 interface PythonProjectMetadata {
   readonly name?: string;
   readonly dependencyNames: ReadonlyArray<string>;
+  readonly dependencySources: ReadonlyMap<
+    string,
+    ReadonlyArray<PythonDependencySource>
+  >;
   readonly workspace?: {
     readonly members: ReadonlyArray<string>;
     readonly exclude: ReadonlyArray<string>;
   };
+}
+
+interface PythonDependencySource {
+  readonly workspace: boolean;
+  readonly path?: string;
 }
 
 const recordValue = (
@@ -719,6 +732,7 @@ const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
   const tool = recordValue(document?.tool);
   const uv = recordValue(tool?.uv);
   const workspace = recordValue(uv?.workspace);
+  const sources = recordValue(uv?.sources);
   const requirements = [
     ...stringArrayValue(project?.dependencies),
     ...Object.values(optionalDependencies ?? {}).flatMap(stringArrayValue),
@@ -730,9 +744,27 @@ const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
     const name = /^([A-Za-z0-9][A-Za-z0-9_.-]*)/.exec(requirement.trim())?.[1];
     if (name !== undefined) names.add(normalizePythonPackageName(name));
   }
+  const dependencySources = new Map<
+    string,
+    ReadonlyArray<PythonDependencySource>
+  >();
+  for (const [name, source] of Object.entries(sources ?? {})) {
+    const declarations = (Array.isArray(source) ? source : [source])
+      .map(recordValue)
+      .filter(
+        (entry): entry is Readonly<Record<string, unknown>> =>
+          entry !== undefined,
+      )
+      .map((entry) => ({
+        workspace: entry.workspace === true,
+        ...(typeof entry.path === "string" ? { path: entry.path } : {}),
+      }));
+    dependencySources.set(normalizePythonPackageName(name), declarations);
+  }
   return {
     name: typeof project?.name === "string" ? project.name : undefined,
     dependencyNames: [...names].sort(),
+    dependencySources,
     ...(workspace === undefined
       ? {}
       : {
@@ -1081,6 +1113,7 @@ export const discoverRepository = (
             cargoDependencies:
               [] satisfies ReadonlyArray<CargoDependencyMetadata>,
             dependencyNames: metadata.dependencyNames,
+            uvDependencySources: metadata.dependencySources,
             tasks: uvTasks(metadata.name, configuredTasks),
             manifest: {
               name: metadata.name,
@@ -1141,7 +1174,26 @@ export const discoverRepository = (
           packageDraft.manager === "uv"
             ? packageDraft.dependencyNames.flatMap((name) => {
                 const resolved = uvNames.get(normalizePythonPackageName(name));
-                return resolved === undefined ? [] : [resolved];
+                const target =
+                  resolved === undefined
+                    ? undefined
+                    : draftsByName.get(resolved);
+                const sources =
+                  packageDraft.uvDependencySources?.get(
+                    normalizePythonPackageName(name),
+                  ) ?? [];
+                return target !== undefined &&
+                  target.manager === "uv" &&
+                  sources.some(
+                    (source) =>
+                      source.workspace ||
+                      (source.path !== undefined &&
+                        normalizePath(
+                          joinPath(packageDraft.directory, source.path),
+                        ) === normalizePath(target.directory)),
+                  )
+                  ? [target.name]
+                  : [];
               })
             : packageDraft.manager === "cargo"
               ? cargoDependencies.flatMap((dependency) => {

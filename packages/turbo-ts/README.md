@@ -76,9 +76,9 @@ default to uncached because binary-only output declarations cannot restore all
 of Cargo's default artifacts. Unfiltered Cargo workspace commands merge the
 effective environments of every grouped member.
 
-Remote cache downloads are limited to 256 MiB compressed and 1 GiB after
-decompression. Artifacts beyond either limit are rejected and the task executes
-locally under the normal remote-restoration fallback.
+Local and remote cache restoration is limited to 256 MiB compressed and 1 GiB
+after decompression. Artifacts beyond either limit are rejected; local entries
+become misses and remote entries use the normal local-execution fallback.
 
 Configured cache directories may be inside or outside the repository, but the
 repository root and its ancestors are rejected because treating them as cache

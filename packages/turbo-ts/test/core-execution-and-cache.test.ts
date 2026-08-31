@@ -9,6 +9,7 @@ import {
   readlink,
   rm,
   symlink,
+  truncate,
   utimes,
   writeFile,
 } from "node:fs/promises";
@@ -20,6 +21,7 @@ import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it } from "@rstest/core";
 import { Effect, Layer } from "effect";
 import { maximumCacheArchiveInputBytes } from "../src/cache/archive.js";
+import { maximumCacheArtifactBytes } from "../src/cache/limits.js";
 import {
   evictLocalCache,
   restoreLocalCache,
@@ -292,9 +294,20 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
-  it("excludes a configured workspace cache directory from task inputs", async () => {
+  it("excludes a configured workspace cache directory from inputs and outputs", async () => {
     const directory = await makeFixture();
     try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: { build: { outputs: Array<string> } } };
+      configuration.tasks.build.outputs.push(
+        "$TURBO_ROOT$/packages/library/task-cache/**",
+      );
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
       const args = [
         candidateEntrypoint,
         "run",
@@ -307,10 +320,18 @@ describe("core CLI execution", () => {
       ];
       const cold = await run(process.execPath, args, repositoryRoot);
       const warm = await run(process.execPath, args, repositoryRoot);
+      const repeated = await run(process.execPath, args, repositoryRoot);
       expect(cold.exitCode).toBe(0);
       expect(cold.stdout).toContain("cache miss");
       expect(warm.exitCode).toBe(0);
       expect(warm.stdout).toContain("cache hit");
+      expect(repeated.exitCode).toBe(0);
+      expect(repeated.stdout).toContain("cache hit");
+      expect(
+        (await readdir(`${directory}/packages/library/task-cache`)).some(
+          (name) => name.endsWith(".tar.zst"),
+        ),
+      ).toBe(true);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1020,7 +1041,9 @@ describe("core CLI execution", () => {
           `exclude = ["python/excluded"]\n`,
       );
       await mkdir(`${directory}/python/app`, { recursive: true });
+      await mkdir(`${directory}/python/helper`, { recursive: true });
       await mkdir(`${directory}/python/library`, { recursive: true });
+      await mkdir(`${directory}/python/registry`, { recursive: true });
       await mkdir(`${directory}/python/excluded`, { recursive: true });
       await mkdir(`${directory}/examples/unrelated`, { recursive: true });
       if (process.platform !== "win32") {
@@ -1036,9 +1059,14 @@ describe("core CLI execution", () => {
           `name = "internal"\n` +
           `url = "https://example.test/simple"\n` +
           `\n` +
+          `[tool.uv.sources]\n` +
+          `my-util = { workspace = true }\n` +
+          `local-helper = { path = "../helper" }\n` +
+          `requests = { index = "internal" }\n` +
+          `\n` +
           `[project]\n` +
           `name = "app"\n` +
-          `dependencies = ["my-util>=1", "requests>=2"]\n` +
+          `dependencies = ["local-helper>=1", "my-util>=1", "requests>=2"]\n` +
           `\n` +
           `[project.optional-dependencies]\n` +
           `test = ["pytest>=8"]\n` +
@@ -1048,8 +1076,16 @@ describe("core CLI execution", () => {
           `lint = ["mypy>=1"]\n`,
       );
       await writeFile(
+        `${directory}/python/helper/pyproject.toml`,
+        `[project]\nname = "local_helper"\ndependencies = []\n`,
+      );
+      await writeFile(
         `${directory}/python/library/pyproject.toml`,
         `[project]\nname = "my_util"\ndependencies = []\n`,
+      );
+      await writeFile(
+        `${directory}/python/registry/pyproject.toml`,
+        `[project]\nname = "requests"\ndependencies = []\n`,
       );
       await writeFile(
         `${directory}/python/excluded/pyproject.toml`,
@@ -1067,6 +1103,7 @@ describe("core CLI execution", () => {
       );
       const app = model.packagesByName.get("app");
       expect(app?.dependencyNames).toEqual([
+        "local-helper",
         "my-util",
         "mypy",
         "pytest",
@@ -1074,7 +1111,7 @@ describe("core CLI execution", () => {
         "ruff",
         "types-requests",
       ]);
-      expect(app?.internalDependencies).toEqual(["my_util"]);
+      expect(app?.internalDependencies).toEqual(["local_helper", "my_util"]);
       expect(model.packagesByName.has("internal")).toBe(false);
       expect(model.packagesByName.has("python-root")).toBe(true);
       expect(model.packagesByName.has("excluded-project")).toBe(false);
@@ -1085,7 +1122,7 @@ describe("core CLI execution", () => {
         [
           ...buildTaskGraph(model, [app!], ["build"], false).nodes.keys(),
         ].sort(),
-      ).toEqual(["app#build", "my_util#build"]);
+      ).toEqual(["app#build", "local_helper#build", "my_util#build"]);
 
       configuration.tasks.build = {
         cache: true,
@@ -4132,6 +4169,31 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("rejects oversized local cache artifacts before reading them", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-limit-"));
+    const cacheDirectory = `${directory}/.turbo/cache`;
+    const hash = "0123456789abcdef";
+    const archivePath = `${cacheDirectory}/${hash}.tar.zst`;
+    try {
+      await mkdir(cacheDirectory, { recursive: true });
+      await writeFile(archivePath, "");
+      await truncate(archivePath, maximumCacheArtifactBytes + 1);
+      expect(
+        await Effect.runPromise(
+          restoreLocalCache(
+            directory,
+            { directory: cacheDirectory },
+            hash,
+            allowCachePaths("**"),
+          ).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).toBe(false);
+      await expect(lstat(archivePath)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("rolls back partial cache restorations before fallback", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-rollback-"));
     const entries = [
@@ -4362,6 +4424,43 @@ describe("cache interoperability and safety", () => {
       expect(await readFile(`${directory}/.env`, "utf8")).toBe(
         "TOP_SECRET=value\n",
       );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("requires exactly one regular task log before clearing outputs", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-log-required-"));
+    const logPath = "packages/app/.turbo/turbo-build.log";
+    const logEntry = {
+      path: logPath,
+      contents: new TextEncoder().encode("cached output\n"),
+      mode: 0o644,
+      modifiedSeconds: 1,
+    };
+    try {
+      for (const [entries, message] of [
+        [[], "missing"],
+        [[logEntry, logEntry], "more than once"],
+      ] as const) {
+        await writeFile(`${directory}/preserved.txt`, "preserved\n");
+        const restored = await Effect.runPromise(
+          restoreArchiveEntries(directory, entries, {
+            pathsToClear: ["preserved.txt"],
+            allowedPathGroups: [
+              { directory: ".", patterns: [logPath, "preserved.txt"] },
+            ],
+            regularFilePaths: [logPath],
+          }).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
+        );
+        expect(restored._tag).toBe("Left");
+        if (restored._tag === "Left") {
+          expect(restored.left.message).toContain(message);
+        }
+        expect(await readFile(`${directory}/preserved.txt`, "utf8")).toBe(
+          "preserved\n",
+        );
+      }
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -4945,6 +5044,80 @@ describe("cache interoperability and safety", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("validates remote cache URLs and timeout environment values before execution", async () => {
+    const directory = await makeFixture();
+    const baseArguments = [
+      candidateEntrypoint,
+      "run",
+      "build",
+      "--cwd",
+      directory,
+      "--filter=synthetic-library",
+      "--cache=remote:r",
+    ];
+    const expectConfigurationFailure = async (
+      args: ReadonlyArray<string>,
+      environment: Readonly<Record<string, string | undefined>>,
+      message: string,
+    ) => {
+      const result = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(message);
+      expect(result.stdout).not.toContain("library build");
+    };
+    try {
+      await expectConfigurationFailure(
+        [...baseArguments, "--api=not a URL"],
+        {},
+        "invalid remote cache URL",
+      );
+      await expectConfigurationFailure(
+        baseArguments,
+        { TURBO_API: "not a URL" },
+        "invalid remote cache URL",
+      );
+      for (const value of ["nonnumeric", "-1", "Infinity"]) {
+        await expectConfigurationFailure(
+          baseArguments,
+          {
+            TURBO_API: "http://127.0.0.1:9",
+            TURBO_REMOTE_CACHE_TIMEOUT: value,
+          },
+          "invalid remote cache timeout",
+        );
+      }
+      await expectConfigurationFailure(
+        [...baseArguments.slice(0, -1), "--cache=remote:w"],
+        {
+          TURBO_API: "http://127.0.0.1:9",
+          TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: "nonnumeric",
+        },
+        "invalid remote cache upload timeout",
+      );
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.remoteCache = { apiUrl: "not a URL" };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await expectConfigurationFailure(
+        baseArguments,
+        {},
+        "invalid remote cache URL",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
 
   it("lets TURBO_TEAMID override the configured remote-cache team ID", async () => {
     const directory = await makeFixture();

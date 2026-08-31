@@ -43,6 +43,9 @@ export const cliProgram = Effect.gen(function* () {
   const delimiter = arguments_.indexOf("--");
   const parserArguments =
     delimiter === -1 ? arguments_ : arguments_.slice(0, delimiter);
+  const noColorRequested = parserArguments.some(
+    (argument) => argument.split("=", 1)[0] === "--no-color",
+  );
   if (parserArguments.includes("--version")) {
     yield* terminal.writeStdout(`${versionOutput}\n`);
     return;
@@ -57,7 +60,7 @@ export const cliProgram = Effect.gen(function* () {
       surface: first,
       targetGate: first === "watch" || first === "query" ? 3 : 4,
     });
-    const color = yield* terminal.stderrColorEnabled;
+    const color = noColorRequested ? false : yield* terminal.stderrColorEnabled;
     yield* terminal.writeStderr(
       renderUnsupportedCompatibilityError(error, color),
     );
@@ -77,7 +80,7 @@ export const cliProgram = Effect.gen(function* () {
     yield* exitStatus.set(outcome.right);
     return;
   }
-  const color = yield* terminal.stderrColorEnabled;
+  const color = noColorRequested ? false : yield* terminal.stderrColorEnabled;
   if (outcome.left instanceof UnsupportedCompatibilityError) {
     yield* terminal.writeStderr(
       renderUnsupportedCompatibilityError(outcome.left, color),

@@ -110,15 +110,17 @@ Workspace configuration inheritance accepts only the exact `["//"]` parent
 list.
 Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
 reject malformed entries. Remote artifact routes preserve configured API path
-prefixes, remote restoration failures warn and fall back to task execution, and
-remote upload failures warn without changing a successful task outcome. Remote
-downloads are limited to 256 MiB compressed and 1 GiB after decompression;
-preflight and upload response bodies have an independent 64 KiB limit.
+prefixes. Active remote URLs and timeout values are validated before cache or
+task work begins. Remote restoration failures warn and fall back to task
+execution, and remote upload failures warn without changing a successful task
+outcome. Local and remote cache restoration is limited to 256 MiB compressed
+and 1 GiB after decompression; preflight and upload response bodies have an
+independent 64 KiB limit.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact log path before clearing or writing files.
-Task-log entries must be regular files. Cache writes whose aggregate
-uncompressed file content exceeds 64 MiB are skipped before contents are read,
-with a warning that preserves the successful task result.
+Every archive must contain exactly one regular task-log entry. Cache writes
+whose aggregate uncompressed file content exceeds 64 MiB are skipped before
+contents are read, with a warning that preserves the successful task result.
 Companion task hashes participate in the owning task's cache key. Local eviction
 accepts week-based ages, runs before cache restoration only when local cache
 reads or writes are enabled, and counts archive and sidecar bytes, including
@@ -127,13 +129,18 @@ limits, and interrupted or failed atomic writes remove their temporary files.
 Archives preserve empty declared output directories. Failed restoration removes
 every partially restored output before local execution, and rollback failure
 aborts execution instead of exposing partial cache state.
+Resolved cache-directory subtrees are excluded from both task inputs and task
+outputs, including custom cache directory names selected by broad output globs.
 uv packages are discovered from the root
 `pyproject.toml` workspace root and member globs after applying workspace
 exclusions; unrelated Python projects and `.venv` trees are ignored.
 Synthesized uv packages
 expose `build` and `test`, and implicit builds default to uncached unless task
 configuration explicitly enables caching. uv tasks execute from their project
-directory, and `uv.lock` is parsed as TOML. JavaScript package-graph edges
+directory, and `uv.lock` is parsed as TOML. uv package-graph edges require a
+matching `tool.uv.sources` workspace declaration or local path resolving to the
+named workspace member; registry, Git, URL, and undeclared sources remain
+external. JavaScript package-graph edges
 require declared workspace or version-range compatibility, or a `file:` or
 `link:` path that resolves to the named local package. Unfiltered Cargo `test`,
 `check`, `lint`, and `format` tasks execute once per Cargo workspace and bypass

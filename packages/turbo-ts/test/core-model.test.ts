@@ -11,6 +11,7 @@ import {
   isPathContained,
   joinPath,
   normalizePath,
+  parentPath,
   relativePath,
 } from "../src/core/path.js";
 import { GraphError } from "../src/effect/errors.js";
@@ -105,6 +106,22 @@ describe("core repository model", () => {
     expect(isPathContained("/repo", "/outside")).toBe(false);
     expect(isAbsolutePath("C:\\repo")).toBe(true);
     expect(isAbsolutePath("packages/app")).toBe(false);
+    expect(isAbsolutePath("\\\\server\\share\\repo")).toBe(true);
+    expect(normalizePath("\\\\server\\share\\repo\\packages\\..\\app")).toBe(
+      "//server/share/repo/app",
+    );
+    expect(joinPath("\\\\server\\share", "repo", "app")).toBe(
+      "//server/share/repo/app",
+    );
+    expect(parentPath("//server/share")).toBe("//server/share");
+    expect(parentPath("//server/share/repo")).toBe("//server/share");
+    expect(relativePath("//server/share/repo", "//server/share/repo/app")).toBe(
+      "app",
+    );
+    expect(isPathContained("//SERVER/Share", "//server/share/repo")).toBe(true);
+    expect(isPathContained("//server/share", "//server/other/repo")).toBe(
+      false,
+    );
   });
 
   it("matches workspace and input globs with negation", () => {

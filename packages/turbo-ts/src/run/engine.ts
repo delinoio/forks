@@ -322,21 +322,29 @@ const resolveOptions = (
     undefined;
   const token = parsed.token ?? environment.TURBO_TOKEN;
   const signatureKey = environment.TURBO_REMOTE_CACHE_SIGNATURE_KEY;
-  const remoteTimeoutSeconds =
+  const remoteTimeoutValue =
     parsed.remoteCacheTimeoutSeconds ??
-    Number(
-      environment.TURBO_REMOTE_CACHE_TIMEOUT ??
-        remoteConfiguration?.timeout ??
-        30,
-    );
-  const remoteUploadTimeoutSeconds =
+    environment.TURBO_REMOTE_CACHE_TIMEOUT ??
+    remoteConfiguration?.timeout ??
+    30;
+  const remoteTimeoutPath =
+    parsed.remoteCacheTimeoutSeconds !== undefined
+      ? "<arguments>"
+      : environment.TURBO_REMOTE_CACHE_TIMEOUT !== undefined
+        ? "TURBO_REMOTE_CACHE_TIMEOUT"
+        : configuration.path;
+  const remoteUploadTimeoutValue =
     parsed.remoteCacheTimeoutSeconds ??
-    Number(
-      environment.TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT ??
-        remoteConfiguration?.uploadTimeout ??
-        remoteConfiguration?.timeout ??
-        30,
-    );
+    environment.TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT ??
+    remoteConfiguration?.uploadTimeout ??
+    remoteConfiguration?.timeout ??
+    30;
+  const remoteUploadTimeoutPath =
+    parsed.remoteCacheTimeoutSeconds !== undefined
+      ? "<arguments>"
+      : environment.TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT !== undefined
+        ? "TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT"
+        : configuration.path;
   if (
     value.futureFlags?.longerSignatureKey === true &&
     remoteConfiguration?.signature === true &&
@@ -348,28 +356,65 @@ const resolveOptions = (
         "TURBO_REMOTE_CACHE_SIGNATURE_KEY must contain at least 32 characters",
     });
   }
-  const remote =
-    apiUrl === undefined || remoteConfiguration?.enabled === false
-      ? undefined
-      : {
-          apiUrl,
-          token,
-          teamId:
-            environment.TURBO_TEAMID ??
-            remoteConfiguration?.teamId ??
-            undefined,
-          teamSlug:
-            parsed.team ??
-            environment.TURBO_TEAM ??
-            remoteConfiguration?.teamSlug ??
-            undefined,
-          timeoutMilliseconds: 1_000 * remoteTimeoutSeconds,
-          uploadTimeoutMilliseconds: 1_000 * remoteUploadTimeoutSeconds,
-          preflight:
-            parsed.preflight || remoteConfiguration?.preflight === true,
-          signatureKey,
-          requireSignature: remoteConfiguration?.signature === true,
-        };
+  const remote = (() => {
+    if (apiUrl === undefined || remoteConfiguration?.enabled === false) {
+      return undefined;
+    }
+    const apiUrlPath =
+      parsed.apiUrl !== undefined
+        ? "<arguments>"
+        : environment.TURBO_API !== undefined
+          ? "TURBO_API"
+          : configuration.path;
+    try {
+      new URL(apiUrl);
+    } catch {
+      throw new ConfigurationError({
+        path: apiUrlPath,
+        message: "invalid remote cache URL",
+      });
+    }
+    const parseTimeout = (
+      input: string | number,
+      path: string,
+      label: string,
+    ): number => {
+      const seconds = Number(input);
+      if (!Number.isFinite(seconds) || seconds < 0) {
+        throw new ConfigurationError({
+          path,
+          message: `invalid ${label}: ${String(input)}`,
+        });
+      }
+      return seconds;
+    };
+    const remoteTimeoutSeconds = parseTimeout(
+      remoteTimeoutValue,
+      remoteTimeoutPath,
+      "remote cache timeout",
+    );
+    const remoteUploadTimeoutSeconds = parseTimeout(
+      remoteUploadTimeoutValue,
+      remoteUploadTimeoutPath,
+      "remote cache upload timeout",
+    );
+    return {
+      apiUrl,
+      token,
+      teamId:
+        environment.TURBO_TEAMID ?? remoteConfiguration?.teamId ?? undefined,
+      teamSlug:
+        parsed.team ??
+        environment.TURBO_TEAM ??
+        remoteConfiguration?.teamSlug ??
+        undefined,
+      timeoutMilliseconds: 1_000 * remoteTimeoutSeconds,
+      uploadTimeoutMilliseconds: 1_000 * remoteUploadTimeoutSeconds,
+      preflight: parsed.preflight || remoteConfiguration?.preflight === true,
+      signatureKey,
+      requireSignature: remoteConfiguration?.signature === true,
+    };
+  })();
   return {
     root,
     tasks: parsed.tasks,
@@ -952,6 +997,7 @@ export const packageManagerCommand = (
 const collectOutputPaths = (
   repository: RepositoryModel,
   nodes: ReadonlyArray<TaskNode>,
+  cacheDirectory: string,
 ): Effect.Effect<ReadonlyArray<string>, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
     const selected = new Set<string>();
@@ -967,6 +1013,9 @@ const collectOutputPaths = (
           includeDirectories: true,
         });
         for (const path of files) {
+          if (isPathContained(cacheDirectory, path)) {
+            continue;
+          }
           const relative = relativePath(directory, path);
           const metadata = yield* fileSystem
             .metadata(path)
@@ -1024,6 +1073,7 @@ const collectCacheEntries = (
   repository: RepositoryModel,
   nodes: ReadonlyArray<TaskNode>,
   logPath: string,
+  cacheDirectory: string,
 ): Effect.Effect<
   | {
       readonly kind: "ready";
@@ -1035,7 +1085,10 @@ const collectCacheEntries = (
 > =>
   Effect.gen(function* () {
     const selected = [
-      ...new Set([logPath, ...(yield* collectOutputPaths(repository, nodes))]),
+      ...new Set([
+        logPath,
+        ...(yield* collectOutputPaths(repository, nodes, cacheDirectory)),
+      ]),
     ].sort();
     const fileSystem = yield* FileSystemService;
     const selectedMetadata = yield* Effect.forEach(
@@ -1281,9 +1334,11 @@ const executeTask = (
       cacheable &&
       !options.force &&
       (options.cachePolicy.localRead || options.cachePolicy.remoteRead)
-        ? (yield* collectOutputPaths(repository, cacheNodes)).map((path) =>
-            relativePath(repository.root, path),
-          )
+        ? (yield* collectOutputPaths(
+            repository,
+            cacheNodes,
+            options.cacheDirectory,
+          )).map((path) => relativePath(repository.root, path))
         : [];
     const restoreScope = cacheRestoreScope(
       repository,
@@ -1498,6 +1553,7 @@ const executeTask = (
         repository,
         cacheNodes,
         logPath,
+        options.cacheDirectory,
       );
       if (collected.kind === "too-large") {
         yield* terminal.writeStderr(

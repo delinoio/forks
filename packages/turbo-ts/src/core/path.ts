@@ -1,14 +1,25 @@
 export const toUnixPath = (value: string): string =>
   value.replaceAll("\\", "/");
 
-export const isAbsolutePath = (value: string): boolean =>
-  value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+const uncPath = (value: string): RegExpExecArray | null =>
+  /^\/\/([^/]+)\/([^/]+)(?:\/(.*))?$/.exec(value);
+
+export const isAbsolutePath = (value: string): boolean => {
+  const unix = toUnixPath(value);
+  return unix.startsWith("/") || /^[A-Za-z]:\//.test(unix);
+};
 
 export const normalizePath = (value: string): string => {
   const unix = toUnixPath(value);
+  const unc = uncPath(unix);
   const drive = /^[A-Za-z]:/.exec(unix)?.[0] ?? "";
-  const absolute = unix.startsWith("/") || drive !== "";
-  const start = drive === "" ? unix : unix.slice(drive.length);
+  const absolute = unc !== null || unix.startsWith("/") || drive !== "";
+  const start =
+    unc !== null
+      ? (unc[3] ?? "")
+      : drive === ""
+        ? unix
+        : unix.slice(drive.length);
   const segments: Array<string> = [];
   for (const segment of start.split("/")) {
     if (segment === "" || segment === ".") {
@@ -24,7 +35,14 @@ export const normalizePath = (value: string): string => {
     }
     segments.push(segment);
   }
-  const prefix = drive !== "" ? `${drive}/` : absolute ? "/" : "";
+  const prefix =
+    unc !== null
+      ? `//${unc[1]}/${unc[2]}${segments.length === 0 ? "" : "/"}`
+      : drive !== ""
+        ? `${drive}/`
+        : absolute
+          ? "/"
+          : "";
   return `${prefix}${segments.join("/")}` || (absolute ? prefix : ".");
 };
 
@@ -33,7 +51,14 @@ export const joinPath = (...values: ReadonlyArray<string>): string =>
 
 export const parentPath = (value: string): string => {
   const normalized = normalizePath(value);
+  const uncRoot = /^\/\/[^/]+\/[^/]+/.exec(normalized)?.[0];
+  if (uncRoot !== undefined && normalized.length <= uncRoot.length) {
+    return uncRoot;
+  }
   const index = normalized.lastIndexOf("/");
+  if (uncRoot !== undefined && index <= uncRoot.length) {
+    return uncRoot;
+  }
   if (index <= 0) {
     return normalized.startsWith("/") ? "/" : ".";
   }
@@ -58,7 +83,8 @@ export const relativePath = (root: string, value: string): string => {
 export const isPathContained = (root: string, value: string): boolean => {
   const normalizedRoot = normalizePath(root).replace(/\/$/, "");
   const normalizedValue = normalizePath(value);
-  const caseInsensitive = /^[A-Za-z]:/.test(normalizedRoot);
+  const caseInsensitive =
+    /^[A-Za-z]:/.test(normalizedRoot) || normalizedRoot.startsWith("//");
   const comparisonRoot = caseInsensitive
     ? normalizedRoot.toLowerCase()
     : normalizedRoot;

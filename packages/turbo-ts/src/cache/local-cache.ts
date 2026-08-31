@@ -12,6 +12,10 @@ import {
   createTarArchive,
   parseTarArchive,
 } from "./archive.js";
+import {
+  maximumCacheArchiveBytes,
+  maximumCacheArtifactBytes,
+} from "./limits.js";
 import { type CacheRestoreScope, restoreArchiveEntries } from "./restore.js";
 
 export type CacheWriteEntry = ArchiveEntry;
@@ -82,6 +86,24 @@ export const restoreLocalCache = (
     }
     const outcome = yield* Effect.either(
       Effect.gen(function* () {
+        const metadata = yield* fileSystem
+          .metadata(paths.archive)
+          .pipe(
+            Effect.mapError((error) =>
+              cacheError(paths.archive, error.message),
+            ),
+          );
+        if (
+          metadata.kind !== "file" ||
+          metadata.size > maximumCacheArtifactBytes
+        ) {
+          return yield* Effect.fail(
+            cacheError(
+              paths.archive,
+              `local cache artifact exceeds the ${maximumCacheArtifactBytes} byte limit`,
+            ),
+          );
+        }
         const compressed = yield* fileSystem
           .readBytes(paths.archive)
           .pipe(
@@ -89,8 +111,16 @@ export const restoreLocalCache = (
               cacheError(paths.archive, error.message),
             ),
           );
+        if (compressed.length > maximumCacheArtifactBytes) {
+          return yield* Effect.fail(
+            cacheError(
+              paths.archive,
+              `local cache artifact exceeds the ${maximumCacheArtifactBytes} byte limit`,
+            ),
+          );
+        }
         const archive = yield* compression
-          .decompressZstd(compressed)
+          .decompressZstd(compressed, maximumCacheArchiveBytes)
           .pipe(
             Effect.mapError((error) =>
               cacheError(paths.archive, error.message),

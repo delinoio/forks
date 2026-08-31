@@ -25,7 +25,7 @@ export interface CacheRestoreScope {
 }
 
 const comparablePath = (path: string): string =>
-  /^[A-Za-z]:/.test(path) ? path.toLowerCase() : path;
+  /^[A-Za-z]:/.test(path) || path.startsWith("//") ? path.toLowerCase() : path;
 
 const isAllowedEntry = (
   root: string,
@@ -94,8 +94,12 @@ export const restoreArchiveEntries = (
         comparablePath(joinPath(root, path)),
       ),
     );
+    const regularFileCounts = new Map<string, number>(
+      [...regularFileDestinations].map((path) => [path, 0] as const),
+    );
     for (const entry of entries) {
       const destination = joinPath(root, entry.path);
+      const comparableDestination = comparablePath(destination);
       if (!isPathContained(root, destination)) {
         return yield* Effect.fail(
           restoreError(destination, "archive path escapes repository"),
@@ -117,12 +121,28 @@ export const restoreArchiveEntries = (
         );
       }
       if (
-        regularFileDestinations.has(comparablePath(destination)) &&
+        regularFileDestinations.has(comparableDestination) &&
         entry.kind !== undefined &&
         entry.kind !== "file"
       ) {
         return yield* Effect.fail(
           restoreError(destination, "archive task log is not a regular file"),
+        );
+      }
+      if (regularFileDestinations.has(comparableDestination)) {
+        const count = (regularFileCounts.get(comparableDestination) ?? 0) + 1;
+        if (count > 1) {
+          return yield* Effect.fail(
+            restoreError(destination, "archive task log occurs more than once"),
+          );
+        }
+        regularFileCounts.set(comparableDestination, count);
+      }
+    }
+    for (const [destination, count] of regularFileCounts) {
+      if (count !== 1) {
+        return yield* Effect.fail(
+          restoreError(destination, "archive task log is missing"),
         );
       }
     }

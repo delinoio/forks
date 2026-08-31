@@ -704,9 +704,7 @@ export const makeTerminalWriter =
       });
     });
 
-interface TerminalStream extends Writable {
-  readonly isTTY?: boolean;
-}
+type TerminalStream = Writable;
 
 export const makeTerminalOperations = (
   stdout: TerminalStream,
@@ -715,12 +713,8 @@ export const makeTerminalOperations = (
 ): TerminalOperations => ({
   writeStdout: makeTerminalWriter(stdout),
   writeStderr: makeTerminalWriter(stderr),
-  stdoutColorEnabled: Effect.sync(
-    () => noColor() === undefined && stdout.isTTY === true,
-  ),
-  stderrColorEnabled: Effect.sync(
-    () => noColor() === undefined && stderr.isTTY === true,
-  ),
+  stdoutColorEnabled: Effect.sync(() => noColor() === undefined),
+  stderrColorEnabled: Effect.sync(() => noColor() === undefined),
 });
 
 const terminalLayer = Layer.succeed(

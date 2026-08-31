@@ -13,6 +13,10 @@ import {
   createTarArchive,
   parseTarArchive,
 } from "./archive.js";
+import {
+  maximumCacheArchiveBytes,
+  maximumCacheArtifactBytes,
+} from "./limits.js";
 import { type CacheRestoreScope, restoreArchiveEntries } from "./restore.js";
 
 export interface RemoteCacheOptions {
@@ -36,8 +40,6 @@ const remoteError = (
 const isTransientStatus = (status: number): boolean =>
   status === 408 || status === 429 || (status >= 500 && status <= 599);
 
-const maximumRemoteArtifactBytes = 256 * 1024 * 1024;
-const maximumRemoteArchiveBytes = 1024 * 1024 * 1024;
 const maximumRemoteControlResponseBytes = 64 * 1024;
 
 const retryTransientCacheErrors = Schedule.whileInput((error: unknown) =>
@@ -130,7 +132,7 @@ export const restoreRemoteCache = (
         method: "GET",
         headers: requestHeaders(options),
         timeoutMilliseconds: options.timeoutMilliseconds,
-        maxResponseBodyBytes: maximumRemoteArtifactBytes,
+        maxResponseBodyBytes: maximumCacheArtifactBytes,
       })
       .pipe(
         Effect.mapError((error) =>
@@ -174,7 +176,7 @@ export const restoreRemoteCache = (
       }
     }
     const archive = yield* compression
-      .decompressZstd(response.body, maximumRemoteArchiveBytes)
+      .decompressZstd(response.body, maximumCacheArchiveBytes)
       .pipe(Effect.mapError((error) => remoteError(url, error.message)));
     let entries: ReadonlyArray<ArchiveEntry>;
     try {
