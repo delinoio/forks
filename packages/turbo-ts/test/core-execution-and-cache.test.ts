@@ -47,6 +47,7 @@ import {
 } from "../src/effect/services.js";
 import { buildTaskGraph } from "../src/graph/task-graph.js";
 import { hashTask } from "../src/hash/task-hash.js";
+import { xxhash64Hex } from "../src/hash/xxhash64.js";
 import { discoverRepository } from "../src/repository/model.js";
 import {
   isTaskScopeCacheable,
@@ -122,6 +123,30 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("rejects a nonexistent explicit working directory", async () => {
+    const directory = await makeFixture();
+    try {
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          `${directory}/missing`,
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("working directory does not exist");
+      expect(result.stdout).not.toContain("library build");
+      expect(result.stdout).not.toContain("app build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("streams ordinary task output to logs with bounded diagnostics", async () => {
     const directory = await makeFixture();
@@ -223,6 +248,60 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
+  it("keeps case-distinct task logs separate", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.Build = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build = "node -e \"console.log('lowercase task')\"";
+      manifest.scripts.Build = "node -e \"console.log('uppercase task')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "Build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--concurrency=2",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode, result.stderr).toBe(0);
+      const lowercaseLog = await readFile(
+        `${packageDirectory}/.turbo/turbo-build.log`,
+        "utf8",
+      );
+      expect(lowercaseLog).toContain("lowercase task");
+      expect(lowercaseLog).not.toContain("uppercase task");
+      const uppercaseLog = await readFile(
+        `${packageDirectory}/.turbo/turbo-%0042uild.log`,
+        "utf8",
+      );
+      expect(uppercaseLog).toContain("uppercase task");
+      expect(uppercaseLog).not.toContain("lowercase task");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("skips oversized cache inputs before retaining file contents", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;
@@ -292,6 +371,46 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   });
+
+  it("validates tasks before an empty affected selection", async () => {
+    await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
+    const directory = await mkdtemp(
+      join(repositoryRoot, ".turbo/turbo-ts-empty-affected-"),
+    );
+    await cp(fixtureRoot, directory, { recursive: true });
+    try {
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "fixture base"],
+      ]) {
+        const git = await run("git", args, directory);
+        expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
+      }
+      const common = ["--cwd", directory, "--affected", "--no-cache"];
+      const valid = await run(
+        process.execPath,
+        [candidateEntrypoint, "run", "build", ...common],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(valid.exitCode, valid.stderr).toBe(0);
+      expect(valid.stdout).not.toContain("library build");
+      expect(valid.stdout).not.toContain("app build");
+      const invalid = await run(
+        process.execPath,
+        [candidateEntrypoint, "run", "verify", ...common],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(invalid.exitCode).not.toBe(0);
+      expect(invalid.stderr).toContain("task not found: verify");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
 
   it("rejects all-commandless strict task entrypoints", async () => {
     const directory = await makeFixture();
@@ -960,6 +1079,43 @@ describe("core CLI execution", () => {
       expect(model.packages.map((packageModel) => packageModel.name)).toEqual([
         "synthetic-app",
       ]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("uses only pnpm-workspace.yaml for pnpm workspace declarations", async () => {
+    const directory = await makeFixture();
+    const workspacePath = `${directory}/pnpm-workspace.yaml`;
+    try {
+      const manifestPath = `${directory}/package.json`;
+      const manifest = JSON.parse(
+        await readFile(manifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      manifest.workspaces = ["packages/*"];
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const discover = () =>
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer));
+
+      await writeFile(workspacePath, "catalog:\n  react: 19.1.0\n");
+      const model = await Effect.runPromise(discover());
+      expect(model.packages).toEqual([]);
+
+      await writeFile(workspacePath, "packages: packages/*\n");
+      const invalid = await Effect.runPromise(discover().pipe(Effect.either));
+      expect(invalid._tag).toBe("Left");
+      if (invalid._tag === "Left") {
+        expect("path" in invalid.left).toBe(true);
+        if ("path" in invalid.left) {
+          expect(invalid.left.path).toBe(workspacePath);
+        }
+        expect(invalid.left.message).toContain(
+          "packages must be an array of strings",
+        );
+      }
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1700,6 +1856,13 @@ describe("core CLI execution", () => {
         }).pipe(Effect.provide(nodeFoundationLayer)),
       );
       expect(streamed).toBe(expected);
+      const streamedXxhash = await Effect.runPromise(
+        Effect.gen(function* () {
+          const digest = yield* DigestService;
+          return yield* digest.xxhash64File(inputPath);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(streamedXxhash).toBe(xxhash64Hex(contents));
 
       const model = await Effect.runPromise(
         Effect.gen(function* () {
@@ -3079,6 +3242,7 @@ describe("core CLI execution", () => {
     const packageDirectory = `${directory}/packages/rust-tool`;
     const libraryDirectory = `${directory}/packages/rust-library`;
     const mixedDirectory = `${directory}/packages/rust-mixed`;
+    const multiBinaryDirectory = `${directory}/packages/rust-multi`;
     try {
       const configurationPath = `${directory}/turbo.json`;
       const configuration = JSON.parse(
@@ -3112,6 +3276,19 @@ describe("core CLI execution", () => {
       );
       await writeFile(`${mixedDirectory}/src/main.rs`, "fn main() {}\n");
       await writeFile(`${mixedDirectory}/src/lib.rs`, "pub fn value() {}\n");
+      await mkdir(`${multiBinaryDirectory}/src/bin`, { recursive: true });
+      await writeFile(
+        `${multiBinaryDirectory}/Cargo.toml`,
+        '[package]\nname = "synthetic-rust-multi"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(
+        `${multiBinaryDirectory}/src/bin/first.rs`,
+        "fn main() {}\n",
+      );
+      await writeFile(
+        `${multiBinaryDirectory}/src/bin/second.rs`,
+        "fn main() {}\n",
+      );
       await cp(
         `${repositoryRoot}/rust-toolchain`,
         `${directory}/rust-toolchain`,
@@ -3149,6 +3326,12 @@ describe("core CLI execution", () => {
       expect(
         model.packagesByName.get("synthetic-rust-tool")?.scripts,
       ).toMatchObject({ dev: "cargo run", run: "cargo run" });
+      expect(
+        model.packagesByName.get("synthetic-rust-multi")?.scripts.run,
+      ).toBeUndefined();
+      expect(
+        model.packagesByName.get("synthetic-rust-multi")?.scripts.dev,
+      ).toBeUndefined();
       const cargoBuildNode = buildTaskGraph(
         model,
         [model.packagesByName.get("synthetic-rust-tool")!],
@@ -5299,6 +5482,33 @@ describe("cache interoperability and safety", () => {
       await rm(directory, { force: true, recursive: true });
     }
   });
+
+  it("falls back to execution when local cache probing fails", async () => {
+    const directory = await makeFixture();
+    try {
+      await writeFile(`${directory}/blocked-cache`, "not a directory\n");
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--cache=local:r",
+          "--cache-dir=blocked-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("library build");
+      expect(result.stderr).toContain("local cache restore failed");
+      expect(result.stderr).toContain("continuing without local cache");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
 
   it("falls back to execution when remote cache restoration fails", async () => {
     const directory = await makeFixture();

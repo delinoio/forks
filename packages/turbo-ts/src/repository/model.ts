@@ -381,12 +381,25 @@ const workspacePatterns = (
         ),
       );
       try {
-        const document = parseYaml(source) as { readonly packages?: unknown };
-        if (Array.isArray(document?.packages)) {
-          return document.packages.filter(
-            (entry): entry is string => typeof entry === "string",
-          );
+        const document = parseYaml(source) as unknown;
+        if (
+          typeof document !== "object" ||
+          document === null ||
+          Array.isArray(document)
+        ) {
+          throw new TypeError("workspace document must be an object");
         }
+        const packages = (document as { readonly packages?: unknown }).packages;
+        if (packages === undefined) {
+          return [];
+        }
+        if (
+          !Array.isArray(packages) ||
+          packages.some((entry) => typeof entry !== "string")
+        ) {
+          throw new TypeError("packages must be an array of strings");
+        }
+        return packages as ReadonlyArray<string>;
       } catch (cause) {
         return yield* Effect.fail(
           new RepositoryError({
@@ -480,10 +493,10 @@ const polyglotScripts = (
     ? {
         build: "cargo build",
         check: "cargo check",
-        ...(entrypointNames.length > 0 ? { dev: "cargo run" } : {}),
+        ...(entrypointNames.length === 1 ? { dev: "cargo run" } : {}),
         format: "cargo fmt",
         lint: "cargo clippy",
-        ...(entrypointNames.length > 0 ? { run: "cargo run" } : {}),
+        ...(entrypointNames.length === 1 ? { run: "cargo run" } : {}),
         test: "cargo test",
       }
     : {

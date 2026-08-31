@@ -22,7 +22,7 @@ import {
   topologicalOrder,
 } from "../src/graph/task-graph.js";
 import { selectEnvironment } from "../src/hash/task-hash.js";
-import { xxhash64Hex } from "../src/hash/xxhash64.js";
+import { createXxhash64, xxhash64Hex } from "../src/hash/xxhash64.js";
 import { parseLockfile } from "../src/repository/lockfiles.js";
 import type {
   RepositoryModel,
@@ -96,6 +96,20 @@ describe("core repository model", () => {
     expect(xxhash64Hex("")).toBe("ef46db3751d8e999");
     expect(xxhash64Hex("a")).toBe("d24ec4f1a98c6e5b");
     expect(xxhash64Hex("abc")).toBe("44bc2cf5ad770999");
+    const bytes = new Uint8Array(257).map((_, index) => index % 251);
+    const streamed = createXxhash64();
+    for (const [start, end] of [
+      [0, 1],
+      [1, 31],
+      [31, 32],
+      [32, 95],
+      [95, bytes.length],
+    ] as const) {
+      streamed.update(bytes.subarray(start, end));
+    }
+    expect(streamed.digest().toString(16).padStart(16, "0")).toBe(
+      xxhash64Hex(bytes),
+    );
   });
 
   it("normalizes and contains repository paths", () => {

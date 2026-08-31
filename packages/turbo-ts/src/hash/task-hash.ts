@@ -564,8 +564,7 @@ export const hashTask = (
     const lockfileHash =
       lockfilePath === undefined
         ? null
-        : yield* fileSystem.readBytes(lockfilePath).pipe(
-            Effect.map(xxhash64Hex),
+        : yield* digest.xxhash64File(lockfilePath).pipe(
             Effect.mapError(
               (error) =>
                 new RepositoryError({

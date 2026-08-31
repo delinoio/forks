@@ -33,57 +33,101 @@ const round = (accumulator: bigint, input: bigint): bigint => {
 const mergeRound = (accumulator: bigint, value: bigint): bigint =>
   ((accumulator ^ round(0n, value)) * prime1 + prime4) & mask64;
 
-export const xxhash64 = (bytes: Uint8Array, seed = 0n): bigint => {
-  let offset = 0;
-  let hash: bigint;
-  if (bytes.length >= 32) {
-    let v1 = (seed + prime1 + prime2) & mask64;
-    let v2 = (seed + prime2) & mask64;
-    let v3 = seed & mask64;
-    let v4 = (seed - prime1) & mask64;
-    const limit = bytes.length - 32;
-    while (offset <= limit) {
-      v1 = round(v1, read64(bytes, offset));
-      v2 = round(v2, read64(bytes, offset + 8));
-      v3 = round(v3, read64(bytes, offset + 16));
-      v4 = round(v4, read64(bytes, offset + 24));
+export interface Xxhash64Accumulator {
+  readonly update: (bytes: Uint8Array) => void;
+  readonly digest: () => bigint;
+}
+
+export const createXxhash64 = (seed = 0n): Xxhash64Accumulator => {
+  let totalLength = 0;
+  let bufferedLength = 0;
+  const buffered = new Uint8Array(32);
+  let v1 = (seed + prime1 + prime2) & mask64;
+  let v2 = (seed + prime2) & mask64;
+  let v3 = seed & mask64;
+  let v4 = (seed - prime1) & mask64;
+
+  const consumeBlock = (bytes: Uint8Array, offset: number): void => {
+    v1 = round(v1, read64(bytes, offset));
+    v2 = round(v2, read64(bytes, offset + 8));
+    v3 = round(v3, read64(bytes, offset + 16));
+    v4 = round(v4, read64(bytes, offset + 24));
+  };
+
+  const update = (bytes: Uint8Array): void => {
+    totalLength += bytes.length;
+    let offset = 0;
+    if (bufferedLength + bytes.length < 32) {
+      buffered.set(bytes, bufferedLength);
+      bufferedLength += bytes.length;
+      return;
+    }
+    if (bufferedLength > 0) {
+      const required = 32 - bufferedLength;
+      buffered.set(bytes.subarray(0, required), bufferedLength);
+      consumeBlock(buffered, 0);
+      bufferedLength = 0;
+      offset = required;
+    }
+    while (offset + 32 <= bytes.length) {
+      consumeBlock(bytes, offset);
       offset += 32;
     }
-    hash =
-      rotateLeft(v1, 1n) +
-      rotateLeft(v2, 7n) +
-      rotateLeft(v3, 12n) +
-      rotateLeft(v4, 18n);
-    hash = mergeRound(hash & mask64, v1);
-    hash = mergeRound(hash, v2);
-    hash = mergeRound(hash, v3);
-    hash = mergeRound(hash, v4);
-  } else {
-    hash = (seed + prime5) & mask64;
-  }
-  hash = (hash + BigInt(bytes.length)) & mask64;
-  while (offset + 8 <= bytes.length) {
-    const lane = round(0n, read64(bytes, offset));
-    hash = rotateLeft(hash ^ lane, 27n) * prime1 + prime4;
-    hash &= mask64;
-    offset += 8;
-  }
-  if (offset + 4 <= bytes.length) {
-    hash ^= read32(bytes, offset) * prime1;
-    hash = (rotateLeft(hash & mask64, 23n) * prime2 + prime3) & mask64;
-    offset += 4;
-  }
-  while (offset < bytes.length) {
-    hash ^= BigInt(bytes[offset]!) * prime5;
-    hash = (rotateLeft(hash & mask64, 11n) * prime1) & mask64;
-    offset += 1;
-  }
-  hash ^= hash >> 33n;
-  hash = (hash * prime2) & mask64;
-  hash ^= hash >> 29n;
-  hash = (hash * prime3) & mask64;
-  hash ^= hash >> 32n;
-  return hash & mask64;
+    if (offset < bytes.length) {
+      const remainder = bytes.subarray(offset);
+      buffered.set(remainder, 0);
+      bufferedLength = remainder.length;
+    }
+  };
+
+  const digest = (): bigint => {
+    let hash: bigint;
+    if (totalLength >= 32) {
+      hash =
+        rotateLeft(v1, 1n) +
+        rotateLeft(v2, 7n) +
+        rotateLeft(v3, 12n) +
+        rotateLeft(v4, 18n);
+      hash = mergeRound(hash & mask64, v1);
+      hash = mergeRound(hash, v2);
+      hash = mergeRound(hash, v3);
+      hash = mergeRound(hash, v4);
+    } else {
+      hash = (seed + prime5) & mask64;
+    }
+    hash = (hash + BigInt(totalLength)) & mask64;
+    let offset = 0;
+    while (offset + 8 <= bufferedLength) {
+      const lane = round(0n, read64(buffered, offset));
+      hash = rotateLeft(hash ^ lane, 27n) * prime1 + prime4;
+      hash &= mask64;
+      offset += 8;
+    }
+    if (offset + 4 <= bufferedLength) {
+      hash ^= read32(buffered, offset) * prime1;
+      hash = (rotateLeft(hash & mask64, 23n) * prime2 + prime3) & mask64;
+      offset += 4;
+    }
+    while (offset < bufferedLength) {
+      hash ^= BigInt(buffered[offset]!) * prime5;
+      hash = (rotateLeft(hash & mask64, 11n) * prime1) & mask64;
+      offset += 1;
+    }
+    hash ^= hash >> 33n;
+    hash = (hash * prime2) & mask64;
+    hash ^= hash >> 29n;
+    hash = (hash * prime3) & mask64;
+    hash ^= hash >> 32n;
+    return hash & mask64;
+  };
+
+  return { update, digest };
+};
+
+export const xxhash64 = (bytes: Uint8Array, seed = 0n): bigint => {
+  const accumulator = createXxhash64(seed);
+  accumulator.update(bytes);
+  return accumulator.digest();
 };
 
 export const xxhash64Hex = (value: string | Uint8Array): string =>

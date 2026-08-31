@@ -1297,7 +1297,6 @@ const encodeTaskLogIdentifier = (task: string): string => {
     const character = task[index]!;
     const portable =
       (code >= 0x30 && code <= 0x39) ||
-      (code >= 0x41 && code <= 0x5a) ||
       (code >= 0x61 && code <= 0x7a) ||
       character === "." ||
       character === "_" ||
@@ -1393,6 +1392,20 @@ const executeTask = (
         localOptions,
         hash.hash,
         restoreScope,
+      ).pipe(
+        Effect.catchTag("CacheError", (error) =>
+          terminal
+            .writeStderr(
+              renderLogEvent(
+                {
+                  kind: "warning",
+                  message: `local cache restore failed for ${taskLabel}; continuing without local cache: ${error.message}`,
+                },
+                warningColor,
+              ),
+            )
+            .pipe(Effect.ignore, Effect.as(false)),
+        ),
       );
     }
     if (
@@ -1965,6 +1978,7 @@ export const executeRun = (
   Effect.gen(function* () {
     const environmentService = yield* EnvironmentService;
     const concurrencyService = yield* ConcurrencyService;
+    const fileSystem = yield* FileSystemService;
     const processCwd = yield* environmentService.cwd;
     const environment = yield* environmentService.entries;
     const requestedRoot =
@@ -1973,6 +1987,25 @@ export const executeRun = (
         : isAbsolutePath(parsed.cwd)
           ? parsed.cwd
           : joinPath(processCwd, parsed.cwd);
+    if (
+      requestedRoot !== undefined &&
+      !(yield* fileSystem.exists(requestedRoot).pipe(
+        Effect.mapError(
+          (error) =>
+            new ConfigurationError({
+              path: requestedRoot,
+              message: error.message,
+            }),
+        ),
+      ))
+    ) {
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: requestedRoot,
+          message: "working directory does not exist",
+        }),
+      );
+    }
     const preliminaryRoot = yield* discoverRepositoryRoot(
       requestedRoot ?? processCwd,
     );
@@ -2070,22 +2103,17 @@ export const executeRun = (
       : hasPositiveRangeFilter
         ? negativePackageFilters
         : nonRangeFilters;
-    const packages = selectPackages(
+    const validationGraph = buildTaskGraph(
       repository,
-      packageFilters,
-      affected.ranges,
-    );
-    const unfilteredGraph = buildTaskGraph(
-      repository,
-      packages,
+      selectPackages(repository, nonRangeFilters),
       options.tasks,
       options.only,
       flags?.strictTaskEntrypointSelection === true,
     );
-    const entrypointIds = new Set(unfilteredGraph.entrypoints);
+    const entrypointIds = new Set(validationGraph.entrypoints);
     const entrypointTasks = new Set(
-      unfilteredGraph.entrypoints.map(
-        (entrypoint) => unfilteredGraph.nodes.get(entrypoint)!.task,
+      validationGraph.entrypoints.map(
+        (entrypoint) => validationGraph.nodes.get(entrypoint)!.task,
       ),
     );
     const unresolvedTasks = [
@@ -2105,6 +2133,18 @@ export const executeRun = (
         }),
       );
     }
+    const packages = selectPackages(
+      repository,
+      packageFilters,
+      affected.ranges,
+    );
+    const unfilteredGraph = buildTaskGraph(
+      repository,
+      packages,
+      options.tasks,
+      options.only,
+      flags?.strictTaskEntrypointSelection === true,
+    );
     const selectedGraph = useTaskInputs
       ? selectAffectedTasks(
           repository,

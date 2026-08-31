@@ -78,13 +78,18 @@ from the resolved JavaScript package manager, applies ordered workspace
 exclusions and brace/class-aware globs, and discovers the owning repository
 from nested working directories, including explicit `--cwd` values. Only pnpm
 uses `pnpm-workspace.yaml`; other JavaScript managers use `package.json`
-workspaces. Declared workspace members remain discoverable beneath directories
-named `dist` or `target`. Every requested task must resolve before any task
-executes, and
+workspaces. An existing pnpm workspace file never falls back to `package.json`:
+an absent `packages` declaration selects no JavaScript workspace members, and
+an invalid declaration fails discovery. Declared workspace members remain
+discoverable beneath directories named `dist` or `target`. Every requested task
+must resolve before any task executes, and
 strict entrypoint selection removes configured tasks without an executable
 package script even when every selected entrypoint is commandless. Every
 explicit `with` reference must resolve to an existing package task before its
-owner can execute.
+owner can execute. Requested task names are validated after ordinary package
+filters but before Git-range and affected filters are applied, so a valid task
+with no affected packages is a successful no-op. An explicit `--cwd` must exist
+before nested repository discovery begins.
 Task-aware Git selectors retain union semantics with positive package
 selectors; negative Git selectors are applied after that union.
 Package-level affected selection treats legacy `globalDependencies` and, when
@@ -96,7 +101,8 @@ lockfiles and Cargo control or toolchain files participate in both task-aware
 selection and hashing. Task hashes preserve Git symlink, gitlink, and dependency
 semantics, exclude the resolved cache directory, and use each task's owning
 ecosystem lockfile. Regular input files are streamed through bounded-memory Git
-blob digests. Cargo task hashes additionally include repository-contained
+blob digests, and owning lockfiles are streamed through bounded-memory xxHash64
+digests. Cargo task hashes additionally include repository-contained
 ancestor manifests, Cargo configuration, and Rust toolchain files that can
 change task execution. Environment-name selection follows Windows
 case-insensitive semantics for both hashing and strict task execution.
@@ -123,8 +129,9 @@ list.
 Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
 reject malformed entries. Remote artifact routes preserve configured API path
 prefixes. Active remote URLs must use HTTP or HTTPS, and URLs and timeout values
-are validated before cache or task work begins. Remote restoration failures
-warn and fall back to task execution. Local cache write and remote upload
+are validated before cache or task work begins. Local and remote restoration
+failures warn and fall back to task execution, except that a failed restoration
+rollback aborts execution. Local cache write and remote upload
 failures warn without changing a successful task outcome, and a local failure
 does not suppress a configured remote upload. Local and remote cache
 restoration is limited to 256 MiB compressed and 1 GiB after decompression;
@@ -132,7 +139,8 @@ preflight and upload response bodies have an independent 64 KiB limit.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact literal log path before clearing or writing
 files. Task identifiers are encoded into portable single-component log
-filenames; portable task names retain their existing filenames.
+filenames; lowercase portable task names retain their existing filenames, and
+uppercase code points are encoded to prevent case-insensitive collisions.
 Restoration rejects symlink parents even when their targets remain inside the
 repository, preventing declared output paths from redirecting writes elsewhere.
 Restored symlink targets must remain within the same declared output group that
@@ -172,8 +180,9 @@ the repository always retain package targeting. Grouped Cargo commands receive
 the union of all member task environments. Cargo package-graph edges require a
 source-free metadata dependency path that resolves to the named member in the
 same workspace; registry and Git dependencies remain external. Cargo `run` and
-`dev` tasks are exposed only for binary crates, and pass-through arguments are
-forwarded to Cargo without an implicit target-argument separator. Cargo builds
+`dev` tasks are exposed only for crates with one unambiguous binary target, and
+pass-through arguments are forwarded to Cargo without an implicit
+target-argument separator. Cargo builds
 for mixed library and binary crates default to uncached. Builds with
 pass-through arguments that select an alternate output layout or an unmodeled
 library, binary, example, test, or benchmark target bypass caching until those

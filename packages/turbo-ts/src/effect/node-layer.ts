@@ -32,6 +32,7 @@ import type { Readable, Writable } from "node:stream";
 import { promisify } from "node:util";
 import { zstdCompress, zstdDecompress } from "node:zlib";
 import { Cause, Effect, Exit, Layer, Option, Ref } from "effect";
+import { createXxhash64 } from "../hash/xxhash64.js";
 import { BoundaryError, ProcessExecutionError } from "./errors.js";
 import {
   CacheService,
@@ -959,6 +960,53 @@ const digestLayer = Layer.succeed(DigestService, {
                 throw new Error("file size changed while hashing");
               }
               return hash.digest("hex");
+            },
+            catch: (cause) =>
+              new BoundaryError({
+                boundary: "digest",
+                message: String(cause),
+                retryable: false,
+              }),
+          }),
+        ),
+      ),
+    ),
+  xxhash64File: (path) =>
+    Effect.scoped(
+      Effect.acquireRelease(
+        Effect.tryPromise({
+          try: () => open(path, "r"),
+          catch: (cause) =>
+            new BoundaryError({
+              boundary: "digest",
+              message: String(cause),
+              retryable: false,
+            }),
+        }),
+        (handle) => Effect.promise(() => handle.close()).pipe(Effect.ignore),
+      ).pipe(
+        Effect.flatMap((handle) =>
+          Effect.tryPromise({
+            try: async (signal) => {
+              const metadata = await handle.stat();
+              const hash = createXxhash64();
+              const stream = handle.createReadStream({
+                autoClose: false,
+                signal,
+              });
+              let bytesRead = 0;
+              try {
+                for await (const chunk of stream) {
+                  bytesRead += chunk.length;
+                  hash.update(chunk);
+                }
+              } finally {
+                stream.destroy();
+              }
+              if (bytesRead !== metadata.size) {
+                throw new Error("file size changed while hashing");
+              }
+              return hash.digest().toString(16).padStart(16, "0");
             },
             catch: (cause) =>
               new BoundaryError({
