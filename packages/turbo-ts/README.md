@@ -71,10 +71,11 @@ execution with a branded unsupported-compatibility diagnostic.
 Cargo builds that receive pass-through arguments selecting release, profile,
 target, another alternate artifact layout, or an unmodeled library, binary,
 example, test, or benchmark target execute without cache reads or writes until
-those outputs are modeled explicitly. Mixed library and binary crates also
-default to uncached because binary-only output declarations cannot restore all
-of Cargo's default artifacts. Unfiltered Cargo workspace commands merge the
-effective environments of every grouped member.
+those outputs are modeled explicitly. Pass-through `--config` arguments also
+disable Cargo build caching because they can override the output layout. Mixed
+library and binary crates default to uncached because binary-only output
+declarations cannot restore all of Cargo's default artifacts. Unfiltered Cargo
+workspace commands merge the effective environments of every grouped member.
 
 Local and remote cache restoration is limited to 256 MiB compressed and 1 GiB
 after decompression. Artifacts beyond either limit are rejected; local entries

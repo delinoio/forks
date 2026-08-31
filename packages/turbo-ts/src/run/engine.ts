@@ -52,6 +52,7 @@ import {
 import {
   effectiveTaskInputs,
   hashTask,
+  implicitTaskInputCandidates,
   type TaskHashResult,
   taskEnvironment,
 } from "../hash/task-hash.js";
@@ -368,7 +369,13 @@ const resolveOptions = (
           ? "TURBO_API"
           : configuration.path;
     try {
-      new URL(apiUrl);
+      const parsedApiUrl = new URL(apiUrl);
+      if (
+        parsedApiUrl.protocol !== "http:" &&
+        parsedApiUrl.protocol !== "https:"
+      ) {
+        throw new TypeError("unsupported remote cache URL protocol");
+      }
     } catch {
       throw new ConfigurationError({
         path: apiUrlPath,
@@ -682,7 +689,13 @@ const taskMatchesChangedFiles = (
     ? ""
     : `${node.package.relativeDirectory}/`;
   const inputs = effectiveTaskInputs(repository, node);
+  const implicitInputs = new Set(
+    implicitTaskInputCandidates(repository, node).map((path) =>
+      relativePath(repository.root, path),
+    ),
+  );
   return changedFiles.some((repositoryRelativeFile) => {
+    if (implicitInputs.has(repositoryRelativeFile)) return true;
     const packageRelativeFile = isRootPackage
       ? repositoryRelativeFile
       : repositoryRelativeFile.startsWith(packagePrefix)
@@ -1189,10 +1202,6 @@ const cacheRestoreScope = (
         : [{ directory: ".", patterns: rootPatterns }]),
     ];
   });
-  allowedPathGroups.push({
-    directory: ".",
-    patterns: [relativePath(repository.root, logPath)],
-  });
   return {
     pathsToClear,
     allowedPathGroups,
@@ -1266,10 +1275,31 @@ const usesAlternateCargoBuildOutputs = (
     (argument) =>
       argument === "--release" ||
       argument === "-r" ||
+      argument === "--config" ||
+      argument.startsWith("--config=") ||
       [...cargoAlternateOutputFlags, ...cargoUnmodeledTargetFlags].some(
         (flag) => argument === flag || argument.startsWith(`${flag}=`),
       ),
   );
+
+const encodeTaskLogIdentifier = (task: string): string => {
+  let encoded = "";
+  for (let index = 0; index < task.length; index += 1) {
+    const code = task.charCodeAt(index);
+    const character = task[index]!;
+    const portable =
+      (code >= 0x30 && code <= 0x39) ||
+      (code >= 0x41 && code <= 0x5a) ||
+      (code >= 0x61 && code <= 0x7a) ||
+      character === "." ||
+      character === "_" ||
+      character === "-";
+    encoded += portable
+      ? character
+      : `%${code.toString(16).toUpperCase().padStart(4, "0")}`;
+  }
+  return encoded;
+};
 
 export const isTaskScopeCacheable = (
   node: TaskNode,
@@ -1328,7 +1358,7 @@ const executeTask = (
     const logPath = joinPath(
       executionDirectory,
       ".turbo",
-      `turbo-${node.task}.log`,
+      `turbo-${encodeTaskLogIdentifier(node.task)}.log`,
     );
     const pathsToClear =
       cacheable &&

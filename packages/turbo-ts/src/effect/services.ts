@@ -234,6 +234,9 @@ export interface DigestOperations {
   readonly gitBlobSha1: (
     contents: Uint8Array,
   ) => Effect.Effect<string, BoundaryError>;
+  readonly gitBlobSha1File: (
+    path: string,
+  ) => Effect.Effect<string, BoundaryError>;
 }
 
 export class DigestService extends Context.Tag("turbo-ts/DigestService")<

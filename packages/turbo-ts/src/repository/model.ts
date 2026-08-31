@@ -1333,7 +1333,7 @@ export const discoverRepository = (
       internalDependencies: javascriptInternalDependencies(
         root,
         rootManifest,
-        draftsByName,
+        javascriptDraftsByName,
       ),
       tasks: rootTasks,
       manifest: rootManifest,

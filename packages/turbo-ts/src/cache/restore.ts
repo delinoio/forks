@@ -114,6 +114,7 @@ export const restoreArchiveEntries = (
         );
       }
       if (
+        !regularFileDestinations.has(comparableDestination) &&
         !isAllowedEntry(
           root,
           destination,

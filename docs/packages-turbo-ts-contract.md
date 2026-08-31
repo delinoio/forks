@@ -91,11 +91,14 @@ Package-level affected selection treats legacy `globalDependencies` and, when
 task-aware selection is disabled, `global.inputs` as repository-global inputs.
 Task-input selection uses the same effective global and task inputs as hashing,
 evaluates task owners before Git-range package narrowing, applies negative Git
-ranges after positive task matches, and includes `with` companions. Task hashes
-preserve Git symlink, gitlink, and dependency semantics, exclude the resolved
-cache directory, and use each task's owning ecosystem lockfile. Cargo task
-hashes additionally include repository-contained ancestor manifests, Cargo
-configuration, and Rust toolchain files that can change task execution.
+ranges after positive task matches, and includes `with` companions. Owning
+lockfiles and Cargo control or toolchain files participate in both task-aware
+selection and hashing. Task hashes preserve Git symlink, gitlink, and dependency
+semantics, exclude the resolved cache directory, and use each task's owning
+ecosystem lockfile. Regular input files are streamed through bounded-memory Git
+blob digests. Cargo task hashes additionally include repository-contained
+ancestor manifests, Cargo configuration, and Rust toolchain files that can
+change task execution.
 Repository discovery records the resolved root lockfile path without
 structurally parsing it;
 lockfile parsing and pruning remain Gate 3 work. Without Git, explicit task
@@ -116,14 +119,16 @@ Workspace configuration inheritance accepts only the exact `["//"]` parent
 list.
 Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
 reject malformed entries. Remote artifact routes preserve configured API path
-prefixes. Active remote URLs and timeout values are validated before cache or
-task work begins. Remote restoration failures warn and fall back to task
-execution, and remote upload failures warn without changing a successful task
-outcome. Local and remote cache restoration is limited to 256 MiB compressed
-and 1 GiB after decompression; preflight and upload response bodies have an
-independent 64 KiB limit.
+prefixes. Active remote URLs must use HTTP or HTTPS, and URLs and timeout values
+are validated before cache or task work begins. Remote restoration failures
+warn and fall back to task execution, and remote upload failures warn without
+changing a successful task outcome. Local and remote cache restoration is
+limited to 256 MiB compressed and 1 GiB after decompression; preflight and
+upload response bodies have an independent 64 KiB limit.
 Cache restoration validates every archive entry against the current task's
-declared output globs or exact log path before clearing or writing files.
+declared output globs or exact literal log path before clearing or writing
+files. Task identifiers are encoded into portable single-component log
+filenames; portable task names retain their existing filenames.
 Restoration rejects symlink parents even when their targets remain inside the
 repository, preventing declared output paths from redirecting writes elsewhere.
 Every archive must contain exactly one regular task-log entry. Cache writes
@@ -166,7 +171,8 @@ forwarded to Cargo without an implicit target-argument separator. Cargo builds
 for mixed library and binary crates default to uncached. Builds with
 pass-through arguments that select an alternate output layout or an unmodeled
 library, binary, example, test, or benchmark target bypass caching until those
-outputs are modeled explicitly.
+outputs are modeled explicitly. Cargo build pass-through `--config` arguments
+also bypass caching because they can override the output layout.
 Cargo discovery uses each metadata response's workspace-member list and does
 not probe excluded or unrelated nested manifests. Combined workspace task
 hashes are propagated into every downstream task hash.

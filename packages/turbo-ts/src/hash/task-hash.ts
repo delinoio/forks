@@ -209,6 +209,70 @@ const taskInputFiles = (
   );
 };
 
+const ancestorDirectories = (
+  repository: RepositoryModel,
+  directory: string,
+): ReadonlyArray<string> => {
+  const directories: Array<string> = [];
+  let current = directory;
+  while (isPathContained(repository.root, current)) {
+    directories.push(current);
+    if (current === repository.root) break;
+    const parent = parentPath(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return directories;
+};
+
+const cargoControlInputCandidates = (
+  repository: RepositoryModel,
+  node: TaskNode,
+): ReadonlyArray<string> =>
+  node.package.manager !== "cargo"
+    ? []
+    : [
+        ...new Set(
+          ancestorDirectories(repository, node.package.directory).flatMap(
+            (directory) => [
+              joinPath(directory, "Cargo.toml"),
+              joinPath(directory, ".cargo/config"),
+              joinPath(directory, ".cargo/config.toml"),
+              joinPath(directory, "rust-toolchain"),
+              joinPath(directory, "rust-toolchain.toml"),
+            ],
+          ),
+        ),
+      ];
+
+const owningLockfileCandidates = (
+  repository: RepositoryModel,
+  node: TaskNode,
+): ReadonlyArray<string> => {
+  if (node.package.manager === "cargo") {
+    const directory = node.package.workspaceDirectory ?? node.package.directory;
+    return isPathContained(repository.root, directory)
+      ? [joinPath(directory, "Cargo.lock")]
+      : [];
+  }
+  if (node.package.manager === "uv") {
+    return ancestorDirectories(repository, node.package.directory).map(
+      (directory) => joinPath(directory, "uv.lock"),
+    );
+  }
+  return repository.lockfile === undefined ? [] : [repository.lockfile];
+};
+
+export const implicitTaskInputCandidates = (
+  repository: RepositoryModel,
+  node: TaskNode,
+): ReadonlyArray<string> => [
+  ...new Set([
+    ...owningLockfileCandidates(repository, node),
+    ...cargoControlInputCandidates(repository, node),
+  ]),
+];
+
 const cargoControlInputFiles = (
   repository: RepositoryModel,
   node: TaskNode,
@@ -221,26 +285,9 @@ const cargoControlInputFiles = (
   Effect.gen(function* () {
     if (node.package.manager !== "cargo") return [];
     const fileSystem = yield* FileSystemService;
-    const directories: Array<string> = [];
-    let current = node.package.directory;
-    while (isPathContained(repository.root, current)) {
-      directories.push(current);
-      if (current === repository.root) break;
-      const parent = parentPath(current);
-      if (parent === current) break;
-      current = parent;
-    }
-    const candidates = [
-      ...new Set(
-        directories.flatMap((directory) => [
-          joinPath(directory, "Cargo.toml"),
-          joinPath(directory, ".cargo/config"),
-          joinPath(directory, ".cargo/config.toml"),
-          joinPath(directory, "rust-toolchain"),
-          joinPath(directory, "rust-toolchain.toml"),
-        ]),
-      ),
-    ].filter((path) => !isIgnoredInputPath(path, cacheDirectory));
+    const candidates = cargoControlInputCandidates(repository, node).filter(
+      (path) => !isIgnoredInputPath(path, cacheDirectory),
+    );
     const existing = yield* Effect.forEach(
       candidates,
       (path) =>
@@ -353,21 +400,8 @@ const owningLockfile = (
             (error) => new RepositoryError({ path, message: error.message }),
           ),
         );
-    if (node.package.manager === "cargo") {
-      const directory =
-        node.package.workspaceDirectory ?? node.package.directory;
-      if (!isPathContained(repository.root, directory)) return undefined;
-      const path = joinPath(directory, "Cargo.lock");
-      return (yield* exists(path)) ? path : undefined;
-    }
-    let directory = node.package.directory;
-    while (isPathContained(repository.root, directory)) {
-      const path = joinPath(directory, "uv.lock");
+    for (const path of owningLockfileCandidates(repository, node)) {
       if (yield* exists(path)) return path;
-      if (directory === repository.root) break;
-      const parent = parentPath(directory);
-      if (parent === directory) break;
-      directory = parent;
     }
     return undefined;
   });
@@ -479,30 +513,24 @@ export const hashTask = (
         if (metadata.kind === "directory") {
           return [relative, "160000", yield* gitlinkObjectId(path)] as const;
         }
-        const bytes = yield* (
-          metadata.kind === "symlink"
-            ? fileSystem
-                .readLink(path)
-                .pipe(Effect.map((target) => new TextEncoder().encode(target)))
-            : fileSystem.readBytes(path)
-        ).pipe(
-          Effect.mapError(
-            (error) => new RepositoryError({ path, message: error.message }),
-          ),
-        );
         const mode =
           metadata.kind === "symlink"
             ? ("120000" as const)
             : (metadata.mode & 0o111) !== 0
               ? ("100755" as const)
               : ("100644" as const);
-        const hash = yield* digest
-          .gitBlobSha1(bytes)
-          .pipe(
-            Effect.mapError(
-              (error) => new RepositoryError({ path, message: error.message }),
-            ),
-          );
+        const hash = yield* (
+          metadata.kind === "symlink"
+            ? fileSystem.readLink(path).pipe(
+                Effect.map((target) => new TextEncoder().encode(target)),
+                Effect.flatMap(digest.gitBlobSha1),
+              )
+            : digest.gitBlobSha1File(path)
+        ).pipe(
+          Effect.mapError(
+            (error) => new RepositoryError({ path, message: error.message }),
+          ),
+        );
         return [relative, mode, hash] as const;
       });
     const fileHashes = yield* Effect.forEach(

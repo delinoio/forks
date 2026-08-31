@@ -922,6 +922,53 @@ const digestLayer = Layer.succeed(DigestService, {
           retryable: false,
         }),
     }),
+  gitBlobSha1File: (path) =>
+    Effect.scoped(
+      Effect.acquireRelease(
+        Effect.tryPromise({
+          try: () => open(path, "r"),
+          catch: (cause) =>
+            new BoundaryError({
+              boundary: "digest",
+              message: String(cause),
+              retryable: false,
+            }),
+        }),
+        (handle) => Effect.promise(() => handle.close()).pipe(Effect.ignore),
+      ).pipe(
+        Effect.flatMap((handle) =>
+          Effect.tryPromise({
+            try: async (signal) => {
+              const metadata = await handle.stat();
+              const hash = createHash("sha1").update(`blob ${metadata.size}\0`);
+              const stream = handle.createReadStream({
+                autoClose: false,
+                signal,
+              });
+              let bytesRead = 0;
+              try {
+                for await (const chunk of stream) {
+                  bytesRead += chunk.length;
+                  hash.update(chunk);
+                }
+              } finally {
+                stream.destroy();
+              }
+              if (bytesRead !== metadata.size) {
+                throw new Error("file size changed while hashing");
+              }
+              return hash.digest("hex");
+            },
+            catch: (cause) =>
+              new BoundaryError({
+                boundary: "digest",
+                message: String(cause),
+                retryable: false,
+              }),
+          }),
+        ),
+      ),
+    ),
 });
 
 const concurrencyLayer = Layer.succeed(ConcurrencyService, {
