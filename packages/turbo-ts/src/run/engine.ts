@@ -18,6 +18,7 @@ import {
 } from "../config/runtime.js";
 import { matchesGlob, selectByGlobs } from "../core/glob.js";
 import {
+  baseName,
   isAbsolutePath,
   isPathContained,
   joinPath,
@@ -977,7 +978,6 @@ export const packageManagerCommand = (
           node.package.name,
           "pytest",
           ...passThroughArguments,
-          ".",
         ],
         cwd: node.package.directory,
       };
@@ -1672,11 +1672,14 @@ export const planCargoWorkspaceTasks = (
   const grouped = new Map<string, Array<TaskNode>>();
   for (const id of graph.entrypoints) {
     const node = graph.nodes.get(id)!;
-    if (node.package.manager !== "cargo" || !eligibleTasks.has(node.task)) {
+    if (
+      node.package.manager !== "cargo" ||
+      node.package.workspaceDirectory === undefined ||
+      !eligibleTasks.has(node.task)
+    ) {
       continue;
     }
-    const workspaceDirectory =
-      node.package.workspaceDirectory ?? node.package.directory;
+    const workspaceDirectory = node.package.workspaceDirectory;
     const key = `${workspaceDirectory}\0${node.task}`;
     const members = grouped.get(key) ?? [];
     members.push(node);
@@ -1830,6 +1833,44 @@ const taskGroups = (graph: TaskGraph): ReadonlyArray<ReadonlyArray<string>> => {
   return groups;
 };
 
+const canonicalContainmentPath = (
+  path: string,
+): Effect.Effect<string, ConfigurationError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const suffix: Array<string> = [];
+    let current = normalizePath(path);
+    while (
+      !(yield* fileSystem
+        .exists(current)
+        .pipe(
+          Effect.mapError(
+            (error) => new ConfigurationError({ path, message: error.message }),
+          ),
+        ))
+    ) {
+      const parent = parentPath(current);
+      if (parent === current) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path,
+            message: "unable to resolve cache directory ancestry",
+          }),
+        );
+      }
+      suffix.unshift(baseName(current));
+      current = parent;
+    }
+    const resolved = yield* fileSystem
+      .realPath(current)
+      .pipe(
+        Effect.mapError(
+          (error) => new ConfigurationError({ path, message: error.message }),
+        ),
+      );
+    return joinPath(resolved, ...suffix);
+  });
+
 export const executeRun = (
   parsed: ParsedRunOptions,
 ): Effect.Effect<number, unknown, RunRequirements> =>
@@ -1863,7 +1904,11 @@ export const executeRun = (
       configuration,
       availableParallelism,
     );
-    if (isPathContained(options.cacheDirectory, options.root)) {
+    const [canonicalRoot, canonicalCacheDirectory] = yield* Effect.all([
+      canonicalContainmentPath(options.root),
+      canonicalContainmentPath(options.cacheDirectory),
+    ]);
+    if (isPathContained(canonicalCacheDirectory, canonicalRoot)) {
       return yield* Effect.fail(
         new ConfigurationError({
           path: options.cacheDirectory,

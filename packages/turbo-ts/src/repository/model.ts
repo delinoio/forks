@@ -81,10 +81,29 @@ const workspaceTraversalIgnoredDirectories = new Set([
   ".git",
   ".turbo",
   ".venv",
-  "dist",
   "node_modules",
-  "target",
 ]);
+
+const comparableFilesystemPath = (path: string): string => {
+  const normalized = normalizePath(path);
+  return /^[A-Za-z]:/.test(normalized) || normalized.startsWith("//")
+    ? normalized.toLowerCase()
+    : normalized;
+};
+
+const repositoryPathFromCanonical = (
+  root: string,
+  canonicalRoot: string,
+  path: string,
+): string | undefined => {
+  const normalizedRoot = normalizePath(canonicalRoot).replace(/\/$/, "");
+  const normalizedPath = normalizePath(path);
+  const comparableRoot = comparableFilesystemPath(normalizedRoot);
+  const comparablePath = comparableFilesystemPath(normalizedPath);
+  if (comparablePath === comparableRoot) return normalizePath(root);
+  if (!comparablePath.startsWith(`${comparableRoot}/`)) return undefined;
+  return joinPath(root, normalizedPath.slice(normalizedRoot.length + 1));
+};
 
 const fileTraversalIgnoredDirectories = new Set([
   ".git",
@@ -1020,25 +1039,97 @@ export const discoverRepository = (
           { concurrency: 1 },
         )).filter((path): path is string => path !== undefined)
       : [];
-    const cargoManifestSet = new Set(
-      cargoManifestPaths.map((path) => normalizePath(path)),
+    const fileSystem = yield* FileSystemService;
+    const canonicalPath = (path: string) =>
+      fileSystem.realPath(path).pipe(
+        Effect.map(normalizePath),
+        Effect.mapError(
+          (error) => new RepositoryError({ path, message: error.message }),
+        ),
+      );
+    const canonicalRoot = cargoEnabled
+      ? yield* canonicalPath(root)
+      : normalizePath(root);
+    const cargoManifestPathsByIdentity = new Map(
+      yield* Effect.forEach(
+        cargoManifestPaths,
+        (path) =>
+          canonicalPath(path).pipe(
+            Effect.map(
+              (canonical) =>
+                [comparableFilesystemPath(canonical), path] as const,
+            ),
+          ),
+        { concurrency: 8 },
+      ),
     );
     const cargoPackages = new Map<string, CargoWorkspacePackageMetadata>();
     const claimedCargoWorkspaceDirectories: Array<string> = [];
     for (const manifestPath of cargoManifestPaths) {
+      const canonicalManifestPath = yield* canonicalPath(manifestPath);
       if (
         claimedCargoWorkspaceDirectories.some((directory) =>
-          isPathContained(directory, parentPath(manifestPath)),
+          isPathContained(directory, parentPath(canonicalManifestPath)),
         )
       ) {
         continue;
       }
       const metadata = yield* cargoWorkspaceMetadata(manifestPath);
-      claimedCargoWorkspaceDirectories.push(metadata.directory);
+      const canonicalWorkspaceDirectory = yield* canonicalPath(
+        metadata.directory,
+      );
+      claimedCargoWorkspaceDirectories.push(canonicalWorkspaceDirectory);
       for (const packageMetadata of metadata.packages) {
-        if (cargoManifestSet.has(packageMetadata.manifestPath)) {
-          cargoPackages.set(packageMetadata.manifestPath, packageMetadata);
-        }
+        const canonicalPackageManifestPath = yield* canonicalPath(
+          packageMetadata.manifestPath,
+        );
+        const repositoryManifestPath = cargoManifestPathsByIdentity.get(
+          comparableFilesystemPath(canonicalPackageManifestPath),
+        );
+        if (repositoryManifestPath === undefined) continue;
+        const canonicalPackageWorkspaceDirectory = yield* canonicalPath(
+          packageMetadata.workspaceDirectory ?? metadata.directory,
+        );
+        const workspaceDirectory = repositoryPathFromCanonical(
+          root,
+          canonicalRoot,
+          canonicalPackageWorkspaceDirectory,
+        );
+        const dependencies = packageMetadata.dependencies.map((dependency) => ({
+          ...dependency,
+          ...(dependency.path === undefined
+            ? {}
+            : {
+                path:
+                  repositoryPathFromCanonical(
+                    root,
+                    canonicalRoot,
+                    dependency.path,
+                  ) ?? normalizePath(dependency.path),
+              }),
+        }));
+        const targetDirectory =
+          packageMetadata.targetDirectory === undefined
+            ? undefined
+            : (repositoryPathFromCanonical(
+                root,
+                canonicalRoot,
+                packageMetadata.targetDirectory,
+              ) ?? normalizePath(packageMetadata.targetDirectory));
+        const {
+          dependencies: _dependencies,
+          manifestPath: _manifestPath,
+          targetDirectory: _targetDirectory,
+          workspaceDirectory: _workspaceDirectory,
+          ...rest
+        } = packageMetadata;
+        cargoPackages.set(repositoryManifestPath, {
+          ...rest,
+          dependencies,
+          manifestPath: repositoryManifestPath,
+          ...(targetDirectory === undefined ? {} : { targetDirectory }),
+          ...(workspaceDirectory === undefined ? {} : { workspaceDirectory }),
+        });
       }
     }
     const cargoDrafts: ReadonlyArray<RepositoryPackageDraft> = [
@@ -1159,6 +1250,11 @@ export const discoverRepository = (
     const draftsByName = new Map(
       drafts.map((packageDraft) => [packageDraft.name, packageDraft] as const),
     );
+    const javascriptDraftsByName = new Map(
+      javascriptDrafts.map(
+        (packageDraft) => [packageDraft.name, packageDraft] as const,
+      ),
+    );
     const cargoDraftsByDirectory = new Map(
       drafts
         .filter((packageDraft) => packageDraft.manager === "cargo")
@@ -1215,7 +1311,7 @@ export const discoverRepository = (
               : javascriptInternalDependencies(
                   packageDraft.directory,
                   packageDraft.manifest,
-                  draftsByName,
+                  javascriptDraftsByName,
                 ),
       }))
       .sort((left, right) => left.name.localeCompare(right.name));

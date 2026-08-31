@@ -739,7 +739,23 @@ describe("core repository model", () => {
       packageManagerCommand(graph.nodes.get("python-app#test")!, []),
     ).toEqual({
       command: "uv",
-      arguments: ["run", "--frozen", "--package", "python-app", "pytest", "."],
+      arguments: ["run", "--frozen", "--package", "python-app", "pytest"],
+      cwd: "/repo/python/app",
+    });
+    expect(
+      packageManagerCommand(graph.nodes.get("python-app#test")!, [
+        "tests/unit",
+      ]),
+    ).toEqual({
+      command: "uv",
+      arguments: [
+        "run",
+        "--frozen",
+        "--package",
+        "python-app",
+        "pytest",
+        "tests/unit",
+      ],
       cwd: "/repo/python/app",
     });
   });

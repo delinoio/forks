@@ -43,6 +43,10 @@ import { FileSystemService, ProcessService } from "../src/effect/services.js";
 import { buildTaskGraph } from "../src/graph/task-graph.js";
 import { hashTask } from "../src/hash/task-hash.js";
 import { discoverRepository } from "../src/repository/model.js";
+import {
+  packageManagerCommand,
+  planCargoWorkspaceTasks,
+} from "../src/run/engine.js";
 
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
@@ -341,6 +345,39 @@ describe("core CLI execution", () => {
     const directory = await makeFixture();
     try {
       for (const cacheDirectory of [directory, dirname(directory)]) {
+        const result = await run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "build",
+            "--cwd",
+            directory,
+            `--cache-dir=${cacheDirectory}`,
+          ],
+          repositoryRoot,
+        );
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stderr).toContain(
+          "cache directory must not be the repository root or one of its ancestors",
+        );
+        expect(result.stdout).not.toContain("library build");
+        expect(result.stdout).not.toContain("app build");
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects cache-directory symlinks that contain the repository", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    try {
+      const rootLink = `${directory}/cache-root-link`;
+      const parentLink = `${directory}/cache-parent-link`;
+      await symlink(".", rootLink);
+      await symlink("..", parentLink);
+      for (const cacheDirectory of [rootLink, parentLink]) {
         const result = await run(
           process.execPath,
           [
@@ -710,6 +747,57 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
+  it("does not link JavaScript dependencies to polyglot packages", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { futureFlags?: Record<string, boolean> };
+      configuration.futureFlags = { experimentalCargoWorkspaces: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const appManifestPath = `${directory}/packages/app/package.json`;
+      const appManifest = JSON.parse(
+        await readFile(appManifestPath, "utf8"),
+      ) as { dependencies: Record<string, string> };
+      appManifest.dependencies.helper = "workspace:*";
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, null, 2)}\n`,
+      );
+      const cargoDirectory = `${directory}/packages/cargo-helper`;
+      await mkdir(`${cargoDirectory}/src`, { recursive: true });
+      await writeFile(
+        `${cargoDirectory}/Cargo.toml`,
+        '[package]\nname = "helper"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(`${cargoDirectory}/src/lib.rs`, "pub fn value() {}\n");
+      await cp(
+        `${repositoryRoot}/rust-toolchain`,
+        `${directory}/rust-toolchain`,
+      );
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const app = model.packagesByName.get("synthetic-app")!;
+      expect(model.packagesByName.get("helper")?.manager).toBe("cargo");
+      expect(app.internalDependencies).not.toContain("helper");
+      expect(
+        buildTaskGraph(model, [app], ["build"], false).nodes.has(
+          "helper#build",
+        ),
+      ).toBe(false);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
   it("hashes explicit dist and target inputs without a Git repository", async () => {
     const directory = await makeFixture();
     try {
@@ -790,6 +878,41 @@ describe("core CLI execution", () => {
       expect(model.manager).toBe("npm");
       expect(model.packages.map((packageModel) => packageModel.name)).toEqual([
         "synthetic-app",
+      ]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("discovers declared workspaces beneath output-named directories", async () => {
+    const directory = await makeFixture();
+    try {
+      const manifestPath = `${directory}/package.json`;
+      const manifest = JSON.parse(
+        await readFile(manifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      manifest.packageManager = "npm@11.6.0";
+      manifest.workspaces = ["packages/dist/app", "packages/target/tool"];
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      for (const [path, name] of [
+        ["packages/dist/app", "dist-app"],
+        ["packages/target/tool", "target-tool"],
+      ] as const) {
+        await mkdir(`${directory}/${path}`, { recursive: true });
+        await writeFile(
+          `${directory}/${path}/package.json`,
+          `${JSON.stringify({ name, version: "1.0.0" }, null, 2)}\n`,
+        );
+      }
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(model.packages.map((packageModel) => packageModel.name)).toEqual([
+        "dist-app",
+        "target-tool",
       ]);
     } finally {
       await rm(directory, { force: true, recursive: true });
@@ -936,6 +1059,105 @@ describe("core CLI execution", () => {
       ).toEqual(["rust-member"]);
     } finally {
       await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
+  it("matches Cargo manifests through a symlinked repository root", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const linkedRoot = `${directory}-link`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { futureFlags?: Record<string, boolean> };
+      configuration.futureFlags = { experimentalCargoWorkspaces: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const cargoDirectory = `${directory}/packages/rust-tool`;
+      await mkdir(`${cargoDirectory}/src`, { recursive: true });
+      await writeFile(
+        `${cargoDirectory}/Cargo.toml`,
+        '[package]\nname = "rust-tool"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(`${cargoDirectory}/src/main.rs`, "fn main() {}\n");
+      await cp(
+        `${repositoryRoot}/rust-toolchain`,
+        `${directory}/rust-toolchain`,
+      );
+      await symlink(directory, linkedRoot);
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(linkedRoot);
+          return yield* discoverRepository(linkedRoot, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(model.packagesByName.get("rust-tool")).toMatchObject({
+        directory: `${linkedRoot}/packages/rust-tool`,
+        workspaceDirectory: `${linkedRoot}/packages/rust-tool`,
+      });
+    } finally {
+      await rm(linkedRoot, { force: true });
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
+  it("keeps Cargo packages in external workspaces package-scoped", async () => {
+    const outer = await mkdtemp(join(tmpdir(), "turbo-ts-outer-cargo-"));
+    const directory = `${outer}/repository`;
+    try {
+      await cp(fixtureRoot, directory, { recursive: true });
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { futureFlags?: Record<string, boolean> };
+      configuration.futureFlags = { experimentalCargoWorkspaces: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${directory}/packages/rust-tool/src`, { recursive: true });
+      await mkdir(`${outer}/sibling/src`, { recursive: true });
+      await writeFile(
+        `${outer}/Cargo.toml`,
+        '[workspace]\nmembers = ["repository/packages/rust-tool", "sibling"]\nresolver = "3"\n',
+      );
+      await writeFile(
+        `${directory}/packages/rust-tool/Cargo.toml`,
+        '[package]\nname = "rust-tool"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(
+        `${outer}/sibling/Cargo.toml`,
+        '[package]\nname = "sibling"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(
+        `${directory}/packages/rust-tool/src/lib.rs`,
+        "pub fn value() {}\n",
+      );
+      await writeFile(`${outer}/sibling/src/lib.rs`, "pub fn value() {}\n");
+      await cp(`${repositoryRoot}/rust-toolchain`, `${outer}/rust-toolchain`);
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const cargoPackage = model.packagesByName.get("rust-tool")!;
+      expect(cargoPackage.workspaceDirectory).toBeUndefined();
+      const graph = buildTaskGraph(model, [cargoPackage], ["test"], false);
+      const plan = planCargoWorkspaceTasks(graph, ["test"], true);
+      expect(plan.scopes.size).toBe(0);
+      expect(
+        packageManagerCommand(graph.nodes.get("rust-tool#test")!, []),
+      ).toEqual({
+        command: "cargo",
+        arguments: ["test", "--package=rust-tool", "--locked"],
+        cwd: `${directory}/packages/rust-tool`,
+      });
+    } finally {
+      await rm(outer, { force: true, recursive: true });
     }
   }, 20_000);
 
@@ -1253,6 +1475,92 @@ describe("core CLI execution", () => {
     }
   }, 20_000);
 
+  it("includes Cargo workspace controls in member task hashes", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, { inputs?: Array<string> }>;
+      };
+      configuration.futureFlags = { experimentalCargoWorkspaces: true };
+      configuration.tasks.test = { inputs: ["src/**"] };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${directory}/rust/.cargo`, { recursive: true });
+      await mkdir(`${directory}/rust/tool/src`, { recursive: true });
+      const workspaceManifest = `${directory}/rust/Cargo.toml`;
+      const cargoConfiguration = `${directory}/rust/.cargo/config.toml`;
+      const toolchain = `${directory}/rust-toolchain`;
+      await writeFile(
+        workspaceManifest,
+        '[workspace]\nmembers = ["tool"]\nresolver = "3"\n',
+      );
+      await writeFile(cargoConfiguration, "[build]\nincremental = false\n");
+      await writeFile(
+        `${directory}/rust/tool/Cargo.toml`,
+        '[package]\nname = "rust-tool"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(
+        `${directory}/rust/tool/src/lib.rs`,
+        "pub fn value() {}\n",
+      );
+      await cp(`${repositoryRoot}/rust-toolchain`, toolchain);
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const cargoPackage = model.packagesByName.get("rust-tool")!;
+      const node = buildTaskGraph(
+        model,
+        [cargoPackage],
+        ["test"],
+        false,
+      ).nodes.get("rust-tool#test")!;
+      const compute = () =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const initial = await compute();
+      expect(initial.inputFiles).toEqual(
+        expect.arrayContaining([
+          "$TURBO_ROOT$/rust-toolchain",
+          "$TURBO_ROOT$/rust/.cargo/config.toml",
+          "$TURBO_ROOT$/rust/Cargo.toml",
+          "Cargo.toml",
+          "src/lib.rs",
+        ]),
+      );
+      await writeFile(
+        workspaceManifest,
+        `${await readFile(workspaceManifest, "utf8")}# workspace revision\n`,
+      );
+      const workspaceChanged = await compute();
+      expect(workspaceChanged.hash).not.toBe(initial.hash);
+      await writeFile(
+        cargoConfiguration,
+        `${await readFile(cargoConfiguration, "utf8")}# config revision\n`,
+      );
+      const configurationChanged = await compute();
+      expect(configurationChanged.hash).not.toBe(workspaceChanged.hash);
+      await writeFile(
+        toolchain,
+        `${await readFile(toolchain, "utf8")}# toolchain revision\n`,
+      );
+      expect((await compute()).hash).not.toBe(configurationChanged.hash);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
   it("includes pass-through arguments in task hashes", async () => {
     const directory = await makeFixture();
     try {
@@ -1405,6 +1713,97 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("hashes tracked Git submodules as gitlinks", async () => {
+    const directory = await mkdtemp(join(packageRoot, "test-gitlink-"));
+    const vendorDirectory = `${directory}/packages/library/vendor`;
+    try {
+      await cp(fixtureRoot, directory, { recursive: true });
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["vendor"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(vendorDirectory, { recursive: true });
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "first"],
+      ]) {
+        const result = await run("git", args, directory);
+        expect(result.exitCode, `${args.join(" ")}: ${result.stderr}`).toBe(0);
+      }
+      const firstCommit = (
+        await run("git", ["rev-parse", "HEAD"], directory)
+      ).stdout.trim();
+      await writeFile(`${directory}/revision.txt`, "second\n");
+      expect(
+        (await run("git", ["add", "revision.txt"], directory)).exitCode,
+      ).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "second"], directory)).exitCode,
+      ).toBe(0);
+      const secondCommit = (
+        await run("git", ["rev-parse", "HEAD"], directory)
+      ).stdout.trim();
+      const gitlinkPath = "packages/library/vendor";
+      expect(
+        (
+          await run(
+            "git",
+            [
+              "update-index",
+              "--add",
+              "--cacheinfo",
+              `160000,${firstCommit},${gitlinkPath}`,
+            ],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      const compute = () =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const first = await compute();
+      expect(first.inputFiles).toContain("vendor");
+      expect(
+        (
+          await run(
+            "git",
+            [
+              "update-index",
+              "--add",
+              "--cacheinfo",
+              `160000,${secondCommit},${gitlinkPath}`,
+            ],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      expect((await compute()).hash).not.toBe(first.hash);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
 
   it("rejects a missing explicit root configuration", async () => {
     const directory = await makeFixture();
@@ -4388,6 +4787,52 @@ describe("cache interoperability and safety", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
       await rm(outside, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects writes through archive-created output symlinks", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-output-link-"));
+    const sourcePath = `${directory}/packages/app/src/index.ts`;
+    try {
+      await mkdir(`${directory}/packages/app/src`, { recursive: true });
+      await writeFile(sourcePath, "preserved\n");
+      const restored = await Effect.runPromise(
+        restoreArchiveEntries(
+          directory,
+          [
+            {
+              kind: "symlink",
+              path: "packages/app/dist/link",
+              linkTarget: "../src",
+              contents: new Uint8Array(),
+              mode: 0o777,
+              modifiedSeconds: 1,
+            },
+            {
+              path: "packages/app/dist/link/index.ts",
+              contents: new TextEncoder().encode("overwritten\n"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+          ],
+          {
+            pathsToClear: ["packages/app/dist"],
+            allowedPathGroups: [
+              { directory: "packages/app", patterns: ["dist/**"] },
+            ],
+            regularFilePaths: [],
+          },
+        ).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
+      );
+      expect(restored._tag).toBe("Left");
+      if (restored._tag === "Left") {
+        expect(restored.left.message).toContain("symlink");
+      }
+      expect(await readFile(sourcePath, "utf8")).toBe("preserved\n");
+      await expect(lstat(`${directory}/packages/app/dist`)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
     }
   });
 

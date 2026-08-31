@@ -209,6 +209,70 @@ const taskInputFiles = (
   );
 };
 
+const cargoControlInputFiles = (
+  repository: RepositoryModel,
+  node: TaskNode,
+  cacheDirectory: string,
+): Effect.Effect<
+  ReadonlyArray<TaskInputFile>,
+  RepositoryError,
+  FileSystemService
+> =>
+  Effect.gen(function* () {
+    if (node.package.manager !== "cargo") return [];
+    const fileSystem = yield* FileSystemService;
+    const directories: Array<string> = [];
+    let current = node.package.directory;
+    while (isPathContained(repository.root, current)) {
+      directories.push(current);
+      if (current === repository.root) break;
+      const parent = parentPath(current);
+      if (parent === current) break;
+      current = parent;
+    }
+    const candidates = [
+      ...new Set(
+        directories.flatMap((directory) => [
+          joinPath(directory, "Cargo.toml"),
+          joinPath(directory, ".cargo/config"),
+          joinPath(directory, ".cargo/config.toml"),
+          joinPath(directory, "rust-toolchain"),
+          joinPath(directory, "rust-toolchain.toml"),
+        ]),
+      ),
+    ].filter((path) => !isIgnoredInputPath(path, cacheDirectory));
+    const existing = yield* Effect.forEach(
+      candidates,
+      (path) =>
+        fileSystem.exists(path).pipe(
+          Effect.map((exists) => (exists ? path : undefined)),
+          Effect.mapError(
+            (error) => new RepositoryError({ path, message: error.message }),
+          ),
+        ),
+      { concurrency: 8 },
+    );
+    return existing
+      .filter((path): path is string => path !== undefined)
+      .map((absolutePath) => {
+        const packageRelative = isPathContained(
+          node.package.directory,
+          absolutePath,
+        );
+        const matchPath = packageRelative
+          ? relativePath(node.package.directory, absolutePath)
+          : relativePath(repository.root, absolutePath);
+        return {
+          absolutePath,
+          hashPath: packageRelative
+            ? matchPath
+            : `${turboRootInputPrefix}${matchPath}`,
+          matchPath,
+        };
+      })
+      .sort((left, right) => left.hashPath.localeCompare(right.hashPath));
+  });
+
 export interface TaskHashResult {
   readonly hash: string;
   readonly environment: Readonly<Record<string, string>>;
@@ -339,6 +403,7 @@ export const hashTask = (
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const digest = yield* DigestService;
+    const processService = yield* ProcessService;
     const environmentService = yield* EnvironmentService;
     const environment = yield* environmentService.entries;
     const inputs = effectiveTaskInputs(repository, node);
@@ -350,7 +415,7 @@ export const hashTask = (
     const repositoryFiles = usesTurboRootInput(inputs)
       ? yield* discoverFiles(repository, repository.root, cacheDirectory)
       : [];
-    const inputFiles = taskInputFiles(
+    const configuredInputFiles = taskInputFiles(
       repository,
       node,
       packageFiles,
@@ -358,35 +423,88 @@ export const hashTask = (
       inputs,
       cacheDirectory,
     );
+    const inputFiles = [
+      ...new Map(
+        [
+          ...configuredInputFiles,
+          ...(yield* cargoControlInputFiles(repository, node, cacheDirectory)),
+        ].map((input) => [input.absolutePath, input] as const),
+      ).values(),
+    ].sort((left, right) => left.hashPath.localeCompare(right.hashPath));
+    const gitlinkObjectId = (path: string) =>
+      Effect.gen(function* () {
+        const result = yield* Effect.scoped(
+          processService.run({
+            command: "git",
+            args: [
+              "ls-files",
+              "--stage",
+              "-z",
+              "--",
+              relativePath(repository.root, path),
+            ],
+            cwd: repository.root,
+          }),
+        ).pipe(
+          Effect.mapError(
+            (error) => new RepositoryError({ path, message: error.message }),
+          ),
+        );
+        const objectId = result.stdout
+          .split("\0")
+          .filter(Boolean)
+          .flatMap((entry) => {
+            const match = /^160000 ([0-9a-fA-F]+) 0\t/.exec(entry);
+            return match?.[1] === undefined ? [] : [match[1]];
+          })[0];
+        if (result.exitCode !== 0 || objectId === undefined) {
+          return yield* Effect.fail(
+            new RepositoryError({
+              path,
+              message: result.stderr || "directory input is not a Git gitlink",
+            }),
+          );
+        }
+        return objectId;
+      });
     const hashFile = (path: string, relative: string) =>
-      fileSystem.metadata(path).pipe(
-        Effect.flatMap((metadata) =>
-          (metadata.kind === "symlink"
+      Effect.gen(function* () {
+        const metadata = yield* fileSystem
+          .metadata(path)
+          .pipe(
+            Effect.mapError(
+              (error) => new RepositoryError({ path, message: error.message }),
+            ),
+          );
+        if (metadata.kind === "directory") {
+          return [relative, "160000", yield* gitlinkObjectId(path)] as const;
+        }
+        const bytes = yield* (
+          metadata.kind === "symlink"
             ? fileSystem
                 .readLink(path)
                 .pipe(Effect.map((target) => new TextEncoder().encode(target)))
             : fileSystem.readBytes(path)
-          ).pipe(
-            Effect.map((bytes) => ({
-              bytes,
-              mode:
-                metadata.kind === "symlink"
-                  ? ("120000" as const)
-                  : (metadata.mode & 0o111) !== 0
-                    ? ("100755" as const)
-                    : ("100644" as const),
-            })),
+        ).pipe(
+          Effect.mapError(
+            (error) => new RepositoryError({ path, message: error.message }),
           ),
-        ),
-        Effect.flatMap(({ bytes, mode }) =>
-          digest
-            .gitBlobSha1(bytes)
-            .pipe(Effect.map((hash) => [relative, mode, hash] as const)),
-        ),
-        Effect.mapError(
-          (error) => new RepositoryError({ path, message: error.message }),
-        ),
-      );
+        );
+        const mode =
+          metadata.kind === "symlink"
+            ? ("120000" as const)
+            : (metadata.mode & 0o111) !== 0
+              ? ("100755" as const)
+              : ("100644" as const);
+        const hash = yield* digest
+          .gitBlobSha1(bytes)
+          .pipe(
+            Effect.mapError(
+              (error) => new RepositoryError({ path, message: error.message }),
+            ),
+          );
+        return [relative, mode, hash] as const;
+      });
     const fileHashes = yield* Effect.forEach(
       inputFiles,
       (input) => hashFile(input.absolutePath, input.hashPath),

@@ -78,7 +78,9 @@ from the resolved JavaScript package manager, applies ordered workspace
 exclusions and brace/class-aware globs, and discovers the owning repository
 from nested working directories, including explicit `--cwd` values. Only pnpm
 uses `pnpm-workspace.yaml`; other JavaScript managers use `package.json`
-workspaces. Every requested task must resolve before any task executes, and
+workspaces. Declared workspace members remain discoverable beneath directories
+named `dist` or `target`. Every requested task must resolve before any task
+executes, and
 strict entrypoint selection removes configured tasks without an executable
 package script even when every selected entrypoint is commandless. Every
 explicit `with` reference must resolve to an existing package task before its
@@ -90,13 +92,17 @@ task-aware selection is disabled, `global.inputs` as repository-global inputs.
 Task-input selection uses the same effective global and task inputs as hashing,
 evaluates task owners before Git-range package narrowing, applies negative Git
 ranges after positive task matches, and includes `with` companions. Task hashes
-preserve Git symlink and dependency semantics, exclude the resolved cache
-directory, and use each task's owning ecosystem lockfile. Repository discovery
-records the resolved root lockfile path without structurally parsing it;
+preserve Git symlink, gitlink, and dependency semantics, exclude the resolved
+cache directory, and use each task's owning ecosystem lockfile. Cargo task
+hashes additionally include repository-contained ancestor manifests, Cargo
+configuration, and Rust toolchain files that can change task execution.
+Repository discovery records the resolved root lockfile path without
+structurally parsing it;
 lockfile parsing and pruning remain Gate 3 work. Without Git, explicit task
 inputs under ordinary `dist` and `target` directories remain hashable.
-Cache directories equal to or containing the repository are rejected before
-cache access. Scheduled `with` groups preserve internal dependency order and
+Cache directories equal to or containing the repository are rejected by
+canonical filesystem location before cache access, including through symlinks.
+Scheduled `with` groups preserve internal dependency order and
 share one run-wide foreground concurrency budget. All non-interactive task
 output streams to the task log through bounded backpressure while retaining
 only a bounded diagnostic tail and incomplete display line in memory.
@@ -118,6 +124,8 @@ and 1 GiB after decompression; preflight and upload response bodies have an
 independent 64 KiB limit.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact log path before clearing or writing files.
+Restoration rejects symlink parents even when their targets remain inside the
+repository, preventing declared output paths from redirecting writes elsewhere.
 Every archive must contain exactly one regular task-log entry. Cache writes
 whose aggregate uncompressed file content exceeds 64 MiB are skipped before
 contents are read, with a warning that preserves the successful task result.
@@ -137,18 +145,22 @@ exclusions; unrelated Python projects and `.venv` trees are ignored.
 Synthesized uv packages
 expose `build` and `test`, and implicit builds default to uncached unless task
 configuration explicitly enables caching. uv tasks execute from their project
-directory, and `uv.lock` is parsed as TOML. uv package-graph edges require a
+directory, forward test arguments directly to `pytest`, and parse `uv.lock` as
+TOML. uv package-graph edges require a
 matching `tool.uv.sources` workspace declaration or local path resolving to the
 named workspace member; registry, Git, URL, and undeclared sources remain
 external. JavaScript package-graph edges
 require declared workspace or version-range compatibility, or a `file:` or
-`link:` path that resolves to the named local package. Unfiltered Cargo `test`,
+`link:` path that resolves to the named local JavaScript package; same-named
+Cargo and uv packages are never JavaScript workspace targets. Cargo metadata
+paths are matched by canonical filesystem identity. Unfiltered Cargo `test`,
 `check`, `lint`, and `format` tasks execute once per Cargo workspace and bypass
 caching when any grouped member disables it; filtered and package-qualified
-runs retain package targeting. Grouped Cargo commands receive the union of all
-member task environments. Cargo package-graph edges require a source-free
-metadata dependency path that resolves to the named member in the same
-workspace; registry and Git dependencies remain external. Cargo `run` and
+runs retain package targeting. Members of an enclosing Cargo workspace outside
+the repository always retain package targeting. Grouped Cargo commands receive
+the union of all member task environments. Cargo package-graph edges require a
+source-free metadata dependency path that resolves to the named member in the
+same workspace; registry and Git dependencies remain external. Cargo `run` and
 `dev` tasks are exposed only for binary crates, and pass-through arguments are
 forwarded to Cargo without an implicit target-argument separator. Cargo builds
 for mixed library and binary crates default to uncached. Builds with

@@ -68,6 +68,14 @@ const prepareParentDirectory = (
             Effect.mapError((error) => restoreError(current, error.message)),
           );
       }
+      const metadata = yield* fileSystem
+        .metadata(current)
+        .pipe(Effect.mapError((error) => restoreError(current, error.message)));
+      if (metadata.kind === "symlink") {
+        return yield* Effect.fail(
+          restoreError(current, "archive parent is an escaping symlink"),
+        );
+      }
       const resolved = yield* fileSystem
         .realPath(current)
         .pipe(Effect.mapError((error) => restoreError(current, error.message)));
@@ -165,6 +173,7 @@ export const restoreArchiveEntries = (
         );
       }
     }
+    const restoredPaths: Array<string> = [];
     const restoration = Effect.gen(function* () {
       for (const path of scope.pathsToClear) {
         const destination = joinPath(root, path);
@@ -224,6 +233,7 @@ export const restoreArchiveEntries = (
                 ),
               );
           }
+          restoredPaths.push(entry.path);
           continue;
         }
         if (entry.kind === "symlink") {
@@ -243,6 +253,7 @@ export const restoreArchiveEntries = (
                 restoreError(destination, error.message),
               ),
             );
+          restoredPaths.push(entry.path);
           continue;
         }
         yield* fileSystem
@@ -252,6 +263,7 @@ export const restoreArchiveEntries = (
               restoreError(destination, error.message),
             ),
           );
+        restoredPaths.push(entry.path);
         yield* fileSystem
           .setFileMetadata(
             destination,
@@ -295,10 +307,7 @@ export const restoreArchiveEntries = (
       return;
     }
     const rollbackPaths = [
-      ...new Set([
-        ...scope.pathsToClear,
-        ...entries.map((entry) => entry.path),
-      ]),
+      ...new Set([...scope.pathsToClear, ...restoredPaths]),
     ].sort(
       (left, right) =>
         right.split("/").length - left.split("/").length ||
