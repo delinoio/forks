@@ -1,4 +1,5 @@
 import { Effect, Fiber, Queue } from "effect";
+import { maximumCacheArchiveInputBytes } from "../cache/archive.js";
 import {
   type CacheWriteEntry,
   evictLocalCache,
@@ -1024,7 +1025,11 @@ const collectCacheEntries = (
   nodes: ReadonlyArray<TaskNode>,
   logPath: string,
 ): Effect.Effect<
-  ReadonlyArray<CacheWriteEntry>,
+  | {
+      readonly kind: "ready";
+      readonly entries: ReadonlyArray<CacheWriteEntry>;
+    }
+  | { readonly kind: "too-large"; readonly inputBytes: number },
   RepositoryError,
   FileSystemService
 > =>
@@ -1033,18 +1038,32 @@ const collectCacheEntries = (
       ...new Set([logPath, ...(yield* collectOutputPaths(repository, nodes))]),
     ].sort();
     const fileSystem = yield* FileSystemService;
-    return yield* Effect.forEach(
+    const selectedMetadata = yield* Effect.forEach(
       selected,
       (path) =>
+        fileSystem.metadata(path).pipe(
+          Effect.mapError(
+            (error) => new RepositoryError({ path, message: error.message }),
+          ),
+          Effect.map((metadata) => ({ path, metadata })),
+        ),
+      { concurrency: 8 },
+    );
+    const inputBytes = selectedMetadata.reduce(
+      (total, { metadata }) =>
+        total +
+        (metadata.kind === "directory" || metadata.kind === "symlink"
+          ? 0
+          : metadata.size),
+      0,
+    );
+    if (inputBytes > maximumCacheArchiveInputBytes) {
+      return { kind: "too-large", inputBytes } as const;
+    }
+    const entries = yield* Effect.forEach(
+      selectedMetadata,
+      ({ path, metadata }) =>
         Effect.gen(function* () {
-          const metadata = yield* fileSystem
-            .metadata(path)
-            .pipe(
-              Effect.mapError(
-                (error) =>
-                  new RepositoryError({ path, message: error.message }),
-              ),
-            );
           const common = {
             path: relativePath(repository.root, path),
             mode: metadata.mode,
@@ -1081,6 +1100,7 @@ const collectCacheEntries = (
         }),
       { concurrency: 8 },
     );
+    return { kind: "ready", entries } as const;
   });
 
 const cacheRestoreScope = (
@@ -1120,7 +1140,11 @@ const cacheRestoreScope = (
     directory: ".",
     patterns: [relativePath(repository.root, logPath)],
   });
-  return { pathsToClear, allowedPathGroups };
+  return {
+    pathsToClear,
+    allowedPathGroups,
+    regularFilePaths: [relativePath(repository.root, logPath)],
+  };
 };
 
 const shouldReplayOutput = (
@@ -1470,36 +1494,53 @@ const executeTask = (
       cacheable &&
       (options.cachePolicy.localWrite || options.cachePolicy.remoteWrite)
     ) {
-      const entries = yield* collectCacheEntries(
+      const collected = yield* collectCacheEntries(
         repository,
         cacheNodes,
         logPath,
       );
-      const duration = (yield* clock.now) - started;
-      if (options.cachePolicy.localWrite) {
-        yield* writeLocalCache(localOptions, hash.hash, entries, duration);
-      }
-      if (options.cachePolicy.remoteWrite && options.remote !== undefined) {
-        yield* writeRemoteCache(
-          options.remote,
-          hash.hash,
-          entries,
-          duration,
-        ).pipe(
-          Effect.catchAll((error) =>
-            terminal
-              .writeStderr(
-                renderLogEvent(
-                  {
-                    kind: "warning",
-                    message: `remote cache upload failed for ${taskLabel}; preserving successful task result: ${error.message}`,
-                  },
-                  warningColor,
-                ),
-              )
-              .pipe(Effect.ignore),
+      if (collected.kind === "too-large") {
+        yield* terminal.writeStderr(
+          renderLogEvent(
+            {
+              kind: "warning",
+              message: `cache write skipped for ${taskLabel}; ${collected.inputBytes} bytes of task outputs exceed the ${maximumCacheArchiveInputBytes} byte safety limit`,
+            },
+            warningColor,
           ),
         );
+      } else {
+        const duration = (yield* clock.now) - started;
+        if (options.cachePolicy.localWrite) {
+          yield* writeLocalCache(
+            localOptions,
+            hash.hash,
+            collected.entries,
+            duration,
+          );
+        }
+        if (options.cachePolicy.remoteWrite && options.remote !== undefined) {
+          yield* writeRemoteCache(
+            options.remote,
+            hash.hash,
+            collected.entries,
+            duration,
+          ).pipe(
+            Effect.catchAll((error) =>
+              terminal
+                .writeStderr(
+                  renderLogEvent(
+                    {
+                      kind: "warning",
+                      message: `remote cache upload failed for ${taskLabel}; preserving successful task result: ${error.message}`,
+                    },
+                    warningColor,
+                  ),
+                )
+                .pipe(Effect.ignore),
+            ),
+          );
+        }
       }
     }
     return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };

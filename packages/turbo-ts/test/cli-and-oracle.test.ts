@@ -2,10 +2,16 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "@rstest/core";
 import { Effect } from "effect";
 import { renderUnsupportedCompatibilityError } from "../src/cli/compatibility-renderer.js";
+import { cliProgram } from "../src/cli/program.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { UnsupportedCompatibilityError } from "../src/effect/errors.js";
 import { nodeFoundationLayer } from "../src/effect/node-layer.js";
-import { ProcessService } from "../src/effect/services.js";
+import {
+  EnvironmentService,
+  ExitStatusService,
+  ProcessService,
+  TerminalService,
+} from "../src/effect/services.js";
 import {
   makeExternalOracle,
   type OracleLauncher,
@@ -50,6 +56,41 @@ describe("CLI and external oracle", () => {
     expect(renderUnsupportedCompatibilityError(error, true)).toBe(
       `\u001B[31m${message}\u001B[0m\n`,
     );
+  });
+
+  it("routes exit status through a substitutable Effect service", async () => {
+    const exitStatuses: Array<number> = [];
+    let stderr = "";
+    const previousExitCode = process.exitCode;
+    await Effect.runPromise(
+      cliProgram.pipe(
+        Effect.provideService(EnvironmentService, {
+          argv: Effect.succeed(["node", "turbo-ts", "watch"]),
+          cwd: Effect.succeed(packageRoot),
+          get: () => Effect.succeed(undefined),
+          entries: Effect.succeed({}),
+        }),
+        Effect.provideService(ExitStatusService, {
+          set: (code) =>
+            Effect.sync(() => {
+              exitStatuses.push(code);
+            }),
+        }),
+        Effect.provideService(TerminalService, {
+          writeStdout: () => Effect.void,
+          writeStderr: (text) =>
+            Effect.sync(() => {
+              stderr += text;
+            }),
+          stdoutColorEnabled: Effect.succeed(false),
+          stderrColorEnabled: Effect.succeed(false),
+        }),
+        Effect.provide(nodeFoundationLayer),
+      ),
+    );
+    expect(exitStatuses).toEqual([1]);
+    expect(stderr).toContain("watch is not implemented");
+    expect(process.exitCode).toBe(previousExitCode);
   });
 
   it(evidenceId.cliVersion, async () => {

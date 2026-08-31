@@ -30,6 +30,7 @@ export type ArchiveEntry =
   | ArchiveDirectoryEntry;
 
 const blockSize = 512;
+export const maximumCacheArchiveInputBytes = 64 * 1024 * 1024;
 const tarNameBytes = 100;
 const tarPrefixBytes = 155;
 const encodedLength = (value: string): number =>
@@ -201,6 +202,16 @@ const pushArchiveRecord = (
 export const createTarArchive = (
   entries: ReadonlyArray<ArchiveEntry>,
 ): Uint8Array => {
+  const inputBytes = entries.reduce(
+    (total, entry) =>
+      total + (entry.kind === "directory" ? 0 : entry.contents.length),
+    0,
+  );
+  if (inputBytes > maximumCacheArchiveInputBytes) {
+    throw new TypeError(
+      `cache archive input exceeds the ${maximumCacheArchiveInputBytes} byte limit`,
+    );
+  }
   const chunks: Array<Uint8Array> = [];
   const sorted = [...entries].sort((left, right) =>
     left.path.localeCompare(right.path),

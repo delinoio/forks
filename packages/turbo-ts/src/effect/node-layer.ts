@@ -43,6 +43,7 @@ import {
   DigestService,
   deterministicRetryLayer,
   EnvironmentService,
+  ExitStatusService,
   type FileSystemOperations,
   FileSystemService,
   GitService,
@@ -653,6 +654,13 @@ const environmentLayer = Layer.succeed(EnvironmentService, {
   entries: Effect.sync(() => ({ ...process.env })),
 });
 
+const exitStatusLayer = Layer.succeed(ExitStatusService, {
+  set: (code) =>
+    Effect.sync(() => {
+      process.exitCode = code;
+    }),
+});
+
 const terminalError = (cause: unknown): BoundaryError =>
   new BoundaryError({
     boundary: "terminal",
@@ -930,6 +938,7 @@ export const nodeFoundationLayer = Layer.mergeAll(
   fileSystemLayer,
   processLayer,
   environmentLayer,
+  exitStatusLayer,
   terminalLayer,
   clockLayer,
   randomnessLayer,

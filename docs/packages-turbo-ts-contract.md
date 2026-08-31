@@ -116,6 +116,9 @@ downloads are limited to 256 MiB compressed and 1 GiB after decompression;
 preflight and upload response bodies have an independent 64 KiB limit.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact log path before clearing or writing files.
+Task-log entries must be regular files. Cache writes whose aggregate
+uncompressed file content exceeds 64 MiB are skipped before contents are read,
+with a warning that preserves the successful task result.
 Companion task hashes participate in the owning task's cache key. Local eviction
 accepts week-based ages, runs before cache restoration only when local cache
 reads or writes are enabled, and counts archive and sidecar bytes, including

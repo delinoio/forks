@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it } from "@rstest/core";
 import { Effect, Layer } from "effect";
+import { maximumCacheArchiveInputBytes } from "../src/cache/archive.js";
 import {
   evictLocalCache,
   restoreLocalCache,
@@ -52,6 +53,7 @@ const allowCachePaths = (
 ): CacheRestoreScope => ({
   pathsToClear: [],
   allowedPathGroups: [{ directory: ".", patterns }],
+  regularFilePaths: [],
 });
 
 const makeFixture = async (): Promise<string> => {
@@ -152,6 +154,51 @@ describe("core CLI execution", () => {
       );
       expect(log.length).toBeGreaterThan(96 * 1024);
       expect(log).toContain("END-MARKER");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("skips oversized cache inputs before retaining file contents", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks["oversized-cache"] = { outputs: ["dist/**"] };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts["oversized-cache"] =
+        `node -e "const fs=require('node:fs'); fs.mkdirSync('dist',{recursive:true}); const file=fs.openSync('dist/large.bin','w'); fs.ftruncateSync(file,${maximumCacheArchiveInputBytes + 1}); fs.closeSync(file); console.log('oversized cache output')"`;
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "oversized-cache",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--cache=local:w",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("oversized cache output");
+      expect(result.stderr).toContain("cache write skipped");
+      expect(result.stderr).toContain(
+        `${maximumCacheArchiveInputBytes} byte safety limit`,
+      );
+      await expect(readdir(`${directory}/.turbo/cache`)).rejects.toThrow();
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -4279,6 +4326,44 @@ describe("cache interoperability and safety", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
       await rm(outside, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects cached task-log symlinks before restoration", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-log-symlink-"));
+    const logPath = "packages/app/.turbo/turbo-build.log";
+    try {
+      await writeFile(`${directory}/.env`, "TOP_SECRET=value\n");
+      const restored = await Effect.runPromise(
+        restoreArchiveEntries(
+          directory,
+          [
+            {
+              kind: "symlink",
+              path: logPath,
+              linkTarget: "../../../.env",
+              contents: new Uint8Array(),
+              mode: 0o777,
+              modifiedSeconds: 1,
+            },
+          ],
+          {
+            pathsToClear: [],
+            allowedPathGroups: [{ directory: ".", patterns: [logPath] }],
+            regularFilePaths: [logPath],
+          },
+        ).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
+      );
+      expect(restored._tag).toBe("Left");
+      if (restored._tag === "Left") {
+        expect(restored.left.message).toContain("not a regular file");
+      }
+      await expect(lstat(`${directory}/${logPath}`)).rejects.toThrow();
+      expect(await readFile(`${directory}/.env`, "utf8")).toBe(
+        "TOP_SECRET=value\n",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
     }
   });
 

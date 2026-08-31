@@ -21,7 +21,11 @@ export interface CacheRestorePathGroup {
 export interface CacheRestoreScope {
   readonly pathsToClear: ReadonlyArray<string>;
   readonly allowedPathGroups: ReadonlyArray<CacheRestorePathGroup>;
+  readonly regularFilePaths: ReadonlyArray<string>;
 }
+
+const comparablePath = (path: string): string =>
+  /^[A-Za-z]:/.test(path) ? path.toLowerCase() : path;
 
 const isAllowedEntry = (
   root: string,
@@ -85,6 +89,11 @@ export const restoreArchiveEntries = (
     const canonicalRoot = yield* fileSystem
       .realPath(root)
       .pipe(Effect.mapError((error) => restoreError(root, error.message)));
+    const regularFileDestinations = new Set(
+      scope.regularFilePaths.map((path) =>
+        comparablePath(joinPath(root, path)),
+      ),
+    );
     for (const entry of entries) {
       const destination = joinPath(root, entry.path);
       if (!isPathContained(root, destination)) {
@@ -107,12 +116,32 @@ export const restoreArchiveEntries = (
           ),
         );
       }
+      if (
+        regularFileDestinations.has(comparablePath(destination)) &&
+        entry.kind !== undefined &&
+        entry.kind !== "file"
+      ) {
+        return yield* Effect.fail(
+          restoreError(destination, "archive task log is not a regular file"),
+        );
+      }
     }
     for (const path of scope.pathsToClear) {
       const destination = joinPath(root, path);
       if (path === "" || path === "." || !isPathContained(root, destination)) {
         return yield* Effect.fail(
           restoreError(destination, "cache output path escapes repository"),
+        );
+      }
+    }
+    for (const path of scope.regularFilePaths) {
+      const destination = joinPath(root, path);
+      if (path === "" || path === "." || !isPathContained(root, destination)) {
+        return yield* Effect.fail(
+          restoreError(
+            destination,
+            "cache regular-file path escapes repository",
+          ),
         );
       }
     }

@@ -113,6 +113,14 @@ export class EnvironmentService extends Context.Tag(
   "turbo-ts/EnvironmentService",
 )<EnvironmentService, EnvironmentOperations>() {}
 
+export interface ExitStatusOperations {
+  readonly set: (code: number) => Effect.Effect<void>;
+}
+
+export class ExitStatusService extends Context.Tag(
+  "turbo-ts/ExitStatusService",
+)<ExitStatusService, ExitStatusOperations>() {}
+
 export interface TerminalOperations {
   readonly writeStdout: (text: string) => Effect.Effect<void, BoundaryError>;
   readonly writeStderr: (text: string) => Effect.Effect<void, BoundaryError>;
