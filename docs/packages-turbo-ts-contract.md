@@ -98,17 +98,20 @@ semantics, exclude the resolved cache directory, and use each task's owning
 ecosystem lockfile. Regular input files are streamed through bounded-memory Git
 blob digests. Cargo task hashes additionally include repository-contained
 ancestor manifests, Cargo configuration, and Rust toolchain files that can
-change task execution.
+change task execution. Environment-name selection follows Windows
+case-insensitive semantics for both hashing and strict task execution.
 Repository discovery records the resolved root lockfile path without
 structurally parsing it;
 lockfile parsing and pruning remain Gate 3 work. Without Git, explicit task
 inputs under ordinary `dist` and `target` directories remain hashable.
 Cache directories equal to or containing the repository are rejected by
 canonical filesystem location before cache access, including through symlinks.
-Scheduled `with` groups preserve internal dependency order and
-share one run-wide foreground concurrency budget. All non-interactive task
-output streams to the task log through bounded backpressure while retaining
-only a bounded diagnostic tail and incomplete display line in memory.
+Scheduled `with` groups preserve internal dependency order and share one
+run-wide foreground concurrency budget. Simultaneously ready non-persistent
+companions acquire foreground permits as an indivisible cohort, and a
+concurrency limit that cannot fit the cohort is rejected. All non-interactive
+task output streams to the task log through bounded backpressure while
+retaining only a bounded diagnostic tail and incomplete display line in memory.
 Persistent companions must remain alive until their foreground owners
 complete; any earlier natural exit fails the group, and foreground owners
 sharing a companion remain subject to the run's concurrency limit.
@@ -121,16 +124,19 @@ Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
 reject malformed entries. Remote artifact routes preserve configured API path
 prefixes. Active remote URLs must use HTTP or HTTPS, and URLs and timeout values
 are validated before cache or task work begins. Remote restoration failures
-warn and fall back to task execution, and remote upload failures warn without
-changing a successful task outcome. Local and remote cache restoration is
-limited to 256 MiB compressed and 1 GiB after decompression; preflight and
-upload response bodies have an independent 64 KiB limit.
+warn and fall back to task execution. Local cache write and remote upload
+failures warn without changing a successful task outcome, and a local failure
+does not suppress a configured remote upload. Local and remote cache
+restoration is limited to 256 MiB compressed and 1 GiB after decompression;
+preflight and upload response bodies have an independent 64 KiB limit.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact literal log path before clearing or writing
 files. Task identifiers are encoded into portable single-component log
 filenames; portable task names retain their existing filenames.
 Restoration rejects symlink parents even when their targets remain inside the
 repository, preventing declared output paths from redirecting writes elsewhere.
+Restored symlink targets must remain within the same declared output group that
+authorized the symlink path.
 Every archive must contain exactly one regular task-log entry. Cache writes
 whose aggregate uncompressed file content exceeds 64 MiB are skipped before
 contents are read, with a warning that preserves the successful task result.

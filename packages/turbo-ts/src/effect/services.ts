@@ -105,6 +105,7 @@ export class ProcessService extends Context.Tag("turbo-ts/ProcessService")<
 export interface EnvironmentOperations {
   readonly argv: Effect.Effect<ReadonlyArray<string>>;
   readonly cwd: Effect.Effect<string>;
+  readonly platform: Effect.Effect<NodeJS.Platform>;
   readonly get: (name: string) => Effect.Effect<string | undefined>;
   readonly entries: Effect.Effect<Readonly<Record<string, string | undefined>>>;
 }

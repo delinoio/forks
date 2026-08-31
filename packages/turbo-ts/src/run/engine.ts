@@ -917,12 +917,20 @@ export const taskScopeEnvironment = (
   mode: "loose" | "strict",
   frameworkInference: boolean,
   scope: TaskCommandScope = packageTaskCommandScope,
+  caseInsensitiveEnvironmentNames = false,
 ): Readonly<Record<string, string | undefined>> =>
   Object.assign(
     {},
     ...(scope.kind === "cargo-workspace" ? scope.members : [node]).map(
       (member) =>
-        taskEnvironment(repository, member, source, mode, frameworkInference),
+        taskEnvironment(
+          repository,
+          member,
+          source,
+          mode,
+          frameworkInference,
+          caseInsensitiveEnvironmentNames,
+        ),
     ),
   );
 
@@ -1322,6 +1330,8 @@ const executeTask = (
     const terminal = yield* TerminalService;
     const fileSystem = yield* FileSystemService;
     const clock = yield* ClockService;
+    const environmentService = yield* EnvironmentService;
+    const platform = yield* environmentService.platform;
     const color =
       options.outputLogs === "none" || !options.colorEnabled
         ? false
@@ -1479,6 +1489,7 @@ const executeTask = (
             options.environmentMode,
             options.frameworkInference,
             scope,
+            platform === "win32",
           ),
           TURBO_HASH: hash.hash,
         },
@@ -1603,6 +1614,20 @@ const executeTask = (
             hash.hash,
             collected.entries,
             duration,
+          ).pipe(
+            Effect.catchAll((error) =>
+              terminal
+                .writeStderr(
+                  renderLogEvent(
+                    {
+                      kind: "warning",
+                      message: `local cache write failed for ${taskLabel}; preserving successful task result: ${error.message}`,
+                    },
+                    warningColor,
+                  ),
+                )
+                .pipe(Effect.ignore),
+            ),
           );
         }
         if (options.cachePolicy.remoteWrite && options.remote !== undefined) {
@@ -1863,6 +1888,39 @@ const taskGroups = (graph: TaskGraph): ReadonlyArray<ReadonlyArray<string>> => {
   return groups;
 };
 
+const readyForegroundCohorts = (
+  graph: TaskGraph,
+  readyIds: ReadonlyArray<string>,
+): ReadonlyArray<ReadonlyArray<string>> => {
+  const ready = new Set(readyIds);
+  const adjacent = new Map(
+    readyIds.map((id) => [id, new Set<string>()] as const),
+  );
+  for (const id of readyIds) {
+    for (const companion of graph.nodes.get(id)!.with) {
+      if (!ready.has(companion)) continue;
+      adjacent.get(id)!.add(companion);
+      adjacent.get(companion)!.add(id);
+    }
+  }
+  const cohorts: Array<ReadonlyArray<string>> = [];
+  const visited = new Set<string>();
+  for (const start of [...ready].sort()) {
+    if (visited.has(start)) continue;
+    const members = new Set<string>();
+    const pending = [start];
+    while (pending.length > 0) {
+      const id = pending.pop()!;
+      if (members.has(id)) continue;
+      members.add(id);
+      visited.add(id);
+      pending.push(...(adjacent.get(id) ?? []));
+    }
+    cohorts.push([...members].sort());
+  }
+  return cohorts.sort((left, right) => left[0]!.localeCompare(right[0]!));
+};
+
 const canonicalContainmentPath = (
   path: string,
 ): Effect.Effect<string, ConfigurationError, FileSystemService> =>
@@ -2101,7 +2159,7 @@ export const executeRun = (
         batch,
         ([, members]): Effect.Effect<
           ReadonlyArray<TaskOutcome>,
-          never,
+          RepositoryError,
           RunRequirements
         > => {
           const memberSet = new Set(members);
@@ -2239,21 +2297,50 @@ export const executeRun = (
                   return dependenciesReady && hasStartedCompanions(id);
                 });
                 if (readyForeground.length === 0) {
-                  throw new RepositoryError({
-                    path: options.root,
-                    message: "scheduler deadlock inside with group",
-                  });
+                  return yield* Effect.fail(
+                    new RepositoryError({
+                      path: options.root,
+                      message: "scheduler deadlock inside with group",
+                    }),
+                  );
                 }
-                const foregroundCompletion = Effect.forEach(
-                  readyForeground.slice(0, options.concurrency),
-                  (id) => foregroundSemaphore.withPermits(1)(runNode(id)),
-                  { concurrency: "unbounded" },
-                ).pipe(
-                  Effect.map((outcome) => ({
-                    _tag: "ForegroundComplete" as const,
-                    outcomes: outcome,
-                  })),
+                const readyCohorts = readyForegroundCohorts(
+                  graph,
+                  readyForeground,
                 );
+                const oversizedCohort = readyCohorts.find(
+                  (cohort) => cohort.length > options.concurrency,
+                );
+                if (oversizedCohort !== undefined) {
+                  return yield* Effect.fail(
+                    new RepositoryError({
+                      path: options.root,
+                      message: `with group requires at least ${oversizedCohort.length} foreground concurrency slots for ready tasks: ${oversizedCohort.join(", ")}`,
+                    }),
+                  );
+                }
+                const scheduledCohorts: Array<ReadonlyArray<string>> = [];
+                let scheduledCount = 0;
+                for (const cohort of readyCohorts) {
+                  if (scheduledCount + cohort.length > options.concurrency) {
+                    break;
+                  }
+                  scheduledCohorts.push(cohort);
+                  scheduledCount += cohort.length;
+                }
+                const scheduledForeground = scheduledCohorts.flat();
+                const foregroundCompletion = foregroundSemaphore
+                  .withPermits(scheduledForeground.length)(
+                    Effect.forEach(scheduledForeground, runNode, {
+                      concurrency: "unbounded",
+                    }),
+                  )
+                  .pipe(
+                    Effect.map((outcome) => ({
+                      _tag: "ForegroundComplete" as const,
+                      outcomes: outcome,
+                    })),
+                  );
                 const completion =
                   backgroundFibers.length === 0
                     ? yield* foregroundCompletion

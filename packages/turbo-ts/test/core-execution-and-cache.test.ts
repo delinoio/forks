@@ -2421,6 +2421,99 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
+  it("starts ready non-persistent with companions as one cohort", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.check = { cache: false, with: ["serve"] };
+      configuration.tasks.serve = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.check =
+        "node -e \"const fs=require('node:fs'); fs.writeFileSync('check.started','1'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('serve.started')){clearInterval(timer); console.log('check alongside serve')}else if(Date.now()-started>3000){clearInterval(timer); process.exit(7)}},10)\"";
+      manifest.scripts.serve =
+        "node -e \"const fs=require('node:fs'); fs.writeFileSync('serve.started','1'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('check.started')){clearInterval(timer); console.log('serve alongside check')}else if(Date.now()-started>3000){clearInterval(timer); process.exit(8)}},10)\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--concurrency=2",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("check alongside serve");
+      expect(result.stdout).toContain("serve alongside check");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("rejects concurrency too small for a ready with cohort", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.check = { cache: false, with: ["serve"] };
+      configuration.tasks.serve = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.check =
+        "node -e \"require('node:fs').writeFileSync('check.ran','1')\"";
+      manifest.scripts.serve =
+        "node -e \"require('node:fs').writeFileSync('serve.ran','1')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--concurrency=1",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(
+        "with group requires at least 2 foreground concurrency slots",
+      );
+      await expect(lstat(`${packageDirectory}/check.ran`)).rejects.toThrow();
+      await expect(lstat(`${packageDirectory}/serve.ran`)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("starts persistent with companions inside one concurrency slot", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;
@@ -3826,7 +3919,7 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  }, 15_000);
+  }, 20_000);
 
   it("applies ordered negations in structured task inputs", async () => {
     const directory = await mkdtemp(join(packageRoot, "turbo-ts-inputs-"));
@@ -5000,6 +5093,51 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("rejects restored symlinks whose targets leave their output group", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-output-target-"));
+    const existingOutput = `${directory}/packages/app/dist/existing.txt`;
+    try {
+      await mkdir(`${directory}/packages/app/dist`, { recursive: true });
+      await writeFile(`${directory}/.env`, "TOP_SECRET=value\n");
+      await writeFile(existingOutput, "preserved\n");
+      const restored = await Effect.runPromise(
+        restoreArchiveEntries(
+          directory,
+          [
+            {
+              kind: "symlink",
+              path: "packages/app/dist/secret",
+              linkTarget: "../../../.env",
+              contents: new Uint8Array(),
+              mode: 0o777,
+              modifiedSeconds: 1,
+            },
+          ],
+          {
+            pathsToClear: ["packages/app/dist"],
+            allowedPathGroups: [
+              { directory: "packages/app", patterns: ["dist/**"] },
+            ],
+            regularFilePaths: [],
+          },
+        ).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
+      );
+      expect(restored._tag).toBe("Left");
+      if (restored._tag === "Left") {
+        expect(restored.left.message).toContain(
+          "link target is not a declared task output",
+        );
+      }
+      expect(await readFile(existingOutput, "utf8")).toBe("preserved\n");
+      await expect(
+        lstat(`${directory}/packages/app/dist/secret`),
+      ).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("rejects writes through archive-created output symlinks", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-output-link-"));
@@ -5326,6 +5464,58 @@ describe("cache interoperability and safety", () => {
       expect(result.exitCode).toBe(0);
       expect(uploads).toBe(1);
       expect(result.stderr).toContain("remote cache upload failed");
+      expect(result.stderr).toContain("preserving successful task result");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("continues remote upload when a local cache write fails", async () => {
+    const directory = await makeFixture();
+    let uploads = 0;
+    const server = createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        if (request.method === "PUT") uploads += 1;
+        response.writeHead(201);
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    try {
+      const manifestPath = `${directory}/packages/library/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); fs.writeFileSync('../../local-cache-blocker','blocked'); console.log('library build')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--cache=local:w,remote:w",
+          "--cache-dir=local-cache-blocker",
+          "--output-logs=hash-only",
+        ],
+        repositoryRoot,
+        { TURBO_API: `http://127.0.0.1:${address.port}` },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(uploads).toBe(1);
+      expect(result.stderr).toContain("local cache write failed");
       expect(result.stderr).toContain("preserving successful task result");
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));

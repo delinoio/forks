@@ -51,19 +51,30 @@ const frameworkEnvironmentPatterns: ReadonlyArray<{
   { dependencies: ["sanity"], patterns: ["SANITY_STUDIO_*"] },
 ];
 
-const matchesEnvironmentPattern = (name: string, pattern: string): boolean =>
-  matchesGlob(name, pattern);
+const matchesEnvironmentPattern = (
+  name: string,
+  pattern: string,
+  caseInsensitiveNames: boolean,
+): boolean =>
+  matchesGlob(
+    caseInsensitiveNames ? name.toLowerCase() : name,
+    caseInsensitiveNames ? pattern.toLowerCase() : pattern,
+  );
 
 export const selectEnvironment = (
   environment: Readonly<Record<string, string | undefined>>,
   patterns: ReadonlyArray<string>,
+  caseInsensitiveNames = false,
 ): Readonly<Record<string, string>> => {
   const selected = new Map<string, string>();
   for (const pattern of patterns) {
     const negative = pattern.startsWith("!");
     const matcher = negative ? pattern.slice(1) : pattern;
     for (const [name, value] of Object.entries(environment)) {
-      if (value === undefined || !matchesEnvironmentPattern(name, matcher)) {
+      if (
+        value === undefined ||
+        !matchesEnvironmentPattern(name, matcher, caseInsensitiveNames)
+      ) {
         continue;
       }
       if (negative) {
@@ -440,6 +451,7 @@ export const hashTask = (
     const processService = yield* ProcessService;
     const environmentService = yield* EnvironmentService;
     const environment = yield* environmentService.entries;
+    const platform = yield* environmentService.platform;
     const inputs = effectiveTaskInputs(repository, node);
     const packageFiles = yield* discoverFiles(
       repository,
@@ -539,11 +551,15 @@ export const hashTask = (
       { concurrency: 8 },
     );
     const globalSettings = activeGlobalSettings(repository);
-    const hashedEnvironment = selectEnvironment(environment, [
-      ...(globalSettings.env ?? []),
-      ...(node.definition.env ?? []),
-      ...(frameworkInference ? inferredEnvironmentPatterns(node) : []),
-    ]);
+    const hashedEnvironment = selectEnvironment(
+      environment,
+      [
+        ...(globalSettings.env ?? []),
+        ...(node.definition.env ?? []),
+        ...(frameworkInference ? inferredEnvironmentPatterns(node) : []),
+      ],
+      platform === "win32",
+    );
     const lockfilePath = yield* owningLockfile(repository, node);
     const lockfileHash =
       lockfilePath === undefined
@@ -635,17 +651,22 @@ export const taskEnvironment = (
   source: Readonly<Record<string, string | undefined>>,
   mode: "loose" | "strict",
   frameworkInference: boolean,
+  caseInsensitiveNames = false,
 ): Readonly<Record<string, string | undefined>> => {
   if (mode === "loose") {
     return source;
   }
   const globalSettings = activeGlobalSettings(repository);
-  return selectEnvironment(source, [
-    ...strictBaselineEnvironment,
-    ...(globalSettings.env ?? []),
-    ...(globalSettings.passThroughEnv ?? []),
-    ...(node.definition.env ?? []),
-    ...(node.definition.passThroughEnv ?? []),
-    ...(frameworkInference ? inferredEnvironmentPatterns(node) : []),
-  ]);
+  return selectEnvironment(
+    source,
+    [
+      ...strictBaselineEnvironment,
+      ...(globalSettings.env ?? []),
+      ...(globalSettings.passThroughEnv ?? []),
+      ...(node.definition.env ?? []),
+      ...(node.definition.passThroughEnv ?? []),
+      ...(frameworkInference ? inferredEnvironmentPatterns(node) : []),
+    ],
+    caseInsensitiveNames,
+  );
 };

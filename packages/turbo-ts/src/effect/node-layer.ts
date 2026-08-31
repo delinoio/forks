@@ -650,6 +650,7 @@ const processLayer = Layer.succeed(ProcessService, {
 const environmentLayer = Layer.succeed(EnvironmentService, {
   argv: Effect.sync(() => [...process.argv]),
   cwd: Effect.sync(() => process.cwd()),
+  platform: Effect.succeed(process.platform),
   get: (name) => Effect.sync(() => process.env[name]),
   entries: Effect.sync(() => ({ ...process.env })),
 });

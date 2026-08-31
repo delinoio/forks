@@ -528,6 +528,17 @@ describe("core repository model", () => {
     ).toEqual({ PATH: "/bin", PUBLIC_VALUE: "yes" });
   });
 
+  it("matches environment names case-insensitively only when requested", () => {
+    const environment = {
+      Path: "C:/Windows/System32",
+      SystemRoot: "C:/Windows",
+    };
+    expect(selectEnvironment(environment, ["PATH", "SYSTEMROOT"])).toEqual({});
+    expect(
+      selectEnvironment(environment, ["PATH", "SYSTEMROOT"], true),
+    ).toEqual({ Path: "C:/Windows/System32", SystemRoot: "C:/Windows" });
+  });
+
   it("preserves pass-through arguments as literal argv values", () => {
     const parsed = parseRunArguments([
       "run",

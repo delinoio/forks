@@ -27,24 +27,33 @@ export interface CacheRestoreScope {
 const comparablePath = (path: string): string =>
   /^[A-Za-z]:/.test(path) || path.startsWith("//") ? path.toLowerCase() : path;
 
-const isAllowedEntry = (
+const groupAllowsEntry = (
+  root: string,
+  destination: string,
+  group: CacheRestorePathGroup,
+  directoryEntry: boolean,
+): boolean => {
+  const directory = joinPath(root, group.directory);
+  const relative = relativePath(directory, destination);
+  const candidates = directoryEntry ? [relative, `${relative}/`] : [relative];
+  return (
+    isPathContained(root, directory) &&
+    isPathContained(directory, destination) &&
+    candidates.some(
+      (candidate) => selectByGlobs([candidate], group.patterns).length > 0,
+    )
+  );
+};
+
+const matchingAllowedGroups = (
   root: string,
   destination: string,
   groups: ReadonlyArray<CacheRestorePathGroup>,
   directoryEntry: boolean,
-): boolean =>
-  groups.some((group) => {
-    const directory = joinPath(root, group.directory);
-    const relative = relativePath(directory, destination);
-    const candidates = directoryEntry ? [relative, `${relative}/`] : [relative];
-    return (
-      isPathContained(root, directory) &&
-      isPathContained(directory, destination) &&
-      candidates.some(
-        (candidate) => selectByGlobs([candidate], group.patterns).length > 0,
-      )
-    );
-  });
+): ReadonlyArray<CacheRestorePathGroup> =>
+  groups.filter((group) =>
+    groupAllowsEntry(root, destination, group, directoryEntry),
+  );
 
 const prepareParentDirectory = (
   root: string,
@@ -108,6 +117,12 @@ export const restoreArchiveEntries = (
     for (const entry of entries) {
       const destination = joinPath(root, entry.path);
       const comparableDestination = comparablePath(destination);
+      const matchingGroups = matchingAllowedGroups(
+        root,
+        destination,
+        scope.allowedPathGroups,
+        entry.kind === "directory",
+      );
       if (!isPathContained(root, destination)) {
         return yield* Effect.fail(
           restoreError(destination, "archive path escapes repository"),
@@ -115,12 +130,7 @@ export const restoreArchiveEntries = (
       }
       if (
         !regularFileDestinations.has(comparableDestination) &&
-        !isAllowedEntry(
-          root,
-          destination,
-          scope.allowedPathGroups,
-          entry.kind === "directory",
-        )
+        matchingGroups.length === 0
       ) {
         return yield* Effect.fail(
           restoreError(
@@ -146,6 +156,28 @@ export const restoreArchiveEntries = (
           );
         }
         regularFileCounts.set(comparableDestination, count);
+      }
+      if (entry.kind === "symlink") {
+        const target = joinPath(parentPath(destination), entry.linkTarget);
+        if (!isPathContained(root, target)) {
+          return yield* Effect.fail(
+            restoreError(destination, "archive link target escapes repository"),
+          );
+        }
+        if (
+          !matchingGroups.some(
+            (group) =>
+              groupAllowsEntry(root, target, group, false) ||
+              groupAllowsEntry(root, target, group, true),
+          )
+        ) {
+          return yield* Effect.fail(
+            restoreError(
+              destination,
+              "archive symlink target is not a declared task output",
+            ),
+          );
+        }
       }
     }
     for (const [destination, count] of regularFileCounts) {

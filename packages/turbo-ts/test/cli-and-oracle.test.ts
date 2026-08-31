@@ -67,6 +67,7 @@ describe("CLI and external oracle", () => {
         Effect.provideService(EnvironmentService, {
           argv: Effect.succeed(["node", "turbo-ts", "watch", "--no-color"]),
           cwd: Effect.succeed(packageRoot),
+          platform: Effect.succeed(process.platform),
           get: () => Effect.succeed(undefined),
           entries: Effect.succeed({}),
         }),
