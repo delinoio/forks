@@ -18,6 +18,7 @@ import {
   nodeFoundationLayer,
 } from "../src/effect/node-layer.js";
 import {
+  CompressionService,
   HttpService,
   ProcessService,
   RandomnessService,
@@ -204,6 +205,56 @@ describe("Effect foundation", () => {
       );
       expect(response.status).toBe(200);
       expect(new TextDecoder().decode(response.body)).toBe("ok");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("bounds streamed HTTP responses and decompressed output", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200);
+      response.write("123");
+      response.end("45");
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    try {
+      const httpOutcome = await Effect.runPromise(
+        HttpService.pipe(
+          Effect.flatMap((http) =>
+            http.request({
+              url: `http://127.0.0.1:${address.port}`,
+              method: "GET",
+              maxResponseBodyBytes: 4,
+            }),
+          ),
+          Effect.either,
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(httpOutcome._tag).toBe("Left");
+      if (httpOutcome._tag === "Left") {
+        expect(httpOutcome.left.retryable).toBe(false);
+        expect(httpOutcome.left.message).toContain("4 byte limit");
+      }
+
+      const decompressionOutcome = await Effect.runPromise(
+        Effect.gen(function* () {
+          const compression = yield* CompressionService;
+          const compressed = yield* compression.compressZstd(
+            new TextEncoder().encode("12345"),
+          );
+          return yield* Effect.either(
+            compression.decompressZstd(compressed, 4),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(decompressionOutcome._tag).toBe("Left");
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }

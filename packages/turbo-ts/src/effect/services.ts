@@ -171,6 +171,7 @@ export interface HttpRequest {
   readonly headers?: Readonly<Record<string, string>>;
   readonly body?: Uint8Array | string;
   readonly timeoutMilliseconds?: number;
+  readonly maxResponseBodyBytes?: number;
 }
 
 export interface HttpResponse {
@@ -202,6 +203,7 @@ export interface CompressionOperations {
   ) => Effect.Effect<Uint8Array, BoundaryError>;
   readonly decompressZstd: (
     contents: Uint8Array,
+    maxOutputBytes?: number,
   ) => Effect.Effect<Uint8Array, BoundaryError>;
 }
 

@@ -36,6 +36,9 @@ const remoteError = (
 const isTransientStatus = (status: number): boolean =>
   status === 408 || status === 429 || (status >= 500 && status <= 599);
 
+const maximumRemoteArtifactBytes = 256 * 1024 * 1024;
+const maximumRemoteArchiveBytes = 1024 * 1024 * 1024;
+
 const artifactUrl = (options: RemoteCacheOptions, hash: string): string => {
   const url = new URL(options.apiUrl);
   url.pathname = `${url.pathname.replace(/\/+$/, "")}/v8/artifacts/${hash}`;
@@ -119,9 +122,12 @@ export const restoreRemoteCache = (
         method: "GET",
         headers: requestHeaders(options),
         timeoutMilliseconds: options.timeoutMilliseconds,
+        maxResponseBodyBytes: maximumRemoteArtifactBytes,
       })
       .pipe(
-        Effect.mapError((error) => remoteError(url, error.message, true)),
+        Effect.mapError((error) =>
+          remoteError(url, error.message, error.retryable),
+        ),
         Effect.flatMap((response) =>
           isTransientStatus(response.status)
             ? Effect.fail(
@@ -160,7 +166,7 @@ export const restoreRemoteCache = (
       }
     }
     const archive = yield* compression
-      .decompressZstd(response.body)
+      .decompressZstd(response.body, maximumRemoteArchiveBytes)
       .pipe(Effect.mapError((error) => remoteError(url, error.message)));
     let entries: ReadonlyArray<ArchiveEntry>;
     try {

@@ -17,7 +17,6 @@ import {
 import { RepositoryError } from "../effect/errors.js";
 import { FileSystemService, ProcessService } from "../effect/services.js";
 import type { Pipeline } from "../generated/configuration.js";
-import { type ParsedLockfile, parseLockfile } from "./lockfiles.js";
 
 export const packageManagerNames = [
   "npm",
@@ -74,7 +73,6 @@ export interface RepositoryModel {
   readonly rootConfiguration: LoadedRootConfiguration;
   readonly rootPackage: RepositoryPackage;
   readonly lockfile?: string;
-  readonly lockfileData?: ParsedLockfile;
   readonly packages: ReadonlyArray<RepositoryPackage>;
   readonly packagesByName: ReadonlyMap<string, RepositoryPackage>;
 }
@@ -82,6 +80,7 @@ export interface RepositoryModel {
 const workspaceTraversalIgnoredDirectories = new Set([
   ".git",
   ".turbo",
+  ".venv",
   "dist",
   "node_modules",
   "target",
@@ -478,6 +477,7 @@ interface CargoPackageMetadata {
   readonly dependencies: ReadonlyArray<CargoDependencyMetadata>;
   readonly dependencyNames: ReadonlyArray<string>;
   readonly entrypointNames: ReadonlyArray<string>;
+  readonly hasLibraryTarget: boolean;
   readonly targetDirectory?: string;
   readonly workspaceDirectory?: string;
 }
@@ -568,6 +568,15 @@ export const parseCargoMetadata = (
         ),
       ),
     ].sort(),
+    hasLibraryTarget: (packageMetadata.targets ?? []).some(
+      (target) =>
+        Array.isArray(target.kind) &&
+        target.kind.some(
+          (kind) =>
+            typeof kind === "string" &&
+            (kind === "lib" || kind === "proc-macro" || kind.endsWith("lib")),
+        ),
+    ),
     ...(typeof document.target_directory === "string"
       ? { targetDirectory: normalizePath(document.target_directory) }
       : {}),
@@ -716,7 +725,9 @@ const cargoTasks = (
           `${outputPrefix}/${name}.exe`,
         ]);
   const buildDefaults: Pipeline =
-    outputs.length === 0 ? { cache: false } : { outputs };
+    metadata?.hasLibraryTarget === true || outputs.length === 0
+      ? { cache: false }
+      : { outputs };
   const formatDefaults: Pipeline = { cache: false };
   const tasks: Record<string, Pipeline> = {
     ...configured,
@@ -1078,25 +1089,6 @@ export const discoverRepository = (
       manifest: rootManifest,
     };
     const lockfile = yield* findLockfile(root, managerIdentity.name);
-    let lockfileData: ParsedLockfile | undefined;
-    if (lockfile !== undefined) {
-      const fileSystem = yield* FileSystemService;
-      const contents = yield* fileSystem
-        .readBytes(lockfile)
-        .pipe(
-          Effect.mapError(
-            (error) =>
-              new RepositoryError({ path: lockfile, message: error.message }),
-          ),
-        );
-      try {
-        lockfileData = parseLockfile(lockfile, contents);
-      } catch (cause) {
-        return yield* Effect.fail(
-          new RepositoryError({ path: lockfile, message: String(cause) }),
-        );
-      }
-    }
     return {
       root,
       manager: managerIdentity.name,
@@ -1105,7 +1097,6 @@ export const discoverRepository = (
       rootConfiguration,
       rootPackage,
       lockfile,
-      lockfileData,
       packages,
       packagesByName: new Map<string, RepositoryPackage>([
         [rootPackage.name, rootPackage],

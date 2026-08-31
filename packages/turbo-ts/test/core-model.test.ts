@@ -37,6 +37,7 @@ import {
   packageManagerCommand,
   parseCacheSpecification,
   planCargoWorkspaceTasks,
+  takePersistentDisplayOutput,
   taskScopeEnvironment,
 } from "../src/run/engine.js";
 import { parseConcurrency, parseRunArguments } from "../src/run/options.js";
@@ -350,8 +351,87 @@ describe("core repository model", () => {
       dependencies: [{ name: "util" }],
       dependencyNames: ["util"],
       entrypointNames: ["app"],
+      hasLibraryTarget: false,
       targetDirectory: "/repo/target",
       workspaceDirectory: "/repo",
+    });
+  });
+
+  it("identifies mixed Cargo library and binary metadata", () => {
+    expect(
+      parseCargoMetadata(
+        JSON.stringify({
+          packages: [
+            {
+              name: "mixed",
+              manifest_path: "/repo/mixed/Cargo.toml",
+              targets: [
+                { kind: ["lib"], name: "mixed" },
+                { kind: ["bin"], name: "mixed-cli" },
+              ],
+            },
+          ],
+        }),
+        "/repo/mixed/Cargo.toml",
+      ),
+    ).toMatchObject({
+      entrypointNames: ["mixed-cli"],
+      hasLibraryTarget: true,
+    });
+  });
+
+  it("rejects unresolved with companions", () => {
+    const missingLocal = {
+      ...packageModel("app", []),
+      tasks: { build: { with: ["serve"] } },
+    } satisfies RepositoryPackage;
+    expect(() =>
+      buildTaskGraph(
+        repository([missingLocal]),
+        [missingLocal],
+        ["build"],
+        false,
+      ),
+    ).toThrow(/cannot resolve with task serve/);
+
+    const missingPackage = {
+      ...packageModel("app", []),
+      tasks: { build: { with: ["missing#dev"] } },
+    } satisfies RepositoryPackage;
+    expect(() =>
+      buildTaskGraph(
+        repository([missingPackage]),
+        [missingPackage],
+        ["build"],
+        false,
+      ),
+    ).toThrow(/cannot resolve with task missing#dev/);
+
+    const library = packageModel("library", []);
+    const missingTask = {
+      ...packageModel("app", []),
+      tasks: { build: { with: ["library#serve"] } },
+    } satisfies RepositoryPackage;
+    expect(() =>
+      buildTaskGraph(
+        repository([missingTask, library]),
+        [missingTask],
+        ["build"],
+        false,
+      ),
+    ).toThrow(/cannot resolve with task library#serve/);
+  });
+
+  it("bounds persistent output without a newline", () => {
+    const pending = "x".repeat(64 * 1024 + 7);
+    expect(takePersistentDisplayOutput(pending)).toEqual({
+      output: "x".repeat(64 * 1024),
+      remainder: "x".repeat(7),
+    });
+    expect(takePersistentDisplayOutput("partial")).toBeUndefined();
+    expect(takePersistentDisplayOutput("complete\npartial")).toEqual({
+      output: "complete\n",
+      remainder: "partial",
     });
   });
 

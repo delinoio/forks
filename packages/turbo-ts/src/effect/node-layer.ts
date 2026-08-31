@@ -764,6 +764,53 @@ const compressionError = (cause: unknown): BoundaryError =>
     retryable: false,
   });
 
+class HttpResponseBodyLimitError extends Error {}
+
+const readResponseBody = async (
+  response: Response,
+  maxBytes: number | undefined,
+): Promise<Uint8Array> => {
+  const contentLength = response.headers.get("content-length");
+  if (
+    maxBytes !== undefined &&
+    contentLength !== null &&
+    Number.isFinite(Number(contentLength)) &&
+    Number(contentLength) > maxBytes
+  ) {
+    await response.body?.cancel();
+    throw new HttpResponseBodyLimitError(
+      `HTTP response body exceeds the ${maxBytes} byte limit`,
+    );
+  }
+  if (response.body === null) return new Uint8Array();
+  const reader = response.body.getReader();
+  const chunks: Array<Uint8Array> = [];
+  let length = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      length += result.value.length;
+      if (maxBytes !== undefined && length > maxBytes) {
+        await reader.cancel();
+        throw new HttpResponseBodyLimitError(
+          `HTTP response body exceeds the ${maxBytes} byte limit`,
+        );
+      }
+      chunks.push(result.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return body;
+};
+
 const compressionLayer = Layer.succeed(CompressionService, {
   compressZstd: (contents) =>
     Effect.tryPromise({
@@ -771,10 +818,17 @@ const compressionLayer = Layer.succeed(CompressionService, {
         new Uint8Array(await promisify(zstdCompress)(Buffer.from(contents))),
       catch: compressionError,
     }),
-  decompressZstd: (contents) =>
+  decompressZstd: (contents, maxOutputBytes) =>
     Effect.tryPromise({
       try: async () =>
-        new Uint8Array(await promisify(zstdDecompress)(Buffer.from(contents))),
+        new Uint8Array(
+          await promisify(zstdDecompress)(
+            Buffer.from(contents),
+            maxOutputBytes === undefined
+              ? undefined
+              : { maxOutputLength: maxOutputBytes },
+          ),
+        ),
       catch: compressionError,
     }),
 });
@@ -809,7 +863,10 @@ const httpLayer = Layer.succeed(HttpService, {
           return {
             status: response.status,
             headers: Object.fromEntries(response.headers.entries()),
-            body: new Uint8Array(await response.arrayBuffer()),
+            body: await readResponseBody(
+              response,
+              request.maxResponseBodyBytes,
+            ),
           };
         } finally {
           if (timeout !== undefined) {
@@ -821,7 +878,7 @@ const httpLayer = Layer.succeed(HttpService, {
         new BoundaryError({
           boundary: "http",
           message: String(cause),
-          retryable: true,
+          retryable: !(cause instanceof HttpResponseBodyLimitError),
         }),
     }),
 });

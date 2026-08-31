@@ -122,18 +122,33 @@ const writeAtomically = (
     yield* fileSystem
       .makeDirectory(parentPath(path))
       .pipe(Effect.mapError((error) => cacheError(path, error.message)));
-    if (typeof contents === "string") {
-      yield* fileSystem
-        .writeText(temporary, contents)
-        .pipe(Effect.mapError((error) => cacheError(temporary, error.message)));
-    } else {
-      yield* fileSystem
-        .writeBytes(temporary, contents)
-        .pipe(Effect.mapError((error) => cacheError(temporary, error.message)));
-    }
-    yield* fileSystem
-      .rename(temporary, path)
-      .pipe(Effect.mapError((error) => cacheError(path, error.message)));
+    yield* Effect.acquireUseRelease(
+      Effect.succeed(temporary),
+      (temporaryPath) =>
+        Effect.gen(function* () {
+          if (typeof contents === "string") {
+            yield* fileSystem
+              .writeText(temporaryPath, contents)
+              .pipe(
+                Effect.mapError((error) =>
+                  cacheError(temporaryPath, error.message),
+                ),
+              );
+          } else {
+            yield* fileSystem
+              .writeBytes(temporaryPath, contents)
+              .pipe(
+                Effect.mapError((error) =>
+                  cacheError(temporaryPath, error.message),
+                ),
+              );
+          }
+          yield* fileSystem
+            .rename(temporaryPath, path)
+            .pipe(Effect.mapError((error) => cacheError(path, error.message)));
+        }),
+      (temporaryPath) => fileSystem.remove(temporaryPath).pipe(Effect.ignore),
+    );
   });
 
 const staleLockMilliseconds = 5 * 60 * 1_000;

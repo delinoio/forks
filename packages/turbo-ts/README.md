@@ -71,8 +71,14 @@ execution with a branded unsupported-compatibility diagnostic.
 Cargo builds that receive pass-through arguments selecting release, profile,
 target, another alternate artifact layout, or an unmodeled library, binary,
 example, test, or benchmark target execute without cache reads or writes until
-those outputs are modeled explicitly. Unfiltered Cargo workspace commands merge
-the effective environments of every grouped member.
+those outputs are modeled explicitly. Mixed library and binary crates also
+default to uncached because binary-only output declarations cannot restore all
+of Cargo's default artifacts. Unfiltered Cargo workspace commands merge the
+effective environments of every grouped member.
+
+Remote cache downloads are limited to 256 MiB compressed and 1 GiB after
+decompression. Artifacts beyond either limit are rejected and the task executes
+locally under the normal remote-restoration fallback.
 
 Configured cache directories may be inside or outside the repository, but the
 repository root and its ancestors are rejected because treating them as cache

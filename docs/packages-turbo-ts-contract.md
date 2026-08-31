@@ -80,23 +80,27 @@ from nested working directories, including explicit `--cwd` values. Only pnpm
 uses `pnpm-workspace.yaml`; other JavaScript managers use `package.json`
 workspaces. Every requested task must resolve before any task executes, and
 strict entrypoint selection removes configured tasks without an executable
-package script even when every selected entrypoint is commandless.
+package script even when every selected entrypoint is commandless. Every
+explicit `with` reference must resolve to an existing package task before its
+owner can execute.
 Package-level affected selection treats legacy `globalDependencies` and, when
 task-aware selection is disabled, `global.inputs` as repository-global inputs.
 Task-input selection uses the same effective global and task inputs as hashing,
 evaluates task owners before Git-range package narrowing, applies negative Git
 ranges after positive task matches, and includes `with` companions. Task hashes
 preserve Git symlink and dependency semantics, exclude the resolved cache
-directory, and use each task's owning ecosystem lockfile. Without Git, explicit
-task inputs under ordinary `dist` and `target` directories remain hashable.
+directory, and use each task's owning ecosystem lockfile. Repository discovery
+records the resolved root lockfile path without structurally parsing it;
+lockfile parsing and pruning remain Gate 3 work. Without Git, explicit task
+inputs under ordinary `dist` and `target` directories remain hashable.
 Cache directories equal to or containing the repository are rejected before
 cache access. Scheduled `with` groups preserve internal dependency order and
 share one run-wide foreground concurrency budget. Non-interactive persistent
 task output streams to the terminal and task log through bounded backpressure
-while retaining only a bounded diagnostic tail in memory. Persistent companions
-must remain alive until their foreground owners complete; any earlier natural
-exit fails the group, and foreground owners sharing a companion remain subject
-to the run's concurrency limit.
+while retaining only a bounded diagnostic tail and incomplete display line in
+memory. Persistent companions must remain alive until their foreground owners
+complete; any earlier natural exit fails the group, and foreground owners
+sharing a companion remain subject to the run's concurrency limit.
 
 Workspace task overrides merge with their effective package-qualified root
 definition and the merged task invariants are revalidated before execution.
@@ -105,16 +109,19 @@ list.
 Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
 reject malformed entries. Remote artifact routes preserve configured API path
 prefixes, remote restoration failures warn and fall back to task execution, and
-remote upload failures warn without changing a successful task outcome.
+remote upload failures warn without changing a successful task outcome. Remote
+downloads are limited to 256 MiB compressed and 1 GiB after decompression.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact log path before clearing or writing files.
 Companion task hashes participate in the owning task's cache key. Local eviction
 accepts week-based ages, runs before cache restoration only when local cache
 reads or writes are enabled, and counts archive and sidecar bytes, including
 orphaned sidecars. Cache archives use PAX extensions for paths beyond ustar
-limits. uv packages are discovered from the root
+limits, and interrupted or failed atomic writes remove their temporary files.
+uv packages are discovered from the root
 `pyproject.toml` workspace root and member globs after applying workspace
-exclusions; unrelated Python projects are ignored. Synthesized uv packages
+exclusions; unrelated Python projects and `.venv` trees are ignored.
+Synthesized uv packages
 expose `build` and `test`, and implicit builds default to uncached unless task
 configuration explicitly enables caching. uv tasks execute from their project
 directory, and `uv.lock` is parsed as TOML. JavaScript package-graph edges
@@ -128,9 +135,10 @@ metadata dependency path that resolves to the named member in the same
 workspace; registry and Git dependencies remain external. Cargo `run` and
 `dev` tasks are exposed only for binary crates, and pass-through arguments are
 forwarded to Cargo without an implicit target-argument separator. Cargo builds
-with pass-through arguments that select an alternate output layout or an
-unmodeled library, binary, example, test, or benchmark target bypass caching
-until those outputs are modeled explicitly.
+for mixed library and binary crates default to uncached. Builds with
+pass-through arguments that select an alternate output layout or an unmodeled
+library, binary, example, test, or benchmark target bypass caching until those
+outputs are modeled explicitly.
 
 Structured task input globs apply ordered inclusion and negation consistently
 to task hashing and task-aware affected selection. Task-aware Git filters

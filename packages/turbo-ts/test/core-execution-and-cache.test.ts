@@ -676,6 +676,23 @@ describe("core CLI execution", () => {
     }
   });
 
+  it("discovers repositories without parsing oversized lockfiles", async () => {
+    const directory = await makeFixture();
+    try {
+      const lockfilePath = `${directory}/pnpm-lock.yaml`;
+      await writeFile(lockfilePath, new Uint8Array(32 * 1024 * 1024 + 1));
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(model.lockfile).toBe(lockfilePath);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("links Cargo dependencies only when metadata resolves a workspace path", async () => {
     const directory = await makeFixture();
     try {
@@ -755,6 +772,7 @@ describe("core CLI execution", () => {
 
   it("reads uv project names and dependencies from their TOML sections", async () => {
     const directory = await makeFixture();
+    const virtualEnvironmentDirectory = `${directory}/.venv`;
     try {
       const configurationPath = `${directory}/turbo.json`;
       const configuration = JSON.parse(
@@ -784,6 +802,10 @@ describe("core CLI execution", () => {
       await mkdir(`${directory}/python/library`, { recursive: true });
       await mkdir(`${directory}/python/excluded`, { recursive: true });
       await mkdir(`${directory}/examples/unrelated`, { recursive: true });
+      if (process.platform !== "win32") {
+        await mkdir(virtualEnvironmentDirectory, { recursive: true });
+        await chmod(virtualEnvironmentDirectory, 0o000);
+      }
       await writeFile(
         `${directory}/python/app/pyproject.toml`,
         `[tool.uv]\n` +
@@ -863,6 +885,9 @@ describe("core CLI execution", () => {
         explicitlyCached.packagesByName.get("app")?.tasks.build,
       ).toMatchObject({ cache: true, outputs: ["dist/**"] });
     } finally {
+      if (process.platform !== "win32") {
+        await chmod(virtualEnvironmentDirectory, 0o700).catch(() => undefined);
+      }
       await rm(directory, { force: true, recursive: true });
     }
   });
@@ -1414,6 +1439,7 @@ describe("core CLI execution", () => {
         `${directory}/pnpm-workspace.yaml`,
         "packages:\n  - packages/*\n  - '!packages/legacy'\n",
       );
+      await writeFile(`${directory}/packages/app/Cargo.lock`, "version = 4\n");
       const result = await run(
         process.execPath,
         [candidateEntrypoint, "run", "build", "--no-cache"],
@@ -1423,6 +1449,8 @@ describe("core CLI execution", () => {
       expect(result.stdout).toContain("app build");
       expect(result.stdout).toContain("library build");
       expect(result.stdout).not.toContain("legacy build");
+      await rm(`${directory}/packages/app/Cargo.lock`);
+      await writeFile(`${directory}/packages/app/uv.lock`, "version = 1\n");
       const explicit = await run(
         process.execPath,
         [
@@ -1443,6 +1471,68 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("preserves non-ASCII changed paths in task-aware affected selection", async () => {
+    await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
+    const directory = await mkdtemp(
+      join(repositoryRoot, ".turbo/turbo-ts-unicode-affected-"),
+    );
+    await cp(fixtureRoot, directory, { recursive: true });
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, unknown>;
+      };
+      configuration.futureFlags = { affectedUsingTaskInputs: true };
+      configuration.tasks.build = { cache: false, inputs: ["café.txt"] };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const changedPath = `${packageDirectory}/café.txt`;
+      await writeFile(changedPath, "first\n");
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "fixture base"],
+      ]) {
+        const git = await run("git", args, directory);
+        expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
+      }
+      await writeFile(changedPath, "second\n");
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "unicode input"], directory))
+          .exitCode,
+      ).toBe(0);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--affected",
+          "--only",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("library build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
 
   it("hashes input links and restores output links from cache", async () => {
     if (process.platform === "win32") return;
@@ -2075,6 +2165,7 @@ describe("core CLI execution", () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/rust-tool`;
     const libraryDirectory = `${directory}/packages/rust-library`;
+    const mixedDirectory = `${directory}/packages/rust-mixed`;
     try {
       const configurationPath = `${directory}/turbo.json`;
       const configuration = JSON.parse(
@@ -2101,6 +2192,13 @@ describe("core CLI execution", () => {
         '[package]\nname = "synthetic-rust-library"\nversion = "0.1.0"\nedition = "2024"\n',
       );
       await writeFile(`${libraryDirectory}/src/lib.rs`, "pub fn value() {}\n");
+      await mkdir(`${mixedDirectory}/src`, { recursive: true });
+      await writeFile(
+        `${mixedDirectory}/Cargo.toml`,
+        '[package]\nname = "synthetic-rust-mixed"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(`${mixedDirectory}/src/main.rs`, "fn main() {}\n");
+      await writeFile(`${mixedDirectory}/src/lib.rs`, "pub fn value() {}\n");
       await cp(
         `${repositoryRoot}/rust-toolchain`,
         `${directory}/rust-toolchain`,
@@ -2128,6 +2226,9 @@ describe("core CLI execution", () => {
       );
       expect(
         model.packagesByName.get("synthetic-rust-library")?.tasks.build,
+      ).toMatchObject({ cache: false });
+      expect(
+        model.packagesByName.get("synthetic-rust-mixed")?.tasks.build,
       ).toMatchObject({ cache: false });
       expect(
         model.packagesByName.get("synthetic-rust-tool")?.tasks.format,
@@ -3452,6 +3553,42 @@ describe("core CLI execution", () => {
 });
 
 describe("cache interoperability and safety", () => {
+  it("cleans atomic-write temporaries after rename failure", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-temp-"));
+    const cacheDirectory = `${directory}/cache`;
+    const hash = "0102030405060708";
+    try {
+      await mkdir(`${cacheDirectory}/${hash}.tar.zst`, { recursive: true });
+      await expect(
+        Effect.runPromise(
+          writeLocalCache(
+            { directory: cacheDirectory },
+            hash,
+            [
+              {
+                path: "packages/app/out.txt",
+                contents: new TextEncoder().encode("cached"),
+                mode: 0o644,
+                modifiedSeconds: 1,
+              },
+            ],
+            1,
+          ).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).rejects.toThrow();
+      expect(
+        (await readdir(cacheDirectory)).filter((name) => name.endsWith(".tmp")),
+      ).toEqual([]);
+      expect(
+        (await readdir(cacheDirectory)).filter((name) =>
+          name.endsWith(".turbo-ts.lock"),
+        ),
+      ).toEqual([]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("counts cache sidecars and orphaned sidecars during size eviction", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-size-"));
     const cacheDirectory = `${directory}/cache`;

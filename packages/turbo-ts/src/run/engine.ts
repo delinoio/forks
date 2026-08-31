@@ -211,12 +211,10 @@ const repositoryRootMarkers = [
   "aube.lock",
   "bun.lock",
   "bun.lockb",
-  "Cargo.lock",
   "nub.lock",
   "package-lock.json",
   "pnpm-lock.yaml",
   "pnpm-workspace.yaml",
-  "uv.lock",
   "yarn.lock",
 ] as const;
 
@@ -491,6 +489,7 @@ const findAffectedPackages = (
               "diff",
               "--no-renames",
               "--name-only",
+              "-z",
               `${baseReference}...${head}`,
             ],
             cwd: repository.root,
@@ -531,7 +530,7 @@ const findAffectedPackages = (
         rootChanged: true,
       };
     }
-    const changedFiles = result.right.stdout.split(/\r?\n/).filter(Boolean);
+    const changedFiles = result.right.stdout.split("\0").filter(Boolean);
     const globalDependencyPatterns =
       repository.rootConfiguration.value.futureFlags?.globalConfiguration ===
       true
@@ -1110,7 +1109,29 @@ type TaskOutputQueueEvent =
   | { readonly kind: "end" };
 
 const persistentOutputCaptureCharacters = 64 * 1024;
+const persistentDisplayBufferCharacters = 64 * 1024;
 const persistentOutputQueueCapacity = 16;
+
+export const takePersistentDisplayOutput = (
+  pending: string,
+): { readonly output: string; readonly remainder: string } | undefined => {
+  const lastLineBreak = pending.lastIndexOf(
+    "\n",
+    persistentDisplayBufferCharacters - 1,
+  );
+  const flushLength =
+    lastLineBreak !== -1
+      ? lastLineBreak + 1
+      : pending.length >= persistentDisplayBufferCharacters
+        ? persistentDisplayBufferCharacters
+        : 0;
+  return flushLength === 0
+    ? undefined
+    : {
+        output: pending.slice(0, flushLength),
+        remainder: pending.slice(flushLength),
+      };
+};
 
 const cargoAlternateOutputFlags = [
   "--artifact-dir",
@@ -1367,23 +1388,21 @@ const executeTask = (
                   yield* fileSystem.appendText(logPath, event.output);
                   if (!displaysPersistentOutput) continue;
                   pendingDisplay += event.output;
-                  const lastLineBreak = pendingDisplay.lastIndexOf("\n");
-                  if (lastLineBreak === -1) continue;
-                  const completeLines = pendingDisplay.slice(
-                    0,
-                    lastLineBreak + 1,
-                  );
-                  pendingDisplay = pendingDisplay.slice(lastLineBreak + 1);
-                  yield* terminal.writeStdout(
-                    renderLogEvent(
-                      {
-                        kind: "task-output",
-                        task: taskLabel,
-                        output: completeLines,
-                      },
-                      color,
-                    ),
-                  );
+                  while (pendingDisplay !== "") {
+                    const display = takePersistentDisplayOutput(pendingDisplay);
+                    if (display === undefined) break;
+                    pendingDisplay = display.remainder;
+                    yield* terminal.writeStdout(
+                      renderLogEvent(
+                        {
+                          kind: "task-output",
+                          task: taskLabel,
+                          output: display.output,
+                        },
+                        color,
+                      ),
+                    );
+                  }
                 }
               }),
             );

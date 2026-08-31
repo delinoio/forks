@@ -219,14 +219,30 @@ export const buildTaskGraph = (
         }
       }
     }
-    const withIds = (definition.with ?? []).flatMap((reference) =>
-      resolveTaskReference(repository, packageModel, reference).flatMap(
-        ([withPackage, withTask]) => {
-          const withId = addNode(withPackage, withTask);
-          return withId === undefined ? [] : [withId];
-        },
-      ),
-    );
+    const withIds: Array<string> = [];
+    for (const reference of definition.with ?? []) {
+      const companions = resolveTaskReference(
+        repository,
+        packageModel,
+        reference,
+      );
+      if (companions.length === 0) {
+        throw new GraphError({
+          task: id,
+          message: `${id} cannot resolve with task ${reference}`,
+        });
+      }
+      for (const [withPackage, withTask] of companions) {
+        const withId = addNode(withPackage, withTask);
+        if (withId === undefined) {
+          throw new GraphError({
+            task: id,
+            message: `${id} cannot resolve with task ${reference}`,
+          });
+        }
+        withIds.push(withId);
+      }
+    }
     nodes.set(id, {
       id,
       package: packageModel,
