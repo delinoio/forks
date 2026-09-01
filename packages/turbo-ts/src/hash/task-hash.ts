@@ -14,8 +14,14 @@ import {
   ProcessService,
 } from "../effect/services.js";
 import type { TaskNode } from "../graph/task-graph.js";
-import type { RepositoryModel } from "../repository/model.js";
-import { listRepositoryFiles } from "../repository/model.js";
+import type {
+  PackageManagerName,
+  RepositoryModel,
+} from "../repository/model.js";
+import {
+  listRepositoryFiles,
+  lockfileNamesByManager,
+} from "../repository/model.js";
 import { xxhash64Hex } from "./xxhash64.js";
 
 const compareCodeUnits = (left: string, right: string): number =>
@@ -257,6 +263,35 @@ const ancestorDirectories = (
   return directories;
 };
 
+type JavaScriptPackageManagerName = Exclude<PackageManagerName, "cargo" | "uv">;
+
+const repositoryControlNamesByJavaScriptManager = {
+  npm: [],
+  pnpm: ["pnpm-workspace.yaml", ".pnpmfile.cjs"],
+  yarn: [".yarnrc", ".yarnrc.yml"],
+  bun: ["bunfig.toml"],
+  aube: ["aube-workspace.yaml", ".config/aube/config.toml"],
+  nub: ["nub.jsonc"],
+} as const satisfies Readonly<
+  Record<JavaScriptPackageManagerName, ReadonlyArray<string>>
+>;
+
+const repositoryPackageManagerControlInputCandidates = (
+  repository: RepositoryModel,
+  node: TaskNode,
+): ReadonlyArray<string> => {
+  if (node.package.manager === "cargo" || node.package.manager === "uv") {
+    return [];
+  }
+  const manager = repository.manager;
+  if (manager === "cargo" || manager === "uv") return [];
+  return [
+    "package.json",
+    ".npmrc",
+    ...repositoryControlNamesByJavaScriptManager[manager],
+  ].map((name) => joinPath(repository.root, name));
+};
+
 const cargoControlInputCandidates = (
   repository: RepositoryModel,
   node: TaskNode,
@@ -292,7 +327,9 @@ const owningLockfileCandidates = (
       (directory) => joinPath(directory, "uv.lock"),
     );
   }
-  return repository.lockfile === undefined ? [] : [repository.lockfile];
+  return lockfileNamesByManager[repository.manager].map((name) =>
+    joinPath(repository.root, name),
+  );
 };
 
 const gitLiteralPathspecEnvironment = {
@@ -394,6 +431,7 @@ export const implicitTaskInputCandidates = (
         ]),
     ...owningLockfileCandidates(repository, node),
     ...cargoControlInputCandidates(repository, node),
+    ...repositoryPackageManagerControlInputCandidates(repository, node),
   ]),
 ];
 
@@ -405,7 +443,10 @@ const alwaysHashedControlInputCandidates = (
     ? cargoControlInputCandidates(repository, node)
     : node.package.manager === "uv"
       ? [joinPath(node.package.directory, "pyproject.toml")]
-      : [joinPath(node.package.directory, "package.json")];
+      : [
+          joinPath(node.package.directory, "package.json"),
+          ...repositoryPackageManagerControlInputCandidates(repository, node),
+        ];
 
 const alwaysHashedControlInputFiles = (
   repository: RepositoryModel,

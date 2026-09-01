@@ -416,7 +416,11 @@ const resolveOptions = (
       label: string,
     ): number => {
       const seconds = Number(input);
-      if (!Number.isFinite(seconds) || seconds < 0) {
+      if (
+        (typeof input === "string" && input.trim() === "") ||
+        !Number.isFinite(seconds) ||
+        seconds < 0
+      ) {
         throw new ConfigurationError({
           path,
           message: `invalid ${label}: ${String(input)}`,
@@ -1387,7 +1391,10 @@ const usesAlternateUvBuildOutputs = (
   node.package.manager === "uv" &&
   node.task === "build" &&
   passThroughArguments.some(
-    (argument) => argument === "--out-dir" || argument.startsWith("--out-dir="),
+    (argument) =>
+      argument === "-o" ||
+      argument === "--out-dir" ||
+      argument.startsWith("--out-dir="),
   );
 
 const usesEnvironmentCargoBuildTarget = (

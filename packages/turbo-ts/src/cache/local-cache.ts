@@ -96,7 +96,7 @@ export const restoreLocalCache = (
 ): Effect.Effect<
   boolean,
   CacheError | CacheRollbackError,
-  FileSystemService | CompressionService
+  FileSystemService | CompressionService | ClockService | RandomnessService
 > =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -110,89 +110,104 @@ export const restoreLocalCache = (
     if (!exists) {
       return false;
     }
-    const outcome = yield* Effect.either(
+    return yield* withEntryLock(
+      options,
+      hash,
       Effect.gen(function* () {
-        const metadata = yield* fileSystem
-          .metadata(paths.archive)
+        const stillExists = yield* fileSystem
+          .exists(paths.archive)
           .pipe(
             Effect.mapError((error) =>
               cacheError(paths.archive, error.message),
             ),
           );
-        if (
-          metadata.kind !== "file" ||
-          metadata.size > maximumCacheArtifactBytes
-        ) {
-          return yield* Effect.fail(
-            cacheError(
-              paths.archive,
-              `local cache artifact exceeds the ${maximumCacheArtifactBytes} byte limit`,
-            ),
-          );
-        }
-        yield* fileSystem
-          .withTemporaryDirectory((directory) => {
-            const archivePath = joinPath(directory, "local-cache.tar");
-            return compression
-              .decompressZstdFileToFile(
-                paths.archive,
-                archivePath,
-                maximumCacheArchiveBytes,
-              )
+        if (!stillExists) return false;
+        const outcome = yield* Effect.either(
+          Effect.gen(function* () {
+            const metadata = yield* fileSystem
+              .metadata(paths.archive)
               .pipe(
                 Effect.mapError((error) =>
                   cacheError(paths.archive, error.message),
                 ),
-                Effect.flatMap(() => parseTarArchiveFile(archivePath)),
-                Effect.flatMap((entries) =>
-                  restoreArchiveEntries(
-                    root,
-                    entries,
-                    scope,
-                    fileSystem
-                      .remove(directory)
-                      .pipe(
-                        Effect.mapError((error) =>
-                          cacheError(
-                            paths.archive,
-                            `temporary archive cleanup failed: ${error.message}`,
-                          ),
-                        ),
-                      ),
-                  ),
+              );
+            if (
+              metadata.kind !== "file" ||
+              metadata.size > maximumCacheArtifactBytes
+            ) {
+              return yield* Effect.fail(
+                cacheError(
+                  paths.archive,
+                  `local cache artifact exceeds the ${maximumCacheArtifactBytes} byte limit`,
                 ),
               );
-          })
-          .pipe(
-            Effect.mapError((error) =>
-              error._tag === "CacheError" || error._tag === "CacheRollbackError"
-                ? error
-                : cacheError(paths.archive, error.message),
-            ),
-          );
-      }),
-    );
-    if (outcome._tag === "Left") {
-      const cleanup = yield* Effect.either(
-        removeEntry(options.directory, hash),
-      );
-      if (
-        cleanup._tag === "Left" &&
-        outcome.left._tag === "CacheRollbackError"
-      ) {
-        return yield* Effect.fail(
-          new CacheRollbackError({
-            path: outcome.left.path,
-            message: `${outcome.left.message}; ${cleanup.left.message}`,
+            }
+            yield* fileSystem
+              .withTemporaryDirectory((directory) => {
+                const archivePath = joinPath(directory, "local-cache.tar");
+                return compression
+                  .decompressZstdFileToFile(
+                    paths.archive,
+                    archivePath,
+                    maximumCacheArchiveBytes,
+                  )
+                  .pipe(
+                    Effect.mapError((error) =>
+                      cacheError(paths.archive, error.message),
+                    ),
+                    Effect.flatMap(() => parseTarArchiveFile(archivePath)),
+                    Effect.flatMap((entries) =>
+                      restoreArchiveEntries(
+                        root,
+                        entries,
+                        scope,
+                        fileSystem
+                          .remove(directory)
+                          .pipe(
+                            Effect.mapError((error) =>
+                              cacheError(
+                                paths.archive,
+                                `temporary archive cleanup failed: ${error.message}`,
+                              ),
+                            ),
+                          ),
+                      ),
+                    ),
+                  );
+              })
+              .pipe(
+                Effect.mapError((error) =>
+                  error._tag === "CacheError" ||
+                  error._tag === "CacheRollbackError"
+                    ? error
+                    : cacheError(paths.archive, error.message),
+                ),
+              );
           }),
         );
-      }
-      if (cleanup._tag === "Left") {
-        return yield* Effect.fail(cleanup.left);
-      }
-      return yield* Effect.fail(outcome.left);
-    }
-    return true;
+        if (outcome._tag === "Left") {
+          const cleanup = yield* Effect.either(
+            removeEntry(options.directory, hash),
+          );
+          if (
+            cleanup._tag === "Left" &&
+            outcome.left._tag === "CacheRollbackError"
+          ) {
+            return yield* Effect.fail(
+              new CacheRollbackError({
+                path: outcome.left.path,
+                message: `${outcome.left.message}; ${cleanup.left.message}`,
+              }),
+            );
+          }
+          if (cleanup._tag === "Left") {
+            return yield* Effect.fail(cleanup.left);
+          }
+          return yield* Effect.fail(outcome.left);
+        }
+        return true;
+      }),
+    );
   });
 
 const writeAtomically = (

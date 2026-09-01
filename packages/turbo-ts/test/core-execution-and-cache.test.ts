@@ -73,6 +73,7 @@ import {
   makeCachePublicationPermit,
   packageManagerCommand,
   planCargoWorkspaceTasks,
+  taskIdsWithUnrestorableCacheInputs,
 } from "../src/run/engine.js";
 import { parseRunArguments } from "../src/run/options.js";
 
@@ -2231,6 +2232,8 @@ describe("core CLI execution", () => {
         );
       const first = await compute();
       expect(first.inputFiles).toEqual([
+        "$TURBO_ROOT$/package.json",
+        "$TURBO_ROOT$/pnpm-workspace.yaml",
         "dist/schema/value.json",
         "package.json",
         "target/generated/value.txt",
@@ -2285,6 +2288,8 @@ describe("core CLI execution", () => {
         ),
       );
       expect(result.inputFiles).toEqual([
+        "$TURBO_ROOT$/package.json",
+        "$TURBO_ROOT$/pnpm-workspace.yaml",
         "package.json",
         "z-input.txt",
         "ä-input.txt",
@@ -2337,6 +2342,56 @@ describe("core CLI execution", () => {
       ) as Record<string, unknown>;
       manifest.type = "module";
       await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      expect((await compute()).hash).not.toBe(before.hash);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("hashes repository package-manager controls independently of task globs", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const npmConfigurationPath = `${directory}/.npmrc`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["src/**"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${packageDirectory}/src`, { recursive: true });
+      await writeFile(`${packageDirectory}/src/input.js`, "export {};\n");
+      await writeFile(npmConfigurationPath, "script-shell=/bin/sh\n");
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      const compute = () =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const before = await compute();
+      expect(before.inputFiles).toEqual(
+        expect.arrayContaining([
+          "$TURBO_ROOT$/.npmrc",
+          "$TURBO_ROOT$/package.json",
+          "$TURBO_ROOT$/pnpm-workspace.yaml",
+          "package.json",
+          "src/input.js",
+        ]),
+      );
+      await writeFile(npmConfigurationPath, "script-shell=/bin/bash\n");
       expect((await compute()).hash).not.toBe(before.hash);
     } finally {
       await rm(directory, { force: true, recursive: true });
@@ -2840,6 +2895,58 @@ describe("core CLI execution", () => {
     } finally {
       await rm(linkedRoot, { force: true });
       await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
+  it("disables Cargo cache scopes for ancestor configuration outside the repository", async () => {
+    const outer = await mkdtemp(join(tmpdir(), "turbo-ts-cargo-config-"));
+    const directory = `${outer}/repository`;
+    const packageDirectory = `${directory}/packages/rust-tool`;
+    try {
+      await cp(fixtureRoot, directory, { recursive: true });
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { futureFlags?: Record<string, boolean> };
+      configuration.futureFlags = { experimentalCargoWorkspaces: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${outer}/.cargo`, { recursive: true });
+      await writeFile(
+        `${outer}/.cargo/config.toml`,
+        '[build]\nrustflags = ["--cfg", "external_parent"]\n',
+      );
+      await mkdir(`${packageDirectory}/src`, { recursive: true });
+      await writeFile(
+        `${packageDirectory}/Cargo.toml`,
+        '[package]\nname = "rust-tool"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(
+        `${packageDirectory}/Cargo.lock`,
+        'version = 4\n\n[[package]]\nname = "rust-tool"\nversion = "0.1.0"\n',
+      );
+      await writeFile(`${packageDirectory}/src/lib.rs`, "pub fn value() {}\n");
+      await cp(
+        `${repositoryRoot}/rust-toolchain`,
+        `${directory}/rust-toolchain`,
+      );
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const cargoPackage = model.packagesByName.get("rust-tool")!;
+      expect(cargoPackage.workspaceDirectory).toBe(packageDirectory);
+      expect(cargoPackage.cacheInputsComplete).toBe(false);
+      const graph = buildTaskGraph(model, [cargoPackage], ["test"], false);
+      expect(taskIdsWithUnrestorableCacheInputs(graph)).toContain(
+        "rust-tool#test",
+      );
+    } finally {
+      await rm(outer, { force: true, recursive: true });
     }
   }, 20_000);
 
@@ -3756,6 +3863,8 @@ describe("core CLI execution", () => {
         );
       const initial = await compute();
       expect(initial.inputFiles).toEqual([
+        "$TURBO_ROOT$/package.json",
+        "$TURBO_ROOT$/pnpm-workspace.yaml",
         "input.txt",
         "package.json",
         "vendor",
@@ -7018,6 +7127,7 @@ describe("core CLI execution", () => {
         `${JSON.stringify(rootManifest, null, 2)}\n`,
       );
       await writeFile(`${directory}/packages/library/README.md`, "first\n");
+      await writeFile(`${directory}/.npmrc`, "script-shell=/bin/sh\n");
       await writeFile(
         `${directory}/pnpm-lock.yaml`,
         "lockfileVersion: '9.0'\nrevision: 1\n",
@@ -7110,6 +7220,35 @@ describe("core CLI execution", () => {
       expect(matchingRootResult.exitCode).toBe(0);
       expect(matchingRootResult.stdout).toContain("root readme affected check");
 
+      await writeFile(`${directory}/.npmrc`, "script-shell=/bin/bash\n");
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      expect(
+        (
+          await run(
+            "git",
+            ["commit", "-m", "package manager config"],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      const managerConfigurationResult = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--affected",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(managerConfigurationResult.exitCode).toBe(0);
+      expect(managerConfigurationResult.stdout).toContain("library build");
+      expect(managerConfigurationResult.stdout).toContain("app build");
+
       await writeFile(
         `${directory}/pnpm-lock.yaml`,
         "lockfileVersion: '9.0'\nrevision: 2\n",
@@ -7135,6 +7274,30 @@ describe("core CLI execution", () => {
       expect(lockfileResult.exitCode).toBe(0);
       expect(lockfileResult.stdout).toContain("library build");
       expect(lockfileResult.stdout).toContain("app build");
+
+      await rm(`${directory}/pnpm-lock.yaml`);
+      expect((await run("git", ["add", "-A"], directory)).exitCode).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "remove lockfile"], directory))
+          .exitCode,
+      ).toBe(0);
+      const deletedLockfileResult = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--affected",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(deletedLockfileResult.exitCode).toBe(0);
+      expect(deletedLockfileResult.stdout).toContain("library build");
+      expect(deletedLockfileResult.stdout).toContain("app build");
 
       await writeFile(
         `${directory}/packages/library/source.txt`,
@@ -8520,6 +8683,105 @@ describe("cache interoperability and safety", () => {
         lstat(`${cacheDirectory}/0123456789abcdef.tar.zst`),
       ).rejects.toThrow();
     } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("serializes corrupt-entry cleanup with active cache writers", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-cleanup-"));
+    const cacheDirectory = `${directory}/cache`;
+    const hash = "1020304050607080";
+    const archivePath = `${cacheDirectory}/${hash}.tar.zst`;
+    const entry = {
+      path: "packages/app/out.txt",
+      contents: new TextEncoder().encode("new cache entry\n"),
+      mode: 0o644,
+      modifiedSeconds: 1,
+    };
+    let markDecompressionStarted: (() => void) | undefined;
+    const decompressionStarted = new Promise<void>((resolve) => {
+      markDecompressionStarted = resolve;
+    });
+    let releaseDecompression: (() => void) | undefined;
+    const decompressionRelease = new Promise<void>((resolve) => {
+      releaseDecompression = resolve;
+    });
+    try {
+      await mkdir(cacheDirectory, { recursive: true });
+      await writeFile(archivePath, "corrupt");
+      await writeFile(
+        `${cacheDirectory}/${hash}-manifest.json`,
+        "old manifest",
+      );
+      await writeFile(`${cacheDirectory}/${hash}-meta.json`, "old metadata");
+      const restore = Effect.runPromise(
+        Effect.gen(function* () {
+          const compression = yield* CompressionService;
+          const blockedCompressionLayer = Layer.succeed(CompressionService, {
+            ...compression,
+            decompressZstdFileToFile: () => {
+              markDecompressionStarted?.();
+              return Effect.promise(() => decompressionRelease).pipe(
+                Effect.zipRight(
+                  Effect.fail(
+                    new BoundaryError({
+                      boundary: "compression",
+                      message: "synthetic corrupt archive",
+                      retryable: false,
+                    }),
+                  ),
+                ),
+              );
+            },
+          });
+          return yield* restoreLocalCache(
+            directory,
+            { directory: cacheDirectory },
+            hash,
+            allowCachePaths("**"),
+          ).pipe(Effect.provide(blockedCompressionLayer));
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      await decompressionStarted;
+      let writerSettled = false;
+      const writer = Effect.runPromise(
+        writeLocalCache({ directory: cacheDirectory }, hash, [entry], 1).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      ).finally(() => {
+        writerSettled = true;
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 75));
+      expect(writerSettled).toBe(false);
+      releaseDecompression?.();
+      await expect(restore).rejects.toThrow(/synthetic corrupt archive/);
+      await writer;
+      expect(
+        await Effect.runPromise(
+          restoreLocalCache(
+            directory,
+            { directory: cacheDirectory },
+            hash,
+            allowCachePaths("**"),
+          ).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).toBe(true);
+      expect(await readFile(`${directory}/${entry.path}`, "utf8")).toBe(
+        "new cache entry\n",
+      );
+      expect(
+        (await readdir(cacheDirectory))
+          .filter((name) => name.startsWith(hash))
+          .sort(),
+      ).toEqual(
+        [
+          `${hash}-manifest.json`,
+          `${hash}-meta.json`,
+          `${hash}.tar.zst`,
+        ].sort(),
+      );
+    } finally {
+      releaseDecompression?.();
       await rm(directory, { force: true, recursive: true });
     }
   });
@@ -10336,7 +10598,7 @@ describe("cache interoperability and safety", () => {
           "invalid remote cache URL",
         );
       }
-      for (const value of ["nonnumeric", "-1", "Infinity"]) {
+      for (const value of ["", "   ", "nonnumeric", "-1", "Infinity"]) {
         await expectConfigurationFailure(
           baseArguments,
           {
@@ -10346,14 +10608,16 @@ describe("cache interoperability and safety", () => {
           "invalid remote cache timeout",
         );
       }
-      await expectConfigurationFailure(
-        [...baseArguments.slice(0, -1), "--cache=remote:w"],
-        {
-          TURBO_API: "http://127.0.0.1:9",
-          TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: "nonnumeric",
-        },
-        "invalid remote cache upload timeout",
-      );
+      for (const value of ["", "   ", "nonnumeric"]) {
+        await expectConfigurationFailure(
+          [...baseArguments.slice(0, -1), "--cache=remote:w"],
+          {
+            TURBO_API: "http://127.0.0.1:9",
+            TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: value,
+          },
+          "invalid remote cache upload timeout",
+        );
+      }
       const configurationPath = `${directory}/turbo.json`;
       const configuration = JSON.parse(
         await readFile(configurationPath, "utf8"),

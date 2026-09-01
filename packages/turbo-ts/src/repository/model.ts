@@ -277,7 +277,7 @@ const discoverManager = (
     return { name: "npm" };
   });
 
-const lockfilesByManager: Readonly<
+export const lockfileNamesByManager: Readonly<
   Record<PackageManagerName, ReadonlyArray<string>>
 > = {
   npm: ["package-lock.json", "npm-shrinkwrap.json"],
@@ -308,7 +308,7 @@ const findLockfile = (
 ): Effect.Effect<string | undefined, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
-    for (const name of lockfilesByManager[manager]) {
+    for (const name of lockfileNamesByManager[manager]) {
       const path = joinPath(root, name);
       const exists = yield* fileSystem
         .exists(path)
@@ -1013,6 +1013,26 @@ const cargoConfigurationPath = (
     return path;
   });
 
+const cargoConfigurationOutsideRepositoryPresent = (
+  root: string,
+): Effect.Effect<boolean, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const normalizedRoot = normalizePath(root);
+    let current = parentPath(normalizedRoot);
+    if (current === normalizedRoot) return false;
+    while (true) {
+      if (
+        (yield* cargoConfigurationPath(joinPath(current, ".cargo"))) !==
+        undefined
+      ) {
+        return true;
+      }
+      const parent = parentPath(current);
+      if (parent === current) return false;
+      current = parent;
+    }
+  });
+
 const cargoConfigurationBuildTargetConfigured = (
   configurationDirectory: string,
 ): Effect.Effect<boolean, RepositoryError, FileSystemService> =>
@@ -1571,6 +1591,10 @@ export const discoverRepository = (
         .filter((owners) => owners.size > 1)
         .flatMap((owners) => [...owners]),
     );
+    const externalCargoConfigurationPresent =
+      cargoPackages.size === 0
+        ? false
+        : yield* cargoConfigurationOutsideRepositoryPresent(root);
     const cargoDrafts: ReadonlyArray<RepositoryPackageDraft> =
       yield* Effect.forEach(
         [...cargoPackages.values()].sort((left, right) =>
@@ -1610,7 +1634,9 @@ export const discoverRepository = (
                 root,
                 directory,
               ),
-              cacheInputsComplete: metadata.workspaceDirectory !== undefined,
+              cacheInputsComplete:
+                metadata.workspaceDirectory !== undefined &&
+                !externalCargoConfigurationPresent,
               workspaceDirectory: metadata.workspaceDirectory,
               manager: "cargo" as const,
               scripts: polyglotScripts("cargo", metadata.entrypointNames),

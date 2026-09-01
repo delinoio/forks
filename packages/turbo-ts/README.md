@@ -74,7 +74,9 @@ does not resolve to a discovered JavaScript package disables caching for the
 declaring package and downstream hash scopes. JavaScript task hashes always
 include their owning `package.json`, independently of configured task globs.
 When that manifest is a symlink, its task hash includes both the link and the
-resolved contents consumed during discovery and execution.
+resolved contents consumed during discovery and execution. Repository-level
+package-manager controls and expected lockfile paths also remain task-aware
+inputs, including when the active lockfile is deleted.
 Enabled JavaScript, Cargo, and uv discovery passes retain co-located package
 scopes in the same workspace directory. Repository-root Cargo and uv scopes do
 not absorb ordinary root files during package-level affected selection.
@@ -87,36 +89,39 @@ cache reads or writes until those outputs are modeled explicitly. Pass-through
 external configuration paths are not task-hash inputs. Mismatched metadata/task
 `CARGO_TARGET_DIR` values also disable Cargo build caching. Any effective
 Cargo-home configuration or `CARGO_BUILD_TARGET` likewise disables every
-cacheable Cargo compilation task. Mixed library and binary crates default to
-uncached because binary-only output declarations cannot restore all of Cargo's
-default artifacts. Source-free local path dependencies that do not resolve to a
-same-workspace repository package also disable caching. Synthesized binary
-outputs cover the extensionless executable plus `.exe` and `.pdb` variants.
-Single-binary Cargo `run` and `dev` tasks also default to uncached
-unless task configuration explicitly enables caching. Repository-root Cargo
-packages reuse the loaded root task configuration. Unfiltered Cargo workspace
-commands merge the effective environments of every grouped member and remain
-package-scoped when any repository member excludes the requested verification
-task.
+cacheable Cargo compilation task. Cargo configuration above the repository
+disables the affected Cargo and downstream cache scopes. Mixed library and
+binary crates default to uncached because binary-only output declarations
+cannot restore all of Cargo's default artifacts. Source-free local path
+dependencies that do not resolve to a same-workspace repository package also
+disable caching. Synthesized binary outputs cover the extensionless executable
+plus `.exe` and `.pdb` variants. Single-binary Cargo `run` and `dev` tasks also
+default to uncached unless task configuration explicitly enables caching.
+Repository-root Cargo packages reuse the loaded root task configuration.
+Unfiltered Cargo workspace commands merge the effective environments of every
+grouped member and remain package-scoped when any repository member excludes
+the requested verification task.
 
 Local and remote cache restoration is limited to 256 MiB compressed and 1 GiB
 after decompression. Artifacts beyond either limit are rejected; invalid local
 entries are removed with a warning and become misses, while remote entries use
 the normal local-execution fallback. Existing-output scan failures likewise
 warn and execute the task locally without cache reads. Decompressed archives
-are parsed from scoped temporary storage, and cache writes independently limit
-file content and tar metadata overhead to 64 MiB each. Cache output files are
-read sequentially against the remaining content budget, so growth after a
-metadata snapshot cannot exceed the collection bound. Cache publication is
-serialized within a run to bound writer memory independently of task
-concurrency. Remote downloads, signature verification, and decompression use
-scoped files so concurrent cache hits do not retain or duplicate complete
-compressed response bodies in memory. Local execution rejects symlinked
-task-log directories and exact log destinations before starting the task, and
-replaces existing regular log files before writing so hard links cannot
-redirect truncation. On Windows, scoped process tracking retains descendant
-identities after command wrappers exit so finalization can terminate detached
-task processes.
+are parsed from scoped temporary storage. Local restore validation and rejected
+entry cleanup share the entry lock with writers, so corrupt cleanup cannot
+remove a concurrent publication. Cache writes independently limit file content
+and tar metadata overhead to 64 MiB each. Cache output files are read
+sequentially against the remaining content budget, so growth after a metadata
+snapshot cannot exceed the collection bound. Cache publication is serialized
+within a run to bound writer memory independently of task concurrency. Remote
+downloads, signature verification, and decompression use scoped files so
+concurrent cache hits do not retain or duplicate complete compressed response
+bodies in memory. Blank remote-cache timeout values are invalid. Local
+execution rejects symlinked task-log directories and exact log destinations
+before starting the task, and replaces existing regular log files before
+writing so hard links cannot redirect truncation. On Windows, scoped process
+tracking retains descendant identities after command wrappers exit so
+finalization can terminate detached task processes.
 
 Configured cache directories may be inside or outside the repository, but the
 repository root, its ancestors, and directories containing discovered packages
@@ -125,9 +130,9 @@ from task hashes. Explicit `dist/**` and `target/**` task inputs remain hashable
 when Git metadata is unavailable.
 
 uv task hashes always include the owning `pyproject.toml`. Explicitly cached uv
-builds using `--out-dir` and uv packages with unresolved external local path
-dependencies bypass cache reads and writes until those inputs and outputs are
-modeled, regardless of editable mode.
+builds using `-o` or `--out-dir` and uv packages with unresolved external local
+path dependencies bypass cache reads and writes until those inputs and outputs
+are modeled, regardless of editable mode.
 
 ## License and Attribution
 

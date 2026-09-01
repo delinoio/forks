@@ -29,6 +29,7 @@ import {
 } from "../src/graph/task-graph.js";
 import {
   canonicalStringify,
+  implicitTaskInputCandidates,
   selectEnvironment,
 } from "../src/hash/task-hash.js";
 import { createXxhash64, xxhash64Hex } from "../src/hash/xxhash64.js";
@@ -360,6 +361,95 @@ describe("core repository model", () => {
     expect(managerFromIdentity("pnpmn@10")).toBeUndefined();
   });
 
+  it("retains repository manager controls and absent lockfiles as task inputs", () => {
+    const cases = [
+      {
+        manager: "npm" as const,
+        names: [
+          "package.json",
+          ".npmrc",
+          "package-lock.json",
+          "npm-shrinkwrap.json",
+        ],
+      },
+      {
+        manager: "pnpm" as const,
+        names: [
+          "package.json",
+          ".npmrc",
+          "pnpm-workspace.yaml",
+          ".pnpmfile.cjs",
+          "pnpm-lock.yaml",
+        ],
+      },
+      {
+        manager: "yarn" as const,
+        names: [
+          "package.json",
+          ".npmrc",
+          ".yarnrc",
+          ".yarnrc.yml",
+          "yarn.lock",
+          ".pnp.cjs",
+        ],
+      },
+      {
+        manager: "bun" as const,
+        names: [
+          "package.json",
+          ".npmrc",
+          "bunfig.toml",
+          "bun.lock",
+          "bun.lockb",
+        ],
+      },
+      {
+        manager: "aube" as const,
+        names: [
+          "package.json",
+          ".npmrc",
+          "aube-workspace.yaml",
+          ".config/aube/config.toml",
+          "aube.lock",
+          "package-lock.json",
+          "pnpm-lock.yaml",
+          "yarn.lock",
+          "bun.lock",
+        ],
+      },
+      {
+        manager: "nub" as const,
+        names: [
+          "package.json",
+          ".npmrc",
+          "nub.jsonc",
+          "nub.lock",
+          "package-lock.json",
+          "pnpm-lock.yaml",
+          "yarn.lock",
+          "bun.lock",
+        ],
+      },
+    ];
+    for (const { manager, names } of cases) {
+      const packageValue = { ...packageModel("app", []), manager };
+      const model = { ...repository([packageValue]), manager };
+      const node: TaskNode = {
+        id: "app#build",
+        package: packageValue,
+        task: "build",
+        command: "build",
+        definition: {},
+        dependencies: [],
+        with: [],
+      };
+      const candidates = implicitTaskInputCandidates(model, node).map((path) =>
+        relativePath(model.root, path),
+      );
+      expect(candidates).toEqual(expect.arrayContaining(names));
+    }
+  });
+
   it("builds dependency graphs, filters closures, and rejects cycles", () => {
     const library = packageModel("library", []);
     const app = packageModel("app", ["library"], { dependsOn: ["^build"] });
@@ -685,6 +775,18 @@ describe("core repository model", () => {
     ).toBe(true);
   });
 
+  it("rejects blank remote cache timeout arguments", () => {
+    for (const value of ["", "   "]) {
+      expect(() =>
+        parseRunArguments(["run", "build", `--remote-cache-timeout=${value}`]),
+      ).toThrow(/invalid remote cache timeout/);
+    }
+    expect(
+      parseRunArguments(["run", "build", "--remote-cache-timeout=0"])
+        .remoteCacheTimeoutSeconds,
+    ).toBe(0);
+  });
+
   it("uses available parallelism and preserves Cargo pass-through arguments", () => {
     expect(parseConcurrency("50%", 8)).toBe(4);
     expect(parseConcurrency("100%", 1)).toBe(1);
@@ -971,6 +1073,7 @@ describe("core repository model", () => {
       false,
     ).nodes.get("python-app#build")!;
     expect(isTaskScopeCacheable(node, [])).toBe(true);
+    expect(isTaskScopeCacheable(node, ["-o", "wheelhouse"])).toBe(false);
     expect(isTaskScopeCacheable(node, ["--out-dir", "wheelhouse"])).toBe(false);
     expect(isTaskScopeCacheable(node, ["--out-dir=wheelhouse"])).toBe(false);
   });

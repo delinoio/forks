@@ -224,6 +224,7 @@ export const parseRunArguments = (
         [value, index] = optionValue(arguments_, index, name);
         remoteCacheTimeoutSeconds = Number(value);
         if (
+          value.trim() === "" ||
           !Number.isFinite(remoteCacheTimeoutSeconds) ||
           remoteCacheTimeoutSeconds < 0
         ) {

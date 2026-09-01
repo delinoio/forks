@@ -120,8 +120,10 @@ manifests participate in task-aware selection and hashing independently of user
 input globs. Symlinked owning control manifests retain their link identity and
 also hash the resolved file contents consumed by discovery and execution.
 Package task configurations participate independently in task-aware selection.
-Owning lockfiles and Cargo control or toolchain files participate in both
-task-aware selection and hashing. A changed
+Owning lockfiles, repository-controlled JavaScript package-manager
+configuration, and Cargo control or toolchain files participate in both
+task-aware selection and hashing. Expected JavaScript lockfile paths remain
+task-aware inputs when the active lockfile is deleted. A changed
 workspace gitlink path is treated as the package-relative `.` input. Task
 hashes preserve Git symlink, gitlink, and dependency semantics, exclude the
 resolved cache directory, and use each task's owning ecosystem lockfile.
@@ -133,10 +135,11 @@ owning lockfiles are streamed through bounded-memory xxHash64 digests.
 NUL-delimited Git discovery output is consumed as bytes and filenames that are
 not valid UTF-8 fail affected selection and hashing instead of being silently
 omitted. Git-discovered POSIX filenames preserve literal backslashes as
-filename characters. Cargo
-task hashes additionally include repository-contained
-ancestor manifests, Cargo configuration, and Rust toolchain files that can
-change task execution. Environment-name selection follows Windows
+filename characters. Cargo task hashes additionally include
+repository-contained ancestor manifests, Cargo configuration, and Rust
+toolchain files that can change task execution. An effective ancestor Cargo
+configuration outside the repository makes the Cargo package and downstream
+hash scopes uncacheable. Environment-name selection follows Windows
 case-insensitive semantics for both hashing and strict task execution.
 Repository discovery records the resolved root lockfile path without
 structurally parsing it;
@@ -181,7 +184,8 @@ list.
 Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
 reject malformed entries. Remote artifact routes preserve configured API path
 prefixes. Active remote URLs must use HTTP or HTTPS, and URLs and timeout values
-are validated before cache or task work begins. Signature-key requirements
+are validated before cache or task work begins; blank download and upload
+timeout strings are invalid. Signature-key requirements
 apply only when a remote transport is active; disabled remotes and
 configurations without an API URL do not require a signing key. Every active
 signed remote requires a non-empty key, while the 32-character minimum applies
@@ -251,7 +255,9 @@ cache maintenance a prerequisite for task execution. Eviction acquires the
 per-entry writer lock before removal so it cannot expose a partially published
 entry; selected-entry removal failures are aggregated after all of its archive
 and sidecar paths are tried. Eviction also reclaims stale atomic-write
-temporaries under the corresponding entry lock.
+temporaries under the corresponding entry lock. Restoration of an existing
+entry holds the same lock through validation and rejected-entry cleanup so it
+cannot remove a concurrent publication.
 Cache archives use PAX
 extensions for paths beyond ustar limits. Tar header paths, link targets, and
 PAX metadata must be valid UTF-8; unsupported raw-byte names reject the
@@ -278,10 +284,10 @@ exclusions; unrelated Python projects and `.venv` trees are ignored.
 Synthesized uv packages
 expose `build` and `test`, and implicit builds default to uncached unless task
 configuration explicitly enables caching. Explicitly cached uv builds bypass
-caching when `--out-dir` selects an unmodeled output directory. uv tasks execute
-from their project directory, forward test arguments directly to `pytest`, and
-parse `uv.lock` as TOML. Each task hash includes the owning `pyproject.toml`
-independently of configured input globs. uv path dependencies that do not
+caching when `-o` or `--out-dir` selects an unmodeled output directory. uv
+tasks execute from their project directory, forward test arguments directly to
+`pytest`, and parse `uv.lock` as TOML. Each task hash includes the owning
+`pyproject.toml` independently of configured input globs. uv path dependencies that do not
 resolve to the named discovered workspace member make the package and hash
 scopes that depend on them uncacheable, regardless of editable mode. uv
 package-graph edges require a
