@@ -58,6 +58,7 @@ export interface RepositoryPackage {
   readonly relativeDirectory: string;
   readonly canonicalRelativeDirectory: string;
   readonly cachePathRestorable: boolean;
+  readonly cacheInputsComplete: boolean;
   readonly workspaceDirectory?: string;
   readonly manager: PackageManagerName;
   readonly scripts: Readonly<Record<string, string>>;
@@ -1302,6 +1303,7 @@ export const discoverRepository = (
             canonicalRelativeDirectory:
               yield* canonicalRelativeDirectory(directory),
             cachePathRestorable: yield* cachePathIsRestorable(root, directory),
+            cacheInputsComplete: true,
             manager: managerIdentity.name,
             scripts: manifest.scripts ?? {},
             cargoDependencies:
@@ -1560,6 +1562,7 @@ export const discoverRepository = (
                 root,
                 directory,
               ),
+              cacheInputsComplete: metadata.workspaceDirectory !== undefined,
               workspaceDirectory: metadata.workspaceDirectory,
               manager: "cargo" as const,
               scripts: polyglotScripts("cargo", metadata.entrypointNames),
@@ -1650,6 +1653,7 @@ export const discoverRepository = (
             canonicalRelativeDirectory:
               yield* canonicalRelativeDirectory(directory),
             cachePathRestorable: yield* cachePathIsRestorable(root, directory),
+            cacheInputsComplete: true,
             manager: "uv" as const,
             scripts: polyglotScripts("uv", []),
             cargoDependencies:
@@ -1853,6 +1857,7 @@ export const discoverRepository = (
       relativeDirectory: ".",
       canonicalRelativeDirectory: ".",
       cachePathRestorable: true,
+      cacheInputsComplete: true,
       manager: managerIdentity.name,
       scripts: rootManifest.scripts ?? {},
       dependencyNames: dependencyNames(rootManifest),

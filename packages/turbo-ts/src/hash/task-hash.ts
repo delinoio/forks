@@ -114,6 +114,7 @@ type GitTrackedMode = "100644" | "100755" | "120000" | "160000";
 
 interface DiscoveredFile {
   readonly absolutePath: string;
+  readonly repositoryRelativePath: string;
   readonly gitMode: GitTrackedMode | undefined;
 }
 
@@ -175,7 +176,11 @@ const taskInputFiles = (
   const defaults = packageFiles
     .filter((file) => !isIgnoredInputPath(file.absolutePath, cacheDirectory))
     .map((file) => {
-      const relative = relativePath(node.package.directory, file.absolutePath);
+      const packagePrefix =
+        node.package.relativeDirectory === "."
+          ? ""
+          : `${node.package.relativeDirectory}/`;
+      const relative = file.repositoryRelativePath.slice(packagePrefix.length);
       return {
         ...file,
         hashPath: relative,
@@ -185,7 +190,7 @@ const taskInputFiles = (
   const rootFiles = repositoryFiles
     .filter((file) => !isIgnoredInputPath(file.absolutePath, cacheDirectory))
     .map((file) => {
-      const relative = relativePath(repository.root, file.absolutePath);
+      const relative = file.repositoryRelativePath;
       return {
         ...file,
         hashPath: `${turboRootInputPrefix}${relative}`,
@@ -481,8 +486,14 @@ const discoverFiles = (
         repository.root,
       ))
         .map((path) => {
-          const absolutePath = joinPath(repository.root, path);
-          return { absolutePath, gitMode: gitModes.get(absolutePath) };
+          const absolutePath = useTrackedGitModes
+            ? joinPath(repository.root, path)
+            : `${repository.root.endsWith("/") ? repository.root : `${repository.root}/`}${path}`;
+          return {
+            absolutePath,
+            repositoryRelativePath: path,
+            gitMode: gitModes.get(absolutePath),
+          };
         })
         .sort((left, right) =>
           left.absolutePath.localeCompare(right.absolutePath),
@@ -510,7 +521,11 @@ const discoverFiles = (
     }
     return (yield* listRepositoryFiles(directory))
       .filter((path) => !isIgnoredInputPath(path, cacheDirectory))
-      .map((absolutePath) => ({ absolutePath, gitMode: undefined }));
+      .map((absolutePath) => ({
+        absolutePath,
+        repositoryRelativePath: relativePath(repository.root, absolutePath),
+        gitMode: undefined,
+      }));
   });
 
 const owningLockfile = (
@@ -727,7 +742,7 @@ export const hashTask = (
           );
     const globalInputFilesByRelativePath = new Map(
       discoveredGlobalInputFiles.map((file) => [
-        relativePath(repository.root, file.absolutePath),
+        file.repositoryRelativePath,
         file,
       ]),
     );

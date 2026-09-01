@@ -1339,6 +1339,7 @@ const cargoAlternateOutputFlags = [
 ] as const;
 
 const cargoUnmodeledTargetFlags = [
+  "--all",
   "--all-targets",
   "--bench",
   "--benches",
@@ -1350,6 +1351,7 @@ const cargoUnmodeledTargetFlags = [
   "--package",
   "--test",
   "--tests",
+  "--workspace",
 ] as const;
 
 const usesAlternateCargoBuildOutputs = (
@@ -1501,6 +1503,7 @@ export const isTaskScopeCacheable = (
   (scope.kind === "cargo-workspace" ? scope.members : [node]).every(
     (member) =>
       member.package.cachePathRestorable &&
+      member.package.cacheInputsComplete &&
       member.definition.cache !== false &&
       member.definition.persistent !== true,
   ) &&
@@ -1545,7 +1548,11 @@ export const taskIdsWithUnrestorableCacheInputs = (
     const scopeNodes =
       scope?.kind === "cargo-workspace" ? scope.members : [node];
     if (
-      scopeNodes.some((member) => !member.package.cachePathRestorable) ||
+      scopeNodes.some(
+        (member) =>
+          !member.package.cachePathRestorable ||
+          !member.package.cacheInputsComplete,
+      ) ||
       [...node.dependencies, ...node.with].some((upstream) =>
         uncacheable.has(upstream),
       )
@@ -1722,16 +1729,24 @@ const executeTask = (
           ),
         );
       }
-      if (
-        shouldReplayOutput(
-          options.outputLogs ?? node.definition.outputLogs ?? undefined,
-          true,
-        )
-      ) {
-        const hasLog = yield* fileSystem.exists(logPath);
-        if (hasLog) {
+      if (shouldReplayOutput(outputMode, true)) {
+        yield* Effect.gen(function* () {
+          const hasLog = yield* fileSystem.exists(logPath).pipe(
+            Effect.mapError(
+              (error) =>
+                new RepositoryError({
+                  path: logPath,
+                  message: error.message,
+                }),
+            ),
+          );
+          if (!hasLog) return;
           let renderState = initialTaskOutputRenderState;
           yield* fileSystem.readTextChunks(logPath).pipe(
+            Stream.mapError(
+              (error) =>
+                new RepositoryError({ path: logPath, message: error.message }),
+            ),
             Stream.runForEach((output) =>
               Effect.gen(function* () {
                 const rendered = renderTaskOutputChunk(
@@ -1750,7 +1765,21 @@ const executeTask = (
           for (const chunk of finishTaskOutput(renderState)) {
             yield* terminal.writeStdout(chunk);
           }
-        }
+        }).pipe(
+          Effect.catchTag("RepositoryError", (error) =>
+            terminal
+              .writeStderr(
+                renderLogEvent(
+                  {
+                    kind: "warning",
+                    message: `cached log replay failed for ${taskLabel}; preserving successful cache hit: ${error.message}`,
+                  },
+                  warningColor,
+                ),
+              )
+              .pipe(Effect.ignore),
+          ),
+        );
       }
       return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
     }

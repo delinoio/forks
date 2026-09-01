@@ -71,6 +71,7 @@ const packageModel = (
   relativeDirectory: `packages/${name}`,
   canonicalRelativeDirectory: `packages/${name}`,
   cachePathRestorable: true,
+  cacheInputsComplete: true,
   manager: "pnpm",
   scripts: {
     build: `node -e "console.log('${name}')"`,
@@ -693,6 +694,7 @@ describe("core repository model", () => {
       relativeDirectory: "crates/app",
       canonicalRelativeDirectory: "crates/app",
       cachePathRestorable: true,
+      cacheInputsComplete: true,
       manager: "cargo" as const,
       scripts: { dev: "cargo run" },
       dependencyNames: [],
@@ -967,6 +969,8 @@ describe("core repository model", () => {
       ["--tests"],
       ["--bench=throughput"],
       ["--benches"],
+      ["--workspace"],
+      ["--all"],
       ["--all-targets"],
       ["--manifest-path", "../alternate/Cargo.toml"],
       ["--manifest-path=../alternate/Cargo.toml"],
@@ -1030,20 +1034,43 @@ describe("core repository model", () => {
       with: withTasks,
     });
     const linked = node(unrestorablePackage);
+    const incomplete = node({
+      ...packageModel("incomplete", []),
+      cacheInputsComplete: false,
+    });
     const dependent = node(packageModel("dependent", ["linked"]), [linked.id]);
+    const incompleteDependent = node(
+      packageModel("incomplete-dependent", ["incomplete"]),
+      [incomplete.id],
+    );
     const companionOwner = node(packageModel("owner", []), [], [linked.id]);
     const unrelated = node(packageModel("unrelated", []));
     const graph: TaskGraph = {
       nodes: new Map(
-        [linked, dependent, companionOwner, unrelated].map((task) => [
-          task.id,
-          task,
-        ]),
+        [
+          linked,
+          incomplete,
+          dependent,
+          incompleteDependent,
+          companionOwner,
+          unrelated,
+        ].map((task) => [task.id, task]),
       ),
-      entrypoints: [dependent.id, companionOwner.id, unrelated.id],
+      entrypoints: [
+        dependent.id,
+        incompleteDependent.id,
+        companionOwner.id,
+        unrelated.id,
+      ],
     };
     expect([...taskIdsWithUnrestorableCacheInputs(graph)].sort()).toEqual(
-      [companionOwner.id, dependent.id, linked.id].sort(),
+      [
+        companionOwner.id,
+        dependent.id,
+        incomplete.id,
+        incompleteDependent.id,
+        linked.id,
+      ].sort(),
     );
   });
 

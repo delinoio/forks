@@ -21,7 +21,7 @@ import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it } from "@rstest/core";
-import { Cause, Effect, Exit, Layer } from "effect";
+import { Cause, Effect, Exit, Layer, Stream } from "effect";
 import {
   createTarArchive,
   maximumCacheArchiveInputBytes,
@@ -55,6 +55,7 @@ import {
   HttpService,
   ProcessService,
   SigningService,
+  TerminalService,
 } from "../src/effect/services.js";
 import { buildTaskGraph } from "../src/graph/task-graph.js";
 import {
@@ -67,11 +68,13 @@ import {
   discoverRepository,
 } from "../src/repository/model.js";
 import {
+  executeRun,
   isTaskScopeCacheable,
   makeCachePublicationPermit,
   packageManagerCommand,
   planCargoWorkspaceTasks,
 } from "../src/run/engine.js";
+import { parseRunArguments } from "../src/run/options.js";
 
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
@@ -781,6 +784,82 @@ describe("core CLI execution", () => {
           "utf8",
         ),
       ).toContain("app build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("preserves cache hits when restored task logs cannot be replayed", async () => {
+    const directory = await makeFixture();
+    const executionPath = `${directory}/packages/library/.turbo/executions.txt`;
+    try {
+      const manifestPath = `${directory}/packages/library/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); fs.appendFileSync('.turbo/executions.txt','run\\n'); console.log('cached output')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const arguments_ = [
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--no-color",
+      ];
+      const cold = await run(
+        process.execPath,
+        [candidateEntrypoint, ...arguments_],
+        repositoryRoot,
+      );
+      expect(cold.exitCode, cold.stderr).toBe(0);
+      expect(cold.stdout).toContain("cache miss");
+
+      const stdout: Array<string> = [];
+      const stderr: Array<string> = [];
+      const exitCode = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const overrides = Layer.merge(
+            Layer.succeed(FileSystemService, {
+              ...fileSystem,
+              readTextChunks: (path) =>
+                path.endsWith("/.turbo/turbo-build.log")
+                  ? Stream.fail(
+                      new BoundaryError({
+                        boundary: "filesystem",
+                        message: "synthetic cached log read failure",
+                        retryable: false,
+                      }),
+                    )
+                  : fileSystem.readTextChunks(path),
+            }),
+            Layer.succeed(TerminalService, {
+              writeStdout: (text) =>
+                Effect.sync(() => {
+                  stdout.push(text);
+                }),
+              writeStderr: (text) =>
+                Effect.sync(() => {
+                  stderr.push(text);
+                }),
+              stdoutColorEnabled: Effect.succeed(false),
+              stderrColorEnabled: Effect.succeed(false),
+            }),
+          );
+          return yield* executeRun(parseRunArguments(arguments_)).pipe(
+            Effect.provide(overrides),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(exitCode).toBe(0);
+      expect(stdout.join("")).toContain("cache hit");
+      expect(stderr.join("")).toContain(
+        "cached log replay failed for synthetic-library:build",
+      );
+      expect(stderr.join("")).toContain("synthetic cached log read failure");
+      expect(await readFile(executionPath, "utf8")).toBe("run\n");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2214,9 +2293,13 @@ describe("core CLI execution", () => {
       );
       const cargoPackage = model.packagesByName.get("rust-tool")!;
       expect(cargoPackage.workspaceDirectory).toBeUndefined();
+      expect(cargoPackage.cacheInputsComplete).toBe(false);
       const graph = buildTaskGraph(model, [cargoPackage], ["test"], false);
       const plan = planCargoWorkspaceTasks(model, graph, ["test"], true);
       expect(plan.scopes.size).toBe(0);
+      expect(isTaskScopeCacheable(graph.nodes.get("rust-tool#test")!, [])).toBe(
+        false,
+      );
       expect(
         packageManagerCommand(graph.nodes.get("rust-tool#test")!, []),
       ).toEqual({
@@ -2841,6 +2924,43 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("preserves literal backslashes in POSIX Git input paths", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(packageRoot, "test-backslash-input-"));
+    await cp(fixtureRoot, directory, { recursive: true });
+    const inputPath = `${directory}/packages/library/src/a\\b.ts`;
+    try {
+      await mkdir(dirname(inputPath), { recursive: true });
+      await writeFile(inputPath, "first\n");
+      for (const args of [["init"], ["add", "."]]) {
+        const result = await run("git", args, directory);
+        expect(result.exitCode, `${args.join(" ")}: ${result.stderr}`).toBe(0);
+      }
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      const compute = () =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const initial = await compute();
+      expect(initial.inputFiles).toContain("src/a\\b.ts");
+      await writeFile(inputPath, "second\n");
+      expect((await compute()).hash).not.toBe(initial.hash);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("excludes deleted tracked files from task hash inputs", async () => {
     const directory = await mkdtemp(join(packageRoot, "test-deleted-input-"));

@@ -118,7 +118,8 @@ task's owning ecosystem lockfile. Regular input files are streamed through
 bounded-memory Git blob digests, and owning lockfiles are streamed through
 bounded-memory xxHash64 digests. NUL-delimited Git discovery output is consumed
 as bytes and filenames that are not valid UTF-8 fail affected selection and
-hashing instead of being silently omitted. Cargo
+hashing instead of being silently omitted. Git-discovered POSIX filenames
+preserve literal backslashes as filename characters. Cargo
 task hashes additionally include repository-contained
 ancestor manifests, Cargo configuration, and Rust toolchain files that can
 change task execution. Environment-name selection follows Windows
@@ -171,7 +172,8 @@ does not suppress a configured remote upload. Local and remote cache
 restoration is limited to 256 MiB compressed and 1 GiB after decompression;
 preflight and upload response bodies have an independent 64 KiB limit.
 Restored task logs replay through scoped, bounded text chunks with terminal
-backpressure instead of loading the complete log into another string.
+backpressure instead of loading the complete log into another string. A task-log
+replay I/O failure warns without changing the successful cache-hit outcome.
 Local cache artifacts are streamed from their compressed files into scoped
 temporary storage. Local and remote archives are decompressed there, and
 regular-file payloads are restored through bounded range copies instead of
@@ -267,7 +269,9 @@ runs retain package targeting. A workspace is grouped only when every
 repository-contained member exposes the requested verification task; otherwise
 participating members retain package targeting so task exclusions are honored.
 Members of an enclosing Cargo workspace outside
-the repository always retain package targeting. Grouped Cargo commands receive
+the repository always retain package targeting and bypass caching, as do task
+scopes whose hashes depend on them, because their external Cargo controls are
+not repository hash inputs. Grouped Cargo commands receive
 the union of all member task environments. Cargo package-graph edges require a
 source-free metadata dependency path that resolves to the named member in the
 same workspace; registry and Git dependencies remain external. Cargo `run` and
@@ -278,7 +282,8 @@ target-argument separator. Cargo builds
 for mixed library and binary crates default to uncached. Builds with
 pass-through arguments that select an additional package, an alternate output
 layout or manifest, or an unmodeled library, binary, example, test, or benchmark
-target bypass caching until those outputs are modeled explicitly. Cargo build
+target bypass caching until those outputs are modeled explicitly. The
+additional-package selectors include `--workspace` and `--all`. Cargo build
 pass-through `--config` arguments also bypass caching because they can override
 the output layout. Cargo builds also bypass caching when an ancestor or
 effective Cargo-home configuration, or the effective task environment, sets a
