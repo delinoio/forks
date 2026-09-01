@@ -487,9 +487,32 @@ const referencesWorkspacePackage = (
   );
 };
 
+const pnpmWorkspaceAlias = (
+  name: string,
+  specification: string,
+): { readonly name: string; readonly specification: string } => {
+  if (!specification.startsWith("workspace:")) {
+    return { name, specification };
+  }
+  const targetAndRange = specification.slice("workspace:".length);
+  const separator = targetAndRange.lastIndexOf("@");
+  if (separator <= 0 || separator === targetAndRange.length - 1) {
+    return { name, specification };
+  }
+  const targetName = targetAndRange.slice(0, separator);
+  if (targetName.startsWith("@") && !targetName.includes("/")) {
+    return { name, specification };
+  }
+  return {
+    name: targetName,
+    specification: `workspace:${targetAndRange.slice(separator + 1)}`,
+  };
+};
+
 const javascriptInternalDependencies = (
   declaringDirectory: string,
   manifest: PackageManifest,
+  manager: PackageManagerName,
   packagesByName: ReadonlyMap<
     string,
     { readonly directory: string; readonly manifest: PackageManifest }
@@ -499,14 +522,20 @@ const javascriptInternalDependencies = (
     const references = yield* Effect.forEach(
       dependencyEntries(manifest),
       ([name, specification]) => {
-        const target = packagesByName.get(name);
+        const reference =
+          manager === "pnpm"
+            ? pnpmWorkspaceAlias(name, specification)
+            : { name, specification };
+        const target = packagesByName.get(reference.name);
         return target === undefined
           ? Effect.succeed(undefined)
           : referencesWorkspacePackage(
               declaringDirectory,
-              specification,
+              reference.specification,
               target,
-            ).pipe(Effect.map((matches) => (matches ? name : undefined)));
+            ).pipe(
+              Effect.map((matches) => (matches ? reference.name : undefined)),
+            );
       },
       { concurrency: 8 },
     );
@@ -902,14 +931,15 @@ const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
 const uvTasks = (
   packageName: string,
   configured: Readonly<Record<string, Pipeline>>,
+  excludedTasks: ReadonlySet<string>,
 ): Readonly<Record<string, Pipeline>> => {
   const buildDefaults: Pipeline = { cache: false };
-  const tasks: Record<string, Pipeline> = {
-    ...configured,
-    build: mergePipeline(buildDefaults, configured.build ?? {}),
-  };
+  const tasks: Record<string, Pipeline> = { ...configured };
+  if (!excludedTasks.has("build")) {
+    tasks.build = mergePipeline(buildDefaults, configured.build ?? {});
+  }
   const qualifiedBuild = `${packageName}#build`;
-  if (configured[qualifiedBuild] !== undefined) {
+  if (!excludedTasks.has("build") && configured[qualifiedBuild] !== undefined) {
     tasks[qualifiedBuild] = mergePipeline(
       buildDefaults,
       configured[qualifiedBuild],
@@ -1333,6 +1363,25 @@ export const discoverRepository = (
           if (metadata.name === undefined) {
             return undefined;
           }
+          const packageConfiguration =
+            directory === root
+              ? {
+                  excludedTasks: new Set<string>(),
+                  tasks: configuredTasks,
+                }
+              : yield* loadPackageConfiguration(
+                  directory,
+                  metadata.name,
+                  rootConfiguration,
+                ).pipe(
+                  Effect.mapError(
+                    (error) =>
+                      new RepositoryError({
+                        path: error.path,
+                        message: error.message,
+                      }),
+                  ),
+                );
           return {
             name: metadata.name,
             directory,
@@ -1342,9 +1391,13 @@ export const discoverRepository = (
             cargoDependencies:
               [] satisfies ReadonlyArray<CargoDependencyMetadata>,
             dependencyNames: metadata.dependencyNames,
-            excludedTasks: new Set<string>(),
+            excludedTasks: packageConfiguration.excludedTasks,
             uvDependencySources: metadata.dependencySources,
-            tasks: uvTasks(metadata.name, configuredTasks),
+            tasks: uvTasks(
+              metadata.name,
+              packageConfiguration.tasks,
+              packageConfiguration.excludedTasks,
+            ),
             manifest: {
               name: metadata.name,
               private: true,
@@ -1407,6 +1460,7 @@ export const discoverRepository = (
           javascriptInternalDependencies(
             directory,
             manifest,
+            managerIdentity.name,
             javascriptDraftsByName,
           ).pipe(
             Effect.map(

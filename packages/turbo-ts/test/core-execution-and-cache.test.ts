@@ -1135,6 +1135,22 @@ describe("core CLI execution", () => {
         (await discover()).packagesByName.get("synthetic-app")
           ?.internalDependencies,
       ).toEqual([]);
+
+      delete appManifest.dependencies["synthetic-library"];
+      appManifest.dependencies["library-alias"] =
+        "workspace:synthetic-library@*";
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, null, 2)}\n`,
+      );
+      const aliased = await discover();
+      const aliasedApp = aliased.packagesByName.get("synthetic-app")!;
+      expect(aliasedApp.internalDependencies).toEqual(["synthetic-library"]);
+      expect(
+        buildTaskGraph(aliased, [aliasedApp], ["build"], false).nodes.has(
+          "synthetic-library#build",
+        ),
+      ).toBe(true);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1847,6 +1863,84 @@ describe("core CLI execution", () => {
       if (process.platform !== "win32") {
         await chmod(virtualEnvironmentDirectory, 0o700).catch(() => undefined);
       }
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("loads package task configuration for uv workspace members", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, unknown>;
+      };
+      configuration.futureFlags = { experimentalPythonWorkspaces: true };
+      configuration.tasks.test = {};
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await writeFile(
+        `${directory}/pyproject.toml`,
+        '[tool.uv.workspace]\nmembers = ["python/*"]\n',
+      );
+      await mkdir(`${directory}/python/app`, { recursive: true });
+      await mkdir(`${directory}/python/helper`, { recursive: true });
+      await writeFile(
+        `${directory}/python/app/pyproject.toml`,
+        `[project]\n` +
+          `name = "python-app"\n` +
+          `dependencies = ["python-helper"]\n` +
+          `\n` +
+          `[tool.uv.sources]\n` +
+          `python-helper = { workspace = true }\n`,
+      );
+      await writeFile(
+        `${directory}/python/helper/pyproject.toml`,
+        '[project]\nname = "python-helper"\ndependencies = []\n',
+      );
+      await writeFile(
+        `${directory}/python/app/turbo.json`,
+        `${JSON.stringify(
+          {
+            extends: ["//"],
+            tasks: {
+              build: { extends: false },
+              test: {
+                dependsOn: ["python-helper#build"],
+                env: ["UV_APP_ENV"],
+                outputs: ["reports/**"],
+              },
+            },
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const app = model.packagesByName.get("python-app")!;
+      expect(app.excludedTasks).toContain("build");
+      expect(app.tasks.build).toBeUndefined();
+      expect(app.tasks.test).toMatchObject({
+        dependsOn: ["python-helper#build"],
+        env: ["UV_APP_ENV"],
+        outputs: ["reports/**"],
+      });
+      expect(
+        buildTaskGraph(model, [app], ["build"], false).entrypoints,
+      ).toEqual([]);
+      expect(
+        [...buildTaskGraph(model, [app], ["test"], false).nodes.keys()].sort(),
+      ).toEqual(["python-app#test", "python-helper#build"]);
+    } finally {
       await rm(directory, { force: true, recursive: true });
     }
   });

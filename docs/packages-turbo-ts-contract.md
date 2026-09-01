@@ -125,8 +125,8 @@ sharing a companion remain subject to the run's concurrency limit.
 Workspace task overrides merge with their effective package-qualified root
 definition and the merged task invariants are revalidated before execution.
 Task-level `extends: false` is package-only: without other fields it removes
-the inherited task, including synthesized Cargo tasks, while additional fields
-create a fresh definition without root-task inheritance.
+the inherited task, including synthesized Cargo and uv tasks, while additional
+fields create a fresh definition without root-task inheritance.
 Workspace configuration inheritance accepts only the exact `["//"]` parent
 list.
 Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
@@ -183,8 +183,9 @@ registry, Git, URL, and undeclared sources remain
 external. JavaScript package-graph edges
 require declared workspace or version-range compatibility, or a `file:` or
 `link:` path whose canonical, platform-aware filesystem identity resolves to
-the named local JavaScript package; same-named Cargo and uv packages are never
-JavaScript workspace targets. Cargo metadata
+the named local JavaScript package. pnpm workspace aliases resolve to the
+package name encoded in their `workspace:` specification; same-named Cargo and
+uv packages are never JavaScript workspace targets. Cargo metadata
 paths are matched by canonical filesystem identity. Unfiltered Cargo `test`,
 `check`, `lint`, and `format` tasks execute once per Cargo workspace and bypass
 caching when any grouped member disables it; filtered and package-qualified
