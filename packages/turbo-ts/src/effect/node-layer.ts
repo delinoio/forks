@@ -226,6 +226,35 @@ const waitForCloseUntil = (
     });
   });
 
+const isProcessGroupRunning = (processGroupId: number): boolean => {
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (cause) {
+    if (isNoSuchProcessError(cause)) {
+      return false;
+    }
+    throw cause;
+  }
+};
+
+const waitForProcessGroupExitUntil = async (
+  processGroupId: number,
+  timeoutMilliseconds: number,
+): Promise<boolean> => {
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (isProcessGroupRunning(processGroupId)) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return false;
+    }
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(10, remaining)),
+    );
+  }
+  return true;
+};
+
 const terminateChild = ({
   child,
   closed,
@@ -241,7 +270,16 @@ const terminateChild = ({
       processGroupId,
       capturesOutput,
     };
-    if (!isClosed()) {
+    if (processGroupId !== undefined) {
+      signalChildProcess(scopedChild, "SIGTERM");
+      const groupClosedGracefully = await waitForProcessGroupExitUntil(
+        processGroupId,
+        gracefulTerminationTimeoutMilliseconds,
+      );
+      if (!groupClosedGracefully) {
+        signalChildProcess(scopedChild, "SIGKILL");
+      }
+    } else if (!isClosed()) {
       signalChildProcess(scopedChild, "SIGTERM");
       const closedGracefully = await waitForCloseUntil(
         closed,
@@ -429,7 +467,7 @@ export const collectChildProcessOutput = (
     let settled = false;
     let closeReceived = false;
     let closeExitCode: number | null = null;
-    let outputSinkPending = false;
+    let pendingOutputSinks = 0;
     let closeCompletionScheduled = false;
     let stdout = "";
     let stderr = "";
@@ -456,7 +494,7 @@ export const collectChildProcessOutput = (
       resume(Effect.fail(processExecutionError(command, cause)));
     };
     const completeClose = () => {
-      if (settled || !closeReceived || outputSinkPending) return;
+      if (settled || !closeReceived || pendingOutputSinks > 0) return;
       settled = true;
       stopInheritedInput();
       resume(
@@ -472,7 +510,7 @@ export const collectChildProcessOutput = (
       if (
         settled ||
         !closeReceived ||
-        outputSinkPending ||
+        pendingOutputSinks > 0 ||
         closeCompletionScheduled
       ) {
         return;
@@ -495,15 +533,17 @@ export const collectChildProcessOutput = (
         ) {
           return;
         }
-        outputSinkPending = true;
+        pendingOutputSinks += 1;
         child.stdout.pause();
         child.stderr.pause();
         Promise.resolve(completion).then(() => {
-          outputSinkPending = false;
+          pendingOutputSinks -= 1;
           if (settled) return;
-          child.stdout.resume();
-          child.stderr.resume();
-          completeCloseAfterBufferedOutput();
+          if (pendingOutputSinks === 0) {
+            child.stdout.resume();
+            child.stderr.resume();
+            completeCloseAfterBufferedOutput();
+          }
         }, fail);
       } catch (cause) {
         fail(cause);
@@ -530,7 +570,7 @@ export const collectChildProcessOutput = (
     child.onceClose((exitCode) => {
       closeReceived = true;
       closeExitCode = exitCode;
-      if (outputSinkPending) {
+      if (pendingOutputSinks > 0) {
         return;
       }
       completeClose();

@@ -347,6 +347,52 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
+  it("preserves task success when cache output collection fails", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const outputPath = `${packageDirectory}/dist/unreadable.txt`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks["unreadable-cache"] = { outputs: ["dist/**"] };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts["unreadable-cache"] =
+        "node -e \"const fs=require('node:fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/unreadable.txt','output'); fs.chmodSync('dist/unreadable.txt',0); console.log('unreadable cache output')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "unreadable-cache",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--cache=local:w",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("unreadable cache output");
+      expect(result.stderr).toContain("cache output collection failed");
+      expect(result.stderr).toContain("preserving successful task result");
+      await expect(readdir(`${directory}/.turbo/cache`)).rejects.toThrow();
+    } finally {
+      await chmod(outputPath, 0o600).catch(() => undefined);
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("rejects every unresolved requested task before execution", async () => {
     const directory = await makeFixture();
     try {
@@ -1016,7 +1062,7 @@ describe("core CLI execution", () => {
     }
   }, 20_000);
 
-  it("hashes explicit dist and target inputs without a Git repository", async () => {
+  it("hashes explicit outputs without Git while excluding .venv", async () => {
     const directory = await makeFixture();
     try {
       const configurationPath = `${directory}/turbo.json`;
@@ -1024,6 +1070,7 @@ describe("core CLI execution", () => {
         await readFile(configurationPath, "utf8"),
       ) as { tasks: Record<string, { inputs?: Array<string> }> };
       configuration.tasks.build!.inputs = [
+        ".venv/**",
         "dist/schema/**",
         "target/generated/**",
       ];
@@ -1032,8 +1079,10 @@ describe("core CLI execution", () => {
         `${JSON.stringify(configuration, null, 2)}\n`,
       );
       const packageDirectory = `${directory}/packages/library`;
+      await mkdir(`${packageDirectory}/.venv/lib`, { recursive: true });
       await mkdir(`${packageDirectory}/dist/schema`, { recursive: true });
       await mkdir(`${packageDirectory}/target/generated`, { recursive: true });
+      await writeFile(`${packageDirectory}/.venv/lib/dependency.py`, "one\n");
       await writeFile(`${packageDirectory}/dist/schema/value.json`, "one\n");
       await writeFile(
         `${packageDirectory}/target/generated/value.txt`,
@@ -1064,6 +1113,8 @@ describe("core CLI execution", () => {
         "dist/schema/value.json",
         "target/generated/value.txt",
       ]);
+      await writeFile(`${packageDirectory}/.venv/lib/dependency.py`, "two\n");
+      expect((await compute()).hash).toBe(first.hash);
       await writeFile(`${packageDirectory}/dist/schema/value.json`, "two\n");
       const second = await compute();
       expect(second.hash).not.toBe(first.hash);

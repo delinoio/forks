@@ -480,6 +480,52 @@ describe("Effect foundation", () => {
     }
   });
 
+  it("terminates owned process groups after their leaders exit", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-group-test-"));
+    const workerPidPath = join(directory, "worker-pid");
+    const heartbeatPath = join(directory, "heartbeat");
+    let workerPid: number | undefined;
+    try {
+      const workerScript =
+        'const fs = require("node:fs"); process.on("SIGTERM", () => {}); fs.writeFileSync(process.argv[1], String(process.pid)); fs.writeFileSync(process.argv[2], "ready"); setInterval(() => fs.writeFileSync(process.argv[2], String(Date.now())), 10);';
+      const leaderScript =
+        'const { spawn } = require("node:child_process"); const fs = require("node:fs"); const worker = spawn(process.execPath, ["-e", process.argv[3], process.argv[1], process.argv[2]], { stdio: "ignore" }); worker.unref(); const timer = setInterval(() => { if (fs.existsSync(process.argv[2])) clearInterval(timer); }, 10);';
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            return yield* processService.run({
+              command: process.execPath,
+              args: [
+                "-e",
+                leaderScript,
+                workerPidPath,
+                heartbeatPath,
+                workerScript,
+              ],
+              cwd: directory,
+            });
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(result.exitCode).toBe(0);
+      workerPid = Number(await waitForTextFile(workerPidPath));
+      const heartbeat = await readFile(heartbeatPath, "utf8");
+      await delay(100);
+      expect(await readFile(heartbeatPath, "utf8")).toBe(heartbeat);
+    } finally {
+      if (workerPid !== undefined) {
+        try {
+          process.kill(workerPid, "SIGKILL");
+        } catch {
+          // The scoped finalizer already terminated the expected descendant.
+        }
+      }
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("supervises child stdin errors inside the process Effect", async () => {
     const outcome = await Effect.runPromise(
       Effect.either(
@@ -666,6 +712,55 @@ describe("Effect foundation", () => {
     const result = await Effect.runPromise(Fiber.join(fiber));
     expect(observed).toEqual(["first\n", "second\n"]);
     expect(result.combinedOutput).toBe("first\nsecond\n");
+  });
+
+  it("waits for every concurrent asynchronous output sink", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const observed: Array<string> = [];
+    const releases: Array<() => void> = [];
+    let close: ((exitCode: number | null) => void) | undefined;
+    const fiber = Effect.runFork(
+      collectChildProcessOutput(
+        {
+          stdin,
+          stdout,
+          stderr,
+          onceClose: (listener) => {
+            close = listener;
+          },
+          onceError: () => {
+            // The synthetic process exits through the close callback.
+          },
+        },
+        "synthetic-concurrent-backpressure",
+        undefined,
+        false,
+        (chunk) =>
+          new Promise<void>((resolve) => {
+            observed.push(chunk);
+            releases.push(resolve);
+          }),
+      ),
+    );
+    await Effect.runPromise(Effect.yieldNow());
+    stdout.emit("data", "stdout\n");
+    stderr.emit("data", "stderr\n");
+    close?.(0);
+    expect(releases).toHaveLength(2);
+    releases[0]?.();
+    await delay(0);
+    const pausedAfterFirstCompletion = [stdout.isPaused(), stderr.isPaused()];
+    const statusAfterFirstCompletion = await Effect.runPromise(
+      Fiber.poll(fiber),
+    );
+    releases[1]?.();
+    const result = await Effect.runPromise(Fiber.join(fiber));
+    expect(pausedAfterFirstCompletion).toEqual([true, true]);
+    expect(statusAfterFirstCompletion._tag).toBe("None");
+    expect(observed).toEqual(["stdout\n", "stderr\n"]);
+    expect(result.combinedOutput).toBe("stdout\nstderr\n");
   });
 
   it("generates canonical lowercase UUID v7 identifiers", async () => {

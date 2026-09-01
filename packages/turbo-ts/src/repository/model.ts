@@ -108,6 +108,7 @@ const repositoryPathFromCanonical = (
 const fileTraversalIgnoredDirectories = new Set([
   ".git",
   ".turbo",
+  ".venv",
   "node_modules",
 ]);
 

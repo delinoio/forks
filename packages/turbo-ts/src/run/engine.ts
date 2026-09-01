@@ -1625,7 +1625,24 @@ const executeTask = (
         cacheNodes,
         logPath,
         options.cacheDirectory,
+      ).pipe(
+        Effect.catchAll((error) =>
+          terminal
+            .writeStderr(
+              renderLogEvent(
+                {
+                  kind: "warning",
+                  message: `cache output collection failed for ${taskLabel}; skipping cache publication while preserving successful task result: ${error.message}`,
+                },
+                warningColor,
+              ),
+            )
+            .pipe(Effect.ignore, Effect.as(undefined)),
+        ),
       );
+      if (collected === undefined) {
+        return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
+      }
       if (collected.kind === "too-large") {
         yield* terminal.writeStderr(
           renderLogEvent(
