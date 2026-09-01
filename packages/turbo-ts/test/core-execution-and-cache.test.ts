@@ -539,8 +539,19 @@ describe("core CLI execution", () => {
         directory,
         "--filter=synthetic-library",
       ];
-      const cold = await run(process.execPath, args, repositoryRoot);
-      const warm = await run(process.execPath, args, repositoryRoot);
+      const environment = { NO_COLOR: "1" };
+      const cold = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
+      const warm = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
       expect(cold.exitCode).toBe(0);
       expect(cold.stdout).toContain("cache miss");
       expect(warm.exitCode).toBe(0);
