@@ -100,9 +100,15 @@ scoped files so concurrent cache hits do not retain or duplicate complete
 compressed response bodies in memory.
 
 Configured cache directories may be inside or outside the repository, but the
-repository root and its ancestors are rejected because treating them as cache
-content would exclude source files from task hashes. Explicit `dist/**` and
-`target/**` task inputs remain hashable when Git metadata is unavailable.
+repository root, its ancestors, and directories containing discovered packages
+are rejected because treating them as cache content would exclude source files
+from task hashes. Explicit `dist/**` and `target/**` task inputs remain hashable
+when Git metadata is unavailable.
+
+uv task hashes always include the owning `pyproject.toml`. Explicitly cached uv
+builds using `--out-dir` and uv packages with unresolved external editable path
+dependencies bypass cache reads and writes until those inputs and outputs are
+modeled.
 
 ## License and Attribution
 

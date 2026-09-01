@@ -21,6 +21,7 @@ export interface CacheRestoreScope {
   readonly pathsToClear: ReadonlyArray<string>;
   readonly allowedPathGroups: ReadonlyArray<CacheRestorePathGroup>;
   readonly regularFilePaths: ReadonlyArray<string>;
+  readonly excludedDirectories: ReadonlyArray<string>;
 }
 
 export interface ArchiveFileContentsRange {
@@ -322,6 +323,21 @@ export const validateArchiveEntriesForRestore = (
       if (!isPathContained(root, destination)) {
         return yield* Effect.fail(
           restoreError(destination, "archive path escapes repository"),
+        );
+      }
+      if (
+        scope.excludedDirectories.some((directory) =>
+          isPathContained(
+            comparablePath(joinPath(root, directory), caseInsensitive),
+            comparableDestination,
+          ),
+        )
+      ) {
+        return yield* Effect.fail(
+          restoreError(
+            destination,
+            "archive path enters the active cache directory",
+          ),
         );
       }
       if (

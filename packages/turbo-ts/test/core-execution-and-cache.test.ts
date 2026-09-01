@@ -88,6 +88,7 @@ const allowCachePaths = (
   pathsToClear: [],
   allowedPathGroups: [{ directory: ".", patterns }],
   regularFilePaths: [],
+  excludedDirectories: [],
 });
 
 const makeFixture = async (): Promise<string> => {
@@ -1088,6 +1089,34 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("rejects cache directories that contain discovered packages", async () => {
+    const directory = await makeFixture();
+    try {
+      for (const cacheDirectory of ["packages/library", "packages"]) {
+        const result = await run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "build",
+            "--cwd",
+            directory,
+            `--cache-dir=${cacheDirectory}`,
+          ],
+          repositoryRoot,
+        );
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stderr).toContain(
+          "cache directory must not contain package",
+        );
+        expect(result.stdout).not.toContain("library build");
+        expect(result.stdout).not.toContain("app build");
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("rejects cache directories that contain the repository", async () => {
     const directory = await makeFixture();
@@ -2554,6 +2583,9 @@ describe("core CLI execution", () => {
 
   it("reads uv project names and dependencies from their TOML sections", async () => {
     const directory = await makeFixture();
+    const externalDependency = await mkdtemp(
+      join(tmpdir(), "turbo-ts-uv-external-"),
+    );
     const virtualEnvironmentDirectory = `${directory}/.venv`;
     try {
       const configurationPath = `${directory}/turbo.json`;
@@ -2595,31 +2627,31 @@ describe("core CLI execution", () => {
         await mkdir(virtualEnvironmentDirectory, { recursive: true });
         await chmod(virtualEnvironmentDirectory, 0o000);
       }
-      await writeFile(
-        `${directory}/python/app/pyproject.toml`,
+      const appManifestPath = `${directory}/python/app/pyproject.toml`;
+      const appManifestSource =
         `[tool.uv]\n` +
-          `dev-dependencies = ["types-requests>=2"]\n` +
-          `\n` +
-          `[[tool.uv.index]]\n` +
-          `name = "internal"\n` +
-          `url = "https://example.test/simple"\n` +
-          `\n` +
-          `[tool.uv.sources]\n` +
-          `my-util = { workspace = true }\n` +
-          `local-helper = { path = ${JSON.stringify(localHelperPath)} }\n` +
-          `requests = { index = "internal" }\n` +
-          `\n` +
-          `[project]\n` +
-          `name = "app"\n` +
-          `dependencies = ["local-helper>=1", "my-util>=1", "requests>=2"]\n` +
-          `\n` +
-          `[project.optional-dependencies]\n` +
-          `test = ["pytest>=8"]\n` +
-          `\n` +
-          `[dependency-groups]\n` +
-          `dev = ["ruff>=1", { include-group = "lint" }]\n` +
-          `lint = ["mypy>=1"]\n`,
-      );
+        `dev-dependencies = ["types-requests>=2"]\n` +
+        `\n` +
+        `[[tool.uv.index]]\n` +
+        `name = "internal"\n` +
+        `url = "https://example.test/simple"\n` +
+        `\n` +
+        `[tool.uv.sources]\n` +
+        `my-util = { workspace = true }\n` +
+        `local-helper = { path = ${JSON.stringify(localHelperPath)}, editable = true }\n` +
+        `requests = { index = "internal" }\n` +
+        `\n` +
+        `[project]\n` +
+        `name = "app"\n` +
+        `dependencies = ["local-helper>=1", "my-util>=1", "requests>=2"]\n` +
+        `\n` +
+        `[project.optional-dependencies]\n` +
+        `test = ["pytest>=8"]\n` +
+        `\n` +
+        `[dependency-groups]\n` +
+        `dev = ["ruff>=1", { include-group = "lint" }]\n` +
+        `lint = ["mypy>=1"]\n`;
+      await writeFile(appManifestPath, appManifestSource);
       await writeFile(
         `${directory}/python/helper/pyproject.toml`,
         `[project]\nname = "local_helper"\ndependencies = []\n`,
@@ -2657,6 +2689,7 @@ describe("core CLI execution", () => {
         "types-requests",
       ]);
       expect(app?.internalDependencies).toEqual(["local_helper", "my_util"]);
+      expect(app?.cacheInputsComplete).toBe(true);
       expect(model.packagesByName.has("internal")).toBe(false);
       expect(model.packagesByName.has("python-root")).toBe(true);
       expect(model.packagesByName.has("excluded-project")).toBe(false);
@@ -2668,6 +2701,28 @@ describe("core CLI execution", () => {
           ...buildTaskGraph(model, [app!], ["build"], false).nodes.keys(),
         ].sort(),
       ).toEqual(["app#build", "local_helper#build", "my_util#build"]);
+
+      await writeFile(
+        appManifestPath,
+        appManifestSource
+          .replace(
+            `requests = { index = "internal" }\n`,
+            `requests = { index = "internal" }\nexternal-helper = { path = ${JSON.stringify(externalDependency)}, editable = true }\n`,
+          )
+          .replace(
+            `dependencies = ["local-helper>=1", "my-util>=1", "requests>=2"]`,
+            `dependencies = ["external-helper>=1", "local-helper>=1", "my-util>=1", "requests>=2"]`,
+          ),
+      );
+      const externalEditable = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(
+        externalEditable.packagesByName.get("app")?.cacheInputsComplete,
+      ).toBe(false);
 
       configuration.tasks.build = {
         cache: true,
@@ -2692,6 +2747,7 @@ describe("core CLI execution", () => {
         await chmod(virtualEnvironmentDirectory, 0o700).catch(() => undefined);
       }
       await rm(directory, { force: true, recursive: true });
+      await rm(externalDependency, { force: true, recursive: true });
     }
   });
 
@@ -2773,7 +2829,7 @@ describe("core CLI execution", () => {
     }
   });
 
-  it("hashes the owning Cargo and uv workspace lockfiles", async () => {
+  it("hashes owning Cargo and uv controls independently of task globs", async () => {
     const directory = await makeFixture();
     try {
       const configurationPath = `${directory}/turbo.json`;
@@ -2787,9 +2843,7 @@ describe("core CLI execution", () => {
         experimentalCargoWorkspaces: true,
         experimentalPythonWorkspaces: true,
       };
-      configuration.tasks.test = {
-        inputs: ["Cargo.toml", "pyproject.toml"],
-      };
+      configuration.tasks.test = { inputs: ["src/**"] };
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
@@ -2823,8 +2877,9 @@ describe("core CLI execution", () => {
       );
       expect(generatedLockfile.exitCode, generatedLockfile.stderr).toBe(0);
       await mkdir(`${directory}/python/app`, { recursive: true });
+      const uvManifest = `${directory}/python/app/pyproject.toml`;
       await writeFile(
-        `${directory}/python/app/pyproject.toml`,
+        uvManifest,
         '[project]\nname = "python-app"\nversion = "0.1.0"\ndependencies = []\n',
       );
       const uvLockfile = `${directory}/uv.lock`;
@@ -2869,8 +2924,17 @@ describe("core CLI execution", () => {
       const uvAfterCargoChange = await compute("python-app#test");
       expect(cargoAfter.hash).not.toBe(cargoBefore.hash);
       expect(uvAfterCargoChange.hash).toBe(uvBefore.hash);
+      await writeFile(
+        uvManifest,
+        `${await readFile(uvManifest, "utf8")}\n[tool.pytest.ini_options]\naddopts = "--strict-markers"\n`,
+      );
+      const uvAfterManifestChange = await compute("python-app#test");
+      expect(uvAfterManifestChange.hash).not.toBe(uvBefore.hash);
+      expect(uvAfterManifestChange.inputFiles).toContain("pyproject.toml");
       await writeFile(uvLockfile, "version = 1\nrevision = 2\n");
-      expect((await compute("python-app#test")).hash).not.toBe(uvBefore.hash);
+      expect((await compute("python-app#test")).hash).not.toBe(
+        uvAfterManifestChange.hash,
+      );
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -7466,6 +7530,53 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("reclaims stale atomic temporaries under their entry lock", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-temp-"));
+    const cacheDirectory = `${directory}/cache`;
+    const hash = "0123456789abcdef";
+    const temporaryPaths = [
+      `${cacheDirectory}/${hash}.tar.zst.00000000-0000-7000-8000-000000000001.tmp`,
+      `${cacheDirectory}/${hash}-manifest.json.00000000-0000-7000-8000-000000000002.tmp`,
+      `${cacheDirectory}/${hash}-meta.json.00000000-0000-7000-8000-000000000003.tmp`,
+    ];
+    const lockPath = `${cacheDirectory}/${hash}.turbo-ts.lock`;
+    try {
+      await mkdir(cacheDirectory, { recursive: true });
+      for (const path of temporaryPaths) await writeFile(path, "temporary");
+      const staleTime = new Date(Date.now() - 6 * 60 * 1_000);
+      for (const path of temporaryPaths) {
+        await utimes(path, staleTime, staleTime);
+      }
+      await writeFile(
+        lockPath,
+        JSON.stringify({
+          owner: "00000000-0000-7000-8000-000000000004",
+          createdAt: Date.now(),
+        }),
+      );
+      const eviction = Effect.runPromise(
+        evictLocalCache({ directory: cacheDirectory, maxSizeBytes: 1 }).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 75));
+      try {
+        for (const path of temporaryPaths) {
+          expect((await lstat(path)).isFile()).toBe(true);
+        }
+      } finally {
+        await rm(lockPath, { force: true });
+      }
+      await eviction;
+      for (const path of temporaryPaths) {
+        await expect(lstat(path)).rejects.toThrow();
+      }
+      await expect(lstat(lockPath)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("counts cache sidecars and orphaned sidecars during size eviction", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-size-"));
     const cacheDirectory = `${directory}/cache`;
@@ -8200,6 +8311,7 @@ describe("cache interoperability and safety", () => {
         { directory: ".", patterns: ["!dist/private/**", "dist/**"] },
       ],
       regularFilePaths: [],
+      excludedDirectories: [],
     };
     const entry = {
       path: "dist/private/secret.txt",
@@ -8264,6 +8376,7 @@ describe("cache interoperability and safety", () => {
       pathsToClear: ["preserved.txt"],
       allowedPathGroups: [{ directory: ".", patterns: ["dist/**"] }],
       regularFilePaths: [],
+      excludedDirectories: [],
     };
     try {
       await writeFile(`${directory}/package.json`, "{}\n");
@@ -8348,6 +8461,7 @@ describe("cache interoperability and safety", () => {
           pathsToClear: ["dist"],
           allowedPathGroups: [{ directory: ".", patterns: ["dist/**"] }],
           regularFilePaths: [],
+          excludedDirectories: [],
         }).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
       );
       expect(outcome._tag).toBe("Left");
@@ -8399,6 +8513,7 @@ describe("cache interoperability and safety", () => {
             pathsToClear: ["preserved.txt"],
             allowedPathGroups: [{ directory: ".", patterns: ["dist/**"] }],
             regularFilePaths: [],
+            excludedDirectories: [],
           }).pipe(Effect.either, Effect.provide(caseInsensitiveLayer));
         }).pipe(Effect.provide(nodeFoundationLayer)),
       );
@@ -8441,6 +8556,7 @@ describe("cache interoperability and safety", () => {
               { directory: "packages/app", patterns: ["dist/**"] },
             ],
             regularFilePaths: [],
+            excludedDirectories: [],
           },
         ).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
       );
@@ -8492,6 +8608,7 @@ describe("cache interoperability and safety", () => {
               { directory: ".", patterns: ["dist/**/*.txt"] },
             ],
             regularFilePaths: [],
+            excludedDirectories: [],
           },
         ).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
       );
@@ -8540,6 +8657,7 @@ describe("cache interoperability and safety", () => {
               { directory: "packages/app", patterns: ["dist/**"] },
             ],
             regularFilePaths: [],
+            excludedDirectories: [],
           },
         ).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
       );
@@ -8576,6 +8694,7 @@ describe("cache interoperability and safety", () => {
             pathsToClear: [],
             allowedPathGroups: [{ directory: ".", patterns: [logPath] }],
             regularFilePaths: [logPath],
+            excludedDirectories: [],
           },
         ).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
       );
@@ -8616,6 +8735,7 @@ describe("cache interoperability and safety", () => {
             pathsToClear: [],
             allowedPathGroups: [],
             regularFilePaths: [logPath],
+            excludedDirectories: [],
           },
         ).pipe(Effect.provide(nodeFoundationLayer)),
       );
@@ -8640,6 +8760,7 @@ describe("cache interoperability and safety", () => {
       pathsToClear: [],
       allowedPathGroups: [],
       regularFilePaths: [logPath],
+      excludedDirectories: [],
     };
     try {
       await Effect.runPromise(
@@ -8690,6 +8811,7 @@ describe("cache interoperability and safety", () => {
               { directory: ".", patterns: [logPath, "preserved.txt"] },
             ],
             regularFilePaths: [logPath],
+            excludedDirectories: [],
           }).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
         );
         expect(restored._tag).toBe("Left");
@@ -8852,6 +8974,100 @@ describe("cache interoperability and safety", () => {
       expect(await readFile(manifestPath, "utf8")).toBe(originalManifest);
       await expect(
         lstat(`${directory}/packages/library/dist/poisoned.txt`),
+      ).rejects.toThrow();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("rejects remote cache artifacts that enter the active cache directory", async () => {
+    const directory = await makeFixture();
+    let artifact = new Uint8Array();
+    const server = createServer((request, response) => {
+      const chunks: Array<Buffer> = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        if (request.method === "PUT") {
+          artifact = new Uint8Array(Buffer.concat(chunks));
+          response.writeHead(201);
+          response.end();
+          return;
+        }
+        response.writeHead(200, {
+          "content-type": "application/octet-stream",
+        });
+        response.end(artifact);
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    const options = {
+      apiUrl: `http://127.0.0.1:${address.port}`,
+      timeoutMilliseconds: 5_000,
+      uploadTimeoutMilliseconds: 5_000,
+      preflight: false,
+      requireSignature: false,
+    };
+    const activeCacheDirectory = `${directory}/active-cache`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: { build: { outputs: Array<string> } } };
+      configuration.tasks.build.outputs.push("$TURBO_ROOT$/**");
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await Effect.runPromise(
+        writeRemoteCache(
+          options,
+          "activecache000000",
+          [
+            {
+              path: "packages/library/.turbo/turbo-build.log",
+              contents: new TextEncoder().encode("cached output\n"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+            {
+              path: "active-cache/poisoned.tar.zst",
+              contents: new TextEncoder().encode("poisoned cache\n"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+          ],
+          1,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--cache=remote:r",
+          "--cache-dir=active-cache",
+        ],
+        repositoryRoot,
+        { TURBO_API: options.apiUrl },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("library build");
+      expect(result.stderr).toContain(
+        "archive path enters the active cache directory",
+      );
+      await expect(
+        lstat(`${activeCacheDirectory}/poisoned.tar.zst`),
       ).rejects.toThrow();
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));

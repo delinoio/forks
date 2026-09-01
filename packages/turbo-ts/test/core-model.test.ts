@@ -939,6 +939,26 @@ describe("core repository model", () => {
     });
   });
 
+  it("disables uv build caching for alternate output directories", () => {
+    const uvPackage = {
+      ...packageModel("python-app", []),
+      directory: "/repo/python/app",
+      relativeDirectory: "python/app",
+      manager: "uv" as const,
+      scripts: { build: "uv build" },
+      tasks: { build: { cache: true, outputs: ["dist/**"] } },
+    } satisfies RepositoryPackage;
+    const node = buildTaskGraph(
+      repository([uvPackage]),
+      [uvPackage],
+      ["build"],
+      false,
+    ).nodes.get("python-app#build")!;
+    expect(isTaskScopeCacheable(node, [])).toBe(true);
+    expect(isTaskScopeCacheable(node, ["--out-dir", "wheelhouse"])).toBe(false);
+    expect(isTaskScopeCacheable(node, ["--out-dir=wheelhouse"])).toBe(false);
+  });
+
   it("disables Cargo build caching for unmodeled target selectors", () => {
     const cargoPackage: RepositoryPackage = {
       ...packageModel("app", []),

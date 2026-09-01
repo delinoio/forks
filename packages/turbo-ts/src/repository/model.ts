@@ -928,6 +928,7 @@ interface PythonProjectMetadata {
 
 interface PythonDependencySource {
   readonly workspace: boolean;
+  readonly editable: boolean;
   readonly path?: string;
 }
 
@@ -1106,6 +1107,7 @@ const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
       )
       .map((entry) => ({
         workspace: entry.workspace === true,
+        editable: entry.editable === true,
         ...(typeof entry.path === "string" ? { path: entry.path } : {}),
       }));
     dependencySources.set(normalizePythonPackageName(name), declarations);
@@ -1787,7 +1789,7 @@ export const discoverRepository = (
         { concurrency: 8 },
       ),
     );
-    const uvInternalDependenciesByName = new Map(
+    const uvDependencyResolutionByName = new Map(
       yield* Effect.forEach(
         drafts.filter((packageDraft) => packageDraft.manager === "uv"),
         (packageDraft) =>
@@ -1800,45 +1802,58 @@ export const discoverRepository = (
                   resolved === undefined
                     ? undefined
                     : draftsByName.get(resolved);
-                if (target === undefined || target.manager !== "uv") {
-                  return undefined;
-                }
                 const sources =
                   packageDraft.uvDependencySources?.get(
                     normalizePythonPackageName(name),
                   ) ?? [];
-                if (sources.some((source) => source.workspace)) {
-                  return target.name;
-                }
-                const targetIdentity = uvFilesystemIdentitiesByName.get(
-                  target.name,
-                );
-                if (targetIdentity === undefined) {
-                  return undefined;
-                }
+                const uvTarget = target?.manager === "uv" ? target : undefined;
+                const targetIdentity =
+                  uvTarget === undefined
+                    ? undefined
+                    : uvFilesystemIdentitiesByName.get(uvTarget.name);
                 const sourceIdentities = yield* Effect.forEach(
-                  sources.flatMap((source) =>
-                    source.path === undefined ? [] : [source.path],
-                  ),
-                  (path) =>
-                    canonicalFilesystemIdentity(
-                      joinPath(packageDraft.directory, path),
-                    ),
+                  sources,
+                  (source) =>
+                    source.path === undefined
+                      ? Effect.succeed(undefined)
+                      : canonicalFilesystemIdentity(
+                          joinPath(packageDraft.directory, source.path),
+                        ),
                   { concurrency: 8 },
                 );
-                return sourceIdentities.includes(targetIdentity)
-                  ? target.name
-                  : undefined;
+                const internalDependency =
+                  uvTarget !== undefined &&
+                  (sources.some((source) => source.workspace) ||
+                    (targetIdentity !== undefined &&
+                      sourceIdentities.includes(targetIdentity)))
+                    ? uvTarget.name
+                    : undefined;
+                const cacheInputsComplete = sources.every(
+                  (source, index) =>
+                    !source.editable ||
+                    source.path === undefined ||
+                    (targetIdentity !== undefined &&
+                      sourceIdentities[index] === targetIdentity),
+                );
+                return { internalDependency, cacheInputsComplete };
               }),
             { concurrency: 8 },
           ).pipe(
             Effect.map(
-              (internalDependencies) =>
+              (dependencies) =>
                 [
                   packageDraft.name,
-                  internalDependencies.filter(
-                    (name): name is string => name !== undefined,
-                  ),
+                  {
+                    internalDependencies: dependencies.flatMap(
+                      ({ internalDependency }) =>
+                        internalDependency === undefined
+                          ? []
+                          : [internalDependency],
+                    ),
+                    cacheInputsComplete: dependencies.every(
+                      (dependency) => dependency.cacheInputsComplete,
+                    ),
+                  },
                 ] as const,
             ),
           ),
@@ -1867,14 +1882,24 @@ export const discoverRepository = (
             ),
           };
         }
+        if (packageDraft.manager === "uv") {
+          const resolution = uvDependencyResolutionByName.get(
+            packageDraft.name,
+          );
+          return {
+            ...packageDraft,
+            cacheInputsComplete:
+              packageDraft.cacheInputsComplete &&
+              (resolution?.cacheInputsComplete ?? true),
+            internalDependencies: resolution?.internalDependencies ?? [],
+          };
+        }
         return {
           ...packageDraft,
           internalDependencies:
-            packageDraft.manager === "uv"
-              ? (uvInternalDependenciesByName.get(packageDraft.name) ?? [])
-              : (javascriptInternalDependenciesByDirectory.get(
-                  normalizePath(packageDraft.directory),
-                ) ?? []),
+            javascriptInternalDependenciesByDirectory.get(
+              normalizePath(packageDraft.directory),
+            ) ?? [],
         };
       })
       .sort((left, right) => left.name.localeCompare(right.name));

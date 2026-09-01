@@ -1259,6 +1259,7 @@ const cacheRestoreScope = (
   nodes: ReadonlyArray<TaskNode>,
   logPath: string,
   pathsToClear: ReadonlyArray<string>,
+  cacheExclusionDirectory: string,
 ): CacheRestoreScope => {
   const rootOutputPrefix = "$TURBO_ROOT$/";
   const allowedPathGroups = nodes.flatMap((node) => {
@@ -1291,6 +1292,12 @@ const cacheRestoreScope = (
     pathsToClear,
     allowedPathGroups,
     regularFilePaths: [relativePath(repository.root, logPath)],
+    excludedDirectories: isPathContained(
+      repository.root,
+      cacheExclusionDirectory,
+    )
+      ? [relativePath(repository.root, cacheExclusionDirectory)]
+      : [],
   };
 };
 
@@ -1370,6 +1377,16 @@ const usesAlternateCargoBuildOutputs = (
       [...cargoAlternateOutputFlags, ...cargoUnmodeledTargetFlags].some(
         (flag) => argument === flag || argument.startsWith(`${flag}=`),
       ),
+  );
+
+const usesAlternateUvBuildOutputs = (
+  node: TaskNode,
+  passThroughArguments: ReadonlyArray<string>,
+): boolean =>
+  node.package.manager === "uv" &&
+  node.task === "build" &&
+  passThroughArguments.some(
+    (argument) => argument === "--out-dir" || argument.startsWith("--out-dir="),
   );
 
 const usesEnvironmentCargoBuildTarget = (
@@ -1508,6 +1525,7 @@ export const isTaskScopeCacheable = (
       member.definition.persistent !== true,
   ) &&
   !usesAlternateCargoBuildOutputs(node, passThroughArguments) &&
+  !usesAlternateUvBuildOutputs(node, passThroughArguments) &&
   !usesEnvironmentCargoBuildTarget(
     node,
     environment,
@@ -1690,6 +1708,7 @@ const executeTask = (
       cacheNodes,
       logPath,
       pathsToClear,
+      options.cacheExclusionDirectory,
     );
     let cacheHit = false;
     if (cacheRestoreEnabled && options.cachePolicy.localRead) {
@@ -2446,6 +2465,21 @@ export const executeRun = (
           )
         : unresolvedOptions.cacheDirectory,
     };
+    const repository = yield* discoverRepository(options.root, configuration);
+    const containedPackage = repository.packages.find((packageModel) =>
+      isPathContained(
+        canonicalCacheDirectory,
+        joinPath(canonicalRoot, packageModel.canonicalRelativeDirectory),
+      ),
+    );
+    if (containedPackage !== undefined) {
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: unresolvedOptions.cacheDirectory,
+          message: `cache directory must not contain package ${containedPackage.name}`,
+        }),
+      );
+    }
     if (options.cachePolicy.localRead || options.cachePolicy.localWrite) {
       yield* evictLocalCache({
         directory: options.cacheDirectory,
@@ -2473,7 +2507,6 @@ export const executeRun = (
         ),
       );
     }
-    const repository = yield* discoverRepository(options.root, configuration);
     const packageManagerCheckDisabled =
       parsed.dangerouslyDisablePackageManagerCheck ||
       environmentBoolean(

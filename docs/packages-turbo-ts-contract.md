@@ -133,8 +133,9 @@ Repository discovery records the resolved root lockfile path without
 structurally parsing it;
 lockfile parsing and pruning remain Gate 3 work. Without Git, explicit task
 inputs under ordinary `dist` and `target` directories remain hashable.
-Cache directories equal to or containing the repository are rejected by
-canonical filesystem location before cache access, including through symlinks.
+Cache directories equal to or containing the repository or any discovered
+package directory are rejected by canonical filesystem location before cache
+access, including through symlinks.
 Scheduled `with` groups preserve internal dependency order and share one
 run-wide foreground concurrency budget. Simultaneously ready non-persistent
 companions acquire foreground permits as an indivisible cohort, and a
@@ -194,10 +195,11 @@ storage; signature verification and decompression consume the compressed file
 without materializing or duplicating the complete response in memory.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact literal log path before clearing or writing
-files. It rejects duplicate destinations and any non-directory archive entry
-that is an ancestor of another destination. Output negations are deny rules
-during both collection and restoration, regardless of their order relative to
-positive patterns. Task identifiers are
+files. It rejects destinations beneath the active cache directory, duplicate
+destinations, and any non-directory archive entry that is an ancestor of
+another destination. Output negations are deny rules during both collection
+and restoration, regardless of their order relative to positive patterns. Task
+identifiers are
 encoded into portable single-component log filenames; lowercase portable task
 names retain their existing filenames, and
 uppercase code points are encoded to prevent case-insensitive collisions.
@@ -230,7 +232,8 @@ orphaned sidecars. Startup eviction failures warn and continue without making
 cache maintenance a prerequisite for task execution. Eviction acquires the
 per-entry writer lock before removal so it cannot expose a partially published
 entry; selected-entry removal failures are aggregated after all of its archive
-and sidecar paths are tried.
+and sidecar paths are tried. Eviction also reclaims stale atomic-write
+temporaries under the corresponding entry lock.
 Cache archives use PAX
 extensions for paths beyond ustar limits. Tar header paths, link targets, and
 PAX metadata must be valid UTF-8; unsupported raw-byte names reject the
@@ -256,9 +259,13 @@ uv packages are discovered from the root
 exclusions; unrelated Python projects and `.venv` trees are ignored.
 Synthesized uv packages
 expose `build` and `test`, and implicit builds default to uncached unless task
-configuration explicitly enables caching. uv tasks execute from their project
-directory, forward test arguments directly to `pytest`, and parse `uv.lock` as
-TOML. uv package-graph edges require a
+configuration explicitly enables caching. Explicitly cached uv builds bypass
+caching when `--out-dir` selects an unmodeled output directory. uv tasks execute
+from their project directory, forward test arguments directly to `pytest`, and
+parse `uv.lock` as TOML. Each task hash includes the owning `pyproject.toml`
+independently of configured input globs. Editable uv path dependencies that do
+not resolve to the named discovered workspace member make the package and hash
+scopes that depend on it uncacheable. uv package-graph edges require a
 matching `tool.uv.sources` workspace declaration or local path resolving to the
 named workspace member by canonical, platform-aware filesystem identity;
 registry, Git, URL, and undeclared sources remain

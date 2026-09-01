@@ -49,6 +49,18 @@ const cacheFileHash = (name: string): string | undefined => {
   return suffix === undefined ? undefined : name.slice(0, -suffix.length);
 };
 
+const atomicTemporaryFile = (
+  name: string,
+): { readonly hash: string; readonly name: string } | undefined => {
+  const match =
+    /^(.*)\.([0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.tmp$/.exec(
+      name,
+    );
+  if (match?.[1] === undefined) return undefined;
+  const hash = cacheFileHash(match[1]);
+  return hash === undefined ? undefined : { hash, name };
+};
+
 const removeEntry = (
   directory: string,
   hash: string,
@@ -496,6 +508,40 @@ export const writeLocalCache = (
     yield* evictLocalCache(options);
   });
 
+const removeStaleTemporaryFiles = (
+  directory: string,
+  names: ReadonlyArray<string>,
+  now: number,
+): Effect.Effect<void, CacheError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const outcomes = yield* Effect.all(
+      names.map((name) => {
+        const path = joinPath(directory, name);
+        return isStaleFile(path, now).pipe(
+          Effect.flatMap((stale) =>
+            stale ? fileSystem.remove(path) : Effect.void,
+          ),
+          Effect.either,
+        );
+      }),
+      { concurrency: 3 },
+    );
+    const failures = outcomes.flatMap((outcome, index) =>
+      outcome._tag === "Left"
+        ? [`${joinPath(directory, names[index]!)}: ${outcome.left.message}`]
+        : [],
+    );
+    if (failures.length > 0) {
+      return yield* Effect.fail(
+        cacheError(
+          directory,
+          `stale atomic temporary cleanup failed: ${failures.join("; ")}`,
+        ),
+      );
+    }
+  });
+
 export const evictLocalCache = (
   options: LocalCacheOptions,
 ): Effect.Effect<
@@ -529,6 +575,32 @@ export const evictLocalCache = (
           cacheError(options.directory, error.message),
         ),
       );
+    const now = yield* clock.now;
+    const staleTemporaries = (yield* Effect.forEach(
+      directoryEntries.flatMap((entry) =>
+        entry.kind === "file" ? (atomicTemporaryFile(entry.name) ?? []) : [],
+      ),
+      (entry) =>
+        isStaleFile(joinPath(options.directory, entry.name), now).pipe(
+          Effect.map((stale) => (stale ? entry : undefined)),
+        ),
+      { concurrency: 8 },
+    )).filter(
+      (entry): entry is NonNullable<typeof entry> => entry !== undefined,
+    );
+    const temporaryNamesByHash = new Map<string, Array<string>>();
+    for (const temporary of staleTemporaries) {
+      const names = temporaryNamesByHash.get(temporary.hash) ?? [];
+      names.push(temporary.name);
+      temporaryNamesByHash.set(temporary.hash, names);
+    }
+    for (const [hash, names] of temporaryNamesByHash) {
+      yield* withEntryLock(
+        options,
+        hash,
+        removeStaleTemporaryFiles(options.directory, names, now),
+      );
+    }
     const cacheFiles = yield* Effect.forEach(
       directoryEntries.flatMap((entry) => {
         const hash =
@@ -574,7 +646,6 @@ export const evictLocalCache = (
       modified: entry.archiveModified ?? entry.modified,
     }));
     let total = cacheEntries.reduce((size, entry) => size + entry.size, 0);
-    const now = yield* clock.now;
     for (const entry of cacheEntries.sort(
       (left, right) => left.modified - right.modified,
     )) {

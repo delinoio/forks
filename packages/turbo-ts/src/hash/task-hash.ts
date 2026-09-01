@@ -396,7 +396,17 @@ export const implicitTaskInputCandidates = (
   ]),
 ];
 
-const cargoControlInputFiles = (
+const alwaysHashedControlInputCandidates = (
+  repository: RepositoryModel,
+  node: TaskNode,
+): ReadonlyArray<string> =>
+  node.package.manager === "cargo"
+    ? cargoControlInputCandidates(repository, node)
+    : node.package.manager === "uv"
+      ? [joinPath(node.package.directory, "pyproject.toml")]
+      : [];
+
+const alwaysHashedControlInputFiles = (
   repository: RepositoryModel,
   node: TaskNode,
   cacheDirectory: string,
@@ -407,11 +417,11 @@ const cargoControlInputFiles = (
   FileSystemService | ProcessService
 > =>
   Effect.gen(function* () {
-    if (node.package.manager !== "cargo") return [];
     const fileSystem = yield* FileSystemService;
-    const candidates = cargoControlInputCandidates(repository, node).filter(
-      (path) => !isIgnoredInputPath(path, cacheDirectory),
-    );
+    const candidates = alwaysHashedControlInputCandidates(
+      repository,
+      node,
+    ).filter((path) => !isIgnoredInputPath(path, cacheDirectory));
     const existing = yield* Effect.forEach(
       candidates,
       (path) =>
@@ -627,7 +637,7 @@ export const hashTask = (
       ...new Map(
         [
           ...configuredInputFiles,
-          ...(yield* cargoControlInputFiles(
+          ...(yield* alwaysHashedControlInputFiles(
             repository,
             node,
             cacheDirectory,
