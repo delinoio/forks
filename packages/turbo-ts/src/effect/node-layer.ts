@@ -37,6 +37,7 @@ import { Cause, Effect, Exit, Layer, Option, Ref, Stream } from "effect";
 import { createXxhash64 } from "../hash/xxhash64.js";
 import { BoundaryError, ProcessExecutionError } from "./errors.js";
 import {
+  type BinaryExecutionRequest,
   CacheService,
   ClockService,
   CompressionService,
@@ -46,6 +47,7 @@ import {
   DigestService,
   deterministicRetryLayer,
   EnvironmentService,
+  type ExecutionRequest,
   ExitStatusService,
   type FileSystemOperations,
   FileSystemService,
@@ -738,6 +740,77 @@ export const collectChildProcessOutput = (
     });
   });
 
+export const collectChildProcessBytes = (
+  child: ChildProcessIo,
+  command: string,
+  stdin: string | undefined,
+): Effect.Effect<
+  {
+    readonly exitCode: number;
+    readonly stdout: Uint8Array;
+    readonly stderr: Uint8Array;
+  },
+  ProcessExecutionError
+> =>
+  Effect.async((resume) => {
+    let settled = false;
+    let closeReceived = false;
+    let closeExitCode: number | null = null;
+    let stdoutEnded = child.stdout.readableEnded;
+    let stderrEnded = child.stderr.readableEnded;
+    const stdout: Array<Buffer> = [];
+    const stderr: Array<Buffer> = [];
+    const fail = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(processExecutionError(command, cause)));
+    };
+    const complete = () => {
+      if (settled || !closeReceived || !stdoutEnded || !stderrEnded) return;
+      settled = true;
+      resume(
+        Effect.succeed({
+          exitCode: closeExitCode ?? 1,
+          stdout: new Uint8Array(Buffer.concat(stdout)),
+          stderr: new Uint8Array(Buffer.concat(stderr)),
+        }),
+      );
+    };
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      if (!settled) stdout.push(Buffer.from(chunk));
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      if (!settled) stderr.push(Buffer.from(chunk));
+    });
+    child.onceError(fail);
+    child.stdin.on("error", fail);
+    child.stdout.once("error", fail);
+    child.stderr.once("error", fail);
+    child.stdout.once("end", () => {
+      stdoutEnded = true;
+      complete();
+    });
+    child.stderr.once("end", () => {
+      stderrEnded = true;
+      complete();
+    });
+    child.onceClose((exitCode) => {
+      closeReceived = true;
+      closeExitCode = exitCode;
+      complete();
+    });
+    if (stdin === undefined) {
+      child.stdin.end();
+    } else {
+      child.stdin.end(stdin);
+    }
+    return Effect.sync(() => {
+      settled = true;
+      child.stdout.pause();
+      child.stderr.pause();
+    });
+  });
+
 const waitForInheritedChild = (
   child: Pick<ChildProcessIo, "onceClose" | "onceError">,
   command: string,
@@ -771,48 +844,53 @@ const waitForInheritedChild = (
     });
   });
 
+const acquireChildProcess = (
+  request: ExecutionRequest | BinaryExecutionRequest,
+  capturesOutput: boolean,
+): Effect.Effect<ScopedChildProcess, ProcessExecutionError> =>
+  Effect.try({
+    try: () => {
+      const ownsProcessGroup = process.platform !== "win32";
+      const invocation = resolveSpawnInvocation(
+        request.command,
+        request.args,
+        process.platform,
+        configuredWindowsCommandInterpreter(),
+      );
+      const child = spawn(invocation.command, [...invocation.args], {
+        cwd: request.cwd,
+        detached: ownsProcessGroup,
+        env: makeChildEnvironment(
+          request.inheritEnvironment === false ? {} : process.env,
+          request.env,
+          process.platform,
+        ),
+        shell: false,
+        stdio: capturesOutput ? "pipe" : "inherit",
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+      });
+      let childClosed = false;
+      const closed = new Promise<void>((resolve) => {
+        child.once("close", () => {
+          childClosed = true;
+          resolve();
+        });
+      });
+      return {
+        child,
+        closed,
+        isClosed: () => childClosed,
+        processGroupId: ownsProcessGroup ? child.pid : undefined,
+        capturesOutput,
+      };
+    },
+    catch: (cause) => processExecutionError(request.command, cause),
+  });
+
 const processLayer = Layer.succeed(ProcessService, {
   run: (request) =>
     Effect.acquireUseRelease(
-      Effect.try({
-        try: () => {
-          const ownsProcessGroup = process.platform !== "win32";
-          const capturesOutput = request.stdio !== "inherit";
-          const invocation = resolveSpawnInvocation(
-            request.command,
-            request.args,
-            process.platform,
-            configuredWindowsCommandInterpreter(),
-          );
-          const child = spawn(invocation.command, [...invocation.args], {
-            cwd: request.cwd,
-            detached: ownsProcessGroup,
-            env: makeChildEnvironment(
-              request.inheritEnvironment === false ? {} : process.env,
-              request.env,
-              process.platform,
-            ),
-            shell: false,
-            stdio: capturesOutput ? "pipe" : "inherit",
-            windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-          });
-          let childClosed = false;
-          const closed = new Promise<void>((resolve) => {
-            child.once("close", () => {
-              childClosed = true;
-              resolve();
-            });
-          });
-          return {
-            child,
-            closed,
-            isClosed: () => childClosed,
-            processGroupId: ownsProcessGroup ? child.pid : undefined,
-            capturesOutput,
-          };
-        },
-        catch: (cause) => processExecutionError(request.command, cause),
-      }),
+      acquireChildProcess(request, request.stdio !== "inherit"),
       ({ child, capturesOutput }) => {
         const lifecycle = {
           onceClose: (listener: (exitCode: number | null) => void) => {
@@ -839,6 +917,23 @@ const processLayer = Layer.succeed(ProcessService, {
           request.maxCapturedOutputCharacters,
         );
       },
+      terminateChild,
+    ),
+  runBytes: (request) =>
+    Effect.acquireUseRelease(
+      acquireChildProcess(request, true),
+      ({ child }) =>
+        collectChildProcessBytes(
+          {
+            stdin: child.stdin!,
+            stdout: child.stdout!,
+            stderr: child.stderr!,
+            onceClose: (listener) => child.once("close", listener),
+            onceError: (listener) => child.once("error", listener),
+          },
+          request.command,
+          request.stdin,
+        ),
       terminateChild,
     ),
 });
@@ -967,10 +1062,10 @@ class HttpResponseBodyLimitError extends Error {}
 
 class CompressionOutputLimitError extends Error {}
 
-const readResponseBody = async (
+const validateResponseContentLength = async (
   response: Response,
   maxBytes: number | undefined,
-): Promise<Uint8Array> => {
+): Promise<void> => {
   const contentLength = response.headers.get("content-length");
   if (
     maxBytes !== undefined &&
@@ -983,6 +1078,13 @@ const readResponseBody = async (
       `HTTP response body exceeds the ${maxBytes} byte limit`,
     );
   }
+};
+
+const readResponseBody = async (
+  response: Response,
+  maxBytes: number | undefined,
+): Promise<Uint8Array> => {
+  await validateResponseContentLength(response, maxBytes);
   if (response.body === null) return new Uint8Array();
   const reader = response.body.getReader();
   const chunks: Array<Uint8Array> = [];
@@ -1012,6 +1114,75 @@ const readResponseBody = async (
   return body;
 };
 
+const writeResponseBodyToFile = async (
+  response: Response,
+  destination: string,
+  maxBytes: number | undefined,
+  signal: AbortSignal,
+): Promise<void> => {
+  await validateResponseContentLength(response, maxBytes);
+  if (response.body === null) {
+    await writeFile(destination, new Uint8Array());
+    return;
+  }
+  let length = 0;
+  const limiter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      length += chunk.length;
+      if (maxBytes !== undefined && length > maxBytes) {
+        callback(
+          new HttpResponseBodyLimitError(
+            `HTTP response body exceeds the ${maxBytes} byte limit`,
+          ),
+        );
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+  try {
+    await pipeline(
+      Readable.fromWeb(response.body),
+      limiter,
+      createWriteStream(destination, { flags: "w" }),
+      { signal },
+    );
+  } catch (cause) {
+    await rm(destination, { force: true }).catch(() => undefined);
+    throw cause;
+  }
+};
+
+const decompressZstdStreamToFile = async (
+  source: Readable,
+  destination: string,
+  maxOutputBytes: number | undefined,
+  signal: AbortSignal,
+): Promise<void> => {
+  let outputBytes = 0;
+  const limiter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      outputBytes += chunk.length;
+      if (maxOutputBytes !== undefined && outputBytes > maxOutputBytes) {
+        callback(
+          new CompressionOutputLimitError(
+            `decompressed output exceeds the ${maxOutputBytes} byte limit`,
+          ),
+        );
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+  await pipeline(
+    source,
+    createZstdDecompress(),
+    limiter,
+    createWriteStream(destination, { flags: "wx" }),
+    { signal },
+  );
+};
+
 const compressionLayer = Layer.succeed(CompressionService, {
   compressZstd: (contents) =>
     Effect.tryPromise({
@@ -1034,30 +1205,24 @@ const compressionLayer = Layer.succeed(CompressionService, {
     }),
   decompressZstdToFile: (contents, destination, maxOutputBytes) =>
     Effect.tryPromise({
-      try: async (signal) => {
-        let outputBytes = 0;
-        const limiter = new Transform({
-          transform(chunk: Buffer, _encoding, callback) {
-            outputBytes += chunk.length;
-            if (maxOutputBytes !== undefined && outputBytes > maxOutputBytes) {
-              callback(
-                new CompressionOutputLimitError(
-                  `decompressed output exceeds the ${maxOutputBytes} byte limit`,
-                ),
-              );
-              return;
-            }
-            callback(null, chunk);
-          },
-        });
-        await pipeline(
+      try: (signal) =>
+        decompressZstdStreamToFile(
           Readable.from([Buffer.from(contents)]),
-          createZstdDecompress(),
-          limiter,
-          createWriteStream(destination, { flags: "wx" }),
-          { signal },
-        );
-      },
+          destination,
+          maxOutputBytes,
+          signal,
+        ),
+      catch: compressionError,
+    }),
+  decompressZstdFileToFile: (source, destination, maxOutputBytes) =>
+    Effect.tryPromise({
+      try: (signal) =>
+        decompressZstdStreamToFile(
+          createReadStream(source),
+          destination,
+          maxOutputBytes,
+          signal,
+        ),
       catch: compressionError,
     }),
 });
@@ -1110,12 +1275,72 @@ const httpLayer = Layer.succeed(HttpService, {
           retryable: !(cause instanceof HttpResponseBodyLimitError),
         }),
     }),
+  downloadToFile: (request, destination) =>
+    Effect.tryPromise({
+      try: async (interruptionSignal) => {
+        const controller = new AbortController();
+        const timeout =
+          request.timeoutMilliseconds === undefined ||
+          request.timeoutMilliseconds === 0
+            ? undefined
+            : setTimeout(() => controller.abort(), request.timeoutMilliseconds);
+        const signal =
+          timeout === undefined
+            ? interruptionSignal
+            : AbortSignal.any([interruptionSignal, controller.signal]);
+        try {
+          const response = await fetch(request.url, {
+            method: request.method,
+            headers: request.headers,
+            redirect: "follow",
+            signal,
+          });
+          await writeResponseBodyToFile(
+            response,
+            destination,
+            request.maxResponseBodyBytes,
+            signal,
+          );
+          return {
+            status: response.status,
+            headers: Object.fromEntries(response.headers.entries()),
+          };
+        } finally {
+          if (timeout !== undefined) clearTimeout(timeout);
+        }
+      },
+      catch: (cause) =>
+        new BoundaryError({
+          boundary: "http",
+          message: String(cause),
+          retryable: !(cause instanceof HttpResponseBodyLimitError),
+        }),
+    }),
 });
 
 const signingLayer = Layer.succeed(SigningService, {
   hmacSha256: (key, contents) =>
     Effect.try({
       try: () => createHmac("sha256", key).update(contents).digest("hex"),
+      catch: (cause) =>
+        new BoundaryError({
+          boundary: "signing",
+          message: String(cause),
+          retryable: false,
+        }),
+    }),
+  hmacSha256File: (key, path) =>
+    Effect.tryPromise({
+      try: async (signal) => {
+        const hmac = createHmac("sha256", key);
+        const stream = createReadStream(path, { signal });
+        try {
+          for await (const chunk of stream) hmac.update(chunk);
+        } finally {
+          stream.destroy();
+        }
+        return hmac.digest("hex");
+      },
       catch: (cause) =>
         new BoundaryError({
           boundary: "signing",

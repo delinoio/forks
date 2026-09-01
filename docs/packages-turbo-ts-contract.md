@@ -84,6 +84,9 @@ an invalid declaration fails discovery. Declared workspace members remain
 discoverable beneath directories named `dist` or `target`. JavaScript workspace
 traversal prunes subtrees that cannot match a positive workspace pattern before
 listing them; ordered exclusions are applied to the resulting candidates.
+Matching directory symlinks are traversed by their declared logical path only
+when their canonical target is a directory inside the repository; canonical
+ancestor tracking prevents symlink cycles.
 Every requested task
 must resolve before any task executes, and
 strict entrypoint selection removes configured tasks without an executable
@@ -105,7 +108,9 @@ selection and hashing. Task hashes preserve Git symlink, gitlink, and dependency
 semantics, exclude the resolved cache directory, and use each task's owning
 ecosystem lockfile. Regular input files are streamed through bounded-memory Git
 blob digests, and owning lockfiles are streamed through bounded-memory xxHash64
-digests. Cargo task hashes additionally include repository-contained
+digests. NUL-delimited Git discovery output is consumed as bytes and filenames
+that are not valid UTF-8 fail hashing instead of being silently omitted. Cargo
+task hashes additionally include repository-contained
 ancestor manifests, Cargo configuration, and Rust toolchain files that can
 change task execution. Environment-name selection follows Windows
 case-insensitive semantics for both hashing and strict task execution.
@@ -158,6 +163,9 @@ limited to 64 KiB per extended header, and cumulative tar headers, padding, and
 PAX metadata are limited to 64 MiB while parsing. Temporary archive cleanup is
 part of the restoration transaction, so cleanup failures roll back installed
 outputs before task execution falls back.
+Remote artifact response bodies are streamed directly into scoped temporary
+storage; signature verification and decompression consume the compressed file
+without materializing or duplicating the complete response in memory.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact literal log path before clearing or writing
 files. Output negations are deny rules during both collection and restoration,
@@ -172,6 +180,10 @@ repository, preventing declared output paths from redirecting writes elsewhere.
 Restored symlink targets must remain within the same declared output group that
 authorized the symlink path, and every existing target component must resolve
 inside the repository without traversing another symlink.
+Cache collection applies the same validation before publication, so artifacts
+with non-restorable symlink targets are skipped. Restoration rejects duplicate
+comparable destinations before clearing outputs, including paths that differ
+only by case on Windows.
 Every archive must contain exactly one regular task-log entry. Cache writes
 whose aggregate uncompressed file content exceeds 64 MiB are skipped before
 contents are read, with a warning that preserves the successful task result.
@@ -203,13 +215,17 @@ registry, Git, URL, and undeclared sources remain
 external. JavaScript package-graph edges
 require declared workspace or version-range compatibility, or a `file:` or
 `link:` path whose canonical, platform-aware filesystem identity resolves to
-the named local JavaScript package. pnpm workspace aliases resolve to the
-package name encoded in their `workspace:` specification; same-named Cargo and
-uv packages are never JavaScript workspace targets. Cargo metadata
+the local JavaScript package. Local path aliases record the resolved package's
+actual name even when the dependency key differs. pnpm workspace aliases
+resolve to the package name encoded in their `workspace:` specification;
+same-named Cargo and uv packages are never JavaScript workspace targets. Cargo metadata
 paths are matched by canonical filesystem identity. Unfiltered Cargo `test`,
 `check`, `lint`, and `format` tasks execute once per Cargo workspace and bypass
 caching when any grouped member disables it; filtered and package-qualified
-runs retain package targeting. Members of an enclosing Cargo workspace outside
+runs retain package targeting. A workspace is grouped only when every
+repository-contained member exposes the requested verification task; otherwise
+participating members retain package targeting so task exclusions are honored.
+Members of an enclosing Cargo workspace outside
 the repository always retain package targeting. Grouped Cargo commands receive
 the union of all member task environments. Cargo package-graph edges require a
 source-free metadata dependency path that resolves to the named member in the
@@ -236,6 +252,8 @@ preserve leading and trailing ellipses and traverse both task and package graphs
 in the requested dependent or dependency direction. Ordinary root-file changes
 select only tasks whose effective inputs match them; repository-global inputs
 and Git discovery failures retain the all-task fallback.
+Changes to the loaded root task configuration select all requested task
+entrypoints under task-aware affected and Git-range filtering.
 
 Gate 2 is not closed: the composed task-hash serializer does not yet reproduce
 the official 2.10.12 task hashes. Individual source-file hashes match Git and

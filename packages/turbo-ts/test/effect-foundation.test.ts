@@ -10,6 +10,7 @@ import { Effect, Fiber, Schedule, Schema, Stream } from "effect";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import {
+  collectChildProcessBytes,
   collectChildProcessOutput,
   makeChildEnvironment,
   makeTerminalOperations,
@@ -269,6 +270,41 @@ describe("Effect foundation", () => {
         expect(httpOutcome.left.retryable).toBe(false);
         expect(httpOutcome.left.message).toContain("4 byte limit");
       }
+      const streamedHttpPath = join(directory, "response.bin");
+      const streamedHttpOutcome = await Effect.runPromise(
+        HttpService.pipe(
+          Effect.flatMap((http) =>
+            http.downloadToFile(
+              {
+                url: `http://127.0.0.1:${address.port}`,
+                method: "GET",
+                maxResponseBodyBytes: 4,
+              },
+              streamedHttpPath,
+            ),
+          ),
+          Effect.either,
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(streamedHttpOutcome._tag).toBe("Left");
+      await expect(readFile(streamedHttpPath)).rejects.toThrow();
+      await Effect.runPromise(
+        HttpService.pipe(
+          Effect.flatMap((http) =>
+            http.downloadToFile(
+              {
+                url: `http://127.0.0.1:${address.port}`,
+                method: "GET",
+                maxResponseBodyBytes: 5,
+              },
+              streamedHttpPath,
+            ),
+          ),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(await readFile(streamedHttpPath, "utf8")).toBe("12345");
 
       const decompressionOutcome = await Effect.runPromise(
         Effect.gen(function* () {
@@ -299,6 +335,25 @@ describe("Effect foundation", () => {
         }).pipe(Effect.provide(nodeFoundationLayer)),
       );
       expect(streamedDecompressionOutcome._tag).toBe("Left");
+
+      const fileDecompressionOutcome = await Effect.runPromise(
+        Effect.gen(function* () {
+          const compression = yield* CompressionService;
+          const compressed = yield* compression.compressZstd(
+            new TextEncoder().encode("12345"),
+          );
+          const source = join(directory, "archive.tar.zst");
+          yield* Effect.promise(() => writeFile(source, compressed));
+          return yield* Effect.either(
+            compression.decompressZstdFileToFile(
+              source,
+              join(directory, "archive-from-file.tar"),
+              4,
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(fileDecompressionOutcome._tag).toBe("Left");
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(directory, { force: true, recursive: true });
@@ -655,6 +710,39 @@ describe("Effect foundation", () => {
         expect(outcome.left.command).toBe(command);
       }
     }
+  });
+
+  it("waits for raw child output streams to drain after close", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let close: ((exitCode: number | null) => void) | undefined;
+    const fiber = Effect.runFork(
+      collectChildProcessBytes(
+        {
+          stdin,
+          stdout,
+          stderr,
+          onceClose: (listener) => {
+            close = listener;
+          },
+          onceError: () => {
+            // The synthetic process exits through the close callback.
+          },
+        },
+        "synthetic-raw-output",
+        undefined,
+      ),
+    );
+    await Effect.runPromise(Effect.yieldNow());
+    close?.(0);
+    expect((await Effect.runPromise(Fiber.poll(fiber)))._tag).toBe("None");
+    stdout.end(Buffer.from([0x70, 0xff]));
+    stderr.end(Buffer.from([0x65, 0xfe]));
+    const result = await Effect.runPromise(Fiber.join(fiber));
+    expect(result.exitCode).toBe(0);
+    expect([...result.stdout]).toEqual([0x70, 0xff]);
+    expect([...result.stderr]).toEqual([0x65, 0xfe]);
   });
 
   it("preserves observed stdout and stderr chunk order", async () => {

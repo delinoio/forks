@@ -65,6 +65,20 @@ const isArchiveFileContentsRange = (
 const comparablePath = (path: string): string =>
   /^[A-Za-z]:/.test(path) || path.startsWith("//") ? path.toLowerCase() : path;
 
+export const duplicateArchiveEntryDestination = (
+  root: string,
+  entries: ReadonlyArray<RestorableArchiveEntry>,
+): string | undefined => {
+  const destinations = new Set<string>();
+  for (const entry of entries) {
+    const destination = joinPath(root, entry.path);
+    const comparableDestination = comparablePath(destination);
+    if (destinations.has(comparableDestination)) return destination;
+    destinations.add(comparableDestination);
+  }
+  return undefined;
+};
+
 const groupAllowsEntry = (
   root: string,
   destination: string,
@@ -172,16 +186,11 @@ const validateExistingPathComponents = (
     }
   });
 
-export const restoreArchiveEntries = (
+export const validateArchiveEntriesForRestore = (
   root: string,
   entries: ReadonlyArray<RestorableArchiveEntry>,
   scope: CacheRestoreScope,
-  finalizeRestoration: Effect.Effect<
-    void,
-    CacheError,
-    FileSystemService
-  > = Effect.void,
-): Effect.Effect<void, CacheError | CacheRollbackError, FileSystemService> =>
+): Effect.Effect<string, CacheError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const canonicalRoot = yield* fileSystem
@@ -195,6 +204,18 @@ export const restoreArchiveEntries = (
     const regularFileCounts = new Map<string, number>(
       [...regularFileDestinations].map((path) => [path, 0] as const),
     );
+    const duplicateDestination = duplicateArchiveEntryDestination(
+      root,
+      entries,
+    );
+    if (duplicateDestination !== undefined) {
+      return yield* Effect.fail(
+        restoreError(
+          duplicateDestination,
+          "archive destination occurs more than once",
+        ),
+      );
+    }
     for (const entry of entries) {
       const destination = joinPath(root, entry.path);
       const comparableDestination = comparablePath(destination);
@@ -288,6 +309,26 @@ export const restoreArchiveEntries = (
         );
       }
     }
+    return canonicalRoot;
+  });
+
+export const restoreArchiveEntries = (
+  root: string,
+  entries: ReadonlyArray<RestorableArchiveEntry>,
+  scope: CacheRestoreScope,
+  finalizeRestoration: Effect.Effect<
+    void,
+    CacheError,
+    FileSystemService
+  > = Effect.void,
+): Effect.Effect<void, CacheError | CacheRollbackError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const canonicalRoot = yield* validateArchiveEntriesForRestore(
+      root,
+      entries,
+      scope,
+    );
     const restoredPaths: Array<string> = [];
     const restoration = Effect.gen(function* () {
       for (const path of scope.pathsToClear) {

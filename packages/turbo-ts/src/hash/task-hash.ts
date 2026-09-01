@@ -293,17 +293,50 @@ const gitLiteralPathspecEnvironment = {
   GIT_LITERAL_PATHSPECS: "1",
 } as const;
 
+export const decodeNullDelimitedGitOutput = (
+  output: Uint8Array,
+  path: string,
+): ReadonlyArray<string> => {
+  try {
+    return new TextDecoder("utf-8", { fatal: true })
+      .decode(output)
+      .split("\0")
+      .filter(Boolean);
+  } catch (cause) {
+    throw new RepositoryError({
+      path,
+      message: `Git returned a path that is not valid UTF-8: ${String(cause)}`,
+    });
+  }
+};
+
+const decodeNullDelimitedGitOutputEffect = (
+  output: Uint8Array,
+  path: string,
+): Effect.Effect<ReadonlyArray<string>, RepositoryError> =>
+  Effect.try({
+    try: () => decodeNullDelimitedGitOutput(output, path),
+    catch: (cause) =>
+      cause instanceof RepositoryError
+        ? cause
+        : new RepositoryError({ path, message: String(cause) }),
+  });
+
 const trackedGitModes = (
   repository: RepositoryModel,
   relativePaths: ReadonlyArray<string>,
-): Effect.Effect<ReadonlyMap<string, GitTrackedMode>, never, ProcessService> =>
+): Effect.Effect<
+  ReadonlyMap<string, GitTrackedMode>,
+  RepositoryError,
+  ProcessService
+> =>
   Effect.gen(function* () {
     const modes = new Map<string, GitTrackedMode>();
     if (relativePaths.length === 0) return modes;
     const processService = yield* ProcessService;
     const result = yield* Effect.either(
       Effect.scoped(
-        processService.run({
+        processService.runBytes({
           command: "git",
           args: [
             "ls-files",
@@ -319,7 +352,10 @@ const trackedGitModes = (
       ),
     );
     if (result._tag === "Left" || result.right.exitCode !== 0) return modes;
-    for (const entry of result.right.stdout.split("\0").filter(Boolean)) {
+    for (const entry of yield* decodeNullDelimitedGitOutputEffect(
+      result.right.stdout,
+      repository.root,
+    )) {
       const match =
         /^(100644|100755|120000|160000) [0-9a-fA-F]+ 0\t([\s\S]+)$/.exec(entry);
       if (match?.[1] === undefined || match[2] === undefined) continue;
@@ -423,7 +459,7 @@ const discoverFiles = (
       : new Map<string, GitTrackedMode>();
     const git = yield* Effect.either(
       Effect.scoped(
-        processService.run({
+        processService.runBytes({
           command: "git",
           args: [
             "ls-files",
@@ -440,9 +476,10 @@ const discoverFiles = (
       ),
     );
     if (git._tag === "Right" && git.right.exitCode === 0) {
-      const discovered = git.right.stdout
-        .split("\0")
-        .filter(Boolean)
+      const discovered = (yield* decodeNullDelimitedGitOutputEffect(
+        git.right.stdout,
+        repository.root,
+      ))
         .map((path) => {
           const absolutePath = joinPath(repository.root, path);
           return { absolutePath, gitMode: gitModes.get(absolutePath) };
@@ -573,7 +610,7 @@ export const hashTask = (
     const gitlinkObjectId = (path: string) =>
       Effect.gen(function* () {
         const result = yield* Effect.scoped(
-          processService.run({
+          processService.runBytes({
             command: "git",
             args: [
               "ls-files",
@@ -590,18 +627,20 @@ export const hashTask = (
             (error) => new RepositoryError({ path, message: error.message }),
           ),
         );
-        const objectId = result.stdout
-          .split("\0")
-          .filter(Boolean)
-          .flatMap((entry) => {
-            const match = /^160000 ([0-9a-fA-F]+) 0\t/.exec(entry);
-            return match?.[1] === undefined ? [] : [match[1]];
-          })[0];
+        const objectId = (yield* decodeNullDelimitedGitOutputEffect(
+          result.stdout,
+          path,
+        )).flatMap((entry) => {
+          const match = /^160000 ([0-9a-fA-F]+) 0\t/.exec(entry);
+          return match?.[1] === undefined ? [] : [match[1]];
+        })[0];
         if (result.exitCode !== 0 || objectId === undefined) {
           return yield* Effect.fail(
             new RepositoryError({
               path,
-              message: result.stderr || "directory input is not a Git gitlink",
+              message:
+                new TextDecoder().decode(result.stderr) ||
+                "directory input is not a Git gitlink",
             }),
           );
         }

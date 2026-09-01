@@ -11,7 +11,10 @@ import {
   restoreRemoteCache,
   writeRemoteCache,
 } from "../cache/remote-cache.js";
-import type { CacheRestoreScope } from "../cache/restore.js";
+import {
+  type CacheRestoreScope,
+  validateArchiveEntriesForRestore,
+} from "../cache/restore.js";
 import {
   type LoadedRootConfiguration,
   loadRootConfiguration,
@@ -614,8 +617,12 @@ const findAffectedPackages = (
           path.startsWith(`${packageModel.relativeDirectory}/`),
         ),
     );
+    const rootConfigurationChanged = changedFiles.includes(
+      relativePath(repository.root, repository.rootConfiguration.path),
+    );
     const rootChanged =
       globalDependencyChanged ||
+      rootConfigurationChanged ||
       (!globalInputsAreTaskAware && ordinaryRootChanged);
     return {
       packages: rootChanged
@@ -1096,6 +1103,7 @@ const collectCacheEntries = (
   nodes: ReadonlyArray<TaskNode>,
   logPath: string,
   cacheDirectory: string,
+  restoreScope: CacheRestoreScope,
 ): Effect.Effect<
   | {
       readonly kind: "ready";
@@ -1174,6 +1182,16 @@ const collectCacheEntries = (
           return { ...common, contents };
         }),
       { concurrency: 8 },
+    );
+    yield* validateArchiveEntriesForRestore(
+      repository.root,
+      entries,
+      restoreScope,
+    ).pipe(
+      Effect.mapError(
+        (error) =>
+          new RepositoryError({ path: error.path, message: error.message }),
+      ),
     );
     return { kind: "ready", entries } as const;
   });
@@ -1708,6 +1726,7 @@ const executeTask = (
         cacheNodes,
         logPath,
         options.cacheExclusionDirectory,
+        restoreScope,
       ).pipe(
         Effect.catchAll((error) =>
           terminal
@@ -1841,6 +1860,7 @@ export interface CargoWorkspaceTaskPlan {
 }
 
 export const planCargoWorkspaceTasks = (
+  repository: RepositoryModel,
   graph: TaskGraph,
   requestedTasks: ReadonlyArray<string>,
   unfiltered: boolean,
@@ -1875,6 +1895,24 @@ export const planCargoWorkspaceTasks = (
   for (const members of grouped.values()) {
     members.sort((left, right) => left.id.localeCompare(right.id));
     const representative = members[0]!;
+    const workspaceMembers = repository.packages.filter(
+      (packageModel) =>
+        packageModel.manager === "cargo" &&
+        packageModel.workspaceDirectory ===
+          representative.package.workspaceDirectory,
+    );
+    const groupedPackageNames = new Set(
+      members.map((member) => member.package.name),
+    );
+    if (
+      workspaceMembers.some(
+        (packageModel) =>
+          packageModel.tasks[representative.task] === undefined ||
+          !groupedPackageNames.has(packageModel.name),
+      )
+    ) {
+      continue;
+    }
     for (const member of members) aliases.set(member.id, representative.id);
     scopes.set(representative.id, {
       kind: "cargo-workspace",
@@ -2332,6 +2370,7 @@ export const executeRun = (
         )
       : unfilteredGraph;
     const cargoWorkspacePlan = planCargoWorkspaceTasks(
+      repository,
       selectedGraph,
       options.tasks,
       affected.filters.length === 0,

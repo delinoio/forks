@@ -725,7 +725,7 @@ describe("core repository model", () => {
     );
   });
 
-  it("plans one unfiltered Cargo verification per workspace", () => {
+  it("plans complete Cargo workspaces without broadening task exclusions", () => {
     const cargoPackage = (name: string): RepositoryPackage => ({
       ...packageModel(name, []),
       directory: `/repo/crates/${name}`,
@@ -742,7 +742,7 @@ describe("core repository model", () => {
     };
     const model = repository([app, library]);
     const graph = buildTaskGraph(model, model.packages, ["test"], false);
-    const workspacePlan = planCargoWorkspaceTasks(graph, ["test"], true);
+    const workspacePlan = planCargoWorkspaceTasks(model, graph, ["test"], true);
     expect(workspacePlan.graph.entrypoints).toEqual(["app#test"]);
     const workspaceNode = workspacePlan.graph.nodes.get("app#test")!;
     const workspaceScope = workspacePlan.scopes.get("app#test")!;
@@ -790,7 +790,12 @@ describe("core repository model", () => {
       ["format"],
       false,
     );
-    const formatPlan = planCargoWorkspaceTasks(formatGraph, ["format"], true);
+    const formatPlan = planCargoWorkspaceTasks(
+      model,
+      formatGraph,
+      ["format"],
+      true,
+    );
     const formatNode = formatPlan.graph.nodes.get("app#format")!;
     expect(
       packageManagerCommand(
@@ -800,7 +805,7 @@ describe("core repository model", () => {
       ),
     ).toEqual({ command: "cargo", arguments: ["fmt", "--all"], cwd: "/repo" });
 
-    const filteredPlan = planCargoWorkspaceTasks(graph, ["test"], false);
+    const filteredPlan = planCargoWorkspaceTasks(model, graph, ["test"], false);
     expect(filteredPlan.graph.entrypoints).toEqual([
       "app#test",
       "library#test",
@@ -822,6 +827,36 @@ describe("core repository model", () => {
         ["library#test", "cccc"],
       ]),
     );
+
+    const excludedModel = repository([
+      app,
+      {
+        ...library,
+        excludedTasks: new Set(["test"]),
+        tasks: { format: {} },
+      },
+    ]);
+    const partialGraph = buildTaskGraph(
+      excludedModel,
+      excludedModel.packages,
+      ["test"],
+      false,
+    );
+    const partialPlan = planCargoWorkspaceTasks(
+      excludedModel,
+      partialGraph,
+      ["test"],
+      true,
+    );
+    expect(partialPlan.graph.entrypoints).toEqual(["app#test"]);
+    expect(partialPlan.scopes.size).toBe(0);
+    expect(
+      packageManagerCommand(partialGraph.nodes.get("app#test")!, []),
+    ).toEqual({
+      command: "cargo",
+      arguments: ["test", "--package=app", "--locked"],
+      cwd: "/repo/crates/app",
+    });
   });
 
   it("runs uv commands from the discovered project directory", () => {

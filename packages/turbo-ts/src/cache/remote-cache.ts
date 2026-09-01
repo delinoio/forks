@@ -125,83 +125,100 @@ export const restoreRemoteCache = (
     const signing = yield* SigningService;
     const url = artifactUrl(options, hash);
     yield* preflight(url, options);
-    const response = yield* http
-      .request({
-        url,
-        method: "GET",
-        headers: requestHeaders(options),
-        timeoutMilliseconds: options.timeoutMilliseconds,
-        maxResponseBodyBytes: maximumCacheArtifactBytes,
-      })
-      .pipe(
-        Effect.mapError((error) =>
-          remoteError(url, error.message, error.retryable),
-        ),
-        Effect.flatMap((response) =>
-          isTransientStatus(response.status)
-            ? Effect.fail(
-                remoteError(
-                  url,
-                  `remote cache returned ${response.status}`,
-                  true,
-                ),
-              )
-            : Effect.succeed(response),
-        ),
-        Effect.retry(retry.transient.pipe(retryTransientCacheErrors)),
-      );
-    if (response.status === 404) {
-      return false;
-    }
-    if (response.status < 200 || response.status >= 300) {
-      return yield* Effect.fail(
-        remoteError(url, `remote cache returned ${response.status}`),
-      );
-    }
-    if (options.requireSignature) {
-      if (options.signatureKey === undefined) {
-        return yield* Effect.fail(
-          remoteError(url, "remote cache signature key is missing"),
-        );
-      }
-      const expected = yield* signing
-        .hmacSha256(options.signatureKey, response.body)
-        .pipe(Effect.mapError((error) => remoteError(url, error.message)));
-      const actual = response.headers["x-artifact-tag"];
-      if (actual === undefined || !(yield* signing.equal(actual, expected))) {
-        return yield* Effect.fail(
-          remoteError(url, "remote cache signature is invalid"),
-        );
-      }
-    }
-    yield* fileSystem
+    return yield* fileSystem
       .withTemporaryDirectory((directory) => {
+        const compressedPath = joinPath(directory, "remote-cache.tar.zst");
         const archivePath = joinPath(directory, "remote-cache.tar");
-        return compression
-          .decompressZstdToFile(
-            response.body,
-            archivePath,
-            maximumCacheArchiveBytes,
+        return http
+          .downloadToFile(
+            {
+              url,
+              method: "GET",
+              headers: requestHeaders(options),
+              timeoutMilliseconds: options.timeoutMilliseconds,
+              maxResponseBodyBytes: maximumCacheArtifactBytes,
+            },
+            compressedPath,
           )
           .pipe(
-            Effect.mapError((error) => remoteError(url, error.message)),
-            Effect.flatMap(() => parseTarArchiveFile(archivePath)),
-            Effect.flatMap((entries) =>
-              restoreArchiveEntries(
-                root,
-                entries,
-                scope,
-                fileSystem
-                  .remove(directory)
+            Effect.mapError((error) =>
+              remoteError(url, error.message, error.retryable),
+            ),
+            Effect.flatMap((response) =>
+              isTransientStatus(response.status)
+                ? Effect.fail(
+                    remoteError(
+                      url,
+                      `remote cache returned ${response.status}`,
+                      true,
+                    ),
+                  )
+                : Effect.succeed(response),
+            ),
+            Effect.retry(retry.transient.pipe(retryTransientCacheErrors)),
+            Effect.flatMap((response) =>
+              Effect.gen(function* () {
+                if (response.status === 404) return false;
+                if (response.status < 200 || response.status >= 300) {
+                  return yield* Effect.fail(
+                    remoteError(
+                      url,
+                      `remote cache returned ${response.status}`,
+                    ),
+                  );
+                }
+                if (options.requireSignature) {
+                  if (options.signatureKey === undefined) {
+                    return yield* Effect.fail(
+                      remoteError(url, "remote cache signature key is missing"),
+                    );
+                  }
+                  const expected = yield* signing
+                    .hmacSha256File(options.signatureKey, compressedPath)
+                    .pipe(
+                      Effect.mapError((error) =>
+                        remoteError(url, error.message),
+                      ),
+                    );
+                  const actual = response.headers["x-artifact-tag"];
+                  if (
+                    actual === undefined ||
+                    !(yield* signing.equal(actual, expected))
+                  ) {
+                    return yield* Effect.fail(
+                      remoteError(url, "remote cache signature is invalid"),
+                    );
+                  }
+                }
+                yield* compression
+                  .decompressZstdFileToFile(
+                    compressedPath,
+                    archivePath,
+                    maximumCacheArchiveBytes,
+                  )
                   .pipe(
-                    Effect.mapError((error) =>
-                      remoteError(
-                        url,
-                        `temporary archive cleanup failed: ${error.message}`,
+                    Effect.mapError((error) => remoteError(url, error.message)),
+                    Effect.flatMap(() => parseTarArchiveFile(archivePath)),
+                    Effect.flatMap((entries) =>
+                      restoreArchiveEntries(
+                        root,
+                        entries,
+                        scope,
+                        fileSystem
+                          .remove(directory)
+                          .pipe(
+                            Effect.mapError((error) =>
+                              remoteError(
+                                url,
+                                `temporary archive cleanup failed: ${error.message}`,
+                              ),
+                            ),
+                          ),
                       ),
                     ),
-                  ),
-              ),
+                  );
+                return true;
+              }),
             ),
           );
       })
@@ -212,7 +229,6 @@ export const restoreRemoteCache = (
             : remoteError(url, error.message),
         ),
       );
-    return true;
   });
 
 export const writeRemoteCache = (

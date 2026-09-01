@@ -25,6 +25,17 @@ export interface ExecutionResult {
   readonly combinedOutput: string;
 }
 
+export type BinaryExecutionRequest = Omit<
+  ExecutionRequest,
+  "maxCapturedOutputCharacters" | "onOutputChunk" | "stdio"
+>;
+
+export interface BinaryExecutionResult {
+  readonly exitCode: number;
+  readonly stdout: Uint8Array;
+  readonly stderr: Uint8Array;
+}
+
 export interface FileSystemOperations {
   readonly readText: (path: string) => Effect.Effect<string, BoundaryError>;
   readonly readTextChunks: (
@@ -109,6 +120,9 @@ export interface ProcessOperations {
   readonly run: (
     request: ExecutionRequest,
   ) => Effect.Effect<ExecutionResult, ProcessExecutionError, Scope.Scope>;
+  readonly runBytes: (
+    request: BinaryExecutionRequest,
+  ) => Effect.Effect<BinaryExecutionResult, ProcessExecutionError, Scope.Scope>;
 }
 
 export class ProcessService extends Context.Tag("turbo-ts/ProcessService")<
@@ -203,10 +217,21 @@ export interface HttpResponse {
   readonly body: Uint8Array;
 }
 
+export type HttpDownloadRequest = Omit<HttpRequest, "body">;
+
+export interface HttpFileResponse {
+  readonly status: number;
+  readonly headers: Readonly<Record<string, string>>;
+}
+
 export interface HttpOperations {
   readonly request: (
     request: HttpRequest,
   ) => Effect.Effect<HttpResponse, BoundaryError>;
+  readonly downloadToFile: (
+    request: HttpDownloadRequest,
+    destination: string,
+  ) => Effect.Effect<HttpFileResponse, BoundaryError>;
 }
 
 export class HttpService extends Context.Tag("turbo-ts/HttpService")<
@@ -233,6 +258,11 @@ export interface CompressionOperations {
     destination: string,
     maxOutputBytes?: number,
   ) => Effect.Effect<void, BoundaryError>;
+  readonly decompressZstdFileToFile: (
+    source: string,
+    destination: string,
+    maxOutputBytes?: number,
+  ) => Effect.Effect<void, BoundaryError>;
 }
 
 export class CompressionService extends Context.Tag(
@@ -242,6 +272,10 @@ export interface SigningOperations {
   readonly hmacSha256: (
     key: string,
     contents: Uint8Array,
+  ) => Effect.Effect<string, BoundaryError>;
+  readonly hmacSha256File: (
+    key: string,
+    path: string,
   ) => Effect.Effect<string, BoundaryError>;
   readonly equal: (left: string, right: string) => Effect.Effect<boolean>;
 }

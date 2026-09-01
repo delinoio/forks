@@ -39,6 +39,7 @@ import {
 } from "../src/cache/remote-cache.js";
 import {
   type CacheRestoreScope,
+  duplicateArchiveEntryDestination,
   restoreArchiveEntries,
 } from "../src/cache/restore.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
@@ -50,10 +51,15 @@ import {
   DigestService,
   EnvironmentService,
   FileSystemService,
+  HttpService,
   ProcessService,
+  SigningService,
 } from "../src/effect/services.js";
 import { buildTaskGraph } from "../src/graph/task-graph.js";
-import { hashTask } from "../src/hash/task-hash.js";
+import {
+  decodeNullDelimitedGitOutput,
+  hashTask,
+} from "../src/hash/task-hash.js";
 import { xxhash64Hex } from "../src/hash/xxhash64.js";
 import { discoverRepository } from "../src/repository/model.js";
 import {
@@ -78,6 +84,15 @@ const allowCachePaths = (
 
 const makeFixture = async (): Promise<string> => {
   const directory = await mkdtemp(join(tmpdir(), "turbo-ts-core-"));
+  await cp(fixtureRoot, directory, { recursive: true });
+  return directory;
+};
+
+const makeGitFixture = async (): Promise<string> => {
+  await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
+  const directory = await mkdtemp(
+    join(repositoryRoot, ".turbo/turbo-ts-git-fixture-"),
+  );
   await cp(fixtureRoot, directory, { recursive: true });
   return directory;
 };
@@ -1233,6 +1248,31 @@ describe("core CLI execution", () => {
         ).toEqual(["synthetic-library"]);
       }
 
+      delete appManifest.dependencies["synthetic-library"];
+      for (const specification of ["file:../library", "link:../library"]) {
+        appManifest.dependencies["library-alias"] = specification;
+        await writeFile(
+          appManifestPath,
+          `${JSON.stringify(appManifest, null, 2)}\n`,
+        );
+        const localAliasModel = await discover();
+        const localAliasApp =
+          localAliasModel.packagesByName.get("synthetic-app")!;
+        expect(localAliasApp.internalDependencies).toEqual([
+          "synthetic-library",
+        ]);
+        expect(
+          buildTaskGraph(
+            localAliasModel,
+            [localAliasApp],
+            ["build"],
+            false,
+          ).nodes.has("synthetic-library#build"),
+        ).toBe(true);
+      }
+      delete appManifest.dependencies["library-alias"];
+      appManifest.dependencies["synthetic-library"] = "file:../library";
+
       if (process.platform === "win32") {
         appManifest.dependencies["synthetic-library"] = "file:../LIBRARY";
       } else {
@@ -1276,6 +1316,46 @@ describe("core CLI execution", () => {
           "synthetic-library#build",
         ),
       ).toBe(true);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("discovers contained symlinked workspace members without following cycles", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const target = `${directory}/real/linked`;
+    try {
+      await mkdir(target, { recursive: true });
+      await writeFile(
+        `${target}/package.json`,
+        `${JSON.stringify({
+          name: "synthetic-linked",
+          private: true,
+          scripts: { build: "node -e \"console.log('linked build')\"" },
+        })}\n`,
+      );
+      await symlink("../..", `${target}/loop`);
+      await symlink("../real/linked", `${directory}/packages/linked`);
+      await writeFile(
+        `${directory}/pnpm-workspace.yaml`,
+        "packages:\n  - packages/**\n",
+      );
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(model.packagesByName.get("synthetic-linked")).toMatchObject({
+        directory: `${directory}/packages/linked`,
+        relativeDirectory: "packages/linked",
+      });
+      expect(
+        model.packages.filter(
+          (packageModel) => packageModel.name === "synthetic-linked",
+        ),
+      ).toHaveLength(1);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1827,7 +1907,7 @@ describe("core CLI execution", () => {
       const cargoPackage = model.packagesByName.get("rust-tool")!;
       expect(cargoPackage.workspaceDirectory).toBeUndefined();
       const graph = buildTaskGraph(model, [cargoPackage], ["test"], false);
-      const plan = planCargoWorkspaceTasks(graph, ["test"], true);
+      const plan = planCargoWorkspaceTasks(model, graph, ["test"], true);
       expect(plan.scopes.size).toBe(0);
       expect(
         packageManagerCommand(graph.nodes.get("rust-tool#test")!, []),
@@ -3245,6 +3325,60 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
+  it("rejects Git discovery paths that are not valid UTF-8", async () => {
+    expect(
+      decodeNullDelimitedGitOutput(
+        new TextEncoder().encode("packages/café.txt\0"),
+        "/repo",
+      ),
+    ).toEqual(["packages/café.txt"]);
+    expect(() =>
+      decodeNullDelimitedGitOutput(
+        new Uint8Array([0x70, 0x61, 0x74, 0x68, 0xff, 0]),
+        "/repo",
+      ),
+    ).toThrow(/not valid UTF-8/);
+    if (process.platform === "win32") return;
+
+    const directory = await makeGitFixture();
+    try {
+      const invalidPath = Buffer.concat([
+        Buffer.from(`${directory}/packages/library/invalid-`),
+        Buffer.from([0xff]),
+      ]);
+      await writeFile(invalidPath, "invalid\n");
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "invalid filename"],
+      ]) {
+        const git = await run("git", args, directory);
+        expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
+      }
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      await expect(
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        ),
+      ).rejects.toThrow(/not valid UTF-8/);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("hashes input links and restores output links from cache", async () => {
     if (process.platform === "win32") return;
     const directory = await makeFixture();
@@ -3307,6 +3441,54 @@ describe("core CLI execution", () => {
       expect(
         (await run(process.execPath, args, repositoryRoot)).stdout,
       ).toContain("cache hit");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("skips cache publication for output symlinks outside their output group", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { outputs?: Array<string> }> };
+      configuration.tasks.build = { outputs: ["dist/**"] };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('source.txt','source'); fs.symlinkSync('../source.txt','dist/escape.txt'); console.log('unsafe output built')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--only",
+        "--output-logs=hash-only",
+      ];
+      const first = await run(process.execPath, args, repositoryRoot);
+      expect(first.exitCode).toBe(0);
+      expect(first.stdout).toContain("cache miss");
+      expect(first.stderr).toContain("cache output collection failed");
+      expect(first.stderr).toContain(
+        "archive symlink target is not a declared task output",
+      );
+      await rm(`${packageDirectory}/dist`, { force: true, recursive: true });
+      const second = await run(process.execPath, args, repositoryRoot);
+      expect(second.exitCode).toBe(0);
+      expect(second.stdout).toContain("cache miss");
+      expect(second.stderr).toContain("cache output collection failed");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -4093,6 +4275,7 @@ describe("core CLI execution", () => {
             combinedOutput: stdout,
           });
         },
+        runBytes: () => Effect.die("unexpected binary process request"),
       });
       await Effect.runPromise(
         discover().pipe(
@@ -4901,6 +5084,80 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("treats root task configuration changes as task-aware inputs", async () => {
+    const directory = await makeGitFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, Record<string, unknown>>;
+      };
+      configuration.futureFlags = {
+        affectedUsingTaskInputs: true,
+        filterUsingTasks: true,
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "fixture base"],
+      ]) {
+        const git = await run("git", args, directory);
+        expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
+      }
+      configuration.tasks.build = {
+        ...configuration.tasks.build,
+        env: ["CONFIG_ONLY_CHANGE"],
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      expect(
+        (await run("git", ["add", "turbo.json"], directory)).exitCode,
+      ).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "task configuration"], directory))
+          .exitCode,
+      ).toBe(0);
+      const common = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--no-cache",
+      ];
+      const affected = await run(
+        process.execPath,
+        [...common, "--affected"],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(affected.exitCode).toBe(0);
+      expect(affected.stdout).toContain("library build");
+      expect(affected.stdout).toContain("app build");
+
+      const filtered = await run(
+        process.execPath,
+        [...common, "--filter=[HEAD~1]"],
+        repositoryRoot,
+      );
+      expect(filtered.exitCode).toBe(0);
+      expect(filtered.stdout).toContain("library build");
+      expect(filtered.stdout).toContain("app build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
 
   it("uses task inputs for affected selection when the future flag is enabled", async () => {
     await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
@@ -6473,6 +6730,51 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("rejects case-colliding archive destinations on Windows", async () => {
+    const entries = [
+      {
+        path: "dist/A.txt",
+        contents: new TextEncoder().encode("upper\n"),
+        mode: 0o644,
+        modifiedSeconds: 1,
+      },
+      {
+        path: "dist/a.txt",
+        contents: new TextEncoder().encode("lower\n"),
+        mode: 0o644,
+        modifiedSeconds: 1,
+      },
+    ];
+    expect(duplicateArchiveEntryDestination("C:/repo", entries)).toBe(
+      "C:/repo/dist/a.txt",
+    );
+    expect(duplicateArchiveEntryDestination("/repo", entries)).toBeUndefined();
+    if (process.platform !== "win32") return;
+
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-case-cache-"));
+    const preserved = `${directory}/dist/preserved.txt`;
+    try {
+      await mkdir(`${directory}/dist`, { recursive: true });
+      await writeFile(preserved, "preserved\n");
+      const outcome = await Effect.runPromise(
+        restoreArchiveEntries(directory, entries, {
+          pathsToClear: ["dist"],
+          allowedPathGroups: [{ directory: ".", patterns: ["dist/**"] }],
+          regularFilePaths: [],
+        }).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
+      );
+      expect(outcome._tag).toBe("Left");
+      if (outcome._tag === "Left") {
+        expect(outcome.left.message).toContain(
+          "archive destination occurs more than once",
+        );
+      }
+      expect(await readFile(preserved, "utf8")).toBe("preserved\n");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("rejects restored symlinks whose targets leave their output group", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-output-target-"));
@@ -7094,6 +7396,8 @@ describe("cache interoperability and safety", () => {
     };
     const streamedPath = `packages/app/${"nested-segment/".repeat(12)}remote-large.txt`;
     const streamedContents = new Uint8Array(2 * 1024 * 1024).fill(0x61);
+    let downloadedArtifactPath: string | undefined;
+    let decompressedArchivePath: string | undefined;
     try {
       await Effect.runPromise(
         writeRemoteCache(
@@ -7124,14 +7428,63 @@ describe("cache interoperability and safety", () => {
       }
       expect(
         await Effect.runPromise(
-          restoreRemoteCache(
-            restoreRoot,
-            options,
-            "0011223344556677",
-            allowCachePaths("packages/app/**"),
-          ).pipe(Effect.provide(nodeFoundationLayer)),
+          Effect.gen(function* () {
+            const http = yield* HttpService;
+            const compression = yield* CompressionService;
+            const signing = yield* SigningService;
+            const fileBoundaryError = (boundary: string) =>
+              new BoundaryError({
+                boundary,
+                message: "in-memory remote restoration must not be used",
+                retryable: false,
+              });
+            const streamingLayer = Layer.mergeAll(
+              Layer.succeed(HttpService, {
+                ...http,
+                request: (request) =>
+                  request.method === "GET"
+                    ? Effect.fail(fileBoundaryError("http"))
+                    : http.request(request),
+                downloadToFile: (request, destination) => {
+                  downloadedArtifactPath = destination;
+                  return http.downloadToFile(request, destination);
+                },
+              }),
+              Layer.succeed(CompressionService, {
+                ...compression,
+                decompressZstdToFile: () =>
+                  Effect.fail(fileBoundaryError("compression")),
+                decompressZstdFileToFile: (
+                  source,
+                  destination,
+                  maxOutputBytes,
+                ) => {
+                  decompressedArchivePath = destination;
+                  return compression.decompressZstdFileToFile(
+                    source,
+                    destination,
+                    maxOutputBytes,
+                  );
+                },
+              }),
+              Layer.succeed(SigningService, {
+                ...signing,
+                hmacSha256: () => Effect.fail(fileBoundaryError("signing")),
+              }),
+            );
+            return yield* restoreRemoteCache(
+              restoreRoot,
+              options,
+              "0011223344556677",
+              allowCachePaths("packages/app/**"),
+            ).pipe(Effect.provide(streamingLayer));
+          }).pipe(Effect.provide(nodeFoundationLayer)),
         ),
       ).toBe(true);
+      expect(downloadedArtifactPath).toBeDefined();
+      expect(decompressedArchivePath).toBeDefined();
+      await expect(lstat(downloadedArtifactPath!)).rejects.toThrow();
+      await expect(lstat(decompressedArchivePath!)).rejects.toThrow();
       expect(
         await readFile(`${directory}/packages/app/remote.txt`, "utf8"),
       ).toBe("remote");

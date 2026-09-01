@@ -330,10 +330,27 @@ const walkDirectories = (
     const positivePatterns = patterns.filter(
       (pattern) => !pattern.startsWith("!"),
     );
+    const canonicalRoot = yield* fileSystem
+      .realPath(root)
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({ path: root, message: error.message }),
+        ),
+      );
     const directories: Array<string> = [root];
-    const pending: Array<string> = [root];
+    const pending: Array<{
+      readonly path: string;
+      readonly ancestors: ReadonlySet<string>;
+    }> = [
+      {
+        path: root,
+        ancestors: new Set([comparableFilesystemPath(canonicalRoot)]),
+      },
+    ];
     while (pending.length > 0) {
-      const directory = pending.pop()!;
+      const current = pending.pop()!;
+      const directory = current.path;
       const entries = yield* fileSystem
         .list(directory)
         .pipe(
@@ -344,7 +361,7 @@ const walkDirectories = (
         );
       for (const entry of entries) {
         if (
-          entry.kind !== "directory" ||
+          (entry.kind !== "directory" && entry.kind !== "symlink") ||
           workspaceTraversalIgnoredDirectories.has(entry.name)
         ) {
           continue;
@@ -358,11 +375,51 @@ const walkDirectories = (
         ) {
           continue;
         }
+        const resolved = yield* Effect.either(fileSystem.realPath(path));
+        if (resolved._tag === "Left") {
+          if (entry.kind === "symlink") continue;
+          return yield* Effect.fail(
+            new RepositoryError({ path, message: resolved.left.message }),
+          );
+        }
+        if (!isPathContained(canonicalRoot, resolved.right)) continue;
+        if (entry.kind === "symlink") {
+          const targetMetadata = yield* fileSystem
+            .metadata(resolved.right)
+            .pipe(
+              Effect.mapError(
+                (error) =>
+                  new RepositoryError({ path, message: error.message }),
+              ),
+            );
+          if (targetMetadata.kind !== "directory") continue;
+        }
+        const identity = comparableFilesystemPath(resolved.right);
+        if (current.ancestors.has(identity)) continue;
         directories.push(path);
-        pending.push(path);
+        pending.push({
+          path,
+          ancestors: new Set([...current.ancestors, identity]),
+        });
       }
     }
-    return directories.sort();
+    const uniqueDirectories: Array<string> = [];
+    const canonicalDirectories = new Set<string>();
+    for (const directory of directories.sort()) {
+      const canonicalDirectory = yield* fileSystem
+        .realPath(directory)
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({ path: directory, message: error.message }),
+          ),
+        );
+      const identity = comparableFilesystemPath(canonicalDirectory);
+      if (canonicalDirectories.has(identity)) continue;
+      canonicalDirectories.add(identity);
+      uniqueDirectories.push(directory);
+    }
+    return uniqueDirectories;
   });
 
 const workspacePatterns = (
@@ -457,32 +514,13 @@ const canonicalFilesystemIdentity = (
   });
 
 const referencesWorkspacePackage = (
-  declaringDirectory: string,
+  _declaringDirectory: string,
   specification: string,
   target: {
     readonly directory: string;
     readonly manifest: PackageManifest;
   },
 ): Effect.Effect<boolean, never, FileSystemService> => {
-  for (const protocol of ["file:", "link:"] as const) {
-    if (specification.startsWith(protocol)) {
-      const path = specification.slice(protocol.length);
-      if (path === "") return Effect.succeed(false);
-      const resolved = isAbsolutePath(path)
-        ? normalizePath(path)
-        : joinPath(declaringDirectory, path);
-      return Effect.all([
-        canonicalFilesystemIdentity(resolved),
-        canonicalFilesystemIdentity(target.directory),
-      ]).pipe(
-        Effect.map(
-          ([resolvedIdentity, targetIdentity]) =>
-            resolvedIdentity !== undefined &&
-            resolvedIdentity === targetIdentity,
-        ),
-      );
-    }
-  }
   if (specification.startsWith("workspace:")) {
     const range = specification.slice("workspace:".length);
     if (range === "" || range === "*" || range === "^" || range === "~") {
@@ -497,6 +535,21 @@ const referencesWorkspacePackage = (
     target.manifest.version !== undefined &&
       satisfies(target.manifest.version, specification),
   );
+};
+
+const localPathSpecification = (
+  declaringDirectory: string,
+  specification: string,
+): string | undefined => {
+  const protocol = (["file:", "link:"] as const).find((candidate) =>
+    specification.startsWith(candidate),
+  );
+  if (protocol === undefined) return undefined;
+  const path = specification.slice(protocol.length);
+  if (path === "") return undefined;
+  return isAbsolutePath(path)
+    ? normalizePath(path)
+    : joinPath(declaringDirectory, path);
 };
 
 const pnpmWorkspaceAlias = (
@@ -531,9 +584,42 @@ const javascriptInternalDependencies = (
   >,
 ): Effect.Effect<ReadonlyArray<string>, never, FileSystemService> =>
   Effect.gen(function* () {
+    const packagesByFilesystemIdentity = new Map(
+      (yield* Effect.forEach(
+        [...packagesByName],
+        ([name, target]) =>
+          canonicalFilesystemIdentity(target.directory).pipe(
+            Effect.map((identity) =>
+              identity === undefined ? undefined : ([identity, name] as const),
+            ),
+          ),
+        { concurrency: 8 },
+      )).filter(
+        (entry): entry is readonly [string, string] => entry !== undefined,
+      ),
+    );
+    const declaringFilesystemIdentity =
+      yield* canonicalFilesystemIdentity(declaringDirectory);
+    const declaringPackageName =
+      declaringFilesystemIdentity === undefined
+        ? undefined
+        : packagesByFilesystemIdentity.get(declaringFilesystemIdentity);
     const references = yield* Effect.forEach(
       dependencyEntries(manifest),
       ([name, specification]) => {
+        const localPath = localPathSpecification(
+          declaringDirectory,
+          specification,
+        );
+        if (localPath !== undefined) {
+          return canonicalFilesystemIdentity(localPath).pipe(
+            Effect.map((identity) =>
+              identity === undefined
+                ? undefined
+                : packagesByFilesystemIdentity.get(identity),
+            ),
+          );
+        }
         const reference =
           manager === "pnpm"
             ? pnpmWorkspaceAlias(name, specification)
@@ -553,7 +639,10 @@ const javascriptInternalDependencies = (
     );
     return [
       ...new Set(
-        references.filter((name): name is string => name !== undefined),
+        references.filter(
+          (name): name is string =>
+            name !== undefined && name !== declaringPackageName,
+        ),
       ),
     ].sort();
   });

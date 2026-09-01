@@ -76,14 +76,17 @@ arguments and mismatched metadata/task `CARGO_TARGET_DIR` values also disable
 Cargo build caching. Mixed library and binary crates default to uncached because
 binary-only output declarations cannot restore all of Cargo's default
 artifacts. Unfiltered Cargo workspace commands merge the effective environments
-of every grouped member.
+of every grouped member and remain package-scoped when any repository member
+excludes the requested verification task.
 
 Local and remote cache restoration is limited to 256 MiB compressed and 1 GiB
 after decompression. Artifacts beyond either limit are rejected; invalid local
 entries are removed with a warning and become misses, while remote entries use
 the normal local-execution fallback. Decompressed archives are parsed from
 scoped temporary storage, and cache writes independently limit file content and
-tar metadata overhead to 64 MiB each.
+tar metadata overhead to 64 MiB each. Remote downloads, signature verification,
+and decompression use scoped files so concurrent cache hits do not retain or
+duplicate complete compressed response bodies in memory.
 
 Configured cache directories may be inside or outside the repository, but the
 repository root and its ancestors are rejected because treating them as cache
