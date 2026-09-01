@@ -107,6 +107,14 @@ interface TaskInputFile {
   readonly absolutePath: string;
   readonly hashPath: string;
   readonly matchPath: string;
+  readonly gitMode?: GitTrackedMode;
+}
+
+type GitTrackedMode = "100644" | "100755" | "120000" | "160000";
+
+interface DiscoveredFile {
+  readonly absolutePath: string;
+  readonly gitMode: GitTrackedMode | undefined;
 }
 
 const turboRootInputPrefix = "$TURBO_ROOT$/";
@@ -159,23 +167,27 @@ const usesTurboRootInput = (inputs: ReadonlyArray<TaskInput>): boolean =>
 const taskInputFiles = (
   repository: RepositoryModel,
   node: TaskNode,
-  packageFiles: ReadonlyArray<string>,
-  repositoryFiles: ReadonlyArray<string>,
+  packageFiles: ReadonlyArray<DiscoveredFile>,
+  repositoryFiles: ReadonlyArray<DiscoveredFile>,
   inputs: ReadonlyArray<TaskInput>,
   cacheDirectory: string,
 ): ReadonlyArray<TaskInputFile> => {
   const defaults = packageFiles
-    .filter((path) => !isIgnoredInputPath(path, cacheDirectory))
-    .map((absolutePath) => {
-      const relative = relativePath(node.package.directory, absolutePath);
-      return { absolutePath, hashPath: relative, matchPath: relative };
+    .filter((file) => !isIgnoredInputPath(file.absolutePath, cacheDirectory))
+    .map((file) => {
+      const relative = relativePath(node.package.directory, file.absolutePath);
+      return {
+        ...file,
+        hashPath: relative,
+        matchPath: relative,
+      };
     });
   const rootFiles = repositoryFiles
-    .filter((path) => !isIgnoredInputPath(path, cacheDirectory))
-    .map((absolutePath) => {
-      const relative = relativePath(repository.root, absolutePath);
+    .filter((file) => !isIgnoredInputPath(file.absolutePath, cacheDirectory))
+    .map((file) => {
+      const relative = relativePath(repository.root, file.absolutePath);
       return {
-        absolutePath,
+        ...file,
         hashPath: `${turboRootInputPrefix}${relative}`,
         matchPath: relative,
       };
@@ -277,6 +289,48 @@ const owningLockfileCandidates = (
   return repository.lockfile === undefined ? [] : [repository.lockfile];
 };
 
+const gitLiteralPathspecEnvironment = {
+  GIT_LITERAL_PATHSPECS: "1",
+} as const;
+
+const trackedGitModes = (
+  repository: RepositoryModel,
+  relativePaths: ReadonlyArray<string>,
+): Effect.Effect<ReadonlyMap<string, GitTrackedMode>, never, ProcessService> =>
+  Effect.gen(function* () {
+    const modes = new Map<string, GitTrackedMode>();
+    if (relativePaths.length === 0) return modes;
+    const processService = yield* ProcessService;
+    const result = yield* Effect.either(
+      Effect.scoped(
+        processService.run({
+          command: "git",
+          args: [
+            "ls-files",
+            "--stage",
+            "-z",
+            "--cached",
+            "--",
+            ...new Set(relativePaths),
+          ],
+          cwd: repository.root,
+          env: gitLiteralPathspecEnvironment,
+        }),
+      ),
+    );
+    if (result._tag === "Left" || result.right.exitCode !== 0) return modes;
+    for (const entry of result.right.stdout.split("\0").filter(Boolean)) {
+      const match =
+        /^(100644|100755|120000|160000) [0-9a-fA-F]+ 0\t([\s\S]+)$/.exec(entry);
+      if (match?.[1] === undefined || match[2] === undefined) continue;
+      modes.set(
+        joinPath(repository.root, match[2]),
+        match[1] as GitTrackedMode,
+      );
+    }
+    return modes;
+  });
+
 export const implicitTaskInputCandidates = (
   repository: RepositoryModel,
   node: TaskNode,
@@ -291,10 +345,11 @@ const cargoControlInputFiles = (
   repository: RepositoryModel,
   node: TaskNode,
   cacheDirectory: string,
+  useTrackedGitModes: boolean,
 ): Effect.Effect<
   ReadonlyArray<TaskInputFile>,
   RepositoryError,
-  FileSystemService
+  FileSystemService | ProcessService
 > =>
   Effect.gen(function* () {
     if (node.package.manager !== "cargo") return [];
@@ -313,8 +368,16 @@ const cargoControlInputFiles = (
         ),
       { concurrency: 8 },
     );
-    return existing
-      .filter((path): path is string => path !== undefined)
+    const existingPaths = existing.filter(
+      (path): path is string => path !== undefined,
+    );
+    const gitModes = useTrackedGitModes
+      ? yield* trackedGitModes(
+          repository,
+          existingPaths.map((path) => relativePath(repository.root, path)),
+        )
+      : new Map<string, GitTrackedMode>();
+    return existingPaths
       .map((absolutePath) => {
         const packageRelative = isPathContained(
           node.package.directory,
@@ -329,6 +392,7 @@ const cargoControlInputFiles = (
             ? matchPath
             : `${turboRootInputPrefix}${matchPath}`,
           matchPath,
+          gitMode: gitModes.get(absolutePath),
         };
       })
       .sort((left, right) => left.hashPath.localeCompare(right.hashPath));
@@ -344,8 +408,9 @@ const discoverFiles = (
   repository: RepositoryModel,
   directory: string,
   cacheDirectory: string,
+  useTrackedGitModes: boolean,
 ): Effect.Effect<
-  ReadonlyArray<string>,
+  ReadonlyArray<DiscoveredFile>,
   RepositoryError,
   FileSystemService | ProcessService
 > =>
@@ -353,6 +418,9 @@ const discoverFiles = (
     const processService = yield* ProcessService;
     const fileSystem = yield* FileSystemService;
     const relativeDirectory = relativePath(repository.root, directory);
+    const gitModes = useTrackedGitModes
+      ? yield* trackedGitModes(repository, [relativeDirectory])
+      : new Map<string, GitTrackedMode>();
     const git = yield* Effect.either(
       Effect.scoped(
         processService.run({
@@ -367,6 +435,7 @@ const discoverFiles = (
             relativeDirectory,
           ],
           cwd: repository.root,
+          env: gitLiteralPathspecEnvironment,
         }),
       ),
     );
@@ -374,27 +443,37 @@ const discoverFiles = (
       const discovered = git.right.stdout
         .split("\0")
         .filter(Boolean)
-        .map((path) => joinPath(repository.root, path))
-        .sort();
+        .map((path) => {
+          const absolutePath = joinPath(repository.root, path);
+          return { absolutePath, gitMode: gitModes.get(absolutePath) };
+        })
+        .sort((left, right) =>
+          left.absolutePath.localeCompare(right.absolutePath),
+        );
       const existing = yield* Effect.forEach(
         discovered,
-        (path) =>
-          fileSystem.exists(path).pipe(
-            Effect.map((exists) => (exists ? path : undefined)),
+        (file) =>
+          fileSystem.exists(file.absolutePath).pipe(
+            Effect.map((exists) => (exists ? file : undefined)),
             Effect.mapError(
-              (error) => new RepositoryError({ path, message: error.message }),
+              (error) =>
+                new RepositoryError({
+                  path: file.absolutePath,
+                  message: error.message,
+                }),
             ),
           ),
         { concurrency: 8 },
       );
       return existing.filter(
-        (path): path is string =>
-          path !== undefined && !isIgnoredInputPath(path, cacheDirectory),
+        (file): file is DiscoveredFile =>
+          file !== undefined &&
+          !isIgnoredInputPath(file.absolutePath, cacheDirectory),
       );
     }
-    return (yield* listRepositoryFiles(directory)).filter(
-      (path) => !isIgnoredInputPath(path, cacheDirectory),
-    );
+    return (yield* listRepositoryFiles(directory))
+      .filter((path) => !isIgnoredInputPath(path, cacheDirectory))
+      .map((absolutePath) => ({ absolutePath, gitMode: undefined }));
   });
 
 const owningLockfile = (
@@ -460,9 +539,15 @@ export const hashTask = (
       repository,
       node.package.directory,
       cacheDirectory,
+      platform === "win32",
     );
     const repositoryFiles = usesTurboRootInput(inputs)
-      ? yield* discoverFiles(repository, repository.root, cacheDirectory)
+      ? yield* discoverFiles(
+          repository,
+          repository.root,
+          cacheDirectory,
+          platform === "win32",
+        )
       : [];
     const configuredInputFiles = taskInputFiles(
       repository,
@@ -476,7 +561,12 @@ export const hashTask = (
       ...new Map(
         [
           ...configuredInputFiles,
-          ...(yield* cargoControlInputFiles(repository, node, cacheDirectory)),
+          ...(yield* cargoControlInputFiles(
+            repository,
+            node,
+            cacheDirectory,
+            platform === "win32",
+          )),
         ].map((input) => [input.absolutePath, input] as const),
       ).values(),
     ].sort((left, right) => compareCodeUnits(left.hashPath, right.hashPath));
@@ -493,6 +583,7 @@ export const hashTask = (
               relativePath(repository.root, path),
             ],
             cwd: repository.root,
+            env: gitLiteralPathspecEnvironment,
           }),
         ).pipe(
           Effect.mapError(
@@ -516,7 +607,11 @@ export const hashTask = (
         }
         return objectId;
       });
-    const hashFile = (path: string, relative: string) =>
+    const hashFile = (
+      path: string,
+      relative: string,
+      gitMode?: GitTrackedMode,
+    ) =>
       Effect.gen(function* () {
         const metadata = yield* fileSystem
           .metadata(path)
@@ -529,11 +624,12 @@ export const hashTask = (
           return [relative, "160000", yield* gitlinkObjectId(path)] as const;
         }
         const mode =
-          metadata.kind === "symlink"
+          gitMode ??
+          (metadata.kind === "symlink"
             ? ("120000" as const)
             : (metadata.mode & 0o111) !== 0
               ? ("100755" as const)
-              : ("100644" as const);
+              : ("100644" as const));
         const hash = yield* (
           metadata.kind === "symlink"
             ? fileSystem.readLink(path).pipe(
@@ -550,7 +646,7 @@ export const hashTask = (
       });
     const fileHashes = yield* Effect.forEach(
       inputFiles,
-      (input) => hashFile(input.absolutePath, input.hashPath),
+      (input) => hashFile(input.absolutePath, input.hashPath, input.gitMode),
       { concurrency: 8 },
     );
     const globalSettings = activeGlobalSettings(repository);
@@ -581,22 +677,30 @@ export const hashTask = (
       true
         ? []
         : (globalSettings.inputs ?? []);
-    const globalInputFiles =
+    const discoveredGlobalInputFiles =
       globalDependencyPatterns.length === 0
         ? []
-        : selectByGlobs(
-            (yield* discoverFiles(
-              repository,
-              repository.root,
-              cacheDirectory,
-            )).map((path) => relativePath(repository.root, path)),
-            globalDependencyPatterns,
+        : yield* discoverFiles(
+            repository,
+            repository.root,
+            cacheDirectory,
+            platform === "win32",
           );
+    const globalInputFilesByRelativePath = new Map(
+      discoveredGlobalInputFiles.map((file) => [
+        relativePath(repository.root, file.absolutePath),
+        file,
+      ]),
+    );
+    const globalInputFiles = selectByGlobs(
+      [...globalInputFilesByRelativePath.keys()],
+      globalDependencyPatterns,
+    );
     const globalFileHashes = yield* Effect.forEach(
       globalInputFiles,
       (relative) => {
-        const path = joinPath(repository.root, relative);
-        return hashFile(path, relative);
+        const file = globalInputFilesByRelativePath.get(relative)!;
+        return hashFile(file.absolutePath, relative, file.gitMode);
       },
       { concurrency: 8 },
     );

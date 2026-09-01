@@ -250,9 +250,7 @@ export const parseRunArguments = (
         break;
       case "--ui":
       case "--verbosity": {
-        if (!argument.includes("=")) {
-          index += 1;
-        }
+        [, index] = optionValue(arguments_, index, name);
         break;
       }
       default:

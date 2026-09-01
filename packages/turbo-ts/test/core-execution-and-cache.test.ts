@@ -43,6 +43,7 @@ import { nodeFoundationLayer } from "../src/effect/node-layer.js";
 import {
   CompressionService,
   DigestService,
+  EnvironmentService,
   FileSystemService,
   ProcessService,
 } from "../src/effect/services.js";
@@ -2460,6 +2461,181 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("treats Git discovery and gitlink paths beginning with colons literally", async () => {
+    const directory = await mkdtemp(
+      join(packageRoot, "test-literal-pathspec-"),
+    );
+    const packageDirectory = `${directory}/:library`;
+    const vendorDirectory = `${packageDirectory}/vendor`;
+    try {
+      await cp(fixtureRoot, directory, { recursive: true });
+      await cp(`${directory}/packages/library`, packageDirectory, {
+        recursive: true,
+      });
+      const workspacePath = `${directory}/pnpm-workspace.yaml`;
+      await writeFile(
+        workspacePath,
+        `${await readFile(workspacePath, "utf8")}  - ':library'\n`,
+      );
+      const packageManifestPath = `${packageDirectory}/package.json`;
+      const packageManifest = JSON.parse(
+        await readFile(packageManifestPath, "utf8"),
+      ) as { name: string };
+      packageManifest.name = "colon-library";
+      await writeFile(
+        packageManifestPath,
+        `${JSON.stringify(packageManifest, null, 2)}\n`,
+      );
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["input.txt", "vendor"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const inputPath = `${packageDirectory}/input.txt`;
+      await writeFile(inputPath, "first\n");
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "first"],
+      ]) {
+        const result = await run("git", args, directory);
+        expect(result.exitCode, `${args.join(" ")}: ${result.stderr}`).toBe(0);
+      }
+      const firstCommit = (
+        await run("git", ["rev-parse", "HEAD"], directory)
+      ).stdout.trim();
+      await writeFile(`${directory}/revision.txt`, "second\n");
+      expect(
+        (await run("git", ["add", "revision.txt"], directory)).exitCode,
+      ).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "second"], directory)).exitCode,
+      ).toBe(0);
+      const secondCommit = (
+        await run("git", ["rev-parse", "HEAD"], directory)
+      ).stdout.trim();
+      await mkdir(vendorDirectory);
+      const gitlinkPath = ":library/vendor";
+      expect(
+        (
+          await run(
+            "git",
+            [
+              "update-index",
+              "--add",
+              "--cacheinfo",
+              `160000,${firstCommit},${gitlinkPath}`,
+            ],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const library = model.packagesByName.get("colon-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "colon-library#build",
+      )!;
+      const compute = () =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const initial = await compute();
+      expect(initial.inputFiles).toEqual(["input.txt", "vendor"]);
+      await writeFile(inputPath, "changed\n");
+      const changedInput = await compute();
+      expect(changedInput.hash).not.toBe(initial.hash);
+      expect(
+        (
+          await run(
+            "git",
+            [
+              "update-index",
+              "--add",
+              "--cacheinfo",
+              `160000,${secondCommit},${gitlinkPath}`,
+            ],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      expect((await compute()).hash).not.toBe(changedInput.hash);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
+  it("uses tracked Git executable modes independently of filesystem modes", async () => {
+    const directory = await mkdtemp(join(packageRoot, "test-index-mode-"));
+    const packageDirectory = `${directory}/packages/library`;
+    const inputPath = `${packageDirectory}/input.txt`;
+    try {
+      await cp(fixtureRoot, directory, { recursive: true });
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["input.txt"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await writeFile(inputPath, "payload");
+      await chmod(inputPath, 0o644);
+      expect((await run("git", ["init"], directory)).exitCode).toBe(0);
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      const compute = () =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provideService(EnvironmentService, {
+              argv: Effect.succeed([]),
+              cwd: Effect.succeed(directory),
+              platform: Effect.succeed("win32" as const),
+              get: () => Effect.succeed(undefined),
+              entries: Effect.succeed({}),
+            }),
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const regular = await compute();
+      expect(
+        (
+          await run(
+            "git",
+            ["update-index", "--chmod=+x", "--", "packages/library/input.txt"],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      expect((await lstat(inputPath)).mode & 0o111).toBe(0);
+      expect((await compute()).hash).not.toBe(regular.hash);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("includes Git file modes and kinds in task hashes", async () => {
     if (process.platform === "win32") return;

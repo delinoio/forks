@@ -629,6 +629,25 @@ describe("core repository model", () => {
     ]);
   });
 
+  it("validates values for ignored value-taking run options", () => {
+    expect(() =>
+      parseRunArguments(["run", "build", "--ui", "--no-cache"]),
+    ).toThrow(/--ui requires a value/);
+    expect(() =>
+      parseRunArguments(["run", "build", "--verbosity", "--no-cache"]),
+    ).toThrow(/--verbosity requires a value/);
+    expect(
+      parseRunArguments([
+        "run",
+        "build",
+        "--ui",
+        "stream",
+        "--verbosity=2",
+        "--no-cache",
+      ]).noCache,
+    ).toBe(true);
+  });
+
   it("uses available parallelism and preserves Cargo pass-through arguments", () => {
     expect(parseConcurrency("50%", 8)).toBe(4);
     expect(parseConcurrency("100%", 1)).toBe(1);
