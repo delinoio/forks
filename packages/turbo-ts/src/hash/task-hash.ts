@@ -404,7 +404,7 @@ const alwaysHashedControlInputCandidates = (
     ? cargoControlInputCandidates(repository, node)
     : node.package.manager === "uv"
       ? [joinPath(node.package.directory, "pyproject.toml")]
-      : [];
+      : [joinPath(node.package.directory, "package.json")];
 
 const alwaysHashedControlInputFiles = (
   repository: RepositoryModel,

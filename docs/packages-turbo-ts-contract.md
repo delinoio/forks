@@ -84,6 +84,9 @@ an invalid declaration fails discovery. Declared workspace members remain
 discoverable beneath directories named `dist` or `target`. JavaScript workspace
 traversal prunes subtrees that cannot match a positive workspace pattern before
 listing them; ordered exclusions are applied to the resulting candidates.
+Enabled JavaScript, Cargo, and uv discovery passes operate independently, so a
+declared JavaScript workspace may also contain co-located Cargo and uv package
+scopes.
 Matching directory symlinks are traversed by their declared logical path only
 when their canonical target is a directory inside the repository; canonical
 ancestor tracking prevents symlink cycles.
@@ -110,9 +113,10 @@ task-aware selection is disabled, `global.inputs` as repository-global inputs.
 Task-input selection uses the same effective global and task inputs as hashing,
 evaluates task owners before Git-range package narrowing, applies negative Git
 ranges after positive task matches, and includes `with` companions. Owning
-manifests and package task configurations participate in task-aware selection
-independently of user input globs. Owning lockfiles and Cargo control or
-toolchain files participate in both task-aware selection and hashing. A changed
+manifests participate in task-aware selection and hashing independently of user
+input globs, while package task configurations participate independently in
+task-aware selection. Owning lockfiles and Cargo control or toolchain files
+participate in both task-aware selection and hashing. A changed
 workspace gitlink path is treated as the package-relative `.` input. Task
 hashes preserve Git symlink, gitlink, and dependency semantics, exclude the
 resolved cache directory, and use each task's owning ecosystem lockfile.
@@ -146,6 +150,9 @@ cohort is dependency-ready; prerequisite companions may run first to unlock
 the cohort. All non-interactive task output streams to the task log through
 bounded backpressure while retaining only a bounded diagnostic tail and
 incomplete display line in memory.
+Before local task execution, an existing task-log directory and exact log
+destination are rejected when either is a symlink, preventing log writes from
+escaping the execution directory.
 Persistent companions must remain alive until their foreground owners
 complete; any earlier natural exit fails the group, and foreground owners
 sharing a companion remain subject to the run's concurrency limit.
@@ -263,9 +270,10 @@ configuration explicitly enables caching. Explicitly cached uv builds bypass
 caching when `--out-dir` selects an unmodeled output directory. uv tasks execute
 from their project directory, forward test arguments directly to `pytest`, and
 parse `uv.lock` as TOML. Each task hash includes the owning `pyproject.toml`
-independently of configured input globs. Editable uv path dependencies that do
-not resolve to the named discovered workspace member make the package and hash
-scopes that depend on it uncacheable. uv package-graph edges require a
+independently of configured input globs. uv path dependencies that do not
+resolve to the named discovered workspace member make the package and hash
+scopes that depend on them uncacheable, regardless of editable mode. uv
+package-graph edges require a
 matching `tool.uv.sources` workspace declaration or local path resolving to the
 named workspace member by canonical, platform-aware filesystem identity;
 registry, Git, URL, and undeclared sources remain
@@ -308,10 +316,11 @@ additional-package selectors include `--workspace` and `--all`. Cargo build
 pass-through `--config` arguments also bypass caching because they can override
 the output layout. Cacheable Cargo compilation tasks (`build`, `check`, `test`,
 `lint`, `run`, and `dev`) bypass caching when any effective Cargo-home
-configuration is present because those external controls are not hashed.
-Ancestor configuration or the effective task environment setting a
-build target, or different `CARGO_TARGET_DIR` values for Cargo metadata and
-strict task execution, likewise bypass caching. Cargo metadata discovery uses
+configuration is present because those external controls are not hashed. The
+same compilation-task set bypasses caching when the effective task environment
+sets a build target. Ancestor configuration setting a build target, or
+different `CARGO_TARGET_DIR` values for Cargo metadata and strict task
+execution, likewise bypass caching. Cargo metadata discovery uses
 `--locked`, uses each response's workspace-member list, and does not probe
 excluded or unrelated nested manifests. Combined workspace task
 hashes are propagated into every downstream task hash.

@@ -867,6 +867,22 @@ describe("core repository model", () => {
         ["library#test", "cccc"],
       ]),
     );
+    expect(
+      cargoWorkspaceHash([
+        ["ä#test", "aaaa"],
+        ["z#test", "bbbb"],
+      ]),
+    ).toBe(
+      xxhash64Hex(
+        JSON.stringify({
+          scope: "cargo-workspace",
+          members: [
+            ["z#test", "bbbb"],
+            ["ä#test", "aaaa"],
+          ],
+        }),
+      ),
+    );
 
     const excludedModel = repository([
       app,
@@ -997,23 +1013,31 @@ describe("core repository model", () => {
     ]) {
       expect(isTaskScopeCacheable(node, arguments_)).toBe(false);
     }
-    expect(
-      isTaskScopeCacheable(
-        node,
-        [],
-        { kind: "package" },
-        { CARGO_BUILD_TARGET: "synthetic-target" },
-      ),
-    ).toBe(false);
-    expect(
-      isTaskScopeCacheable(
-        node,
-        [],
-        { kind: "package" },
-        { cargo_build_target: "synthetic-target" },
-        true,
-      ),
-    ).toBe(false);
+    for (const task of ["build", "check", "dev", "lint", "run", "test"]) {
+      const compilationNode = {
+        ...node,
+        id: `app#${task}`,
+        task,
+        command: `cargo ${task}`,
+      };
+      expect(
+        isTaskScopeCacheable(
+          compilationNode,
+          [],
+          { kind: "package" },
+          { CARGO_BUILD_TARGET: "synthetic-target" },
+        ),
+      ).toBe(false);
+      expect(
+        isTaskScopeCacheable(
+          compilationNode,
+          [],
+          { kind: "package" },
+          { cargo_build_target: "synthetic-target" },
+          true,
+        ),
+      ).toBe(false);
+    }
     expect(
       isTaskScopeCacheable(node, [], { kind: "package" }, {}, false, {
         CARGO_TARGET_DIR: "/repo/custom-target",

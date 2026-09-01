@@ -71,7 +71,10 @@ execution with a branded unsupported-compatibility diagnostic.
 JavaScript `file:`, `link:`, and relative pnpm `workspace:` dependencies resolve
 to discovered packages by canonical filesystem identity. A local path that
 does not resolve to a discovered JavaScript package disables caching for the
-declaring package and downstream hash scopes.
+declaring package and downstream hash scopes. JavaScript task hashes always
+include their owning `package.json`, independently of configured task globs.
+Enabled JavaScript, Cargo, and uv discovery passes retain co-located package
+scopes in the same workspace directory.
 
 Cargo builds that receive pass-through arguments selecting another package,
 release, profile, target, another manifest or alternate artifact layout, or an
@@ -80,7 +83,8 @@ cache reads or writes until those outputs are modeled explicitly. Pass-through
 `--config` arguments and mismatched metadata/task `CARGO_TARGET_DIR` values also
 disable Cargo build caching. Any effective Cargo-home configuration also
 disables cacheable Cargo compilation tasks because those external controls are
-not task-hash inputs. Mixed library and binary crates default to uncached
+not task-hash inputs. An effective `CARGO_BUILD_TARGET` likewise disables every
+cacheable Cargo compilation task. Mixed library and binary crates default to uncached
 because binary-only output declarations cannot restore all of Cargo's default
 artifacts. Source-free local path dependencies that do not resolve to a
 same-workspace repository package also disable caching. Synthesized binary
@@ -102,7 +106,8 @@ file content and tar metadata overhead to 64 MiB each. Cache publication is
 serialized within a run to bound writer memory independently of task
 concurrency. Remote downloads, signature verification, and decompression use
 scoped files so concurrent cache hits do not retain or duplicate complete
-compressed response bodies in memory.
+compressed response bodies in memory. Local execution rejects symlinked task-log
+directories and exact log destinations before starting the task.
 
 Configured cache directories may be inside or outside the repository, but the
 repository root, its ancestors, and directories containing discovered packages
@@ -111,9 +116,9 @@ from task hashes. Explicit `dist/**` and `target/**` task inputs remain hashable
 when Git metadata is unavailable.
 
 uv task hashes always include the owning `pyproject.toml`. Explicitly cached uv
-builds using `--out-dir` and uv packages with unresolved external editable path
+builds using `--out-dir` and uv packages with unresolved external local path
 dependencies bypass cache reads and writes until those inputs and outputs are
-modeled.
+modeled, regardless of editable mode.
 
 ## License and Attribution
 

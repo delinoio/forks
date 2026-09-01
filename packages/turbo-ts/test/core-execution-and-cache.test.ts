@@ -437,10 +437,11 @@ describe("core CLI execution", () => {
   it("separates logs and cached replay for co-located package scopes", async () => {
     if (process.platform === "win32") return;
     const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/polyglot`;
     const commandDirectory = `${directory}/commands`;
-    const cargoPackageId = `path+file://${directory}#rust-root@0.1.0`;
-    const cargoLog = `${directory}/.turbo/turbo-rust-root%0023build.log`;
-    const uvLog = `${directory}/.turbo/turbo-python-root%0023build.log`;
+    const cargoPackageId = `path+file://${packageDirectory}#rust-scope@0.1.0`;
+    const cargoLog = `${packageDirectory}/.turbo/turbo-rust-scope%0023build.log`;
+    const uvLog = `${packageDirectory}/.turbo/turbo-python-scope%0023build.log`;
     try {
       const configurationPath = `${directory}/turbo.json`;
       const configuration = JSON.parse(
@@ -462,33 +463,49 @@ describe("core CLI execution", () => {
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
       );
-      await mkdir(`${directory}/src`, { recursive: true });
+      await mkdir(`${packageDirectory}/src`, { recursive: true });
       await writeFile(
-        `${directory}/Cargo.toml`,
-        '[package]\nname = "rust-root"\nversion = "0.1.0"\nedition = "2024"\n',
+        `${packageDirectory}/package.json`,
+        `${JSON.stringify(
+          {
+            name: "javascript-scope",
+            version: "0.1.0",
+            scripts: { build: "node -e \"console.log('javascript scope')\"" },
+          },
+          null,
+          2,
+        )}\n`,
       );
-      await writeFile(`${directory}/src/lib.rs`, "pub fn value() {}\n");
       await writeFile(
-        `${directory}/Cargo.lock`,
-        'version = 4\n\n[[package]]\nname = "rust-root"\nversion = "0.1.0"\n',
+        `${packageDirectory}/Cargo.toml`,
+        '[package]\nname = "rust-scope"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(`${packageDirectory}/src/lib.rs`, "pub fn value() {}\n");
+      await writeFile(
+        `${packageDirectory}/Cargo.lock`,
+        'version = 4\n\n[[package]]\nname = "rust-scope"\nversion = "0.1.0"\n',
       );
       await writeFile(
         `${directory}/pyproject.toml`,
-        '[project]\nname = "python-root"\nversion = "0.1.0"\ndependencies = []\n\n[tool.uv.workspace]\nmembers = []\n',
+        '[tool.uv.workspace]\nmembers = ["packages/polyglot"]\n',
+      );
+      await writeFile(
+        `${packageDirectory}/pyproject.toml`,
+        '[project]\nname = "python-scope"\nversion = "0.1.0"\ndependencies = []\n',
       );
       await writeFile(`${directory}/uv.lock`, "version = 1\nrevision = 1\n");
       await mkdir(commandDirectory, { recursive: true });
       const metadata = JSON.stringify({
-        workspace_root: directory,
+        workspace_root: packageDirectory,
         workspace_members: [cargoPackageId],
-        target_directory: `${directory}/target`,
+        target_directory: `${packageDirectory}/target`,
         packages: [
           {
             id: cargoPackageId,
-            name: "rust-root",
-            manifest_path: `${directory}/Cargo.toml`,
+            name: "rust-scope",
+            manifest_path: `${packageDirectory}/Cargo.toml`,
             dependencies: [],
-            targets: [{ kind: ["lib"], name: "rust_root" }],
+            targets: [{ kind: ["lib"], name: "rust_scope" }],
           },
         ],
       });
@@ -510,8 +527,8 @@ describe("core CLI execution", () => {
         "build",
         "--cwd",
         directory,
-        "--filter=rust-root",
-        "--filter=python-root",
+        "--filter=rust-scope",
+        "--filter=python-scope",
         "--concurrency=2",
       ];
       const env = {
@@ -530,8 +547,8 @@ describe("core CLI execution", () => {
       await rm(uvLog);
       const second = await run(process.execPath, args, repositoryRoot, env);
       expect(second.exitCode, second.stderr).toBe(0);
-      expect(second.stdout).toContain("rust-root:build: cache hit");
-      expect(second.stdout).toContain("python-root:build: cache hit");
+      expect(second.stdout).toContain("rust-scope:build: cache hit");
+      expect(second.stdout).toContain("python-scope:build: cache hit");
       expect(await readFile(cargoLog, "utf8")).toContain("cargo scope output");
       expect(await readFile(cargoLog, "utf8")).not.toContain("uv scope output");
       expect(await readFile(uvLog, "utf8")).toContain("uv scope output");
@@ -539,6 +556,66 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
+  }, 20_000);
+
+  it("rejects symlinked task log paths before execution", async () => {
+    if (process.platform === "win32") return;
+    const executeCase = async (kind: "directory" | "file") => {
+      const directory = await makeFixture();
+      const outside = await mkdtemp(join(tmpdir(), "turbo-ts-log-outside-"));
+      const packageDirectory = `${directory}/packages/library`;
+      const marker = `${packageDirectory}/task-ran`;
+      const outsideLog = `${outside}/outside.log`;
+      try {
+        const manifestPath = `${packageDirectory}/package.json`;
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          scripts: Record<string, string>;
+        };
+        manifest.scripts.build =
+          "node -e \"require('node:fs').writeFileSync('task-ran','ran')\"";
+        await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+        if (kind === "directory") {
+          await symlink(outside, `${packageDirectory}/.turbo`);
+        } else {
+          await mkdir(`${packageDirectory}/.turbo`, { recursive: true });
+          await writeFile(outsideLog, "sentinel\n");
+          await symlink(
+            outsideLog,
+            `${packageDirectory}/.turbo/turbo-build.log`,
+          );
+        }
+        const result = await run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "build",
+            "--cwd",
+            directory,
+            "--filter=synthetic-library",
+            "--no-cache",
+          ],
+          repositoryRoot,
+        );
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stderr).toContain(
+          kind === "directory"
+            ? "task log parent must be a directory without symlinks"
+            : "task log destination must not be a symlink",
+        );
+        await expect(lstat(marker)).rejects.toThrow();
+        if (kind === "directory") {
+          await expect(lstat(`${outside}/turbo-build.log`)).rejects.toThrow();
+        } else {
+          expect(await readFile(outsideLog, "utf8")).toBe("sentinel\n");
+        }
+      } finally {
+        await rm(directory, { force: true, recursive: true });
+        await rm(outside, { force: true, recursive: true });
+      }
+    };
+    await executeCase("directory");
+    await executeCase("file");
   }, 20_000);
 
   it("skips oversized cache inputs before retaining file contents", async () => {
@@ -2033,6 +2110,7 @@ describe("core CLI execution", () => {
       const first = await compute();
       expect(first.inputFiles).toEqual([
         "dist/schema/value.json",
+        "package.json",
         "target/generated/value.txt",
       ]);
       await writeFile(`${packageDirectory}/.venv/lib/dependency.py`, "two\n");
@@ -2084,7 +2162,60 @@ describe("core CLI execution", () => {
           Effect.provide(nodeFoundationLayer),
         ),
       );
-      expect(result.inputFiles).toEqual(["z-input.txt", "ä-input.txt"]);
+      expect(result.inputFiles).toEqual([
+        "package.json",
+        "z-input.txt",
+        "ä-input.txt",
+      ]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("hashes the owning JavaScript manifest independently of task globs", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["src/**"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${packageDirectory}/src`, { recursive: true });
+      await writeFile(`${packageDirectory}/src/input.js`, "export {};\n");
+      const rootConfiguration = await Effect.runPromise(
+        loadRootConfiguration(directory).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const model = await Effect.runPromise(
+        discoverRepository(directory, rootConfiguration).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      const compute = () =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const before = await compute();
+      expect(before.inputFiles).toContain("package.json");
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(
+        await readFile(manifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      manifest.type = "module";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      expect((await compute()).hash).not.toBe(before.hash);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2606,6 +2737,8 @@ describe("core CLI execution", () => {
       configuration.futureFlags = { experimentalCargoWorkspaces: true };
       configuration.tasks.test = {};
       configuration.tasks["//#verify"] = { dependsOn: ["rust-a#test"] };
+      configuration.tasks["//#alpha"] = { with: ["//#zeta"] };
+      configuration.tasks["//#zeta"] = { with: ["rust-a#test"] };
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
@@ -2615,6 +2748,8 @@ describe("core CLI execution", () => {
         await readFile(rootManifestPath, "utf8"),
       ) as { scripts: Record<string, string> };
       rootManifest.scripts.verify = "node -e \"console.log('root verify')\"";
+      rootManifest.scripts.alpha = "node -e \"console.log('root alpha')\"";
+      rootManifest.scripts.zeta = "node -e \"console.log('root zeta')\"";
       await writeFile(
         rootManifestPath,
         `${JSON.stringify(rootManifest, null, 2)}\n`,
@@ -2647,6 +2782,7 @@ describe("core CLI execution", () => {
         "run",
         "test",
         "//#verify",
+        "//#alpha",
         "--cwd",
         directory,
         "--output-logs=hash-only",
@@ -2654,6 +2790,7 @@ describe("core CLI execution", () => {
       const first = await run(process.execPath, args, repositoryRoot);
       expect(first.exitCode, first.stderr).toBe(0);
       expect(first.stdout).toContain("//:verify: cache miss");
+      expect(first.stdout).toContain("//:alpha: cache miss");
       await writeFile(
         `${directory}/rust/b/src/lib.rs`,
         'pub fn value() -> &\'static str { "changed" }\n',
@@ -2661,6 +2798,7 @@ describe("core CLI execution", () => {
       const second = await run(process.execPath, args, repositoryRoot);
       expect(second.exitCode, second.stderr).toBe(0);
       expect(second.stdout).toContain("//:verify: cache miss");
+      expect(second.stdout).toContain("//:alpha: cache miss");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2792,22 +2930,22 @@ describe("core CLI execution", () => {
         appManifestSource
           .replace(
             `requests = { index = "internal" }\n`,
-            `requests = { index = "internal" }\nexternal-helper = { path = ${JSON.stringify(externalDependency)}, editable = true }\n`,
+            `requests = { index = "internal" }\nexternal-helper = { path = ${JSON.stringify(externalDependency)} }\n`,
           )
           .replace(
             `dependencies = ["local-helper>=1", "my-util>=1", "requests>=2"]`,
             `dependencies = ["external-helper>=1", "local-helper>=1", "my-util>=1", "requests>=2"]`,
           ),
       );
-      const externalEditable = await Effect.runPromise(
+      const externalPath = await Effect.runPromise(
         Effect.gen(function* () {
           const rootConfiguration = yield* loadRootConfiguration(directory);
           return yield* discoverRepository(directory, rootConfiguration);
         }).pipe(Effect.provide(nodeFoundationLayer)),
       );
-      expect(
-        externalEditable.packagesByName.get("app")?.cacheInputsComplete,
-      ).toBe(false);
+      expect(externalPath.packagesByName.get("app")?.cacheInputsComplete).toBe(
+        false,
+      );
 
       configuration.tasks.build = {
         cache: true,
@@ -3437,7 +3575,11 @@ describe("core CLI execution", () => {
           ),
         );
       const initial = await compute();
-      expect(initial.inputFiles).toEqual(["input.txt", "vendor"]);
+      expect(initial.inputFiles).toEqual([
+        "input.txt",
+        "package.json",
+        "vendor",
+      ]);
       await writeFile(inputPath, "changed\n");
       const changedInput = await compute();
       expect(changedInput.hash).not.toBe(initial.hash);

@@ -1390,12 +1390,9 @@ const usesAlternateUvBuildOutputs = (
   );
 
 const usesEnvironmentCargoBuildTarget = (
-  node: TaskNode,
   environment: Readonly<Record<string, string | undefined>>,
   caseInsensitiveEnvironmentNames: boolean,
 ): boolean =>
-  node.package.manager === "cargo" &&
-  node.task === "build" &&
   Object.entries(environment).some(
     ([name, value]) =>
       value !== undefined &&
@@ -1545,10 +1542,12 @@ export const isTaskScopeCacheable = (
   ) &&
   !usesAlternateCargoBuildOutputs(node, passThroughArguments) &&
   !usesAlternateUvBuildOutputs(node, passThroughArguments) &&
-  !usesEnvironmentCargoBuildTarget(
-    node,
-    environment,
-    caseInsensitiveEnvironmentNames,
+  !(
+    isCargoCompilationTask(node) &&
+    usesEnvironmentCargoBuildTarget(
+      environment,
+      caseInsensitiveEnvironmentNames,
+    )
   ) &&
   !usesMismatchedCargoTargetDirectory(
     node,
@@ -1558,24 +1557,25 @@ export const isTaskScopeCacheable = (
   ) &&
   !(isCargoCompilationTask(node) && cargoHomeHasConfiguration);
 
+const hashDependencyGraph = (graph: TaskGraph): TaskGraph => ({
+  ...graph,
+  nodes: new Map(
+    [...graph.nodes].map(([id, node]) => [
+      id,
+      {
+        ...node,
+        dependencies: [...new Set([...node.dependencies, ...node.with])],
+      },
+    ]),
+  ),
+});
+
 export const taskIdsWithUnrestorableCacheInputs = (
   graph: TaskGraph,
   scopes: ReadonlyMap<string, TaskCommandScope> = new Map(),
 ): ReadonlySet<string> => {
   const uncacheable = new Set<string>();
-  const hashGraph: TaskGraph = {
-    ...graph,
-    nodes: new Map(
-      [...graph.nodes].map(([id, node]) => [
-        id,
-        {
-          ...node,
-          dependencies: [...new Set([...node.dependencies, ...node.with])],
-        },
-      ]),
-    ),
-  };
-  for (const id of topologicalOrder(hashGraph)) {
+  for (const id of topologicalOrder(hashDependencyGraph(graph))) {
     const node = graph.nodes.get(id)!;
     const scope = scopes.get(id);
     const scopeNodes =
@@ -1606,6 +1606,74 @@ export const makeCachePublicationPermit: Effect.Effect<CachePublicationPermit> =
       (semaphore) => (publication) => semaphore.withPermits(1)(publication),
     ),
   );
+
+const prepareTaskLogPath = (
+  logPath: string,
+): Effect.Effect<void, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const logDirectory = parentPath(logPath);
+    const directoryExists = yield* fileSystem
+      .exists(logDirectory)
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({ path: logDirectory, message: error.message }),
+        ),
+      );
+    if (!directoryExists) {
+      yield* fileSystem.makeDirectory(logDirectory).pipe(
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({
+              path: logDirectory,
+              message: error.message,
+            }),
+        ),
+      );
+    }
+    const directoryMetadata = yield* fileSystem
+      .metadata(logDirectory)
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({ path: logDirectory, message: error.message }),
+        ),
+      );
+    if (directoryMetadata.kind !== "directory") {
+      return yield* Effect.fail(
+        new RepositoryError({
+          path: logDirectory,
+          message: "task log parent must be a directory without symlinks",
+        }),
+      );
+    }
+    const logExists = yield* fileSystem
+      .exists(logPath)
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({ path: logPath, message: error.message }),
+        ),
+      );
+    if (!logExists) return;
+    const logMetadata = yield* fileSystem
+      .metadata(logPath)
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({ path: logPath, message: error.message }),
+        ),
+      );
+    if (logMetadata.kind === "symlink") {
+      return yield* Effect.fail(
+        new RepositoryError({
+          path: logPath,
+          message: "task log destination must not be a symlink",
+        }),
+      );
+    }
+  });
 
 const executeTask = (
   repository: RepositoryModel,
@@ -1845,6 +1913,7 @@ const executeTask = (
         ),
       );
     }
+    yield* prepareTaskLogPath(logPath);
     const started = yield* clock.now;
     const invocation = packageManagerCommand(
       node,
@@ -1875,9 +1944,6 @@ const executeTask = (
     const result = streamsCapturedOutput
       ? yield* Effect.scoped(
           Effect.gen(function* () {
-            yield* fileSystem.makeDirectory(
-              joinPath(executionDirectory, ".turbo"),
-            );
             yield* fileSystem.writeText(logPath, "");
             const outputQueue = yield* Queue.bounded<TaskOutputQueueEvent>(
               persistentOutputQueueCapacity,
@@ -1942,7 +2008,6 @@ const executeTask = (
       : yield* Effect.scoped(startProcess());
     const output = result.combinedOutput;
     if (!streamsCapturedOutput) {
-      yield* fileSystem.makeDirectory(joinPath(executionDirectory, ".turbo"));
       yield* fileSystem.writeText(logPath, output);
     }
     if (
@@ -2063,19 +2128,7 @@ const computeTaskHashes = (
 > =>
   Effect.gen(function* () {
     const hashes = new Map<string, TaskHashResult>();
-    const hashGraph: TaskGraph = {
-      ...graph,
-      nodes: new Map(
-        [...graph.nodes].map(([id, node]) => [
-          id,
-          {
-            ...node,
-            dependencies: [...new Set([...node.dependencies, ...node.with])],
-          },
-        ]),
-      ),
-    };
-    for (const id of topologicalOrder(hashGraph)) {
+    for (const id of topologicalOrder(hashDependencyGraph(graph))) {
       const node = graph.nodes.get(id)!;
       const upstreamIds = [
         ...new Set([...node.dependencies, ...node.with]),
@@ -2239,7 +2292,7 @@ const applyCargoWorkspaceHashes = (
       });
       changed.add(id);
     }
-    for (const id of topologicalOrder(graph)) {
+    for (const id of topologicalOrder(hashDependencyGraph(graph))) {
       if (scopes.has(id)) continue;
       const node = graph.nodes.get(id)!;
       const upstreamIds = [
@@ -2269,7 +2322,7 @@ export const cargoWorkspaceHash = (
     JSON.stringify({
       scope: "cargo-workspace",
       members: [...members].sort(([left], [right]) =>
-        left.localeCompare(right),
+        left < right ? -1 : left > right ? 1 : 0,
       ),
     }),
   );

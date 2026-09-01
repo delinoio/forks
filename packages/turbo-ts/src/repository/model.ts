@@ -1373,9 +1373,6 @@ export const discoverRepository = (
     const javascriptDrafts = packageDrafts.filter(
       (entry): entry is NonNullable<typeof entry> => entry !== undefined,
     );
-    const javascriptDirectories = new Set(
-      javascriptDrafts.map((entry) => entry.directory),
-    );
     const cargoEnabled =
       rootConfiguration.value.futureFlags?.experimentalCargoWorkspaces === true;
     const pythonEnabled =
@@ -1442,12 +1439,9 @@ export const discoverRepository = (
     const configuredTasks = (rootConfiguration.value.tasks ?? {}) as Readonly<
       Record<string, Pipeline>
     >;
-    const polyglotDirectories = directories.filter(
-      (directory) => !javascriptDirectories.has(directory),
-    );
     const cargoManifestPaths = cargoEnabled
       ? (yield* Effect.forEach(
-          polyglotDirectories,
+          directories,
           (directory) =>
             Effect.gen(function* () {
               const fileSystem = yield* FileSystemService;
@@ -1643,7 +1637,7 @@ export const discoverRepository = (
         { concurrency: 8 },
       );
     const uvDrafts = yield* Effect.forEach(
-      polyglotDirectories.filter((directory) =>
+      directories.filter((directory) =>
         pythonWorkspaceDirectories.has(directory),
       ),
       (directory) =>
@@ -1869,7 +1863,6 @@ export const discoverRepository = (
                     : undefined;
                 const cacheInputsComplete = sources.every(
                   (source, index) =>
-                    !source.editable ||
                     source.path === undefined ||
                     (targetIdentity !== undefined &&
                       sourceIdentities[index] === targetIdentity),
