@@ -76,9 +76,12 @@ cache reads or writes until those outputs are modeled explicitly. Pass-through
 disable Cargo build caching, as does a build target in the effective Cargo-home
 configuration. Mixed library and binary crates default to uncached because
 binary-only output declarations cannot restore all of Cargo's default
-artifacts. Unfiltered Cargo workspace commands merge the effective environments
-of every grouped member and remain package-scoped when any repository member
-excludes the requested verification task.
+artifacts. Single-binary Cargo `run` and `dev` tasks also default to uncached
+unless task configuration explicitly enables caching. Repository-root Cargo
+packages reuse the loaded root task configuration. Unfiltered Cargo workspace
+commands merge the effective environments of every grouped member and remain
+package-scoped when any repository member excludes the requested verification
+task.
 
 Local and remote cache restoration is limited to 256 MiB compressed and 1 GiB
 after decompression. Artifacts beyond either limit are rejected; invalid local

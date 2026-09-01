@@ -226,6 +226,9 @@ Regular archive destinations are unlinked before their contents are restored,
 so an existing hard link cannot redirect truncation outside the repository.
 Resolved cache-directory subtrees are excluded from both task inputs and task
 outputs, including custom cache directory names selected by broad output globs.
+Cache output collection prunes directory subtrees that cannot match a positive
+output pattern, while matching patterns may explicitly retain `node_modules`
+or other normally ignored directories.
 uv packages are discovered from the root
 `pyproject.toml` workspace root and member globs after applying workspace
 exclusions; unrelated Python projects and `.venv` trees are ignored.
@@ -244,7 +247,9 @@ the local JavaScript package. Local path aliases record the resolved package's
 actual name even when the dependency key differs. pnpm workspace aliases
 resolve to the package name encoded in their `workspace:` specification;
 same-named Cargo and uv packages are never JavaScript workspace targets. Cargo metadata
-paths are matched by canonical filesystem identity. Unfiltered Cargo `test`,
+paths are matched by canonical filesystem identity. Repository-root Cargo
+packages reuse the loaded root task configuration instead of interpreting it as
+a workspace configuration. Unfiltered Cargo `test`,
 `check`, `lint`, and `format` tasks execute once per Cargo workspace and bypass
 caching when any grouped member disables it; filtered and package-qualified
 runs retain package targeting. A workspace is grouped only when every
@@ -256,7 +261,8 @@ the union of all member task environments. Cargo package-graph edges require a
 source-free metadata dependency path that resolves to the named member in the
 same workspace; registry and Git dependencies remain external. Cargo `run` and
 `dev` tasks are exposed only for crates with one unambiguous binary target, and
-pass-through arguments are forwarded to Cargo without an implicit
+default to uncached unless task configuration explicitly enables caching.
+Pass-through arguments are forwarded to Cargo without an implicit
 target-argument separator. Cargo builds
 for mixed library and binary crates default to uncached. Builds with
 pass-through arguments that select an additional package, an alternate output
@@ -275,7 +281,9 @@ hashes are propagated into every downstream task hash.
 Structured task input globs apply ordered inclusion and negation consistently
 to task hashing and task-aware affected selection. Task-aware Git filters
 preserve leading and trailing ellipses and traverse both task and package graphs
-in the requested dependent or dependency direction. Ordinary root-file changes
+in the requested dependent or dependency direction. Filters requesting both
+directions compute each closure from the original matches before unioning them.
+Ordinary root-file changes
 select only tasks whose effective inputs match them; repository-global inputs
 and Git discovery failures retain the all-task fallback.
 Changes to the loaded root task configuration select all requested task

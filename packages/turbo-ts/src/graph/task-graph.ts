@@ -104,19 +104,24 @@ export const selectPackages = (
     if (includeDependencies) {
       filter = filter.slice(0, -3);
     }
-    let matches = selectFilterBase(repository, filter, gitRangePackages);
+    const baseMatches = selectFilterBase(repository, filter, gitRangePackages);
+    const matches = new Set(baseMatches);
     if (includeDependencies) {
-      matches = expandPackageClosure(
-        matches,
+      for (const name of expandPackageClosure(
+        baseMatches,
         (name) =>
           repository.packagesByName.get(name)?.internalDependencies ?? [],
-      );
+      )) {
+        matches.add(name);
+      }
     }
     if (includeDependents) {
-      matches = expandPackageClosure(
-        matches,
+      for (const name of expandPackageClosure(
+        baseMatches,
         (name) => dependents.get(name) ?? [],
-      );
+      )) {
+        matches.add(name);
+      }
     }
     for (const name of matches) {
       if (negative) selected.delete(name);

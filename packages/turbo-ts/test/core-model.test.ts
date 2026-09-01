@@ -372,6 +372,20 @@ describe("core repository model", () => {
     expect(
       selectPackages(model, ["!app", "*"]).map((entry) => entry.name),
     ).toEqual(["library"]);
+    const base = packageModel("base", []);
+    const target = packageModel("target", ["base"]);
+    const sibling = packageModel("sibling", ["base"]);
+    const bidirectional = repository([base, target, sibling]);
+    expect(
+      selectPackages(bidirectional, ["...target..."]).map(
+        (entry) => entry.name,
+      ),
+    ).toEqual(["base", "target"]);
+    expect(
+      selectPackages(bidirectional, ["!...target..."]).map(
+        (entry) => entry.name,
+      ),
+    ).toEqual(["sibling"]);
     const graph = buildTaskGraph(model, [app], ["build"], false);
     expect(topologicalOrder(graph)).toEqual(["library#build", "app#build"]);
 

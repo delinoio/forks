@@ -1157,6 +1157,7 @@ const cargoTasks = (
     metadata?.hasLibraryTarget === true || outputs.length === 0
       ? { cache: false }
       : { outputs };
+  const executionDefaults: Pipeline = { cache: false };
   const formatDefaults: Pipeline = { cache: false };
   const buildTask = (configuredTask: Pipeline): Pipeline => {
     const merged = mergePipeline(buildDefaults, configuredTask);
@@ -1168,6 +1169,20 @@ const cargoTasks = (
   }
   if (!excludedTasks.has("format")) {
     tasks.format = mergePipeline(formatDefaults, configured.format ?? {});
+  }
+  if (metadata?.entrypointNames.length === 1) {
+    for (const task of ["dev", "run"] as const) {
+      if (!excludedTasks.has(task)) {
+        tasks[task] = mergePipeline(executionDefaults, configured[task] ?? {});
+      }
+      const qualifiedTask = `${packageName}#${task}`;
+      if (!excludedTasks.has(task) && configured[qualifiedTask] !== undefined) {
+        tasks[qualifiedTask] = mergePipeline(
+          executionDefaults,
+          configured[qualifiedTask],
+        );
+      }
+    }
   }
   const qualifiedBuild = `${packageName}#build`;
   if (!excludedTasks.has("build") && configured[qualifiedBuild] !== undefined) {
@@ -1491,19 +1506,25 @@ export const discoverRepository = (
             const directory = parentPath(metadata.manifestPath);
             const configuredBuildTarget =
               yield* cargoBuildTargetConfigured(directory);
-            const packageConfiguration = yield* loadPackageConfiguration(
-              directory,
-              metadata.name,
-              rootConfiguration,
-            ).pipe(
-              Effect.mapError(
-                (error) =>
-                  new RepositoryError({
-                    path: error.path,
-                    message: error.message,
-                  }),
-              ),
-            );
+            const packageConfiguration =
+              directory === root
+                ? {
+                    excludedTasks: new Set<string>(),
+                    tasks: configuredTasks,
+                  }
+                : yield* loadPackageConfiguration(
+                    directory,
+                    metadata.name,
+                    rootConfiguration,
+                  ).pipe(
+                    Effect.mapError(
+                      (error) =>
+                        new RepositoryError({
+                          path: error.path,
+                          message: error.message,
+                        }),
+                    ),
+                  );
             return {
               name: metadata.name,
               directory,
@@ -1836,6 +1857,7 @@ export const listRepositoryFiles = (
   options: {
     readonly ignoredDirectories?: ReadonlySet<string>;
     readonly includeDirectories?: boolean;
+    readonly shouldTraverseDirectory?: (relativeDirectory: string) => boolean;
   } = {},
 ): Effect.Effect<ReadonlyArray<string>, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
@@ -1853,13 +1875,17 @@ export const listRepositoryFiles = (
           ),
         );
       for (const entry of entries) {
-        if (
-          entry.kind === "directory" &&
-          !(options.ignoredDirectories ?? fileTraversalIgnoredDirectories).has(
-            entry.name,
-          )
-        ) {
+        if (entry.kind === "directory") {
           const path = joinPath(current, entry.name);
+          if (
+            (options.ignoredDirectories ?? fileTraversalIgnoredDirectories).has(
+              entry.name,
+            ) ||
+            options.shouldTraverseDirectory?.(relativePath(directory, path)) ===
+              false
+          ) {
+            continue;
+          }
           if (options.includeDirectories === true) {
             files.push(path);
           }

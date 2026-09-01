@@ -20,6 +20,7 @@ import {
   loadRootConfiguration,
 } from "../config/runtime.js";
 import {
+  canMatchGlobDescendant,
   matchesGlob,
   matchesGlobsWithExclusions,
   selectByGlobs,
@@ -1090,9 +1091,16 @@ const collectOutputPaths = (
     ): Effect.Effect<void, RepositoryError, FileSystemService> =>
       Effect.gen(function* () {
         const fileSystem = yield* FileSystemService;
+        const positivePatterns = patterns.filter(
+          (pattern) => !pattern.startsWith("!"),
+        );
         const files = yield* listRepositoryFiles(directory, {
           ignoredDirectories: new Set([".git", ".turbo"]),
           includeDirectories: true,
+          shouldTraverseDirectory: (relativeDirectory) =>
+            positivePatterns.some((pattern) =>
+              canMatchGlobDescendant(relativeDirectory, pattern),
+            ),
         });
         for (const path of files) {
           if (isPathContained(cacheDirectory, path)) {

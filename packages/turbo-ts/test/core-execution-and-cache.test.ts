@@ -1981,6 +1981,48 @@ describe("core CLI execution", () => {
     }
   }, 20_000);
 
+  it("reuses root task configuration for root Cargo packages", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, Record<string, unknown>>;
+      };
+      configuration.futureFlags = { experimentalCargoWorkspaces: true };
+      configuration.tasks.run = { cache: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${directory}/src`, { recursive: true });
+      await writeFile(
+        `${directory}/Cargo.toml`,
+        '[package]\nname = "synthetic-rust-root"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(`${directory}/src/main.rs`, "fn main() {}\n");
+      await cp(
+        `${repositoryRoot}/rust-toolchain`,
+        `${directory}/rust-toolchain`,
+      );
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const rootCargoPackage = model.packagesByName.get("synthetic-rust-root");
+      expect(rootCargoPackage?.relativeDirectory).toBe(".");
+      expect(rootCargoPackage?.tasks.build?.dependsOn).toEqual(["^build"]);
+      expect(rootCargoPackage?.tasks.run).toMatchObject({ cache: true });
+      expect(rootCargoPackage?.tasks.dev).toMatchObject({ cache: false });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
   it("matches Cargo manifests through a symlinked repository root", async () => {
     if (process.platform === "win32") return;
     const directory = await makeFixture();
@@ -4753,6 +4795,12 @@ describe("core CLI execution", () => {
         model.packagesByName.get("synthetic-rust-tool")?.scripts,
       ).toMatchObject({ dev: "cargo run", run: "cargo run" });
       expect(
+        model.packagesByName.get("synthetic-rust-tool")?.tasks.dev,
+      ).toMatchObject({ cache: false });
+      expect(
+        model.packagesByName.get("synthetic-rust-tool")?.tasks.run,
+      ).toMatchObject({ cache: false });
+      expect(
         model.packagesByName.get("synthetic-rust-multi")?.scripts.run,
       ).toBeUndefined();
       expect(
@@ -4954,7 +5002,7 @@ describe("core CLI execution", () => {
       const configuration = JSON.parse(
         await readFile(configurationPath, "utf8"),
       ) as { tasks: { build: { outputs: Array<string> } } };
-      configuration.tasks.build.outputs = ["bundle/**"];
+      configuration.tasks.build.outputs = ["bundle/node_modules/**"];
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
@@ -4985,6 +5033,48 @@ describe("core CLI execution", () => {
       expect(warm.stdout).toContain("cache hit");
       expect(await readFile(bundledDependency, "utf8")).toBe("bundled");
     } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("prunes unrelated node_modules during output collection", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const unreadableDirectory = `${packageDirectory}/node_modules/unreadable`;
+    try {
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt','built'); console.log('built dist')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      await mkdir(unreadableDirectory, { recursive: true });
+      await chmod(unreadableDirectory, 0o000);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      const cold = await run(process.execPath, args, repositoryRoot);
+      expect(cold.exitCode, cold.stderr).toBe(0);
+      expect(cold.stdout).toContain("cache miss");
+      expect(cold.stderr).not.toContain("cache output collection failed");
+      await rm(`${packageDirectory}/dist`, { force: true, recursive: true });
+      await rm(`${packageDirectory}/.turbo`, { force: true, recursive: true });
+      const warm = await run(process.execPath, args, repositoryRoot);
+      expect(warm.exitCode, warm.stderr).toBe(0);
+      expect(warm.stdout).toContain("cache hit");
+      expect(await readFile(`${packageDirectory}/dist/value.txt`, "utf8")).toBe(
+        "built",
+      );
+    } finally {
+      await chmod(unreadableDirectory, 0o700).catch(() => undefined);
       await rm(directory, { force: true, recursive: true });
     }
   }, 15_000);
