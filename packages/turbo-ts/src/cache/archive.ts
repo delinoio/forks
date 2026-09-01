@@ -31,6 +31,7 @@ export type ArchiveEntry =
 
 export const tarBlockSize = 512;
 export const maximumCacheArchiveInputBytes = 64 * 1024 * 1024;
+export const maximumCacheArchiveOverheadBytes = 64 * 1024 * 1024;
 const tarNameBytes = 100;
 const tarPrefixBytes = 155;
 const encodedLength = (value: string): number =>
@@ -200,24 +201,32 @@ const pushArchiveRecord = (
   if (padding > 0) chunks.push(new Uint8Array(padding));
 };
 
+const archiveRecordBytes = (contentsLength: number): number =>
+  tarBlockSize + Math.ceil(contentsLength / tarBlockSize) * tarBlockSize;
+
+interface PreparedArchiveEntry {
+  readonly entry: ArchiveEntry;
+  readonly path: string;
+  readonly pathFields:
+    | { readonly name: string; readonly prefix: string }
+    | undefined;
+  readonly symlink: boolean;
+  readonly directory: boolean;
+  readonly contents: Uint8Array;
+  readonly linkTarget: string;
+  readonly extensions: {
+    readonly path?: string;
+    readonly linkpath?: string;
+  };
+}
+
 export const createTarArchive = (
   entries: ReadonlyArray<ArchiveEntry>,
 ): Uint8Array => {
-  const inputBytes = entries.reduce(
-    (total, entry) =>
-      total + (entry.kind === "directory" ? 0 : entry.contents.length),
-    0,
-  );
-  if (inputBytes > maximumCacheArchiveInputBytes) {
-    throw new TypeError(
-      `cache archive input exceeds the ${maximumCacheArchiveInputBytes} byte limit`,
-    );
-  }
-  const chunks: Array<Uint8Array> = [];
-  const sorted = [...entries].sort((left, right) =>
-    left.path.localeCompare(right.path),
-  );
-  for (const [index, entry] of sorted.entries()) {
+  const preparedEntries: Array<PreparedArchiveEntry> = [];
+  let inputBytes = 0;
+  let overheadBytes = tarBlockSize * 2;
+  for (const entry of entries) {
     const path = validateArchivePath(entry.path);
     const pathFields = splitArchivePath(path);
     const symlink = entry.kind === "symlink";
@@ -232,6 +241,53 @@ export const createTarArchive = (
         ? { linkpath: linkTarget }
         : {}),
     };
+    const extendedContentsBytes =
+      extensions.path === undefined && extensions.linkpath === undefined
+        ? 0
+        : paxContents(extensions).length;
+    inputBytes += contents.length;
+    overheadBytes +=
+      archiveRecordBytes(contents.length) -
+      contents.length +
+      (extendedContentsBytes === 0
+        ? 0
+        : archiveRecordBytes(extendedContentsBytes));
+    if (inputBytes > maximumCacheArchiveInputBytes) {
+      throw new TypeError(
+        `cache archive input exceeds the ${maximumCacheArchiveInputBytes} byte limit`,
+      );
+    }
+    if (overheadBytes > maximumCacheArchiveOverheadBytes) {
+      throw new TypeError(
+        `cache archive overhead exceeds the ${maximumCacheArchiveOverheadBytes} byte limit`,
+      );
+    }
+    preparedEntries.push({
+      entry,
+      path,
+      pathFields,
+      symlink,
+      directory,
+      contents,
+      linkTarget,
+      extensions,
+    });
+  }
+  const chunks: Array<Uint8Array> = [];
+  const sorted = preparedEntries.sort((left, right) =>
+    left.entry.path.localeCompare(right.entry.path),
+  );
+  for (const [index, prepared] of sorted.entries()) {
+    const {
+      entry,
+      path,
+      pathFields,
+      symlink,
+      directory,
+      contents,
+      linkTarget,
+      extensions,
+    } = prepared;
     if (extensions.path !== undefined || extensions.linkpath !== undefined) {
       const extendedContents = paxContents(extensions);
       pushArchiveRecord(

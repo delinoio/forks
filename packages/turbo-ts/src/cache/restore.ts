@@ -95,6 +95,7 @@ const prepareParentDirectory = (
   root: string,
   canonicalRoot: string,
   destination: string,
+  restoredPaths: Array<string>,
 ): Effect.Effect<void, CacheError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -112,6 +113,7 @@ const prepareParentDirectory = (
           .pipe(
             Effect.mapError((error) => restoreError(current, error.message)),
           );
+        restoredPaths.push(relativePath(root, current));
       }
       const metadata = yield* fileSystem
         .metadata(current)
@@ -295,7 +297,12 @@ export const restoreArchiveEntries = (
       }
       for (const entry of entries) {
         const destination = joinPath(root, entry.path);
-        yield* prepareParentDirectory(root, canonicalRoot, destination);
+        yield* prepareParentDirectory(
+          root,
+          canonicalRoot,
+          destination,
+          restoredPaths,
+        );
         let exists = yield* fileSystem
           .exists(destination)
           .pipe(

@@ -41,6 +41,7 @@ import { loadRootConfiguration } from "../src/config/runtime.js";
 import { BoundaryError } from "../src/effect/errors.js";
 import { nodeFoundationLayer } from "../src/effect/node-layer.js";
 import {
+  CompressionService,
   DigestService,
   FileSystemService,
   ProcessService,
@@ -2708,6 +2709,35 @@ describe("core CLI execution", () => {
       );
       expect(invalid.stdout).not.toContain("library build");
       expect(invalid.stdout).not.toContain("app build");
+
+      const selectorOutput = `${directory}/selector-output`;
+      const optionSelector = await execute(
+        `[--output=${selectorOutput}...HEAD]`,
+      );
+      expect(optionSelector.exitCode).not.toBe(0);
+      expect(optionSelector.stderr).toContain("invalid Git range filter");
+      await expect(lstat(selectorOutput)).rejects.toThrow();
+
+      const scmOutput = `${directory}/scm-output`;
+      const optionEnvironment = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--affected",
+          "--only",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: `--output=${scmOutput}`, TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(optionEnvironment.exitCode).toBe(0);
+      expect(optionEnvironment.stdout).toContain("app build");
+      expect(optionEnvironment.stdout).toContain("library build");
+      await expect(lstat(scmOutput)).rejects.toThrow();
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -4004,6 +4034,41 @@ describe("core CLI execution", () => {
       expect(releaseWarm.exitCode).toBe(0);
       expect(releaseWarm.stdout).not.toContain("cache hit");
       expect((await lstat(releaseExecutable)).isFile()).toBe(true);
+
+      const ambientTargetDirectory = `${packageDirectory}/ambient-target`;
+      await rm(`${packageDirectory}/target`, {
+        force: true,
+        recursive: true,
+      });
+      const mismatchedTargetCold = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        { CARGO_TARGET_DIR: ambientTargetDirectory },
+      );
+      expect(mismatchedTargetCold.exitCode).toBe(0);
+      expect(mismatchedTargetCold.stdout).not.toContain("cache hit");
+      expect((await lstat(executable)).isFile()).toBe(true);
+      await rm(`${packageDirectory}/target`, {
+        force: true,
+        recursive: true,
+      });
+      const mismatchedTargetWarm = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        { CARGO_TARGET_DIR: ambientTargetDirectory },
+      );
+      expect(mismatchedTargetWarm.exitCode).toBe(0);
+      expect(mismatchedTargetWarm.stdout).not.toContain("cache hit");
+      expect((await lstat(executable)).isFile()).toBe(true);
+      await expect(
+        lstat(
+          `${ambientTargetDirectory}/debug/synthetic-rust-tool${
+            process.platform === "win32" ? ".exe" : ""
+          }`,
+        ),
+      ).rejects.toThrow();
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -5639,6 +5704,69 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("streams local cache decompression through scoped temporary storage", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-local-stream-"));
+    const cacheDirectory = `${directory}/cache`;
+    const hash = "0123456789abcdef";
+    const outputPath = "packages/app/output.txt";
+    let temporaryArchivePath: string | undefined;
+    try {
+      await Effect.runPromise(
+        writeLocalCache(
+          { directory: cacheDirectory },
+          hash,
+          [
+            {
+              path: outputPath,
+              contents: new TextEncoder().encode("streamed local output\n"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+          ],
+          1,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const restored = await Effect.runPromise(
+        Effect.gen(function* () {
+          const compression = yield* CompressionService;
+          const streamingCompressionLayer = Layer.succeed(CompressionService, {
+            ...compression,
+            decompressZstd: () =>
+              Effect.fail(
+                new BoundaryError({
+                  boundary: "compression",
+                  message: "in-memory decompression must not be used",
+                  retryable: false,
+                }),
+              ),
+            decompressZstdToFile: (contents, destination, maxOutputBytes) => {
+              temporaryArchivePath = destination;
+              return compression.decompressZstdToFile(
+                contents,
+                destination,
+                maxOutputBytes,
+              );
+            },
+          });
+          return yield* restoreLocalCache(
+            directory,
+            { directory: cacheDirectory },
+            hash,
+            allowCachePaths("**"),
+          ).pipe(Effect.provide(streamingCompressionLayer));
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(restored).toBe(true);
+      expect(await readFile(`${directory}/${outputPath}`, "utf8")).toBe(
+        "streamed local output\n",
+      );
+      expect(temporaryArchivePath).toBeDefined();
+      await expect(lstat(temporaryArchivePath!)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("warns and falls back when a local cache artifact is corrupt", async () => {
     const directory = await makeFixture();
     const cacheDirectory = `${directory}/.turbo/cache`;
@@ -5757,13 +5885,13 @@ describe("cache interoperability and safety", () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-rollback-"));
     const entries = [
       {
-        path: "output/first.txt",
+        path: "output/nested/first.txt",
         contents: new TextEncoder().encode("first"),
         mode: 0o644,
         modifiedSeconds: 1,
       },
       {
-        path: "output/second.txt",
+        path: "output/nested/second.txt",
         contents: new TextEncoder().encode("second"),
         mode: 0o644,
         modifiedSeconds: 1,
@@ -5810,8 +5938,13 @@ describe("cache interoperability and safety", () => {
     try {
       const safeFailure = await restore(false);
       expect(safeFailure._tag).toBe("Left");
-      await expect(lstat(`${directory}/output/first.txt`)).rejects.toThrow();
-      await expect(lstat(`${directory}/output/second.txt`)).rejects.toThrow();
+      await expect(
+        lstat(`${directory}/output/nested/first.txt`),
+      ).rejects.toThrow();
+      await expect(
+        lstat(`${directory}/output/nested/second.txt`),
+      ).rejects.toThrow();
+      await expect(lstat(`${directory}/output`)).rejects.toThrow();
       const unsafeFailure = await restore(true);
       expect(unsafeFailure._tag).toBe("Left");
       if (unsafeFailure._tag === "Left") {

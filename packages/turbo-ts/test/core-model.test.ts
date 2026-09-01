@@ -1,5 +1,10 @@
 import { describe, expect, it } from "@rstest/core";
-import { createTarArchive, parseTarArchive } from "../src/cache/archive.js";
+import {
+  createTarArchive,
+  maximumCacheArchiveOverheadBytes,
+  parseTarArchive,
+  tarBlockSize,
+} from "../src/cache/archive.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import {
   mergePipeline,
@@ -21,7 +26,10 @@ import {
   type TaskNode,
   topologicalOrder,
 } from "../src/graph/task-graph.js";
-import { selectEnvironment } from "../src/hash/task-hash.js";
+import {
+  canonicalStringify,
+  selectEnvironment,
+} from "../src/hash/task-hash.js";
 import { createXxhash64, xxhash64Hex } from "../src/hash/xxhash64.js";
 import {
   finishTaskOutput,
@@ -591,6 +599,19 @@ describe("core repository model", () => {
     ).toEqual({ Path: "C:/Windows/System32", SystemRoot: "C:/Windows" });
   });
 
+  it("orders canonical object and environment keys by code unit", () => {
+    expect(canonicalStringify({ äValue: "unicode", zValue: "ascii" })).toBe(
+      '{"zValue":"ascii","äValue":"unicode"}',
+    );
+    expect(
+      Object.keys(
+        selectEnvironment({ ä_VALUE: "unicode", Z_VALUE: "ascii" }, [
+          "*_VALUE",
+        ]),
+      ),
+    ).toEqual(["Z_VALUE", "ä_VALUE"]);
+  });
+
   it("preserves pass-through arguments as literal argv values", () => {
     const parsed = parseRunArguments([
       "run",
@@ -841,6 +862,10 @@ describe("core repository model", () => {
       with: [],
     };
     for (const arguments_ of [
+      ["-p", "helper"],
+      ["-phelper"],
+      ["--package", "helper"],
+      ["--package=helper"],
       ["--lib"],
       ["--bin", "tool"],
       ["--bins"],
@@ -871,6 +896,21 @@ describe("core repository model", () => {
         true,
       ),
     ).toBe(false);
+    expect(
+      isTaskScopeCacheable(node, [], { kind: "package" }, {}, false, {
+        CARGO_TARGET_DIR: "/repo/custom-target",
+      }),
+    ).toBe(false);
+    expect(
+      isTaskScopeCacheable(
+        node,
+        [],
+        { kind: "package" },
+        { CARGO_TARGET_DIR: "/repo/custom-target" },
+        false,
+        { CARGO_TARGET_DIR: "/repo/custom-target" },
+      ),
+    ).toBe(true);
     expect(isTaskScopeCacheable(node, ["--features=integration"])).toBe(true);
   });
 
@@ -882,6 +922,21 @@ describe("core repository model", () => {
 });
 
 describe("cache archive safety", () => {
+  it("rejects excessive tar metadata overhead before constructing chunks", () => {
+    const entry = {
+      kind: "directory" as const,
+      path: "packages/app/dist/empty",
+      mode: 0o755,
+      modifiedSeconds: 1,
+    };
+    const entries = new Array(
+      maximumCacheArchiveOverheadBytes / tarBlockSize,
+    ).fill(entry) as ReadonlyArray<typeof entry>;
+    expect(() => createTarArchive(entries)).toThrow(
+      /cache archive overhead exceeds/,
+    );
+  });
+
   it("round trips deterministic archives", () => {
     const entries = [
       {

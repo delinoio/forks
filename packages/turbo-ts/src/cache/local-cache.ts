@@ -7,11 +7,8 @@ import {
   FileSystemService,
   RandomnessService,
 } from "../effect/services.js";
-import {
-  type ArchiveEntry,
-  createTarArchive,
-  parseTarArchive,
-} from "./archive.js";
+import { type ArchiveEntry, createTarArchive } from "./archive.js";
+import { parseTarArchiveFile } from "./archive-file.js";
 import {
   maximumCacheArchiveBytes,
   maximumCacheArtifactBytes,
@@ -119,20 +116,32 @@ export const restoreLocalCache = (
             ),
           );
         }
-        const archive = yield* compression
-          .decompressZstd(compressed, maximumCacheArchiveBytes)
+        yield* fileSystem
+          .withTemporaryDirectory((directory) => {
+            const archivePath = joinPath(directory, "local-cache.tar");
+            return compression
+              .decompressZstdToFile(
+                compressed,
+                archivePath,
+                maximumCacheArchiveBytes,
+              )
+              .pipe(
+                Effect.mapError((error) =>
+                  cacheError(paths.archive, error.message),
+                ),
+                Effect.flatMap(() => parseTarArchiveFile(archivePath)),
+                Effect.flatMap((entries) =>
+                  restoreArchiveEntries(root, entries, scope),
+                ),
+              );
+          })
           .pipe(
             Effect.mapError((error) =>
-              cacheError(paths.archive, error.message),
+              error._tag === "CacheError" || error._tag === "CacheRollbackError"
+                ? error
+                : cacheError(paths.archive, error.message),
             ),
           );
-        let entries: ReadonlyArray<ArchiveEntry>;
-        try {
-          entries = parseTarArchive(archive);
-        } catch (cause) {
-          return yield* Effect.fail(cacheError(paths.archive, cause));
-        }
-        yield* restoreArchiveEntries(root, entries, scope);
       }),
     );
     if (outcome._tag === "Left") {

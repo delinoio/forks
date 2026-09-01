@@ -68,19 +68,22 @@ symlink attacks, signatures, command-injection arguments, and concurrent cache
 writers. `futureFlags.experimentalCargoSccache: true` always fails before task
 execution with a branded unsupported-compatibility diagnostic.
 
-Cargo builds that receive pass-through arguments selecting release, profile,
-target, another alternate artifact layout, or an unmodeled library, binary,
-example, test, or benchmark target execute without cache reads or writes until
-those outputs are modeled explicitly. Pass-through `--config` arguments also
-disable Cargo build caching because they can override the output layout. Mixed
-library and binary crates default to uncached because binary-only output
-declarations cannot restore all of Cargo's default artifacts. Unfiltered Cargo
-workspace commands merge the effective environments of every grouped member.
+Cargo builds that receive pass-through arguments selecting another package,
+release, profile, target, another alternate artifact layout, or an unmodeled
+library, binary, example, test, or benchmark target execute without cache reads
+or writes until those outputs are modeled explicitly. Pass-through `--config`
+arguments and mismatched metadata/task `CARGO_TARGET_DIR` values also disable
+Cargo build caching. Mixed library and binary crates default to uncached because
+binary-only output declarations cannot restore all of Cargo's default
+artifacts. Unfiltered Cargo workspace commands merge the effective environments
+of every grouped member.
 
 Local and remote cache restoration is limited to 256 MiB compressed and 1 GiB
 after decompression. Artifacts beyond either limit are rejected; invalid local
 entries are removed with a warning and become misses, while remote entries use
-the normal local-execution fallback.
+the normal local-execution fallback. Decompressed archives are parsed from
+scoped temporary storage, and cache writes independently limit file content and
+tar metadata overhead to 64 MiB each.
 
 Configured cache directories may be inside or outside the repository, but the
 repository root and its ancestors are rejected because treating them as cache

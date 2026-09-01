@@ -556,7 +556,9 @@ const findAffectedPackages = (
               "--no-renames",
               "--name-only",
               "-z",
+              "--end-of-options",
               `${baseReference}...${head}`,
+              "--",
             ],
             cwd: repository.root,
           }),
@@ -1268,6 +1270,7 @@ const cargoUnmodeledTargetFlags = [
   "--example",
   "--examples",
   "--lib",
+  "--package",
   "--test",
   "--tests",
 ] as const;
@@ -1282,6 +1285,7 @@ const usesAlternateCargoBuildOutputs = (
     (argument) =>
       argument === "--release" ||
       argument === "-r" ||
+      argument.startsWith("-p") ||
       argument === "--config" ||
       argument.startsWith("--config=") ||
       [...cargoAlternateOutputFlags, ...cargoUnmodeledTargetFlags].some(
@@ -1303,6 +1307,43 @@ const usesEnvironmentCargoBuildTarget = (
         ? name.toLowerCase() === "cargo_build_target"
         : name === "CARGO_BUILD_TARGET"),
   );
+
+const environmentValue = (
+  environment: Readonly<Record<string, string | undefined>>,
+  name: string,
+  caseInsensitiveNames: boolean,
+): string | undefined => {
+  const normalizedName = caseInsensitiveNames ? name.toLowerCase() : name;
+  let selected: string | undefined;
+  for (const [candidate, value] of Object.entries(environment)) {
+    if (
+      (caseInsensitiveNames ? candidate.toLowerCase() : candidate) ===
+      normalizedName
+    ) {
+      selected = value;
+    }
+  }
+  return selected;
+};
+
+const usesMismatchedCargoTargetDirectory = (
+  node: TaskNode,
+  sourceEnvironment: Readonly<Record<string, string | undefined>>,
+  executionEnvironment: Readonly<Record<string, string | undefined>>,
+  caseInsensitiveEnvironmentNames: boolean,
+): boolean =>
+  node.package.manager === "cargo" &&
+  node.task === "build" &&
+  environmentValue(
+    sourceEnvironment,
+    "CARGO_TARGET_DIR",
+    caseInsensitiveEnvironmentNames,
+  ) !==
+    environmentValue(
+      executionEnvironment,
+      "CARGO_TARGET_DIR",
+      caseInsensitiveEnvironmentNames,
+    );
 
 const encodeTaskLogIdentifier = (task: string): string => {
   let encoded = "";
@@ -1328,6 +1369,7 @@ export const isTaskScopeCacheable = (
   scope: TaskCommandScope = packageTaskCommandScope,
   environment: Readonly<Record<string, string | undefined>> = {},
   caseInsensitiveEnvironmentNames = false,
+  sourceEnvironment: Readonly<Record<string, string | undefined>> = environment,
 ): boolean =>
   (scope.kind === "cargo-workspace" ? scope.members : [node]).every(
     (member) => member.definition.cache !== false,
@@ -1335,6 +1377,12 @@ export const isTaskScopeCacheable = (
   !usesAlternateCargoBuildOutputs(node, passThroughArguments) &&
   !usesEnvironmentCargoBuildTarget(
     node,
+    environment,
+    caseInsensitiveEnvironmentNames,
+  ) &&
+  !usesMismatchedCargoTargetDirectory(
+    node,
+    sourceEnvironment,
     environment,
     caseInsensitiveEnvironmentNames,
   );
@@ -1387,6 +1435,7 @@ const executeTask = (
       scope,
       executionEnvironment,
       platform === "win32",
+      sourceEnvironment,
     );
     const localOptions = {
       directory: options.cacheDirectory,

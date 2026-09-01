@@ -18,6 +18,9 @@ import type { RepositoryModel } from "../repository/model.js";
 import { listRepositoryFiles } from "../repository/model.js";
 import { xxhash64Hex } from "./xxhash64.js";
 
+const compareCodeUnits = (left: string, right: string): number =>
+  left < right ? -1 : left > right ? 1 : 0;
+
 const canonicalize = (value: unknown): unknown => {
   if (Array.isArray(value)) {
     return value.map(canonicalize);
@@ -26,7 +29,7 @@ const canonicalize = (value: unknown): unknown => {
     return Object.fromEntries(
       Object.entries(value)
         .filter(([, entry]) => entry !== undefined)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => compareCodeUnits(left, right))
         .map(([key, entry]) => [key, canonicalize(entry)]),
     );
   }
@@ -85,7 +88,7 @@ export const selectEnvironment = (
     }
   }
   return Object.fromEntries(
-    [...selected].sort(([left], [right]) => left.localeCompare(right)),
+    [...selected].sort(([left], [right]) => compareCodeUnits(left, right)),
   );
 };
 
@@ -107,9 +110,6 @@ interface TaskInputFile {
 }
 
 const turboRootInputPrefix = "$TURBO_ROOT$/";
-
-const compareCodeUnits = (left: string, right: string): number =>
-  left < right ? -1 : left > right ? 1 : 0;
 
 const isIgnoredInputPath = (path: string, cacheDirectory: string): boolean =>
   path.includes("/.turbo/") ||

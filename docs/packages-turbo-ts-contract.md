@@ -146,10 +146,10 @@ restoration is limited to 256 MiB compressed and 1 GiB after decompression;
 preflight and upload response bodies have an independent 64 KiB limit.
 Restored task logs replay through scoped, bounded text chunks with terminal
 backpressure instead of loading the complete log into another string.
-Remote archives are decompressed into scoped temporary storage and regular-file
-payloads are restored through bounded range copies instead of materializing the
-complete decompressed archive in memory. Remote PAX metadata is limited to 64
-KiB per extended header.
+Local and remote archives are decompressed into scoped temporary storage and
+regular-file payloads are restored through bounded range copies instead of
+materializing the complete decompressed archive in memory. PAX metadata is
+limited to 64 KiB per extended header.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact literal log path before clearing or writing
 files. Output negations are deny rules during both collection and restoration,
@@ -165,6 +165,8 @@ inside the repository without traversing another symlink.
 Every archive must contain exactly one regular task-log entry. Cache writes
 whose aggregate uncompressed file content exceeds 64 MiB are skipped before
 contents are read, with a warning that preserves the successful task result.
+Tar headers, padding, PAX metadata, and end markers have an independent 64 MiB
+preflight limit that is enforced before archive chunks are constructed.
 Companion task hashes participate in the owning task's cache key. Local eviction
 accepts week-based ages, runs before cache restoration only when local cache
 reads or writes are enabled, and counts archive and sidecar bytes, including
@@ -206,14 +208,16 @@ same workspace; registry and Git dependencies remain external. Cargo `run` and
 pass-through arguments are forwarded to Cargo without an implicit
 target-argument separator. Cargo builds
 for mixed library and binary crates default to uncached. Builds with
-pass-through arguments that select an alternate output layout or an unmodeled
-library, binary, example, test, or benchmark target bypass caching until those
-outputs are modeled explicitly. Cargo build pass-through `--config` arguments
-also bypass caching because they can override the output layout. Cargo builds
-also bypass caching when an ancestor Cargo configuration or the effective task
-environment sets a build target. Cargo metadata discovery uses `--locked`, uses
-each response's workspace-member list, and does not probe excluded or unrelated
-nested manifests. Combined workspace task
+pass-through arguments that select an additional package, an alternate output
+layout, or an unmodeled library, binary, example, test, or benchmark target
+bypass caching until those outputs are modeled explicitly. Cargo build
+pass-through `--config` arguments also bypass caching because they can override
+the output layout. Cargo builds also bypass caching when an ancestor Cargo
+configuration or the effective task environment sets a build target, or when
+Cargo metadata and strict task execution receive different `CARGO_TARGET_DIR`
+values. Cargo metadata discovery uses `--locked`, uses each response's
+workspace-member list, and does not probe excluded or unrelated nested
+manifests. Combined workspace task
 hashes are propagated into every downstream task hash.
 
 Structured task input globs apply ordered inclusion and negation consistently
