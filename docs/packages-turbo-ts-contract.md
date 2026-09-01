@@ -117,8 +117,8 @@ dependency semantics, exclude the resolved cache directory, and use each
 task's owning ecosystem lockfile. Regular input files are streamed through
 bounded-memory Git blob digests, and owning lockfiles are streamed through
 bounded-memory xxHash64 digests. NUL-delimited Git discovery output is consumed
-as bytes and filenames that are not valid UTF-8 fail hashing instead of being
-silently omitted. Cargo
+as bytes and filenames that are not valid UTF-8 fail affected selection and
+hashing instead of being silently omitted. Cargo
 task hashes additionally include repository-contained
 ancestor manifests, Cargo configuration, and Rust toolchain files that can
 change task execution. Environment-name selection follows Windows
@@ -140,6 +140,8 @@ display line in memory.
 Persistent companions must remain alive until their foreground owners
 complete; any earlier natural exit fails the group, and foreground owners
 sharing a companion remain subject to the run's concurrency limit.
+Persistent task scopes always bypass local and remote caching, regardless of
+their configured cache value.
 On Windows, npm, pnpm, and Yarn task commands use their standard command shims
 through a narrowly escaped command-interpreter adapter; POSIX task execution
 does not use a shell. Scope finalization terminates the Windows wrapper and its
@@ -222,6 +224,8 @@ write failure, including when the write or rename also failed.
 Archives preserve empty declared output directories. Failed restoration removes
 every partially restored output before local execution, and rollback failure
 aborts execution instead of exposing partial cache state.
+Failure to remove the corrupt cache entry does not downgrade a restoration
+rollback failure to an ordinary cache miss.
 Regular archive destinations are unlinked before their contents are restored,
 so an existing hard link cannot redirect truncation outside the repository.
 Resolved cache-directory subtrees are excluded from both task inputs and task
@@ -277,6 +281,8 @@ uses each response's
 workspace-member list, and does not probe excluded or unrelated nested
 manifests. Combined workspace task
 hashes are propagated into every downstream task hash.
+Cargo builds with colliding synthesized binary destinations bypass caching,
+including when task configuration explicitly enables it.
 
 Structured task input globs apply ordered inclusion and negation consistently
 to task hashing and task-aware affected selection. Task-aware Git filters

@@ -3675,21 +3675,68 @@ describe("core CLI execution", () => {
 
     const directory = await makeGitFixture();
     try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, unknown>;
+      };
+      configuration.futureFlags = {
+        ...configuration.futureFlags,
+        affectedUsingTaskInputs: true,
+      };
+      configuration.tasks.check = { cache: false, inputs: ["known.txt"] };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${directory}/packages/library/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.check = "node -e \"console.log('library check')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "fixture base"],
+      ]) {
+        const git = await run("git", args, directory);
+        expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
+      }
       const invalidPath = Buffer.concat([
         Buffer.from(`${directory}/packages/library/invalid-`),
         Buffer.from([0xff]),
       ]);
       await writeFile(invalidPath, "invalid\n");
       for (const args of [
-        ["init"],
-        ["config", "user.email", "synthetic@example.test"],
-        ["config", "user.name", "Synthetic Fixture"],
         ["add", "."],
         ["commit", "-m", "invalid filename"],
       ]) {
         const git = await run("git", args, directory);
         expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
       }
+      const affected = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--affected",
+          "--only",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(affected.exitCode).not.toBe(0);
+      expect(affected.stderr).toContain("not valid UTF-8");
       const model = await Effect.runPromise(
         Effect.gen(function* () {
           const rootConfiguration = yield* loadRootConfiguration(directory);
@@ -4704,6 +4751,103 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 20_000);
+
+  it("disables caching for colliding Cargo binary outputs", async () => {
+    const directory = await makeFixture();
+    const workspaceDirectory = `${directory}/packages/rust-workspace`;
+    const firstDirectory = `${workspaceDirectory}/first`;
+    const secondDirectory = `${workspaceDirectory}/second`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, Record<string, unknown>>;
+      };
+      configuration.futureFlags = {
+        ...configuration.futureFlags,
+        experimentalCargoWorkspaces: true,
+      };
+      configuration.tasks.build = {
+        ...configuration.tasks.build,
+        cache: true,
+      };
+      delete configuration.tasks.build.outputs;
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(firstDirectory, { recursive: true });
+      await mkdir(secondDirectory, { recursive: true });
+      await writeFile(
+        `${workspaceDirectory}/Cargo.toml`,
+        '[workspace]\nmembers = ["first", "second"]\nresolver = "3"\n',
+      );
+      await writeFile(
+        `${firstDirectory}/Cargo.toml`,
+        '[package]\nname = "rust-first"\nversion = "0.1.0"\nedition = "2024"\n\n[[bin]]\nname = "shared-tool"\npath = "src/main.rs"\n',
+      );
+      await writeFile(
+        `${secondDirectory}/Cargo.toml`,
+        '[package]\nname = "rust-second"\nversion = "0.1.0"\nedition = "2024"\n\n[[bin]]\nname = "shared-tool"\npath = "src/main.rs"\n',
+      );
+      const firstId = `path+file://${firstDirectory}#rust-first@0.1.0`;
+      const secondId = `path+file://${secondDirectory}#rust-second@0.1.0`;
+      const stdout = JSON.stringify({
+        workspace_root: workspaceDirectory,
+        workspace_members: [firstId, secondId],
+        target_directory: `${workspaceDirectory}/target`,
+        packages: [
+          {
+            id: firstId,
+            name: "rust-first",
+            manifest_path: `${firstDirectory}/Cargo.toml`,
+            dependencies: [],
+            targets: [{ kind: ["bin"], name: "shared-tool" }],
+          },
+          {
+            id: secondId,
+            name: "rust-second",
+            manifest_path: `${secondDirectory}/Cargo.toml`,
+            dependencies: [],
+            targets: [{ kind: ["bin"], name: "shared-tool" }],
+          },
+        ],
+      });
+      const metadataProcessLayer = Layer.succeed(ProcessService, {
+        run: () =>
+          Effect.succeed({
+            exitCode: 0,
+            stdout,
+            stderr: "",
+            combinedOutput: stdout,
+          }),
+        runBytes: () => Effect.die("unexpected binary process request"),
+      });
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(
+          Effect.provide(metadataProcessLayer),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const output =
+        "$TURBO_ROOT$/packages/rust-workspace/target/debug/shared-tool";
+      for (const packageName of ["rust-first", "rust-second"]) {
+        expect(
+          model.packagesByName.get(packageName)?.tasks.build,
+        ).toMatchObject({
+          cache: false,
+          outputs: [output, `${output}.exe`],
+        });
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("restores implicit Cargo binary outputs and leaves libraries uncached", async () => {
     const directory = await makeFixture();
@@ -7089,6 +7233,91 @@ describe("cache interoperability and safety", () => {
       expect(unsafeFailure._tag).toBe("Left");
       if (unsafeFailure._tag === "Left") {
         expect(unsafeFailure.left._tag).toBe("CacheRollbackError");
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("preserves rollback failures when corrupt entry cleanup also fails", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-rollback-cache-"));
+    const cacheDirectory = `${directory}/cache`;
+    const hash = "1234567890abcdef";
+    const entries = [
+      {
+        path: "output/first.txt",
+        contents: new TextEncoder().encode("first"),
+        mode: 0o644,
+        modifiedSeconds: 1,
+      },
+      {
+        path: "output/second.txt",
+        contents: new TextEncoder().encode("second"),
+        mode: 0o644,
+        modifiedSeconds: 1,
+      },
+    ];
+    try {
+      await Effect.runPromise(
+        writeLocalCache({ directory: cacheDirectory }, hash, entries, 1).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const outcome = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const failingLayer = Layer.succeed(FileSystemService, {
+            ...fileSystem,
+            copyBytesRange: (source, offset, length, destination) =>
+              destination.endsWith("second.txt")
+                ? fileSystem
+                    .copyBytesRange(source, offset, length, destination)
+                    .pipe(
+                      Effect.zipRight(
+                        Effect.fail(
+                          new BoundaryError({
+                            boundary: "filesystem",
+                            message: "synthetic restore failure",
+                            retryable: false,
+                          }),
+                        ),
+                      ),
+                    )
+                : fileSystem.copyBytesRange(
+                    source,
+                    offset,
+                    length,
+                    destination,
+                  ),
+            remove: (path) =>
+              path.endsWith("first.txt") ||
+              path.startsWith(`${cacheDirectory}/`)
+                ? Effect.fail(
+                    new BoundaryError({
+                      boundary: "filesystem",
+                      message: path.endsWith("first.txt")
+                        ? "synthetic rollback failure"
+                        : "synthetic cache cleanup failure",
+                      retryable: false,
+                    }),
+                  )
+                : fileSystem.remove(path),
+          });
+          return yield* restoreLocalCache(
+            directory,
+            { directory: cacheDirectory },
+            hash,
+            allowCachePaths("**"),
+          ).pipe(Effect.either, Effect.provide(failingLayer));
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(outcome._tag).toBe("Left");
+      if (outcome._tag === "Left") {
+        expect(outcome.left._tag).toBe("CacheRollbackError");
+        expect(outcome.left.message).toContain("synthetic rollback failure");
+        expect(outcome.left.message).toContain(
+          "synthetic cache cleanup failure",
+        );
       }
     } finally {
       await rm(directory, { force: true, recursive: true });

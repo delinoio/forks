@@ -549,6 +549,23 @@ describe("core repository model", () => {
     ).toThrow(/persistent/);
   });
 
+  it("keeps persistent task scopes uncacheable", () => {
+    const app = packageModel("app", []);
+    const node = buildTaskGraph(
+      repository([app]),
+      [app],
+      ["dev"],
+      false,
+    ).nodes.get("app#dev")!;
+    expect(isTaskScopeCacheable(node, [])).toBe(false);
+    expect(
+      isTaskScopeCacheable(
+        { ...node, definition: { ...node.definition, cache: true } },
+        [],
+      ),
+    ).toBe(false);
+  });
+
   it("preserves transit tasks and applies strict entrypoint selection", () => {
     const transit = {
       ...packageModel("transit", []),

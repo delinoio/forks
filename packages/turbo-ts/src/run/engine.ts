@@ -58,6 +58,7 @@ import {
   topologicalOrder,
 } from "../graph/task-graph.js";
 import {
+  decodeNullDelimitedGitOutput,
   effectiveTaskInputs,
   hashTask,
   implicitTaskInputCandidates,
@@ -583,7 +584,7 @@ const findAffectedPackages = (
     const diff = (baseReference: string) =>
       Effect.either(
         Effect.scoped(
-          processService.run({
+          processService.runBytes({
             command: "git",
             args: [
               "diff",
@@ -614,7 +615,7 @@ const findAffectedPackages = (
         const detail =
           result._tag === "Left"
             ? result.left.message
-            : result.right.stderr.trim();
+            : new TextDecoder().decode(result.right.stderr).trim();
         return yield* Effect.fail(
           new ConfigurationError({
             path: "<arguments>",
@@ -632,7 +633,16 @@ const findAffectedPackages = (
         rootChanged: true,
       };
     }
-    const changedFiles = result.right.stdout.split("\0").filter(Boolean);
+    const changedFiles = yield* Effect.try({
+      try: () =>
+        decodeNullDelimitedGitOutput(result.right.stdout, repository.root),
+      catch: (cause) =>
+        new ConfigurationError({
+          path: repository.root,
+          message:
+            cause instanceof RepositoryError ? cause.message : String(cause),
+        }),
+    });
     const globalDependencyPatterns =
       repository.rootConfiguration.value.futureFlags?.globalConfiguration ===
       true
@@ -1457,7 +1467,9 @@ export const isTaskScopeCacheable = (
 ): boolean =>
   (scope.kind === "cargo-workspace" ? scope.members : [node]).every(
     (member) =>
-      member.package.cachePathRestorable && member.definition.cache !== false,
+      member.package.cachePathRestorable &&
+      member.definition.cache !== false &&
+      member.definition.persistent !== true,
   ) &&
   !usesAlternateCargoBuildOutputs(node, passThroughArguments) &&
   !usesEnvironmentCargoBuildTarget(

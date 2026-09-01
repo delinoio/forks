@@ -1140,6 +1140,7 @@ const cargoTasks = (
   configured: Readonly<Record<string, Pipeline>>,
   excludedTasks: ReadonlySet<string>,
   configuredBuildTarget: boolean,
+  hasCollidingBuildOutput: boolean,
 ): Readonly<Record<string, Pipeline>> => {
   const outputPrefix =
     metadata?.targetDirectory !== undefined &&
@@ -1161,7 +1162,9 @@ const cargoTasks = (
   const formatDefaults: Pipeline = { cache: false };
   const buildTask = (configuredTask: Pipeline): Pipeline => {
     const merged = mergePipeline(buildDefaults, configuredTask);
-    return configuredBuildTarget ? { ...merged, cache: false } : merged;
+    return configuredBuildTarget || hasCollidingBuildOutput
+      ? { ...merged, cache: false }
+      : merged;
   };
   const tasks: Record<string, Pipeline> = { ...configured };
   if (!excludedTasks.has("build")) {
@@ -1496,6 +1499,28 @@ export const discoverRepository = (
         });
       }
     }
+    const cargoBuildOutputOwners = new Map<string, Set<string>>();
+    for (const metadata of cargoPackages.values()) {
+      if (
+        metadata.targetDirectory === undefined ||
+        !isPathContained(root, metadata.targetDirectory)
+      ) {
+        continue;
+      }
+      for (const entrypointName of metadata.entrypointNames) {
+        const output = comparableFilesystemPath(
+          joinPath(metadata.targetDirectory, "debug", entrypointName),
+        );
+        const owners = cargoBuildOutputOwners.get(output) ?? new Set<string>();
+        owners.add(metadata.manifestPath);
+        cargoBuildOutputOwners.set(output, owners);
+      }
+    }
+    const cargoManifestsWithCollidingBuildOutputs = new Set(
+      [...cargoBuildOutputOwners.values()]
+        .filter((owners) => owners.size > 1)
+        .flatMap((owners) => [...owners]),
+    );
     const cargoDrafts: ReadonlyArray<RepositoryPackageDraft> =
       yield* Effect.forEach(
         [...cargoPackages.values()].sort((left, right) =>
@@ -1548,6 +1573,9 @@ export const discoverRepository = (
                 packageConfiguration.tasks,
                 packageConfiguration.excludedTasks,
                 configuredBuildTarget,
+                cargoManifestsWithCollidingBuildOutputs.has(
+                  metadata.manifestPath,
+                ),
               ),
               manifest: {
                 name: metadata.name,

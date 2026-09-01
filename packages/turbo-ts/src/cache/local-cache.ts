@@ -161,7 +161,23 @@ export const restoreLocalCache = (
       }),
     );
     if (outcome._tag === "Left") {
-      yield* removeEntry(options.directory, hash);
+      const cleanup = yield* Effect.either(
+        removeEntry(options.directory, hash),
+      );
+      if (
+        cleanup._tag === "Left" &&
+        outcome.left._tag === "CacheRollbackError"
+      ) {
+        return yield* Effect.fail(
+          new CacheRollbackError({
+            path: outcome.left.path,
+            message: `${outcome.left.message}; ${cleanup.left.message}`,
+          }),
+        );
+      }
+      if (cleanup._tag === "Left") {
+        return yield* Effect.fail(cleanup.left);
+      }
       return yield* Effect.fail(outcome.left);
     }
     return true;
