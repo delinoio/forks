@@ -431,6 +431,17 @@ const dependencyEntries = (
 const dependencyNames = (manifest: PackageManifest): ReadonlyArray<string> =>
   [...new Set(dependencyEntries(manifest).map(([name]) => name))].sort();
 
+const canonicalFilesystemIdentity = (
+  path: string,
+): Effect.Effect<string | undefined, never, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    return yield* fileSystem.realPath(path).pipe(
+      Effect.map((resolved) => comparableFilesystemPath(resolved)),
+      Effect.catchAll(() => Effect.succeed(undefined)),
+    );
+  });
+
 const referencesWorkspacePackage = (
   declaringDirectory: string,
   specification: string,
@@ -438,30 +449,39 @@ const referencesWorkspacePackage = (
     readonly directory: string;
     readonly manifest: PackageManifest;
   },
-): boolean => {
+): Effect.Effect<boolean, never, FileSystemService> => {
   for (const protocol of ["file:", "link:"] as const) {
     if (specification.startsWith(protocol)) {
       const path = specification.slice(protocol.length);
-      if (path === "") return false;
+      if (path === "") return Effect.succeed(false);
       const resolved = isAbsolutePath(path)
         ? normalizePath(path)
         : joinPath(declaringDirectory, path);
-      return resolved === normalizePath(target.directory);
+      return Effect.all([
+        canonicalFilesystemIdentity(resolved),
+        canonicalFilesystemIdentity(target.directory),
+      ]).pipe(
+        Effect.map(
+          ([resolvedIdentity, targetIdentity]) =>
+            resolvedIdentity !== undefined &&
+            resolvedIdentity === targetIdentity,
+        ),
+      );
     }
   }
   if (specification.startsWith("workspace:")) {
     const range = specification.slice("workspace:".length);
     if (range === "" || range === "*" || range === "^" || range === "~") {
-      return true;
+      return Effect.succeed(true);
     }
-    return (
+    return Effect.succeed(
       target.manifest.version !== undefined &&
-      satisfies(target.manifest.version, range)
+        satisfies(target.manifest.version, range),
     );
   }
-  return (
+  return Effect.succeed(
     target.manifest.version !== undefined &&
-    satisfies(target.manifest.version, specification)
+      satisfies(target.manifest.version, specification),
   );
 };
 
@@ -472,18 +492,28 @@ const javascriptInternalDependencies = (
     string,
     { readonly directory: string; readonly manifest: PackageManifest }
   >,
-): ReadonlyArray<string> =>
-  [
-    ...new Set(
-      dependencyEntries(manifest).flatMap(([name, specification]) => {
+): Effect.Effect<ReadonlyArray<string>, never, FileSystemService> =>
+  Effect.gen(function* () {
+    const references = yield* Effect.forEach(
+      dependencyEntries(manifest),
+      ([name, specification]) => {
         const target = packagesByName.get(name);
-        return target !== undefined &&
-          referencesWorkspacePackage(declaringDirectory, specification, target)
-          ? [name]
-          : [];
-      }),
-    ),
-  ].sort();
+        return target === undefined
+          ? Effect.succeed(undefined)
+          : referencesWorkspacePackage(
+              declaringDirectory,
+              specification,
+              target,
+            ).pipe(Effect.map((matches) => (matches ? name : undefined)));
+      },
+      { concurrency: 8 },
+    );
+    return [
+      ...new Set(
+        references.filter((name): name is string => name !== undefined),
+      ),
+    ].sort();
+  });
 
 const polyglotScripts = (
   manager: "cargo" | "uv",
@@ -695,6 +725,7 @@ const cargoWorkspaceMetadata = (
           "metadata",
           "--format-version=1",
           "--no-deps",
+          "--locked",
           "--manifest-path",
           manifestPath,
         ],
@@ -747,6 +778,64 @@ const recordValue = (
   typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Readonly<Record<string, unknown>>)
     : undefined;
+
+const cargoBuildTargetConfigured = (
+  directory: string,
+): Effect.Effect<boolean, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    let current = normalizePath(directory);
+    while (true) {
+      const modernPath = joinPath(current, ".cargo/config.toml");
+      const legacyPath = joinPath(current, ".cargo/config");
+      const modernExists = yield* fileSystem
+        .exists(modernPath)
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({ path: modernPath, message: error.message }),
+          ),
+        );
+      const legacyExists = modernExists
+        ? false
+        : yield* fileSystem.exists(legacyPath).pipe(
+            Effect.mapError(
+              (error) =>
+                new RepositoryError({
+                  path: legacyPath,
+                  message: error.message,
+                }),
+            ),
+          );
+      const path = modernExists
+        ? modernPath
+        : legacyExists
+          ? legacyPath
+          : undefined;
+      if (path !== undefined) {
+        const source = yield* fileSystem
+          .readText(path)
+          .pipe(
+            Effect.mapError(
+              (error) => new RepositoryError({ path, message: error.message }),
+            ),
+          );
+        try {
+          const document = recordValue(parseToml(source));
+          if (recordValue(document?.build)?.target !== undefined) {
+            return true;
+          }
+        } catch (cause) {
+          return yield* Effect.fail(
+            new RepositoryError({ path, message: String(cause) }),
+          );
+        }
+      }
+      const parent = parentPath(current);
+      if (parent === current) return false;
+      current = parent;
+    }
+  });
 
 const stringArrayValue = (value: unknown): ReadonlyArray<string> =>
   Array.isArray(value)
@@ -832,6 +921,7 @@ const cargoTasks = (
   packageName: string,
   metadata: CargoPackageMetadata | undefined,
   configured: Readonly<Record<string, Pipeline>>,
+  configuredBuildTarget: boolean,
 ): Readonly<Record<string, Pipeline>> => {
   const outputPrefix =
     metadata?.targetDirectory !== undefined &&
@@ -850,17 +940,18 @@ const cargoTasks = (
       ? { cache: false }
       : { outputs };
   const formatDefaults: Pipeline = { cache: false };
+  const buildTask = (configuredTask: Pipeline): Pipeline => {
+    const merged = mergePipeline(buildDefaults, configuredTask);
+    return configuredBuildTarget ? { ...merged, cache: false } : merged;
+  };
   const tasks: Record<string, Pipeline> = {
     ...configured,
-    build: mergePipeline(buildDefaults, configured.build ?? {}),
+    build: buildTask(configured.build ?? {}),
     format: mergePipeline(formatDefaults, configured.format ?? {}),
   };
   const qualifiedBuild = `${packageName}#build`;
   if (configured[qualifiedBuild] !== undefined) {
-    tasks[qualifiedBuild] = mergePipeline(
-      buildDefaults,
-      configured[qualifiedBuild],
-    );
+    tasks[qualifiedBuild] = buildTask(configured[qualifiedBuild]);
   }
   const qualifiedFormat = `${packageName}#format`;
   if (configured[qualifiedFormat] !== undefined) {
@@ -1145,30 +1236,40 @@ export const discoverRepository = (
         });
       }
     }
-    const cargoDrafts: ReadonlyArray<RepositoryPackageDraft> = [
-      ...cargoPackages.values(),
-    ]
-      .sort((left, right) =>
-        left.manifestPath.localeCompare(right.manifestPath),
-      )
-      .map((metadata) => {
-        const directory = parentPath(metadata.manifestPath);
-        return {
-          name: metadata.name,
-          directory,
-          relativeDirectory: relativePath(root, directory),
-          workspaceDirectory: metadata.workspaceDirectory,
-          manager: "cargo" as const,
-          scripts: polyglotScripts("cargo", metadata.entrypointNames),
-          cargoDependencies: metadata.dependencies,
-          dependencyNames: metadata.dependencyNames,
-          tasks: cargoTasks(root, metadata.name, metadata, configuredTasks),
-          manifest: {
-            name: metadata.name,
-            private: true,
-          } satisfies PackageManifest,
-        };
-      });
+    const cargoDrafts: ReadonlyArray<RepositoryPackageDraft> =
+      yield* Effect.forEach(
+        [...cargoPackages.values()].sort((left, right) =>
+          left.manifestPath.localeCompare(right.manifestPath),
+        ),
+        (metadata) =>
+          Effect.gen(function* () {
+            const directory = parentPath(metadata.manifestPath);
+            const configuredBuildTarget =
+              yield* cargoBuildTargetConfigured(directory);
+            return {
+              name: metadata.name,
+              directory,
+              relativeDirectory: relativePath(root, directory),
+              workspaceDirectory: metadata.workspaceDirectory,
+              manager: "cargo" as const,
+              scripts: polyglotScripts("cargo", metadata.entrypointNames),
+              cargoDependencies: metadata.dependencies,
+              dependencyNames: metadata.dependencyNames,
+              tasks: cargoTasks(
+                root,
+                metadata.name,
+                metadata,
+                configuredTasks,
+                configuredBuildTarget,
+              ),
+              manifest: {
+                name: metadata.name,
+                private: true,
+              } satisfies PackageManifest,
+            };
+          }),
+        { concurrency: 8 },
+      );
     const uvDrafts = yield* Effect.forEach(
       polyglotDirectories.filter((directory) =>
         pythonWorkspaceDirectories.has(directory),
@@ -1268,6 +1369,29 @@ export const discoverRepository = (
         (packageDraft) => [packageDraft.name, packageDraft] as const,
       ),
     );
+    const javascriptInternalDependenciesByDirectory = new Map(
+      yield* Effect.forEach(
+        [
+          ...javascriptDrafts.map(({ directory, manifest }) => ({
+            directory,
+            manifest,
+          })),
+          { directory: root, manifest: rootManifest },
+        ],
+        ({ directory, manifest }) =>
+          javascriptInternalDependencies(
+            directory,
+            manifest,
+            javascriptDraftsByName,
+          ).pipe(
+            Effect.map(
+              (internalDependencies) =>
+                [normalizePath(directory), internalDependencies] as const,
+            ),
+          ),
+        { concurrency: 8 },
+      ),
+    );
     const cargoDraftsByDirectory = new Map(
       drafts
         .filter((packageDraft) => packageDraft.manager === "cargo")
@@ -1321,11 +1445,9 @@ export const discoverRepository = (
                     ? [target.name]
                     : [];
                 })
-              : javascriptInternalDependencies(
-                  packageDraft.directory,
-                  packageDraft.manifest,
-                  javascriptDraftsByName,
-                ),
+              : (javascriptInternalDependenciesByDirectory.get(
+                  normalizePath(packageDraft.directory),
+                ) ?? []),
       }))
       .sort((left, right) => left.name.localeCompare(right.name));
     const rootTasks = Object.fromEntries(
@@ -1343,11 +1465,9 @@ export const discoverRepository = (
       manager: managerIdentity.name,
       scripts: rootManifest.scripts ?? {},
       dependencyNames: dependencyNames(rootManifest),
-      internalDependencies: javascriptInternalDependencies(
-        root,
-        rootManifest,
-        javascriptDraftsByName,
-      ),
+      internalDependencies:
+        javascriptInternalDependenciesByDirectory.get(normalizePath(root)) ??
+        [],
       tasks: rootTasks,
       manifest: rootManifest,
     };

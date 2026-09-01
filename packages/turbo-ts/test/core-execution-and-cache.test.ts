@@ -910,6 +910,24 @@ describe("core CLI execution", () => {
         ).toEqual(["synthetic-library"]);
       }
 
+      if (process.platform === "win32") {
+        appManifest.dependencies["synthetic-library"] = "file:../LIBRARY";
+      } else {
+        await symlink(
+          `${directory}/packages/library`,
+          `${directory}/packages/library-link`,
+        );
+        appManifest.dependencies["synthetic-library"] = "link:../library-link";
+      }
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, null, 2)}\n`,
+      );
+      expect(
+        (await discover()).packagesByName.get("synthetic-app")
+          ?.internalDependencies,
+      ).toEqual(["synthetic-library"]);
+
       appManifest.dependencies["synthetic-library"] = "file:../app";
       await writeFile(
         appManifestPath,
@@ -3237,6 +3255,136 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
+  it("keeps Cargo discovery locked and disables configured target caching", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/rust-target`;
+    const lockfilePath = `${packageDirectory}/Cargo.lock`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, Record<string, unknown>>;
+      };
+      configuration.futureFlags = { experimentalCargoWorkspaces: true };
+      configuration.tasks.build = {
+        ...configuration.tasks.build,
+        cache: true,
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${packageDirectory}/src`, { recursive: true });
+      await mkdir(`${packageDirectory}/vendor/helper/src`, { recursive: true });
+      await writeFile(
+        `${packageDirectory}/Cargo.toml`,
+        '[package]\nname = "rust-target"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\nhelper = { path = "vendor/helper" }\n',
+      );
+      await writeFile(`${packageDirectory}/src/main.rs`, "fn main() {}\n");
+      await writeFile(
+        `${packageDirectory}/vendor/helper/Cargo.toml`,
+        '[package]\nname = "helper"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(
+        `${packageDirectory}/vendor/helper/src/lib.rs`,
+        "pub fn value() {}\n",
+      );
+      await cp(
+        `${repositoryRoot}/rust-toolchain`,
+        `${directory}/rust-toolchain`,
+      );
+      const discover = () =>
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        });
+      const metadataRequests: Array<{
+        readonly command: string;
+        readonly args: ReadonlyArray<string>;
+      }> = [];
+      const packageId = `path+file://${packageDirectory}#rust-target@0.1.0`;
+      const metadataProcessLayer = Layer.succeed(ProcessService, {
+        run: (request) => {
+          metadataRequests.push(request);
+          const stdout = JSON.stringify({
+            workspace_root: packageDirectory,
+            workspace_members: [packageId],
+            target_directory: `${packageDirectory}/target`,
+            packages: [
+              {
+                id: packageId,
+                name: "rust-target",
+                manifest_path: `${packageDirectory}/Cargo.toml`,
+                dependencies: [
+                  {
+                    name: "helper",
+                    path: `${packageDirectory}/vendor/helper`,
+                  },
+                ],
+                targets: [{ kind: ["bin"], name: "rust-target" }],
+              },
+            ],
+          });
+          return Effect.succeed({
+            exitCode: 0,
+            stdout,
+            stderr: "",
+            combinedOutput: stdout,
+          });
+        },
+      });
+      await Effect.runPromise(
+        discover().pipe(
+          Effect.provide(metadataProcessLayer),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(metadataRequests).toHaveLength(1);
+      expect(metadataRequests[0]).toMatchObject({
+        command: "cargo",
+        args: [
+          "metadata",
+          "--format-version=1",
+          "--no-deps",
+          "--locked",
+          "--manifest-path",
+          `${packageDirectory}/Cargo.toml`,
+        ],
+      });
+      await expect(lstat(lockfilePath)).rejects.toThrow();
+
+      const generated = await run(
+        "cargo",
+        [
+          "generate-lockfile",
+          "--manifest-path",
+          `${packageDirectory}/Cargo.toml`,
+        ],
+        packageDirectory,
+      );
+      expect(generated.exitCode, generated.stderr).toBe(0);
+      const rustc = await run("rustc", ["-vV"], packageDirectory);
+      expect(rustc.exitCode, rustc.stderr).toBe(0);
+      const host = /^host: (.+)$/m.exec(rustc.stdout)?.[1];
+      expect(host).toBeDefined();
+      await mkdir(`${packageDirectory}/.cargo`, { recursive: true });
+      await writeFile(
+        `${packageDirectory}/.cargo/config.toml`,
+        `[build]\ntarget = ${JSON.stringify(host)}\n`,
+      );
+      const configuredTarget = await Effect.runPromise(
+        discover().pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(
+        configuredTarget.packagesByName.get("rust-target")?.tasks.build,
+      ).toMatchObject({ cache: false });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
   it("restores implicit Cargo binary outputs and leaves libraries uncached", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/rust-tool`;
@@ -5276,6 +5424,49 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("treats output negations as restore deny rules", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-output-deny-"));
+    const scope: CacheRestoreScope = {
+      pathsToClear: [],
+      allowedPathGroups: [
+        { directory: ".", patterns: ["!dist/private/**", "dist/**"] },
+      ],
+      regularFilePaths: [],
+    };
+    const entry = {
+      path: "dist/private/secret.txt",
+      contents: new TextEncoder().encode("secret\n"),
+      mode: 0o644,
+      modifiedSeconds: 1,
+    };
+    try {
+      const denied = await Effect.runPromise(
+        restoreArchiveEntries(directory, [entry], scope).pipe(
+          Effect.either,
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(denied._tag).toBe("Left");
+      if (denied._tag === "Left") {
+        expect(denied.left.message).toContain("not a declared task output");
+      }
+      await expect(lstat(`${directory}/${entry.path}`)).rejects.toThrow();
+
+      await Effect.runPromise(
+        restoreArchiveEntries(
+          directory,
+          [{ ...entry, path: "dist/public.txt" }],
+          scope,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(await readFile(`${directory}/dist/public.txt`, "utf8")).toBe(
+        "secret\n",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("rejects restored symlinks whose targets leave their output group", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-output-target-"));
@@ -6137,6 +6328,71 @@ describe("cache interoperability and safety", () => {
       expect(uploads).toBe(1);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("validates longer signature keys only for active remote caching", async () => {
+    const directory = await makeFixture();
+    const configurationPath = `${directory}/turbo.json`;
+    const arguments_ = [
+      candidateEntrypoint,
+      "run",
+      "build",
+      "--cwd",
+      directory,
+      "--filter=synthetic-library",
+      "--no-cache",
+    ];
+    try {
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        remoteCache?: Record<string, unknown>;
+      };
+      configuration.futureFlags = {
+        ...configuration.futureFlags,
+        longerSignatureKey: true,
+      };
+      for (const remoteCache of [
+        {
+          apiUrl: "http://127.0.0.1:9",
+          enabled: false,
+          signature: true,
+        },
+        { signature: true },
+      ]) {
+        configuration.remoteCache = remoteCache;
+        await writeFile(
+          configurationPath,
+          `${JSON.stringify(configuration, null, 2)}\n`,
+        );
+        const inactive = await run(
+          process.execPath,
+          arguments_,
+          repositoryRoot,
+          { TURBO_REMOTE_CACHE_SIGNATURE_KEY: undefined },
+        );
+        expect(inactive.exitCode, inactive.combinedOutput).toBe(0);
+      }
+
+      configuration.remoteCache = {
+        apiUrl: "http://127.0.0.1:9",
+        signature: true,
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const active = await run(process.execPath, arguments_, repositoryRoot, {
+        TURBO_REMOTE_CACHE_SIGNATURE_KEY: undefined,
+      });
+      expect(active.exitCode).not.toBe(0);
+      expect(active.stderr).toContain(
+        "TURBO_REMOTE_CACHE_SIGNATURE_KEY must contain at least 32 characters",
+      );
+    } finally {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);

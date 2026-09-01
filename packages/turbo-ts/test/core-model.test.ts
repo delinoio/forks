@@ -815,6 +815,23 @@ describe("core repository model", () => {
     ]) {
       expect(isTaskScopeCacheable(node, arguments_)).toBe(false);
     }
+    expect(
+      isTaskScopeCacheable(
+        node,
+        [],
+        { kind: "package" },
+        { CARGO_BUILD_TARGET: "synthetic-target" },
+      ),
+    ).toBe(false);
+    expect(
+      isTaskScopeCacheable(
+        node,
+        [],
+        { kind: "package" },
+        { cargo_build_target: "synthetic-target" },
+        true,
+      ),
+    ).toBe(false);
     expect(isTaskScopeCacheable(node, ["--features=integration"])).toBe(true);
   });
 

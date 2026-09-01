@@ -129,17 +129,21 @@ list.
 Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
 reject malformed entries. Remote artifact routes preserve configured API path
 prefixes. Active remote URLs must use HTTP or HTTPS, and URLs and timeout values
-are validated before cache or task work begins. Local and remote restoration
-failures warn and fall back to task execution, except that a failed restoration
-rollback aborts execution. Local cache write and remote upload
+are validated before cache or task work begins. Signature-key requirements
+apply only when a remote transport is active; disabled remotes and
+configurations without an API URL do not require a signing key. Local and remote
+restoration failures warn and fall back to task execution, except that a failed
+restoration rollback aborts execution. Local cache write and remote upload
 failures warn without changing a successful task outcome, and a local failure
 does not suppress a configured remote upload. Local and remote cache
 restoration is limited to 256 MiB compressed and 1 GiB after decompression;
 preflight and upload response bodies have an independent 64 KiB limit.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact literal log path before clearing or writing
-files. Task identifiers are encoded into portable single-component log
-filenames; lowercase portable task names retain their existing filenames, and
+files. Output negations are deny rules during both collection and restoration,
+regardless of their order relative to positive patterns. Task identifiers are
+encoded into portable single-component log filenames; lowercase portable task
+names retain their existing filenames, and
 uppercase code points are encoded to prevent case-insensitive collisions.
 Restoration rejects symlink parents even when their targets remain inside the
 repository, preventing declared output paths from redirecting writes elsewhere.
@@ -170,8 +174,9 @@ matching `tool.uv.sources` workspace declaration or local path resolving to the
 named workspace member; registry, Git, URL, and undeclared sources remain
 external. JavaScript package-graph edges
 require declared workspace or version-range compatibility, or a `file:` or
-`link:` path that resolves to the named local JavaScript package; same-named
-Cargo and uv packages are never JavaScript workspace targets. Cargo metadata
+`link:` path whose canonical, platform-aware filesystem identity resolves to
+the named local JavaScript package; same-named Cargo and uv packages are never
+JavaScript workspace targets. Cargo metadata
 paths are matched by canonical filesystem identity. Unfiltered Cargo `test`,
 `check`, `lint`, and `format` tasks execute once per Cargo workspace and bypass
 caching when any grouped member disables it; filtered and package-qualified
@@ -187,9 +192,11 @@ for mixed library and binary crates default to uncached. Builds with
 pass-through arguments that select an alternate output layout or an unmodeled
 library, binary, example, test, or benchmark target bypass caching until those
 outputs are modeled explicitly. Cargo build pass-through `--config` arguments
-also bypass caching because they can override the output layout.
-Cargo discovery uses each metadata response's workspace-member list and does
-not probe excluded or unrelated nested manifests. Combined workspace task
+also bypass caching because they can override the output layout. Cargo builds
+also bypass caching when an ancestor Cargo configuration or the effective task
+environment sets a build target. Cargo metadata discovery uses `--locked`, uses
+each response's workspace-member list, and does not probe excluded or unrelated
+nested manifests. Combined workspace task
 hashes are propagated into every downstream task hash.
 
 Structured task input globs apply ordered inclusion and negation consistently

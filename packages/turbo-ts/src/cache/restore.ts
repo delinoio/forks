@@ -1,5 +1,5 @@
 import { Effect } from "effect";
-import { selectByGlobs } from "../core/glob.js";
+import { matchesGlobsWithExclusions } from "../core/glob.js";
 import {
   isPathContained,
   joinPath,
@@ -39,9 +39,7 @@ const groupAllowsEntry = (
   return (
     isPathContained(root, directory) &&
     isPathContained(directory, destination) &&
-    candidates.some(
-      (candidate) => selectByGlobs([candidate], group.patterns).length > 0,
-    )
+    matchesGlobsWithExclusions(candidates, group.patterns)
   );
 };
 

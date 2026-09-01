@@ -16,7 +16,11 @@ import {
   type LoadedRootConfiguration,
   loadRootConfiguration,
 } from "../config/runtime.js";
-import { matchesGlob, selectByGlobs } from "../core/glob.js";
+import {
+  matchesGlob,
+  matchesGlobsWithExclusions,
+  selectByGlobs,
+} from "../core/glob.js";
 import {
   baseName,
   isAbsolutePath,
@@ -347,20 +351,20 @@ const resolveOptions = (
       : environment.TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT !== undefined
         ? "TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT"
         : configuration.path;
-  if (
-    value.futureFlags?.longerSignatureKey === true &&
-    remoteConfiguration?.signature === true &&
-    (signatureKey?.length ?? 0) < 32
-  ) {
-    throw new ConfigurationError({
-      path: configuration.path,
-      message:
-        "TURBO_REMOTE_CACHE_SIGNATURE_KEY must contain at least 32 characters",
-    });
-  }
   const remote = (() => {
     if (apiUrl === undefined || remoteConfiguration?.enabled === false) {
       return undefined;
+    }
+    if (
+      value.futureFlags?.longerSignatureKey === true &&
+      remoteConfiguration?.signature === true &&
+      (signatureKey?.length ?? 0) < 32
+    ) {
+      throw new ConfigurationError({
+        path: configuration.path,
+        message:
+          "TURBO_REMOTE_CACHE_SIGNATURE_KEY must contain at least 32 characters",
+      });
     }
     const apiUrlPath =
       parsed.apiUrl !== undefined
@@ -1050,20 +1054,7 @@ const collectOutputPaths = (
             metadata.kind === "directory"
               ? [relative, `${relative}/`]
               : [relative];
-          if (
-            patterns.some(
-              (pattern) =>
-                !pattern.startsWith("!") &&
-                candidates.some((candidate) => matchesGlob(candidate, pattern)),
-            ) &&
-            !patterns.some(
-              (pattern) =>
-                pattern.startsWith("!") &&
-                candidates.some((candidate) =>
-                  matchesGlob(candidate, pattern.slice(1)),
-                ),
-            )
-          ) {
+          if (matchesGlobsWithExclusions(candidates, patterns)) {
             selected.add(path);
           }
         }
@@ -1290,6 +1281,21 @@ const usesAlternateCargoBuildOutputs = (
       ),
   );
 
+const usesEnvironmentCargoBuildTarget = (
+  node: TaskNode,
+  environment: Readonly<Record<string, string | undefined>>,
+  caseInsensitiveEnvironmentNames: boolean,
+): boolean =>
+  node.package.manager === "cargo" &&
+  node.task === "build" &&
+  Object.entries(environment).some(
+    ([name, value]) =>
+      value !== undefined &&
+      (caseInsensitiveEnvironmentNames
+        ? name.toLowerCase() === "cargo_build_target"
+        : name === "CARGO_BUILD_TARGET"),
+  );
+
 const encodeTaskLogIdentifier = (task: string): string => {
   let encoded = "";
   for (let index = 0; index < task.length; index += 1) {
@@ -1312,10 +1318,18 @@ export const isTaskScopeCacheable = (
   node: TaskNode,
   passThroughArguments: ReadonlyArray<string>,
   scope: TaskCommandScope = packageTaskCommandScope,
+  environment: Readonly<Record<string, string | undefined>> = {},
+  caseInsensitiveEnvironmentNames = false,
 ): boolean =>
   (scope.kind === "cargo-workspace" ? scope.members : [node]).every(
     (member) => member.definition.cache !== false,
-  ) && !usesAlternateCargoBuildOutputs(node, passThroughArguments);
+  ) &&
+  !usesAlternateCargoBuildOutputs(node, passThroughArguments) &&
+  !usesEnvironmentCargoBuildTarget(
+    node,
+    environment,
+    caseInsensitiveEnvironmentNames,
+  );
 
 const executeTask = (
   repository: RepositoryModel,
@@ -1348,12 +1362,23 @@ const executeTask = (
       outputMode !== "errors-only" ||
       repository.rootConfiguration.value.futureFlags?.errorsOnlyShowHash ===
         true;
+    const executionEnvironment = taskScopeEnvironment(
+      repository,
+      node,
+      sourceEnvironment,
+      options.environmentMode,
+      options.frameworkInference,
+      scope,
+      platform === "win32",
+    );
     const cacheNodes =
       scope.kind === "cargo-workspace" ? scope.members : [node];
     const cacheable = isTaskScopeCacheable(
       node,
       options.passThroughArguments,
       scope,
+      executionEnvironment,
+      platform === "win32",
     );
     const localOptions = {
       directory: options.cacheDirectory,
@@ -1495,15 +1520,7 @@ const executeTask = (
             ? undefined
             : persistentOutputCaptureCharacters,
         env: {
-          ...taskScopeEnvironment(
-            repository,
-            node,
-            sourceEnvironment,
-            options.environmentMode,
-            options.frameworkInference,
-            scope,
-            platform === "win32",
-          ),
+          ...executionEnvironment,
           TURBO_HASH: hash.hash,
         },
       });

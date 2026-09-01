@@ -29,3 +29,18 @@ export const selectByGlobs = (
   }
   return [...selected].sort();
 };
+
+export const matchesGlobsWithExclusions = (
+  values: ReadonlyArray<string>,
+  patterns: ReadonlyArray<string>,
+): boolean =>
+  patterns.some(
+    (pattern) =>
+      !pattern.startsWith("!") &&
+      values.some((value) => matchesGlob(value, pattern)),
+  ) &&
+  !patterns.some(
+    (pattern) =>
+      pattern.startsWith("!") &&
+      values.some((value) => matchesGlob(value, pattern.slice(1))),
+  );
