@@ -69,6 +69,7 @@ const packageModel = (
   name,
   directory: `/repo/packages/${name}`,
   relativeDirectory: `packages/${name}`,
+  canonicalRelativeDirectory: `packages/${name}`,
   cachePathRestorable: true,
   manager: "pnpm",
   scripts: {
@@ -89,6 +90,7 @@ const repository = (
     ...packageModel("//", []),
     directory: "/repo",
     relativeDirectory: ".",
+    canonicalRelativeDirectory: ".",
   } satisfies RepositoryPackage;
   return {
     root: "/repo",
@@ -658,6 +660,7 @@ describe("core repository model", () => {
       name: "app",
       directory: "/repo/crates/app",
       relativeDirectory: "crates/app",
+      canonicalRelativeDirectory: "crates/app",
       cachePathRestorable: true,
       manager: "cargo" as const,
       scripts: { dev: "cargo run" },
@@ -934,6 +937,8 @@ describe("core repository model", () => {
       ["--bench=throughput"],
       ["--benches"],
       ["--all-targets"],
+      ["--manifest-path", "../alternate/Cargo.toml"],
+      ["--manifest-path=../alternate/Cargo.toml"],
     ]) {
       expect(isTaskScopeCacheable(node, arguments_)).toBe(false);
     }

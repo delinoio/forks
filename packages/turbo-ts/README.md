@@ -69,11 +69,11 @@ writers. `futureFlags.experimentalCargoSccache: true` always fails before task
 execution with a branded unsupported-compatibility diagnostic.
 
 Cargo builds that receive pass-through arguments selecting another package,
-release, profile, target, another alternate artifact layout, or an unmodeled
-library, binary, example, test, or benchmark target execute without cache reads
-or writes until those outputs are modeled explicitly. Pass-through `--config`
-arguments and mismatched metadata/task `CARGO_TARGET_DIR` values also disable
-Cargo build caching, as does a build target in the effective Cargo-home
+release, profile, target, another manifest or alternate artifact layout, or an
+unmodeled library, binary, example, test, or benchmark target execute without
+cache reads or writes until those outputs are modeled explicitly. Pass-through
+`--config` arguments and mismatched metadata/task `CARGO_TARGET_DIR` values also
+disable Cargo build caching, as does a build target in the effective Cargo-home
 configuration. Mixed library and binary crates default to uncached because
 binary-only output declarations cannot restore all of Cargo's default
 artifacts. Unfiltered Cargo workspace commands merge the effective environments
@@ -85,9 +85,10 @@ after decompression. Artifacts beyond either limit are rejected; invalid local
 entries are removed with a warning and become misses, while remote entries use
 the normal local-execution fallback. Decompressed archives are parsed from
 scoped temporary storage, and cache writes independently limit file content and
-tar metadata overhead to 64 MiB each. Remote downloads, signature verification,
-and decompression use scoped files so concurrent cache hits do not retain or
-duplicate complete compressed response bodies in memory.
+tar metadata overhead to 64 MiB each. Cache publication is serialized within a
+run to bound writer memory independently of task concurrency. Remote downloads,
+signature verification, and decompression use scoped files so concurrent cache
+hits do not retain or duplicate complete compressed response bodies in memory.
 
 Configured cache directories may be inside or outside the repository, but the
 repository root and its ancestors are rejected because treating them as cache

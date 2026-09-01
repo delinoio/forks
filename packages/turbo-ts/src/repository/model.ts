@@ -56,6 +56,7 @@ export interface RepositoryPackage {
   readonly name: string;
   readonly directory: string;
   readonly relativeDirectory: string;
+  readonly canonicalRelativeDirectory: string;
   readonly cachePathRestorable: boolean;
   readonly workspaceDirectory?: string;
   readonly manager: PackageManagerName;
@@ -1194,6 +1195,23 @@ export const discoverRepository = (
   FileSystemService | ProcessService
 > =>
   Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const canonicalRepositoryRoot = yield* fileSystem.realPath(root).pipe(
+      Effect.map(normalizePath),
+      Effect.mapError(
+        (error) => new RepositoryError({ path: root, message: error.message }),
+      ),
+    );
+    const canonicalRelativeDirectory = (directory: string) =>
+      fileSystem.realPath(directory).pipe(
+        Effect.map((resolved) =>
+          relativePath(canonicalRepositoryRoot, normalizePath(resolved)),
+        ),
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({ path: directory, message: error.message }),
+        ),
+      );
     const rootManifestPath = joinPath(root, "package.json");
     const rootManifest = decodeManifest(
       yield* readJsonObject(rootManifestPath),
@@ -1263,6 +1281,8 @@ export const discoverRepository = (
             name,
             directory,
             relativeDirectory: relativePath(root, directory),
+            canonicalRelativeDirectory:
+              yield* canonicalRelativeDirectory(directory),
             cachePathRestorable: yield* cachePathIsRestorable(root, directory),
             manager: managerIdentity.name,
             scripts: manifest.scripts ?? {},
@@ -1371,7 +1391,6 @@ export const discoverRepository = (
           { concurrency: 1 },
         )).filter((path): path is string => path !== undefined)
       : [];
-    const fileSystem = yield* FileSystemService;
     const canonicalPath = (path: string) =>
       fileSystem.realPath(path).pipe(
         Effect.map(normalizePath),
@@ -1379,9 +1398,7 @@ export const discoverRepository = (
           (error) => new RepositoryError({ path, message: error.message }),
         ),
       );
-    const canonicalRoot = cargoEnabled
-      ? yield* canonicalPath(root)
-      : normalizePath(root);
+    const canonicalRoot = canonicalRepositoryRoot;
     const cargoManifestPathsByIdentity = new Map(
       yield* Effect.forEach(
         cargoManifestPaths,
@@ -1491,6 +1508,8 @@ export const discoverRepository = (
               name: metadata.name,
               directory,
               relativeDirectory: relativePath(root, directory),
+              canonicalRelativeDirectory:
+                yield* canonicalRelativeDirectory(directory),
               cachePathRestorable: yield* cachePathIsRestorable(
                 root,
                 directory,
@@ -1579,6 +1598,8 @@ export const discoverRepository = (
             name: metadata.name,
             directory,
             relativeDirectory: relativePath(root, directory),
+            canonicalRelativeDirectory:
+              yield* canonicalRelativeDirectory(directory),
             cachePathRestorable: yield* cachePathIsRestorable(root, directory),
             manager: "uv" as const,
             scripts: polyglotScripts("uv", []),
@@ -1781,6 +1802,7 @@ export const discoverRepository = (
       name: "//",
       directory: root,
       relativeDirectory: ".",
+      canonicalRelativeDirectory: ".",
       cachePathRestorable: true,
       manager: managerIdentity.name,
       scripts: rootManifest.scripts ?? {},

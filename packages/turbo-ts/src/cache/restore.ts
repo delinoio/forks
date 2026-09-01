@@ -463,11 +463,7 @@ export const restoreArchiveEntries = (
               restoreError(destination, "archive destination is a symlink"),
             );
           }
-          if (
-            entry.kind === "symlink" ||
-            (entry.kind === "directory" && metadata.kind !== "directory") ||
-            (entry.kind !== "directory" && metadata.kind === "directory")
-          ) {
+          if (entry.kind !== "directory" || metadata.kind !== "directory") {
             yield* fileSystem
               .remove(destination)
               .pipe(

@@ -75,6 +75,7 @@ import {
   discoverRepository,
   listRepositoryFiles,
   type RepositoryModel,
+  type RepositoryPackage,
 } from "../repository/model.js";
 import { type ParsedRunOptions, parseConcurrency } from "./options.js";
 
@@ -510,6 +511,26 @@ interface AffectedPackages {
   readonly rootChanged: boolean;
 }
 
+const packageRelativeChangedFile = (
+  packageModel: RepositoryPackage,
+  repositoryRelativeFile: string,
+): string | undefined => {
+  if (packageModel.relativeDirectory === ".") {
+    return repositoryRelativeFile;
+  }
+  for (const directory of new Set([
+    packageModel.relativeDirectory,
+    packageModel.canonicalRelativeDirectory,
+  ])) {
+    if (repositoryRelativeFile === directory) return ".";
+    const prefix = `${directory}/`;
+    if (repositoryRelativeFile.startsWith(prefix)) {
+      return repositoryRelativeFile.slice(prefix.length);
+    }
+  }
+  return undefined;
+};
+
 const parseGitRange = (selector: string): GitRange => {
   const separator = selector.indexOf("...");
   const base = separator === -1 ? selector : selector.slice(0, separator);
@@ -622,8 +643,9 @@ const findAffectedPackages = (
       selectByGlobs(changedFiles, globalDependencyPatterns).length > 0;
     const ordinaryRootChanged = changedFiles.some(
       (path) =>
-        !repository.packages.some((packageModel) =>
-          path.startsWith(`${packageModel.relativeDirectory}/`),
+        !repository.packages.some(
+          (packageModel) =>
+            packageRelativeChangedFile(packageModel, path) !== undefined,
         ),
     );
     const rootConfigurationChanged = changedFiles.includes(
@@ -639,8 +661,10 @@ const findAffectedPackages = (
         : new Set(
             repository.packages
               .filter((packageModel) =>
-                changedFiles.some((path) =>
-                  path.startsWith(`${packageModel.relativeDirectory}/`),
+                changedFiles.some(
+                  (path) =>
+                    packageRelativeChangedFile(packageModel, path) !==
+                    undefined,
                 ),
               )
               .map((packageModel) => packageModel.name),
@@ -715,9 +739,6 @@ const taskMatchesChangedFiles = (
 ): boolean => {
   const rootRelativeInputPrefix = "$TURBO_ROOT$/";
   const isRootPackage = node.package.relativeDirectory === ".";
-  const packagePrefix = isRootPackage
-    ? ""
-    : `${node.package.relativeDirectory}/`;
   const inputs = effectiveTaskInputs(repository, node);
   const implicitInputs = new Set(
     implicitTaskInputCandidates(repository, node).map((path) =>
@@ -725,14 +746,22 @@ const taskMatchesChangedFiles = (
     ),
   );
   return changedFiles.some((repositoryRelativeFile) => {
-    if (implicitInputs.has(repositoryRelativeFile)) return true;
-    const packageRelativeFile = isRootPackage
-      ? repositoryRelativeFile
-      : repositoryRelativeFile === node.package.relativeDirectory
-        ? "."
-        : repositoryRelativeFile.startsWith(packagePrefix)
-          ? repositoryRelativeFile.slice(packagePrefix.length)
-          : undefined;
+    const packageRelativeFile = packageRelativeChangedFile(
+      node.package,
+      repositoryRelativeFile,
+    );
+    const logicalRepositoryRelativeFile =
+      isRootPackage || packageRelativeFile === undefined
+        ? repositoryRelativeFile
+        : packageRelativeFile === "."
+          ? node.package.relativeDirectory
+          : joinPath(node.package.relativeDirectory, packageRelativeFile);
+    if (
+      implicitInputs.has(repositoryRelativeFile) ||
+      implicitInputs.has(logicalRepositoryRelativeFile)
+    ) {
+      return true;
+    }
     const matchesInput = (pattern: string): boolean => {
       const rootRelative = pattern.startsWith(rootRelativeInputPrefix);
       const file = rootRelative ? repositoryRelativeFile : packageRelativeFile;
@@ -1284,6 +1313,7 @@ export const takePersistentDisplayOutput = (
 
 const cargoAlternateOutputFlags = [
   "--artifact-dir",
+  "--manifest-path",
   "--out-dir",
   "--profile",
   "--target",
@@ -1473,6 +1503,17 @@ export const taskIdsWithUnrestorableCacheInputs = (
   return uncacheable;
 };
 
+type CachePublicationPermit = <A, E, R>(
+  publication: Effect.Effect<A, E, R>,
+) => Effect.Effect<A, E, R>;
+
+export const makeCachePublicationPermit: Effect.Effect<CachePublicationPermit> =
+  Effect.makeSemaphore(1).pipe(
+    Effect.map(
+      (semaphore) => (publication) => semaphore.withPermits(1)(publication),
+    ),
+  );
+
 const executeTask = (
   repository: RepositoryModel,
   node: TaskNode,
@@ -1481,6 +1522,8 @@ const executeTask = (
   sourceEnvironment: Readonly<Record<string, string | undefined>>,
   scope: TaskCommandScope = packageTaskCommandScope,
   cacheInputsRestorable = true,
+  withCachePublicationPermit: CachePublicationPermit = (publication) =>
+    publication,
 ): Effect.Effect<TaskOutcome, unknown, RunRequirements> =>
   Effect.gen(function* () {
     const terminal = yield* TerminalService;
@@ -1785,87 +1828,89 @@ const executeTask = (
       cacheable &&
       (options.cachePolicy.localWrite || options.cachePolicy.remoteWrite)
     ) {
-      const collected = yield* collectCacheEntries(
-        repository,
-        cacheNodes,
-        logPath,
-        options.cacheExclusionDirectory,
-        restoreScope,
-      ).pipe(
-        Effect.catchAll((error) =>
-          terminal
-            .writeStderr(
+      yield* withCachePublicationPermit(
+        Effect.gen(function* () {
+          const collected = yield* collectCacheEntries(
+            repository,
+            cacheNodes,
+            logPath,
+            options.cacheExclusionDirectory,
+            restoreScope,
+          ).pipe(
+            Effect.catchAll((error) =>
+              terminal
+                .writeStderr(
+                  renderLogEvent(
+                    {
+                      kind: "warning",
+                      message: `cache output collection failed for ${taskLabel}; skipping cache publication while preserving successful task result: ${error.message}`,
+                    },
+                    warningColor,
+                  ),
+                )
+                .pipe(Effect.ignore, Effect.as(undefined)),
+            ),
+          );
+          if (collected === undefined) return;
+          if (collected.kind === "too-large") {
+            yield* terminal.writeStderr(
               renderLogEvent(
                 {
                   kind: "warning",
-                  message: `cache output collection failed for ${taskLabel}; skipping cache publication while preserving successful task result: ${error.message}`,
+                  message: `cache write skipped for ${taskLabel}; ${collected.inputBytes} bytes of task outputs exceed the ${maximumCacheArchiveInputBytes} byte safety limit`,
                 },
                 warningColor,
               ),
-            )
-            .pipe(Effect.ignore, Effect.as(undefined)),
-        ),
+            );
+            return;
+          }
+          const duration = (yield* clock.now) - started;
+          if (options.cachePolicy.localWrite) {
+            yield* writeLocalCache(
+              localOptions,
+              hash.hash,
+              collected.entries,
+              duration,
+            ).pipe(
+              Effect.catchAll((error) =>
+                terminal
+                  .writeStderr(
+                    renderLogEvent(
+                      {
+                        kind: "warning",
+                        message: `local cache write failed for ${taskLabel}; preserving successful task result: ${error.message}`,
+                      },
+                      warningColor,
+                    ),
+                  )
+                  .pipe(Effect.ignore),
+              ),
+            );
+          }
+          if (options.cachePolicy.remoteWrite && options.remote !== undefined) {
+            yield* writeRemoteCache(
+              options.remote,
+              hash.hash,
+              collected.entries,
+              duration,
+            ).pipe(
+              Effect.catchAll((error) =>
+                terminal
+                  .writeStderr(
+                    renderLogEvent(
+                      {
+                        kind: "warning",
+                        message: `remote cache upload failed for ${taskLabel}; preserving successful task result: ${error.message}`,
+                      },
+                      warningColor,
+                    ),
+                  )
+                  .pipe(Effect.ignore),
+              ),
+            );
+          }
+        }),
       );
-      if (collected === undefined) {
-        return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
-      }
-      if (collected.kind === "too-large") {
-        yield* terminal.writeStderr(
-          renderLogEvent(
-            {
-              kind: "warning",
-              message: `cache write skipped for ${taskLabel}; ${collected.inputBytes} bytes of task outputs exceed the ${maximumCacheArchiveInputBytes} byte safety limit`,
-            },
-            warningColor,
-          ),
-        );
-      } else {
-        const duration = (yield* clock.now) - started;
-        if (options.cachePolicy.localWrite) {
-          yield* writeLocalCache(
-            localOptions,
-            hash.hash,
-            collected.entries,
-            duration,
-          ).pipe(
-            Effect.catchAll((error) =>
-              terminal
-                .writeStderr(
-                  renderLogEvent(
-                    {
-                      kind: "warning",
-                      message: `local cache write failed for ${taskLabel}; preserving successful task result: ${error.message}`,
-                    },
-                    warningColor,
-                  ),
-                )
-                .pipe(Effect.ignore),
-            ),
-          );
-        }
-        if (options.cachePolicy.remoteWrite && options.remote !== undefined) {
-          yield* writeRemoteCache(
-            options.remote,
-            hash.hash,
-            collected.entries,
-            duration,
-          ).pipe(
-            Effect.catchAll((error) =>
-              terminal
-                .writeStderr(
-                  renderLogEvent(
-                    {
-                      kind: "warning",
-                      message: `remote cache upload failed for ${taskLabel}; preserving successful task result: ${error.message}`,
-                    },
-                    warningColor,
-                  ),
-                )
-                .pipe(Effect.ignore),
-            ),
-          );
-        }
-      }
     }
     return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
   });
@@ -2456,6 +2501,7 @@ export const executeRun = (
     const foregroundSemaphore = yield* Effect.makeSemaphore(
       options.concurrency,
     );
+    const withCachePublicationPermit = yield* makeCachePublicationPermit;
     const runGroup = ([, members]: readonly [
       string,
       ReadonlyArray<string>,
@@ -2496,6 +2542,7 @@ export const executeRun = (
           environment,
           cargoWorkspacePlan.scopes.get(id),
           !unrestorableCacheInputs.has(id),
+          withCachePublicationPermit,
         ).pipe(
           Effect.catchAll((cause) =>
             Effect.gen(function* () {

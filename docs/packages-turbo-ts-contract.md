@@ -87,6 +87,8 @@ listing them; ordered exclusions are applied to the resulting candidates.
 Matching directory symlinks are traversed by their declared logical path only
 when their canonical target is a directory inside the repository; canonical
 ancestor tracking prevents symlink cycles.
+Git changes beneath a contained workspace symlink's canonical target map back
+to that workspace for package and task-aware affected selection.
 Tasks owned by a logical workspace path containing a symlink component execute
 without local or remote caching because restoration intentionally rejects
 symlink parents. Task scopes whose hashes depend on those tasks, including
@@ -200,13 +202,18 @@ only by case on case-insensitive target filesystems.
 Every archive must contain exactly one regular task-log entry. Cache writes
 whose aggregate uncompressed file content exceeds 64 MiB are skipped before
 contents are read, with a warning that preserves the successful task result.
+Output collection and cache publication are serialized within a run so
+concurrent task completion cannot multiply the archive writer's bounded memory
+footprint.
 Tar headers, padding, PAX metadata, and end markers have an independent 64 MiB
 preflight limit that is enforced before archive chunks are constructed.
 Companion task hashes participate in the owning task's cache key. Local eviction
 accepts week-based ages, runs before cache restoration only when local cache
 reads or writes are enabled, and counts archive and sidecar bytes, including
 orphaned sidecars. Startup eviction failures warn and continue without making
-cache maintenance a prerequisite for task execution. Cache archives use PAX
+cache maintenance a prerequisite for task execution; selected-entry removal
+failures are aggregated after all of its archive and sidecar paths are tried.
+Cache archives use PAX
 extensions for paths beyond ustar limits. Tar header paths, link targets, and
 PAX metadata must be valid UTF-8; unsupported raw-byte names reject the
 artifact. Interrupted or failed atomic writes attempt to remove their temporary
@@ -215,6 +222,8 @@ write failure, including when the write or rename also failed.
 Archives preserve empty declared output directories. Failed restoration removes
 every partially restored output before local execution, and rollback failure
 aborts execution instead of exposing partial cache state.
+Regular archive destinations are unlinked before their contents are restored,
+so an existing hard link cannot redirect truncation outside the repository.
 Resolved cache-directory subtrees are excluded from both task inputs and task
 outputs, including custom cache directory names selected by broad output globs.
 uv packages are discovered from the root
@@ -251,8 +260,8 @@ pass-through arguments are forwarded to Cargo without an implicit
 target-argument separator. Cargo builds
 for mixed library and binary crates default to uncached. Builds with
 pass-through arguments that select an additional package, an alternate output
-layout, or an unmodeled library, binary, example, test, or benchmark target
-bypass caching until those outputs are modeled explicitly. Cargo build
+layout or manifest, or an unmodeled library, binary, example, test, or benchmark
+target bypass caching until those outputs are modeled explicitly. Cargo build
 pass-through `--config` arguments also bypass caching because they can override
 the output layout. Cargo builds also bypass caching when an ancestor or
 effective Cargo-home configuration, or the effective task environment, sets a

@@ -52,16 +52,28 @@ const cacheFileHash = (name: string): string | undefined => {
 const removeEntry = (
   directory: string,
   hash: string,
-): Effect.Effect<void, never, FileSystemService> =>
+): Effect.Effect<void, CacheError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const paths = cachePaths(directory, hash);
-    yield* Effect.all(
-      [paths.archive, paths.manifest, paths.metadata].map((path) =>
-        fileSystem.remove(path).pipe(Effect.ignore),
-      ),
+    const entryPaths = [paths.archive, paths.manifest, paths.metadata];
+    const outcomes = yield* Effect.all(
+      entryPaths.map((path) => fileSystem.remove(path).pipe(Effect.either)),
       { concurrency: 3 },
     );
+    const failures = outcomes.flatMap((outcome, index) =>
+      outcome._tag === "Left"
+        ? [`${entryPaths[index]}: ${outcome.left.message}`]
+        : [],
+    );
+    if (failures.length > 0) {
+      return yield* Effect.fail(
+        cacheError(
+          directory,
+          `cache entry ${hash} cleanup failed: ${failures.join("; ")}`,
+        ),
+      );
+    }
   });
 
 export const restoreLocalCache = (

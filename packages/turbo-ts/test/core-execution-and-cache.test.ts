@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   chmod,
   cp,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -67,6 +68,7 @@ import {
 } from "../src/repository/model.js";
 import {
   isTaskScopeCacheable,
+  makeCachePublicationPermit,
   packageManagerCommand,
   planCargoWorkspaceTasks,
 } from "../src/run/engine.js";
@@ -472,6 +474,36 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 15_000);
+
+  it("serializes cache publication across concurrent task completions", async () => {
+    let activePublications = 0;
+    let maximumActivePublications = 0;
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const withCachePublicationPermit = yield* makeCachePublicationPermit;
+        const publication = withCachePublicationPermit(
+          Effect.acquireUseRelease(
+            Effect.sync(() => {
+              activePublications += 1;
+              maximumActivePublications = Math.max(
+                maximumActivePublications,
+                activePublications,
+              );
+            }),
+            () => Effect.sleep("20 millis"),
+            () =>
+              Effect.sync(() => {
+                activePublications -= 1;
+              }),
+          ),
+        );
+        yield* Effect.all([publication, publication], {
+          concurrency: "unbounded",
+        });
+      }),
+    );
+    expect(maximumActivePublications).toBe(1);
+  });
 
   it("preserves task success when cache output collection fails", async () => {
     if (process.platform === "win32") return;
@@ -1354,9 +1386,21 @@ describe("core CLI execution", () => {
 
   it("discovers contained symlinked workspace members without following cycles", async () => {
     if (process.platform === "win32") return;
-    const directory = await makeFixture();
+    const directory = await makeGitFixture();
     const target = `${directory}/real/linked`;
     try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { futureFlags?: Record<string, boolean> };
+      configuration.futureFlags = {
+        affectedUsingTaskInputs: true,
+        filterUsingTasks: true,
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
       await mkdir(target, { recursive: true });
       await writeFile(
         `${target}/package.json`,
@@ -1369,6 +1413,7 @@ describe("core CLI execution", () => {
           },
         })}\n`,
       );
+      await writeFile(`${target}/source.txt`, "initial\n");
       await symlink("../..", `${target}/loop`);
       await symlink("../real/linked", `${directory}/packages/linked`);
       await writeFile(
@@ -1389,6 +1434,16 @@ describe("core CLI execution", () => {
         appManifestPath,
         `${JSON.stringify(appManifest, null, 2)}\n`,
       );
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "fixture base"],
+      ]) {
+        const git = await run("git", args, directory);
+        expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
+      }
       const model = await Effect.runPromise(
         Effect.gen(function* () {
           const rootConfiguration = yield* loadRootConfiguration(directory);
@@ -1398,6 +1453,7 @@ describe("core CLI execution", () => {
       expect(model.packagesByName.get("synthetic-linked")).toMatchObject({
         directory: `${directory}/packages/linked`,
         relativeDirectory: "packages/linked",
+        canonicalRelativeDirectory: "real/linked",
         cachePathRestorable: false,
       });
       expect(
@@ -1420,6 +1476,14 @@ describe("core CLI execution", () => {
         );
       expect((await execute()).exitCode).toBe(0);
       await writeFile(`${target}/source.txt`, "changed\n");
+      expect(
+        (await run("git", ["add", "real/linked/source.txt"], directory))
+          .exitCode,
+      ).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "change linked source"], directory))
+          .exitCode,
+      ).toBe(0);
       const second = await execute();
       expect(second.exitCode).toBe(0);
       expect(second.stderr).not.toContain("cache restore failed");
@@ -1427,11 +1491,34 @@ describe("core CLI execution", () => {
       expect(await readFile(`${directory}/packages/app/runs.txt`, "utf8")).toBe(
         "run\nrun\n",
       );
+      for (const selector of ["--affected", "--filter=...[HEAD~1]"]) {
+        const selected = await run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "build",
+            "--cwd",
+            directory,
+            selector,
+            "--no-cache",
+          ],
+          repositoryRoot,
+          { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+        );
+        expect(selected.exitCode, selected.stderr).toBe(0);
+      }
+      expect(await readFile(`${target}/runs.txt`, "utf8")).toBe(
+        "run\nrun\nrun\nrun\n",
+      );
+      expect(await readFile(`${directory}/packages/app/runs.txt`, "utf8")).toBe(
+        "run\nrun\nrun\nrun\n",
+      );
       await expect(lstat(`${directory}/.turbo/cache`)).rejects.toThrow();
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  }, 10_000);
+  }, 20_000);
 
   it("does not link JavaScript dependencies to polyglot packages", async () => {
     const directory = await makeFixture();
@@ -6501,6 +6588,53 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("aggregates cache entry removal failures during eviction", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-evict-"));
+    const cacheDirectory = `${directory}/cache`;
+    const hash = "0123456789abcdef";
+    const paths = [
+      `${cacheDirectory}/${hash}.tar.zst`,
+      `${cacheDirectory}/${hash}-manifest.json`,
+      `${cacheDirectory}/${hash}-meta.json`,
+    ];
+    try {
+      await mkdir(cacheDirectory, { recursive: true });
+      for (const path of paths) await writeFile(path, "cached");
+      const attempted: Array<string> = [];
+      const outcome = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const failingLayer = Layer.succeed(FileSystemService, {
+            ...fileSystem,
+            remove: (path) => {
+              attempted.push(path);
+              return Effect.fail(
+                new BoundaryError({
+                  boundary: "filesystem",
+                  message: `synthetic removal failure for ${path}`,
+                  retryable: false,
+                }),
+              );
+            },
+          });
+          return yield* evictLocalCache({
+            directory: cacheDirectory,
+            maxSizeBytes: 1,
+          }).pipe(Effect.either, Effect.provide(failingLayer));
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(outcome._tag).toBe("Left");
+      if (outcome._tag === "Left") {
+        expect(outcome.left.message).toContain("cleanup failed");
+        for (const path of paths) expect(outcome.left.message).toContain(path);
+      }
+      expect(attempted.sort()).toEqual([...paths].sort());
+      for (const path of paths) expect((await lstat(path)).isFile()).toBe(true);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("reads official Turbo local archives", async () => {
     const directory = await makeFixture();
     try {
@@ -7401,6 +7535,41 @@ describe("cache interoperability and safety", () => {
       );
     } finally {
       await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("replaces hard-linked task logs without modifying external files", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-log-hardlink-"));
+    const externalPath = `${directory}-external.txt`;
+    const logPath = "packages/app/.turbo/turbo-build.log";
+    const destination = `${directory}/${logPath}`;
+    try {
+      await writeFile(externalPath, "external contents\n");
+      await mkdir(dirname(destination), { recursive: true });
+      await link(externalPath, destination);
+      await Effect.runPromise(
+        restoreArchiveEntries(
+          directory,
+          [
+            {
+              path: logPath,
+              contents: new TextEncoder().encode("cached output\n"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+          ],
+          {
+            pathsToClear: [],
+            allowedPathGroups: [],
+            regularFilePaths: [logPath],
+          },
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(await readFile(externalPath, "utf8")).toBe("external contents\n");
+      expect(await readFile(destination, "utf8")).toBe("cached output\n");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+      await rm(externalPath, { force: true });
     }
   });
 
