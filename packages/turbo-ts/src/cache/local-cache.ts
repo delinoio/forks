@@ -1,4 +1,4 @@
-import { Effect } from "effect";
+import { Cause, Effect, Exit, Option, Ref } from "effect";
 import { joinPath, parentPath } from "../core/path.js";
 import { CacheError, CacheRollbackError } from "../effect/errors.js";
 import {
@@ -28,6 +28,11 @@ const cacheError = (
   cause: unknown,
   retryable = false,
 ): CacheError => new CacheError({ path, message: String(cause), retryable });
+
+const effectFromExit = <A, E>(exit: Exit.Exit<A, E>): Effect.Effect<A, E> =>
+  Exit.isSuccess(exit)
+    ? Effect.succeed(exit.value)
+    : Effect.failCause(exit.cause);
 
 const cachePaths = (directory: string, hash: string) => ({
   archive: joinPath(directory, `${hash}.tar.zst`),
@@ -179,32 +184,70 @@ const writeAtomically = (
     yield* fileSystem
       .makeDirectory(parentPath(path))
       .pipe(Effect.mapError((error) => cacheError(path, error.message)));
-    yield* Effect.acquireUseRelease(
-      Effect.succeed(temporary),
-      (temporaryPath) =>
-        Effect.gen(function* () {
-          if (typeof contents === "string") {
-            yield* fileSystem
-              .writeText(temporaryPath, contents)
-              .pipe(
-                Effect.mapError((error) =>
-                  cacheError(temporaryPath, error.message),
+    yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const cleanupResult = yield* Ref.make<
+          Option.Option<Exit.Exit<void, CacheError>>
+        >(Option.none());
+        const useResult = yield* Effect.scoped(
+          Effect.acquireRelease(Effect.succeed(temporary), (temporaryPath) =>
+            fileSystem.remove(temporaryPath).pipe(
+              Effect.mapError((error) =>
+                cacheError(
+                  temporaryPath,
+                  `atomic write cleanup failed: ${error.message}`,
                 ),
-              );
-          } else {
-            yield* fileSystem
-              .writeBytes(temporaryPath, contents)
-              .pipe(
-                Effect.mapError((error) =>
-                  cacheError(temporaryPath, error.message),
-                ),
-              );
+              ),
+              Effect.exit,
+              Effect.flatMap((exit) =>
+                Ref.set(cleanupResult, Option.some(exit)),
+              ),
+            ),
+          ).pipe(
+            Effect.flatMap((temporaryPath) =>
+              restore(
+                Effect.gen(function* () {
+                  if (typeof contents === "string") {
+                    yield* fileSystem
+                      .writeText(temporaryPath, contents)
+                      .pipe(
+                        Effect.mapError((error) =>
+                          cacheError(temporaryPath, error.message),
+                        ),
+                      );
+                  } else {
+                    yield* fileSystem
+                      .writeBytes(temporaryPath, contents)
+                      .pipe(
+                        Effect.mapError((error) =>
+                          cacheError(temporaryPath, error.message),
+                        ),
+                      );
+                  }
+                  yield* fileSystem
+                    .rename(temporaryPath, path)
+                    .pipe(
+                      Effect.mapError((error) =>
+                        cacheError(path, error.message),
+                      ),
+                    );
+                }),
+              ),
+            ),
+            Effect.exit,
+          ),
+        );
+        const cleanup = yield* Ref.get(cleanupResult);
+        if (Option.isSome(cleanup) && Exit.isFailure(cleanup.value)) {
+          if (Exit.isFailure(useResult)) {
+            return yield* Effect.failCause(
+              Cause.sequential(useResult.cause, cleanup.value.cause),
+            );
           }
-          yield* fileSystem
-            .rename(temporaryPath, path)
-            .pipe(Effect.mapError((error) => cacheError(path, error.message)));
-        }),
-      (temporaryPath) => fileSystem.remove(temporaryPath).pipe(Effect.ignore),
+          return yield* Effect.failCause(cleanup.value.cause);
+        }
+        return yield* effectFromExit(useResult);
+      }),
     );
   });
 

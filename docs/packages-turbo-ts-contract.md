@@ -87,6 +87,9 @@ listing them; ordered exclusions are applied to the resulting candidates.
 Matching directory symlinks are traversed by their declared logical path only
 when their canonical target is a directory inside the repository; canonical
 ancestor tracking prevents symlink cycles.
+Tasks owned by a logical workspace path containing a symlink component execute
+without local or remote caching because restoration intentionally rejects
+symlink parents.
 Every requested task
 must resolve before any task executes, and
 strict entrypoint selection removes configured tasks without an executable
@@ -183,7 +186,7 @@ inside the repository without traversing another symlink.
 Cache collection applies the same validation before publication, so artifacts
 with non-restorable symlink targets are skipped. Restoration rejects duplicate
 comparable destinations before clearing outputs, including paths that differ
-only by case on Windows.
+only by case on case-insensitive target filesystems.
 Every archive must contain exactly one regular task-log entry. Cache writes
 whose aggregate uncompressed file content exceeds 64 MiB are skipped before
 contents are read, with a warning that preserves the successful task result.
@@ -195,7 +198,9 @@ reads or writes are enabled, and counts archive and sidecar bytes, including
 orphaned sidecars. Startup eviction failures warn and continue without making
 cache maintenance a prerequisite for task execution. Cache archives use PAX
 extensions for paths beyond ustar
-limits, and interrupted or failed atomic writes remove their temporary files.
+limits, and interrupted or failed atomic writes attempt to remove their
+temporary files. An atomic-write cleanup failure is surfaced as a local cache
+write failure, including when the write or rename also failed.
 Archives preserve empty declared output directories. Failed restoration removes
 every partially restored output before local execution, and rollback failure
 aborts execution instead of exposing partial cache state.

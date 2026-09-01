@@ -20,7 +20,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it } from "@rstest/core";
-import { Effect, Layer } from "effect";
+import { Cause, Effect, Exit, Layer } from "effect";
 import {
   createTarArchive,
   maximumCacheArchiveInputBytes,
@@ -1332,7 +1332,10 @@ describe("core CLI execution", () => {
         `${JSON.stringify({
           name: "synthetic-linked",
           private: true,
-          scripts: { build: "node -e \"console.log('linked build')\"" },
+          scripts: {
+            build:
+              "node -e \"const fs=require('node:fs');fs.appendFileSync('runs.txt','run\\n');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/output.txt','linked')\"",
+          },
         })}\n`,
       );
       await symlink("../..", `${target}/loop`);
@@ -1350,12 +1353,32 @@ describe("core CLI execution", () => {
       expect(model.packagesByName.get("synthetic-linked")).toMatchObject({
         directory: `${directory}/packages/linked`,
         relativeDirectory: "packages/linked",
+        cachePathRestorable: false,
       });
       expect(
         model.packages.filter(
           (packageModel) => packageModel.name === "synthetic-linked",
         ),
       ).toHaveLength(1);
+      const execute = () =>
+        run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "build",
+            "--cwd",
+            directory,
+            "--filter=synthetic-linked",
+          ],
+          repositoryRoot,
+        );
+      expect((await execute()).exitCode).toBe(0);
+      const second = await execute();
+      expect(second.exitCode).toBe(0);
+      expect(second.stderr).not.toContain("cache restore failed");
+      expect(await readFile(`${target}/runs.txt`, "utf8")).toBe("run\nrun\n");
+      await expect(lstat(`${directory}/.turbo/cache`)).rejects.toThrow();
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -6142,6 +6165,63 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("surfaces atomic-write cleanup failures after rename failure", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-cleanup-"));
+    const cacheDirectory = `${directory}/cache`;
+    const hash = "1112131415161718";
+    try {
+      await mkdir(`${cacheDirectory}/${hash}.tar.zst`, { recursive: true });
+      const outcome = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const failingLayer = Layer.succeed(FileSystemService, {
+            ...fileSystem,
+            remove: (path) =>
+              path.endsWith(".tmp")
+                ? fileSystem.exists(path).pipe(
+                    Effect.flatMap((exists) =>
+                      exists
+                        ? Effect.fail(
+                            new BoundaryError({
+                              boundary: "filesystem",
+                              message: "temporary file is locked",
+                              retryable: false,
+                            }),
+                          )
+                        : fileSystem.remove(path),
+                    ),
+                  )
+                : fileSystem.remove(path),
+          });
+          return yield* writeLocalCache(
+            { directory: cacheDirectory },
+            hash,
+            [
+              {
+                path: "packages/app/out.txt",
+                contents: new TextEncoder().encode("cached"),
+                mode: 0o644,
+                modifiedSeconds: 1,
+              },
+            ],
+            1,
+          ).pipe(Effect.exit, Effect.provide(failingLayer));
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(Exit.isFailure(outcome)).toBe(true);
+      if (Exit.isFailure(outcome)) {
+        expect(Cause.pretty(outcome.cause)).toContain(
+          "atomic write cleanup failed: temporary file is locked",
+        );
+      }
+      expect(
+        (await readdir(cacheDirectory)).some((name) => name.endsWith(".tmp")),
+      ).toBe(true);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("counts cache sidecars and orphaned sidecars during size eviction", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-size-"));
     const cacheDirectory = `${directory}/cache`;
@@ -6730,7 +6810,7 @@ describe("cache interoperability and safety", () => {
     }
   });
 
-  it("rejects case-colliding archive destinations on Windows", async () => {
+  it("rejects case-colliding archive destinations on case-insensitive filesystems", async () => {
     const entries = [
       {
         path: "dist/A.txt",
@@ -6745,10 +6825,15 @@ describe("cache interoperability and safety", () => {
         modifiedSeconds: 1,
       },
     ];
-    expect(duplicateArchiveEntryDestination("C:/repo", entries)).toBe(
+    expect(duplicateArchiveEntryDestination("C:/repo", entries, true)).toBe(
       "C:/repo/dist/a.txt",
     );
-    expect(duplicateArchiveEntryDestination("/repo", entries)).toBeUndefined();
+    expect(duplicateArchiveEntryDestination("/repo", entries, true)).toBe(
+      "/repo/dist/a.txt",
+    );
+    expect(
+      duplicateArchiveEntryDestination("/repo", entries, false),
+    ).toBeUndefined();
     if (process.platform !== "win32") return;
 
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-case-cache-"));
@@ -6762,6 +6847,58 @@ describe("cache interoperability and safety", () => {
           allowedPathGroups: [{ directory: ".", patterns: ["dist/**"] }],
           regularFilePaths: [],
         }).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
+      );
+      expect(outcome._tag).toBe("Left");
+      if (outcome._tag === "Left") {
+        expect(outcome.left.message).toContain(
+          "archive destination occurs more than once",
+        );
+      }
+      expect(await readFile(preserved, "utf8")).toBe("preserved\n");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("detects case-insensitive POSIX restore roots before clearing outputs", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-posix-case-cache-"),
+    );
+    const preserved = `${directory}/preserved.txt`;
+    const entries = [
+      {
+        path: "dist/A.txt",
+        contents: new TextEncoder().encode("upper\n"),
+        mode: 0o644,
+        modifiedSeconds: 1,
+      },
+      {
+        path: "dist/a.txt",
+        contents: new TextEncoder().encode("lower\n"),
+        mode: 0o644,
+        modifiedSeconds: 1,
+      },
+    ];
+    try {
+      await writeFile(`${directory}/package.json`, "{}\n");
+      await writeFile(preserved, "preserved\n");
+      const outcome = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const caseInsensitiveLayer = Layer.succeed(FileSystemService, {
+            ...fileSystem,
+            exists: (path) =>
+              path === `${directory}/Package.json` ||
+              path === `${directory}/Preserved.txt`
+                ? Effect.succeed(true)
+                : fileSystem.exists(path),
+          });
+          return yield* restoreArchiveEntries(directory, entries, {
+            pathsToClear: ["preserved.txt"],
+            allowedPathGroups: [{ directory: ".", patterns: ["dist/**"] }],
+            regularFilePaths: [],
+          }).pipe(Effect.either, Effect.provide(caseInsensitiveLayer));
+        }).pipe(Effect.provide(nodeFoundationLayer)),
       );
       expect(outcome._tag).toBe("Left");
       if (outcome._tag === "Left") {

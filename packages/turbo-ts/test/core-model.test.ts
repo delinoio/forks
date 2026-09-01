@@ -67,6 +67,7 @@ const packageModel = (
   name,
   directory: `/repo/packages/${name}`,
   relativeDirectory: `packages/${name}`,
+  cachePathRestorable: true,
   manager: "pnpm",
   scripts: {
     build: `node -e "console.log('${name}')"`,
@@ -655,6 +656,7 @@ describe("core repository model", () => {
       name: "app",
       directory: "/repo/crates/app",
       relativeDirectory: "crates/app",
+      cachePathRestorable: true,
       manager: "cargo" as const,
       scripts: { dev: "cargo run" },
       dependencyNames: [],

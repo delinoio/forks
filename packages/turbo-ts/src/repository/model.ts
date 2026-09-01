@@ -56,6 +56,7 @@ export interface RepositoryPackage {
   readonly name: string;
   readonly directory: string;
   readonly relativeDirectory: string;
+  readonly cachePathRestorable: boolean;
   readonly workspaceDirectory?: string;
   readonly manager: PackageManagerName;
   readonly scripts: Readonly<Record<string, string>>;
@@ -511,6 +512,30 @@ const canonicalFilesystemIdentity = (
       Effect.map((resolved) => comparableFilesystemPath(resolved)),
       Effect.catchAll(() => Effect.succeed(undefined)),
     );
+  });
+
+const cachePathIsRestorable = (
+  root: string,
+  directory: string,
+): Effect.Effect<boolean, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    if (!isPathContained(root, directory)) return false;
+    const fileSystem = yield* FileSystemService;
+    let current = root;
+    for (const segment of relativePath(root, directory).split("/")) {
+      if (segment === "" || segment === ".") continue;
+      current = joinPath(current, segment);
+      const metadata = yield* fileSystem
+        .metadata(current)
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({ path: current, message: error.message }),
+          ),
+        );
+      if (metadata.kind === "symlink") return false;
+    }
+    return true;
   });
 
 const referencesWorkspacePackage = (
@@ -1180,6 +1205,7 @@ export const discoverRepository = (
             name,
             directory,
             relativeDirectory: relativePath(root, directory),
+            cachePathRestorable: yield* cachePathIsRestorable(root, directory),
             manager: managerIdentity.name,
             scripts: manifest.scripts ?? {},
             cargoDependencies:
@@ -1407,6 +1433,10 @@ export const discoverRepository = (
               name: metadata.name,
               directory,
               relativeDirectory: relativePath(root, directory),
+              cachePathRestorable: yield* cachePathIsRestorable(
+                root,
+                directory,
+              ),
               workspaceDirectory: metadata.workspaceDirectory,
               manager: "cargo" as const,
               scripts: polyglotScripts("cargo", metadata.entrypointNames),
@@ -1491,6 +1521,7 @@ export const discoverRepository = (
             name: metadata.name,
             directory,
             relativeDirectory: relativePath(root, directory),
+            cachePathRestorable: yield* cachePathIsRestorable(root, directory),
             manager: "uv" as const,
             scripts: polyglotScripts("uv", []),
             cargoDependencies:
@@ -1692,6 +1723,7 @@ export const discoverRepository = (
       name: "//",
       directory: root,
       relativeDirectory: ".",
+      cachePathRestorable: true,
       manager: managerIdentity.name,
       scripts: rootManifest.scripts ?? {},
       dependencyNames: dependencyNames(rootManifest),

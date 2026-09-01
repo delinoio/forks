@@ -1406,7 +1406,8 @@ export const isTaskScopeCacheable = (
   sourceEnvironment: Readonly<Record<string, string | undefined>> = environment,
 ): boolean =>
   (scope.kind === "cargo-workspace" ? scope.members : [node]).every(
-    (member) => member.definition.cache !== false,
+    (member) =>
+      member.package.cachePathRestorable && member.definition.cache !== false,
   ) &&
   !usesAlternateCargoBuildOutputs(node, passThroughArguments) &&
   !usesEnvironmentCargoBuildTarget(

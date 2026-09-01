@@ -62,17 +62,59 @@ const isArchiveFileContentsRange = (
   contents: Uint8Array | ArchiveFileContentsRange,
 ): contents is ArchiveFileContentsRange => !(contents instanceof Uint8Array);
 
-const comparablePath = (path: string): string =>
-  /^[A-Za-z]:/.test(path) || path.startsWith("//") ? path.toLowerCase() : path;
+const alternateAsciiCase = (value: string): string | undefined => {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0x41 && code <= 0x5a) {
+      return `${value.slice(0, index)}${value[index]!.toLowerCase()}${value.slice(index + 1)}`;
+    }
+    if (code >= 0x61 && code <= 0x7a) {
+      return `${value.slice(0, index)}${value[index]!.toUpperCase()}${value.slice(index + 1)}`;
+    }
+  }
+  return undefined;
+};
+
+const pathNamesAreCaseInsensitive = (
+  directory: string,
+): Effect.Effect<boolean, CacheError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const entries = yield* fileSystem
+      .list(directory)
+      .pipe(Effect.mapError((error) => restoreError(directory, error.message)));
+    const names = new Set(entries.map((entry) => entry.name));
+    for (const entry of entries) {
+      const alternate = alternateAsciiCase(entry.name);
+      if (alternate === undefined || names.has(alternate)) continue;
+      const alternatePath = joinPath(directory, alternate);
+      const exists = yield* fileSystem
+        .exists(alternatePath)
+        .pipe(
+          Effect.mapError((error) =>
+            restoreError(alternatePath, error.message),
+          ),
+        );
+      return exists;
+    }
+    // A repository always has package.json, but fail closed for an unusual
+    // empty or non-ASCII-only restore root whose case behavior cannot be
+    // observed without mutating it.
+    return true;
+  });
+
+const comparablePath = (path: string, caseInsensitive: boolean): string =>
+  caseInsensitive ? path.toLowerCase() : path;
 
 export const duplicateArchiveEntryDestination = (
   root: string,
   entries: ReadonlyArray<RestorableArchiveEntry>,
+  caseInsensitive: boolean,
 ): string | undefined => {
   const destinations = new Set<string>();
   for (const entry of entries) {
     const destination = joinPath(root, entry.path);
-    const comparableDestination = comparablePath(destination);
+    const comparableDestination = comparablePath(destination, caseInsensitive);
     if (destinations.has(comparableDestination)) return destination;
     destinations.add(comparableDestination);
   }
@@ -196,9 +238,10 @@ export const validateArchiveEntriesForRestore = (
     const canonicalRoot = yield* fileSystem
       .realPath(root)
       .pipe(Effect.mapError((error) => restoreError(root, error.message)));
+    const caseInsensitive = yield* pathNamesAreCaseInsensitive(root);
     const regularFileDestinations = new Set(
       scope.regularFilePaths.map((path) =>
-        comparablePath(joinPath(root, path)),
+        comparablePath(joinPath(root, path), caseInsensitive),
       ),
     );
     const regularFileCounts = new Map<string, number>(
@@ -207,6 +250,7 @@ export const validateArchiveEntriesForRestore = (
     const duplicateDestination = duplicateArchiveEntryDestination(
       root,
       entries,
+      caseInsensitive,
     );
     if (duplicateDestination !== undefined) {
       return yield* Effect.fail(
@@ -218,7 +262,10 @@ export const validateArchiveEntriesForRestore = (
     }
     for (const entry of entries) {
       const destination = joinPath(root, entry.path);
-      const comparableDestination = comparablePath(destination);
+      const comparableDestination = comparablePath(
+        destination,
+        caseInsensitive,
+      );
       const matchingGroups = matchingAllowedGroups(
         root,
         destination,
