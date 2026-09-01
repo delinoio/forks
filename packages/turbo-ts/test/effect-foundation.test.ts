@@ -16,6 +16,7 @@ import {
   makeTerminalWriter,
   makeWithTemporaryDirectory,
   nodeFoundationLayer,
+  resolveSpawnInvocation,
 } from "../src/effect/node-layer.js";
 import {
   CompressionService,
@@ -406,6 +407,29 @@ describe("Effect foundation", () => {
     expect(
       makeChildEnvironment({ Path: "inherited" }, { PATH: undefined }, "linux"),
     ).toEqual({ Path: "inherited" });
+  });
+
+  it("adapts Windows package-manager command shims without changing POSIX", () => {
+    const commandInterpreter = "C:\\Windows\\System32\\cmd.exe";
+    for (const manager of ["npm", "pnpm", "yarn"]) {
+      const invocation = resolveSpawnInvocation(
+        manager,
+        ["run", "build task", "", "a&b", "100%", 'say"hi', "tail\\"],
+        "win32",
+        commandInterpreter,
+      );
+      expect(invocation.command).toBe(commandInterpreter);
+      expect(invocation.args.slice(0, 4)).toEqual(["/d", "/s", "/v:off", "/c"]);
+      expect(invocation.args[4]).toContain(`${manager}.cmd`);
+      expect(invocation.args[4]).toContain("^^^&");
+      expect(invocation.args[4]).toContain("^^^%");
+      expect(invocation.windowsVerbatimArguments).toBe(true);
+    }
+    expect(resolveSpawnInvocation("pnpm", ["run", "build"], "linux")).toEqual({
+      command: "pnpm",
+      args: ["run", "build"],
+      windowsVerbatimArguments: false,
+    });
   });
 
   it("reports synchronous spawn failures as typed errors", async () => {

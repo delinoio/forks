@@ -176,6 +176,11 @@ export const restoreArchiveEntries = (
   root: string,
   entries: ReadonlyArray<RestorableArchiveEntry>,
   scope: CacheRestoreScope,
+  finalizeRestoration: Effect.Effect<
+    void,
+    CacheError,
+    FileSystemService
+  > = Effect.void,
 ): Effect.Effect<void, CacheError | CacheRollbackError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -431,6 +436,7 @@ export const restoreArchiveEntries = (
             ),
           );
       }
+      yield* finalizeRestoration;
     });
     const outcome = yield* Effect.either(restoration);
     if (outcome._tag === "Right") {

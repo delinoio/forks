@@ -190,6 +190,84 @@ export const makeChildEnvironment = (
   return environment;
 };
 
+interface SpawnInvocation {
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+  readonly windowsVerbatimArguments: boolean;
+}
+
+const windowsPackageManagerCommands = new Set(["npm", "pnpm", "yarn"]);
+const windowsCommandFilePattern = /\.(?:bat|cmd)$/i;
+const windowsCommandMetacharacters = /([()\][%!^"`<>&|;, *?])/g;
+
+// Windows cannot execute command files through spawn without a command
+// interpreter. Keep this adapter limited to .cmd/.bat files and escape every
+// argv token; it can be removed if Node gains direct, argv-preserving support.
+const escapeWindowsCommandMetacharacters = (value: string): string =>
+  value.replace(windowsCommandMetacharacters, "^$1");
+
+const quoteWindowsCommandArgument = (value: string): string => {
+  let quoted = '"';
+  let backslashes = 0;
+  for (const character of value) {
+    if (character === "\\") {
+      backslashes += 1;
+      continue;
+    }
+    if (character === '"') {
+      quoted += `${"\\".repeat(backslashes * 2 + 1)}"`;
+      backslashes = 0;
+      continue;
+    }
+    quoted += `${"\\".repeat(backslashes)}${character}`;
+    backslashes = 0;
+  }
+  quoted += `${"\\".repeat(backslashes * 2)}"`;
+  return quoted;
+};
+
+export const resolveSpawnInvocation = (
+  command: string,
+  args: ReadonlyArray<string>,
+  platform: NodeJS.Platform,
+  commandInterpreter = "cmd.exe",
+): SpawnInvocation => {
+  if (platform !== "win32") {
+    return { command, args, windowsVerbatimArguments: false };
+  }
+  const commandName = command.toLowerCase();
+  const resolvedCommand = windowsPackageManagerCommands.has(commandName)
+    ? `${command}.cmd`
+    : command;
+  if (!windowsCommandFilePattern.test(resolvedCommand)) {
+    return {
+      command: resolvedCommand,
+      args,
+      windowsVerbatimArguments: false,
+    };
+  }
+  const escapedArguments = args.map((argument) => {
+    const escaped = escapeWindowsCommandMetacharacters(
+      quoteWindowsCommandArgument(argument),
+    );
+    return escapeWindowsCommandMetacharacters(escaped);
+  });
+  const commandLine = [
+    escapeWindowsCommandMetacharacters(resolvedCommand),
+    ...escapedArguments,
+  ].join(" ");
+  return {
+    command: commandInterpreter,
+    args: ["/d", "/s", "/v:off", "/c", `"${commandLine}"`],
+    windowsVerbatimArguments: true,
+  };
+};
+
+const configuredWindowsCommandInterpreter = (): string =>
+  Object.entries(process.env).find(
+    ([name, value]) => name.toLowerCase() === "comspec" && value !== undefined,
+  )?.[1] ?? "cmd.exe";
+
 const isChildRunning = (child: ChildProcess): boolean =>
   child.exitCode === null && child.signalCode === null;
 
@@ -700,7 +778,13 @@ const processLayer = Layer.succeed(ProcessService, {
         try: () => {
           const ownsProcessGroup = process.platform !== "win32";
           const capturesOutput = request.stdio !== "inherit";
-          const child = spawn(request.command, [...request.args], {
+          const invocation = resolveSpawnInvocation(
+            request.command,
+            request.args,
+            process.platform,
+            configuredWindowsCommandInterpreter(),
+          );
+          const child = spawn(invocation.command, [...invocation.args], {
             cwd: request.cwd,
             detached: ownsProcessGroup,
             env: makeChildEnvironment(
@@ -710,6 +794,7 @@ const processLayer = Layer.succeed(ProcessService, {
             ),
             shell: false,
             stdio: capturesOutput ? "pipe" : "inherit",
+            windowsVerbatimArguments: invocation.windowsVerbatimArguments,
           });
           let childClosed = false;
           const closed = new Promise<void>((resolve) => {

@@ -2,6 +2,7 @@ import { Effect } from "effect";
 import { CacheError } from "../effect/errors.js";
 import { FileSystemService } from "../effect/services.js";
 import {
+  maximumCacheArchiveOverheadBytes,
   type PaxValues,
   parsePaxContents,
   parseTarHeader,
@@ -39,6 +40,7 @@ const readExactRange = (
 
 export const parseTarArchiveFile = (
   path: string,
+  maximumMetadataBytes = maximumCacheArchiveOverheadBytes,
 ): Effect.Effect<
   ReadonlyArray<RestorableArchiveEntry>,
   CacheError,
@@ -56,9 +58,24 @@ export const parseTarArchiveFile = (
     }
     const entries: Array<RestorableArchiveEntry> = [];
     let extended: PaxValues | undefined;
+    let metadataBytes = 0;
     let offset = 0;
+    const accountMetadata = (
+      bytes: number,
+    ): Effect.Effect<void, CacheError> => {
+      metadataBytes += bytes;
+      return metadataBytes > maximumMetadataBytes
+        ? Effect.fail(
+            archiveFileError(
+              path,
+              `cache archive metadata exceeds the ${maximumMetadataBytes} byte limit`,
+            ),
+          )
+        : Effect.void;
+    };
     while (offset + tarBlockSize <= metadata.size) {
       const header = yield* readExactRange(path, offset, tarBlockSize);
+      yield* accountMetadata(tarBlockSize);
       if (header.every((byte) => byte === 0)) {
         if (extended !== undefined) {
           return yield* Effect.fail(
@@ -86,6 +103,9 @@ export const parseTarArchiveFile = (
           archiveFileError(path, "truncated tar entry"),
         );
       }
+      yield* accountMetadata(
+        parsed.type === 0x78 ? paddedSize : paddedSize - parsed.size,
+      );
       if (parsed.type === 0x78) {
         if (parsed.size > maximumPaxHeaderBytes) {
           return yield* Effect.fail(

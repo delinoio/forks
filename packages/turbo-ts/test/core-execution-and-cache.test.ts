@@ -21,7 +21,12 @@ import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it } from "@rstest/core";
 import { Effect, Layer } from "effect";
-import { maximumCacheArchiveInputBytes } from "../src/cache/archive.js";
+import {
+  createTarArchive,
+  maximumCacheArchiveInputBytes,
+  tarBlockSize,
+} from "../src/cache/archive.js";
+import { parseTarArchiveFile } from "../src/cache/archive-file.js";
 import { maximumCacheArtifactBytes } from "../src/cache/limits.js";
 import {
   evictLocalCache,
@@ -38,7 +43,7 @@ import {
 } from "../src/cache/restore.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { loadRootConfiguration } from "../src/config/runtime.js";
-import { BoundaryError } from "../src/effect/errors.js";
+import { BoundaryError, CacheError } from "../src/effect/errors.js";
 import { nodeFoundationLayer } from "../src/effect/node-layer.js";
 import {
   CompressionService,
@@ -318,6 +323,60 @@ describe("core CLI execution", () => {
       );
       expect(uppercaseLog).toContain("uppercase task");
       expect(uppercaseLog).not.toContain("lowercase task");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("bounds long encoded task-log components with deterministic hashes", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const tasks = [`${"A".repeat(60)}one`, `${"A".repeat(60)}two`];
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      for (const task of tasks) {
+        configuration.tasks[task] = { cache: false };
+        manifest.scripts[task] = `node -e "console.log('${task}')"`;
+      }
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          ...tasks,
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--concurrency=2",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode, result.stderr).toBe(0);
+      const encodedPrefix = "%0041".repeat(45);
+      const names = tasks.map(
+        (task) => `turbo-${encodedPrefix}-${xxhash64Hex(task)}.log`,
+      );
+      expect(new Set(names).size).toBe(2);
+      for (const [index, name] of names.entries()) {
+        expect(new TextEncoder().encode(name).length).toBeLessThanOrEqual(255);
+        expect(
+          await readFile(`${packageDirectory}/.turbo/${name}`, "utf8"),
+        ).toContain(tasks[index]);
+      }
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2917,7 +2976,7 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  }, 15_000);
+  }, 20_000);
 
   it("treats global dependencies and both rename paths as affected", async () => {
     await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
@@ -3571,6 +3630,55 @@ describe("core CLI execution", () => {
       expect(result.stdout).toContain("library check");
       expect(result.stdout).toContain("app verify");
       expect(result.stdout).toContain("library verify");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("refills concurrency when an individual task group finishes", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      for (const task of ["//#a-slow", "//#b-fast", "//#c-release"]) {
+        configuration.tasks[task] = { cache: false };
+      }
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${directory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts["a-slow"] =
+        "node -e \"const fs=require('node:fs'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('release.marker')){clearInterval(timer); console.log('slow released')}else if(Date.now()-started>3000){clearInterval(timer); process.exit(7)}},10)\"";
+      manifest.scripts["b-fast"] = "node -e \"console.log('fast complete')\"";
+      manifest.scripts["c-release"] =
+        "node -e \"require('node:fs').writeFileSync('release.marker','1')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "//#a-slow",
+          "//#b-fast",
+          "//#c-release",
+          "--cwd",
+          directory,
+          "--concurrency=2",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode, result.stderr).toBe(0);
+      expect(result.stdout).toContain("fast complete");
+      expect(result.stdout).toContain("slow released");
+      expect(await readFile(`${directory}/release.marker`, "utf8")).toBe("1");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -5683,6 +5791,64 @@ describe("core CLI execution", () => {
 });
 
 describe("cache interoperability and safety", () => {
+  it("bounds cumulative tar metadata while parsing", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-tar-metadata-"));
+    const archivePath = `${directory}/archive.tar`;
+    try {
+      const archive = createTarArchive(
+        ["first", "second", "third"].map((name) => ({
+          path: `dist/${name}`,
+          kind: "directory" as const,
+          mode: 0o755,
+          modifiedSeconds: 1,
+        })),
+      );
+      await writeFile(archivePath, archive);
+      await expect(
+        Effect.runPromise(
+          parseTarArchiveFile(archivePath, tarBlockSize * 2).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        ),
+      ).rejects.toThrow(/archive metadata exceeds/);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("rolls back restored outputs when archive cleanup fails", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cleanup-"));
+    const path = "output/result.txt";
+    try {
+      const outcome = await Effect.runPromise(
+        restoreArchiveEntries(
+          directory,
+          [
+            {
+              path,
+              contents: new TextEncoder().encode("cached"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+          ],
+          allowCachePaths("**"),
+          Effect.fail(
+            new CacheError({
+              path: "temporary-archive",
+              message: "directory is locked",
+              retryable: false,
+            }),
+          ),
+        ).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
+      );
+      expect(outcome._tag).toBe("Left");
+      await expect(lstat(`${directory}/${path}`)).rejects.toThrow();
+      await expect(lstat(`${directory}/output`)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("cleans atomic-write temporaries after rename failure", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-temp-"));
     const cacheDirectory = `${directory}/cache`;

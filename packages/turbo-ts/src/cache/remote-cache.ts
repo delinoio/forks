@@ -187,7 +187,21 @@ export const restoreRemoteCache = (
             Effect.mapError((error) => remoteError(url, error.message)),
             Effect.flatMap(() => parseTarArchiveFile(archivePath)),
             Effect.flatMap((entries) =>
-              restoreArchiveEntries(root, entries, scope),
+              restoreArchiveEntries(
+                root,
+                entries,
+                scope,
+                fileSystem
+                  .remove(directory)
+                  .pipe(
+                    Effect.mapError((error) =>
+                      remoteError(
+                        url,
+                        `temporary archive cleanup failed: ${error.message}`,
+                      ),
+                    ),
+                  ),
+              ),
             ),
           );
       })

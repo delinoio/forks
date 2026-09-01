@@ -118,12 +118,17 @@ canonical filesystem location before cache access, including through symlinks.
 Scheduled `with` groups preserve internal dependency order and share one
 run-wide foreground concurrency budget. Simultaneously ready non-persistent
 companions acquire foreground permits as an indivisible cohort, and a
-concurrency limit that cannot fit the cohort is rejected. All non-interactive
-task output streams to the task log through bounded backpressure while
-retaining only a bounded diagnostic tail and incomplete display line in memory.
+concurrency limit that cannot fit the cohort is rejected. Ready groups are
+refilled as individual groups finish rather than waiting for a whole scheduling
+wave. All non-interactive task output streams to the task log through bounded
+backpressure while retaining only a bounded diagnostic tail and incomplete
+display line in memory.
 Persistent companions must remain alive until their foreground owners
 complete; any earlier natural exit fails the group, and foreground owners
 sharing a companion remain subject to the run's concurrency limit.
+On Windows, npm, pnpm, and Yarn task commands use their standard command shims
+through a narrowly escaped command-interpreter adapter; POSIX task execution
+does not use a shell.
 
 Workspace task overrides merge with their effective package-qualified root
 definition and the merged task invariants are revalidated before execution.
@@ -149,7 +154,10 @@ backpressure instead of loading the complete log into another string.
 Local and remote archives are decompressed into scoped temporary storage and
 regular-file payloads are restored through bounded range copies instead of
 materializing the complete decompressed archive in memory. PAX metadata is
-limited to 64 KiB per extended header.
+limited to 64 KiB per extended header, and cumulative tar headers, padding, and
+PAX metadata are limited to 64 MiB while parsing. Temporary archive cleanup is
+part of the restoration transaction, so cleanup failures roll back installed
+outputs before task execution falls back.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact literal log path before clearing or writing
 files. Output negations are deny rules during both collection and restoration,
@@ -157,6 +165,8 @@ regardless of their order relative to positive patterns. Task identifiers are
 encoded into portable single-component log filenames; lowercase portable task
 names retain their existing filenames, and
 uppercase code points are encoded to prevent case-insensitive collisions.
+Encoded names that would exceed a 255-byte filename component retain a bounded
+encoded prefix and append a deterministic task-name hash.
 Restoration rejects symlink parents even when their targets remain inside the
 repository, preventing declared output paths from redirecting writes elsewhere.
 Restored symlink targets must remain within the same declared output group that

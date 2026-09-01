@@ -1346,7 +1346,7 @@ const usesMismatchedCargoTargetDirectory = (
     );
 
 const encodeTaskLogIdentifier = (task: string): string => {
-  let encoded = "";
+  const tokens: Array<string> = [];
   for (let index = 0; index < task.length; index += 1) {
     const code = task.charCodeAt(index);
     const character = task[index]!;
@@ -1356,11 +1356,27 @@ const encodeTaskLogIdentifier = (task: string): string => {
       character === "." ||
       character === "_" ||
       character === "-";
-    encoded += portable
-      ? character
-      : `%${code.toString(16).toUpperCase().padStart(4, "0")}`;
+    tokens.push(
+      portable
+        ? character
+        : `%${code.toString(16).toUpperCase().padStart(4, "0")}`,
+    );
   }
-  return encoded;
+  const maximumIdentifierBytes = 255 - "turbo-".length - ".log".length;
+  const encoded = tokens.join("");
+  if (encoded.length <= maximumIdentifierBytes) {
+    return encoded;
+  }
+  const suffix = `-${xxhash64Hex(task)}`;
+  const maximumPrefixBytes = maximumIdentifierBytes - suffix.length;
+  let prefix = "";
+  for (const token of tokens) {
+    if (prefix.length + token.length > maximumPrefixBytes) {
+      break;
+    }
+    prefix += token;
+  }
+  return `${prefix}${suffix}`;
 };
 
 export const isTaskScopeCacheable = (
@@ -2334,262 +2350,285 @@ export const executeRun = (
     const foregroundSemaphore = yield* Effect.makeSemaphore(
       options.concurrency,
     );
-    while (pending.size > 0) {
-      const ready = [...pending.entries()]
-        .filter(([, members]) => {
-          const memberSet = new Set(members);
+    const runGroup = ([, members]: readonly [
+      string,
+      ReadonlyArray<string>,
+    ]): Effect.Effect<
+      ReadonlyArray<TaskOutcome>,
+      RepositoryError,
+      RunRequirements
+    > => {
+      const memberSet = new Set(members);
+      const groupOutcomes = new Map<string, TaskOutcome>();
+      const runNode = (
+        id: string,
+      ): Effect.Effect<TaskOutcome, never, RunRequirements> => {
+        const node = graph.nodes.get(id)!;
+        const dependencyFailed = node.dependencies.some((dependency) => {
+          const outcome =
+            groupOutcomes.get(dependency) ?? outcomes.get(dependency);
           return (
-            options.parallel ||
-            members.every((id) =>
-              graph.nodes
-                .get(id)!
-                .dependencies.filter((dependency) => !memberSet.has(dependency))
-                .every((dependency) => outcomes.has(dependency)),
-            )
+            outcome !== undefined && (outcome.exitCode !== 0 || outcome.skipped)
           );
-        })
-        .sort(([left], [right]) => left.localeCompare(right));
-      if (ready.length === 0) {
-        throw new RepositoryError({
-          path: options.root,
-          message: "scheduler deadlock",
         });
-      }
-      const batch = ready.slice(0, options.concurrency);
-      const groupedResults = yield* Effect.forEach(
-        batch,
-        ([, members]): Effect.Effect<
-          ReadonlyArray<TaskOutcome>,
-          RepositoryError,
-          RunRequirements
-        > => {
-          const memberSet = new Set(members);
-          const groupOutcomes = new Map<string, TaskOutcome>();
-          const runNode = (
-            id: string,
-          ): Effect.Effect<TaskOutcome, never, RunRequirements> => {
-            const node = graph.nodes.get(id)!;
-            const dependencyFailed = node.dependencies.some((dependency) => {
-              const outcome =
-                groupOutcomes.get(dependency) ?? outcomes.get(dependency);
-              return (
-                outcome !== undefined &&
-                (outcome.exitCode !== 0 || outcome.skipped)
-              );
-            });
-            if (
-              !options.parallel &&
-              dependencyFailed &&
-              options.continueMode !== "always"
-            ) {
-              return Effect.succeed({
+        if (
+          !options.parallel &&
+          dependencyFailed &&
+          options.continueMode !== "always"
+        ) {
+          return Effect.succeed({
+            id,
+            exitCode: 1,
+            skipped: true,
+          });
+        }
+        return executeTask(
+          repository,
+          node,
+          options,
+          hashes.get(id)!,
+          environment,
+          cargoWorkspacePlan.scopes.get(id),
+        ).pipe(
+          Effect.catchAll((cause) =>
+            Effect.gen(function* () {
+              const terminal = yield* TerminalService;
+              yield* terminal
+                .writeStderr(`turbo-ts: ${String(cause)}\n`)
+                .pipe(Effect.ignore);
+              return {
                 id,
                 exitCode: 1,
-                skipped: true,
-              });
-            }
-            return executeTask(
-              repository,
-              node,
-              options,
-              hashes.get(id)!,
-              environment,
-              cargoWorkspacePlan.scopes.get(id),
-            ).pipe(
-              Effect.catchAll((cause) =>
-                Effect.gen(function* () {
-                  const terminal = yield* TerminalService;
-                  yield* terminal
-                    .writeStderr(`turbo-ts: ${String(cause)}\n`)
-                    .pipe(Effect.ignore);
-                  return {
-                    id,
-                    exitCode: 1,
-                    skipped: false,
-                  } satisfies TaskOutcome;
-                }),
+                skipped: false,
+              } satisfies TaskOutcome;
+            }),
+          ),
+        );
+      };
+      const targets = new Set(
+        members.flatMap((id) => graph.nodes.get(id)!.with),
+      );
+      const background = members.filter(
+        (id) =>
+          targets.has(id) &&
+          graph.nodes.get(id)!.definition.persistent === true,
+      );
+      const backgroundSet = new Set(background);
+      const foreground = members.filter((id) => !background.includes(id));
+      return Effect.scoped(
+        Effect.gen(function* () {
+          const backgroundFibers: Array<{
+            readonly id: string;
+            readonly fiber: Fiber.RuntimeFiber<TaskOutcome, never>;
+          }> = [];
+          const startedBackground = new Set<string>();
+          const remaining = new Set(foreground);
+          const results: Array<TaskOutcome> = [];
+          const hasStartedCompanions = (id: string): boolean =>
+            graph.nodes
+              .get(id)!
+              .with.filter((companion) => backgroundSet.has(companion))
+              .every((companion) => startedBackground.has(companion));
+          const backgroundOutcomes = (): ReadonlyArray<TaskOutcome> =>
+            backgroundFibers.map(({ id }) => ({
+              id,
+              exitCode: 0,
+              hash: hashes.get(id)!.hash,
+              skipped: false,
+            }));
+          const firstBackgroundFailure = () => {
+            const failures = backgroundFibers.map(({ fiber }) =>
+              Fiber.join(fiber).pipe(
+                Effect.map((outcome) => ({
+                  _tag: "BackgroundFailed" as const,
+                  outcome:
+                    outcome.exitCode === 0
+                      ? { ...outcome, exitCode: 1 }
+                      : outcome,
+                })),
               ),
             );
+            return failures
+              .slice(1)
+              .reduce((left, right) => Effect.race(left, right), failures[0]!);
           };
-          const targets = new Set(
-            members.flatMap((id) => graph.nodes.get(id)!.with),
-          );
-          const background = members.filter(
-            (id) =>
-              targets.has(id) &&
-              graph.nodes.get(id)!.definition.persistent === true,
-          );
-          const backgroundSet = new Set(background);
-          const foreground = members.filter((id) => !background.includes(id));
-          return Effect.scoped(
-            Effect.gen(function* () {
-              const backgroundFibers: Array<{
-                readonly id: string;
-                readonly fiber: Fiber.RuntimeFiber<TaskOutcome, never>;
-              }> = [];
-              const startedBackground = new Set<string>();
-              const remaining = new Set(foreground);
-              const results: Array<TaskOutcome> = [];
-              const hasStartedCompanions = (id: string): boolean =>
+          while (remaining.size > 0) {
+            while (true) {
+              const readyBackground = background.filter((id) => {
+                if (startedBackground.has(id)) return false;
+                const node = graph.nodes.get(id)!;
+                return (
+                  node.dependencies
+                    .filter((dependency) => memberSet.has(dependency))
+                    .every((dependency) => groupOutcomes.has(dependency)) &&
+                  hasStartedCompanions(id)
+                );
+              });
+              if (readyBackground.length === 0) break;
+              const started = yield* Effect.forEach(
+                readyBackground,
+                (id) =>
+                  Effect.forkScoped(runNode(id)).pipe(
+                    Effect.map((fiber) => ({ id, fiber })),
+                  ),
+                { concurrency: "unbounded" },
+              );
+              backgroundFibers.push(...started);
+              for (const { id } of started) startedBackground.add(id);
+              yield* Effect.yieldNow();
+            }
+            const readyForeground = [...remaining].filter((id) => {
+              const dependenciesReady =
+                options.parallel ||
                 graph.nodes
                   .get(id)!
-                  .with.filter((companion) => backgroundSet.has(companion))
-                  .every((companion) => startedBackground.has(companion));
-              const backgroundOutcomes = (): ReadonlyArray<TaskOutcome> =>
-                backgroundFibers.map(({ id }) => ({
-                  id,
-                  exitCode: 0,
-                  hash: hashes.get(id)!.hash,
-                  skipped: false,
-                }));
-              const firstBackgroundFailure = () => {
-                const failures = backgroundFibers.map(({ fiber }) =>
-                  Fiber.join(fiber).pipe(
-                    Effect.map((outcome) => ({
-                      _tag: "BackgroundFailed" as const,
-                      outcome:
-                        outcome.exitCode === 0
-                          ? { ...outcome, exitCode: 1 }
-                          : outcome,
-                    })),
-                  ),
-                );
-                return failures
-                  .slice(1)
-                  .reduce(
-                    (left, right) => Effect.race(left, right),
-                    failures[0]!,
+                  .dependencies.filter((dependency) =>
+                    memberSet.has(dependency),
+                  )
+                  .every((dependency) => groupOutcomes.has(dependency));
+              return dependenciesReady && hasStartedCompanions(id);
+            });
+            if (readyForeground.length === 0) {
+              return yield* Effect.fail(
+                new RepositoryError({
+                  path: options.root,
+                  message: "scheduler deadlock inside with group",
+                }),
+              );
+            }
+            const readyCohorts = readyForegroundCohorts(graph, readyForeground);
+            const oversizedCohort = readyCohorts.find(
+              (cohort) => cohort.length > options.concurrency,
+            );
+            if (oversizedCohort !== undefined) {
+              return yield* Effect.fail(
+                new RepositoryError({
+                  path: options.root,
+                  message: `with group requires at least ${oversizedCohort.length} foreground concurrency slots for ready tasks: ${oversizedCohort.join(", ")}`,
+                }),
+              );
+            }
+            const scheduledCohorts: Array<ReadonlyArray<string>> = [];
+            let scheduledCount = 0;
+            for (const cohort of readyCohorts) {
+              if (scheduledCount + cohort.length > options.concurrency) {
+                break;
+              }
+              scheduledCohorts.push(cohort);
+              scheduledCount += cohort.length;
+            }
+            const scheduledForeground = scheduledCohorts.flat();
+            const foregroundCompletion = foregroundSemaphore
+              .withPermits(scheduledForeground.length)(
+                Effect.forEach(scheduledForeground, runNode, {
+                  concurrency: "unbounded",
+                }),
+              )
+              .pipe(
+                Effect.map((outcome) => ({
+                  _tag: "ForegroundComplete" as const,
+                  outcomes: outcome,
+                })),
+              );
+            const completion =
+              backgroundFibers.length === 0
+                ? yield* foregroundCompletion
+                : yield* Effect.race(
+                    foregroundCompletion,
+                    firstBackgroundFailure(),
                   );
-              };
-              while (remaining.size > 0) {
-                while (true) {
-                  const readyBackground = background.filter((id) => {
-                    if (startedBackground.has(id)) return false;
-                    const node = graph.nodes.get(id)!;
-                    return (
-                      node.dependencies
-                        .filter((dependency) => memberSet.has(dependency))
-                        .every((dependency) => groupOutcomes.has(dependency)) &&
-                      hasStartedCompanions(id)
-                    );
-                  });
-                  if (readyBackground.length === 0) break;
-                  const started = yield* Effect.forEach(
-                    readyBackground,
-                    (id) =>
-                      Effect.forkScoped(runNode(id)).pipe(
-                        Effect.map((fiber) => ({ id, fiber })),
-                      ),
-                    { concurrency: "unbounded" },
-                  );
-                  backgroundFibers.push(...started);
-                  for (const { id } of started) startedBackground.add(id);
-                  yield* Effect.yieldNow();
-                }
-                const readyForeground = [...remaining].filter((id) => {
-                  const dependenciesReady =
-                    options.parallel ||
+            if (completion._tag === "BackgroundFailed") {
+              return members.map((id) =>
+                id === completion.outcome.id
+                  ? completion.outcome
+                  : {
+                      id,
+                      exitCode: 1,
+                      skipped: true,
+                    },
+              );
+            }
+            for (const outcome of completion.outcomes) {
+              remaining.delete(outcome.id);
+              groupOutcomes.set(outcome.id, outcome);
+              results.push(outcome);
+            }
+            if (
+              options.continueMode === "never" &&
+              completion.outcomes.some((outcome) => outcome.exitCode !== 0)
+            ) {
+              return [...results, ...backgroundOutcomes()];
+            }
+          }
+          return [...results, ...backgroundOutcomes()];
+        }),
+      );
+    };
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const completions = yield* Queue.unbounded<string>();
+        const running = new Map<
+          string,
+          Fiber.RuntimeFiber<ReadonlyArray<TaskOutcome>, RepositoryError>
+        >();
+        let stopScheduling = false;
+        while (pending.size > 0 || running.size > 0) {
+          if (!stopScheduling && running.size < options.concurrency) {
+            const ready = [...pending.entries()]
+              .filter(([, members]) => {
+                const memberSet = new Set(members);
+                return (
+                  options.parallel ||
+                  members.every((id) =>
                     graph.nodes
                       .get(id)!
-                      .dependencies.filter((dependency) =>
-                        memberSet.has(dependency),
+                      .dependencies.filter(
+                        (dependency) => !memberSet.has(dependency),
                       )
-                      .every((dependency) => groupOutcomes.has(dependency));
-                  return dependenciesReady && hasStartedCompanions(id);
-                });
-                if (readyForeground.length === 0) {
-                  return yield* Effect.fail(
-                    new RepositoryError({
-                      path: options.root,
-                      message: "scheduler deadlock inside with group",
-                    }),
-                  );
-                }
-                const readyCohorts = readyForegroundCohorts(
-                  graph,
-                  readyForeground,
-                );
-                const oversizedCohort = readyCohorts.find(
-                  (cohort) => cohort.length > options.concurrency,
-                );
-                if (oversizedCohort !== undefined) {
-                  return yield* Effect.fail(
-                    new RepositoryError({
-                      path: options.root,
-                      message: `with group requires at least ${oversizedCohort.length} foreground concurrency slots for ready tasks: ${oversizedCohort.join(", ")}`,
-                    }),
-                  );
-                }
-                const scheduledCohorts: Array<ReadonlyArray<string>> = [];
-                let scheduledCount = 0;
-                for (const cohort of readyCohorts) {
-                  if (scheduledCount + cohort.length > options.concurrency) {
-                    break;
-                  }
-                  scheduledCohorts.push(cohort);
-                  scheduledCount += cohort.length;
-                }
-                const scheduledForeground = scheduledCohorts.flat();
-                const foregroundCompletion = foregroundSemaphore
-                  .withPermits(scheduledForeground.length)(
-                    Effect.forEach(scheduledForeground, runNode, {
-                      concurrency: "unbounded",
-                    }),
+                      .every((dependency) => outcomes.has(dependency)),
                   )
-                  .pipe(
-                    Effect.map((outcome) => ({
-                      _tag: "ForegroundComplete" as const,
-                      outcomes: outcome,
-                    })),
-                  );
-                const completion =
-                  backgroundFibers.length === 0
-                    ? yield* foregroundCompletion
-                    : yield* Effect.race(
-                        foregroundCompletion,
-                        firstBackgroundFailure(),
-                      );
-                if (completion._tag === "BackgroundFailed") {
-                  return members.map((id) =>
-                    id === completion.outcome.id
-                      ? completion.outcome
-                      : {
-                          id,
-                          exitCode: 1,
-                          skipped: true,
-                        },
-                  );
-                }
-                for (const outcome of completion.outcomes) {
-                  remaining.delete(outcome.id);
-                  groupOutcomes.set(outcome.id, outcome);
-                  results.push(outcome);
-                }
-                if (
-                  options.continueMode === "never" &&
-                  completion.outcomes.some((outcome) => outcome.exitCode !== 0)
-                ) {
-                  return [...results, ...backgroundOutcomes()];
-                }
-              }
-              return [...results, ...backgroundOutcomes()];
-            }),
-          );
-        },
-        { concurrency: options.concurrency },
-      );
-      const results = groupedResults.flat();
-      for (const [groupId] of batch) pending.delete(groupId);
-      for (const result of results) {
-        outcomes.set(result.id, result);
-      }
-      if (
-        options.continueMode === "never" &&
-        results.some((result) => result.exitCode !== 0)
-      ) {
-        break;
-      }
-    }
+                );
+              })
+              .sort(([left], [right]) => left.localeCompare(right));
+            const availableGroups = options.concurrency - running.size;
+            for (const entry of ready.slice(0, availableGroups)) {
+              const [groupId] = entry;
+              pending.delete(groupId);
+              const fiber = yield* Effect.forkScoped(
+                runGroup(entry).pipe(
+                  Effect.onExit(() => Queue.offer(completions, groupId)),
+                ),
+              );
+              running.set(groupId, fiber);
+            }
+          }
+          if (running.size === 0) {
+            if (pending.size > 0 && !stopScheduling) {
+              return yield* Effect.fail(
+                new RepositoryError({
+                  path: options.root,
+                  message: "scheduler deadlock",
+                }),
+              );
+            }
+            break;
+          }
+          const completedGroupId = yield* Queue.take(completions);
+          const fiber = running.get(completedGroupId)!;
+          running.delete(completedGroupId);
+          const results = yield* Fiber.join(fiber);
+          for (const result of results) {
+            outcomes.set(result.id, result);
+          }
+          if (
+            options.continueMode === "never" &&
+            results.some((result) => result.exitCode !== 0)
+          ) {
+            stopScheduling = true;
+          }
+        }
+      }),
+    );
     return [...outcomes.values()].some((outcome) => outcome.exitCode !== 0)
       ? 1
       : 0;
