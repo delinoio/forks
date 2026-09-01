@@ -33,6 +33,11 @@ export interface FileSystemOperations {
   readonly readBytes: (
     path: string,
   ) => Effect.Effect<Uint8Array, BoundaryError>;
+  readonly readBytesRange: (
+    path: string,
+    offset: number,
+    length: number,
+  ) => Effect.Effect<Uint8Array, BoundaryError>;
   readonly readLink: (path: string) => Effect.Effect<string, BoundaryError>;
   readonly exists: (path: string) => Effect.Effect<boolean, BoundaryError>;
   readonly list: (
@@ -57,6 +62,12 @@ export interface FileSystemOperations {
   readonly writeBytes: (
     path: string,
     contents: Uint8Array,
+  ) => Effect.Effect<void, BoundaryError>;
+  readonly copyBytesRange: (
+    source: string,
+    offset: number,
+    length: number,
+    destination: string,
   ) => Effect.Effect<void, BoundaryError>;
   readonly createSymlink: (
     target: string,
@@ -217,6 +228,11 @@ export interface CompressionOperations {
     contents: Uint8Array,
     maxOutputBytes?: number,
   ) => Effect.Effect<Uint8Array, BoundaryError>;
+  readonly decompressZstdToFile: (
+    contents: Uint8Array,
+    destination: string,
+    maxOutputBytes?: number,
+  ) => Effect.Effect<void, BoundaryError>;
 }
 
 export class CompressionService extends Context.Tag(

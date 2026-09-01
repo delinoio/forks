@@ -29,7 +29,7 @@ export type ArchiveEntry =
   | ArchiveSymlinkEntry
   | ArchiveDirectoryEntry;
 
-const blockSize = 512;
+export const tarBlockSize = 512;
 export const maximumCacheArchiveInputBytes = 64 * 1024 * 1024;
 const tarNameBytes = 100;
 const tarPrefixBytes = 155;
@@ -139,7 +139,7 @@ const createHeader = (
   if (pathFields === undefined) {
     throw new TypeError("internal tar header path exceeds the ustar limit");
   }
-  const header = new Uint8Array(blockSize);
+  const header = new Uint8Array(tarBlockSize);
   writeText(header, 0, tarNameBytes, pathFields.name);
   writeOctal(header, 100, 8, mode & 0o777);
   writeOctal(header, 108, 8, 0);
@@ -195,7 +195,8 @@ const pushArchiveRecord = (
   contents: Uint8Array,
 ): void => {
   chunks.push(header, contents);
-  const padding = (blockSize - (contents.length % blockSize)) % blockSize;
+  const padding =
+    (tarBlockSize - (contents.length % tarBlockSize)) % tarBlockSize;
   if (padding > 0) chunks.push(new Uint8Array(padding));
 };
 
@@ -261,7 +262,7 @@ export const createTarArchive = (
       contents,
     );
   }
-  chunks.push(new Uint8Array(blockSize * 2));
+  chunks.push(new Uint8Array(tarBlockSize * 2));
   const total = chunks.reduce((size, chunk) => size + chunk.length, 0);
   const archive = new Uint8Array(total);
   let offset = 0;
@@ -295,12 +296,12 @@ const readOctal = (
   return value;
 };
 
-interface PaxValues {
+export interface PaxValues {
   readonly path?: string;
   readonly linkpath?: string;
 }
 
-const parsePaxContents = (contents: Uint8Array): PaxValues => {
+export const parsePaxContents = (contents: Uint8Array): PaxValues => {
   const values: { path?: string; linkpath?: string } = {};
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let offset = 0;
@@ -337,46 +338,78 @@ const parsePaxContents = (contents: Uint8Array): PaxValues => {
   return values;
 };
 
+export interface ParsedTarHeader {
+  readonly headerPath: string;
+  readonly type: number;
+  readonly size: number;
+  readonly mode: number;
+  readonly modifiedSeconds: number;
+  readonly linkTarget: string;
+}
+
+export const parseTarHeader = (header: Uint8Array): ParsedTarHeader => {
+  if (header.length !== tarBlockSize) {
+    throw new TypeError("truncated tar header");
+  }
+  const expectedChecksum = readOctal(header, 148, 8);
+  if (checksum(header) !== expectedChecksum) {
+    throw new TypeError("invalid tar checksum");
+  }
+  const name = readText(header, 0, tarNameBytes);
+  const prefix =
+    readText(header, 257, 6) === "ustar" && readText(header, 263, 2) === "00"
+      ? readText(header, 345, tarPrefixBytes)
+      : "";
+  const type = header[156] ?? 0;
+  if (
+    type !== 0 &&
+    type !== 0x30 &&
+    type !== 0x32 &&
+    type !== 0x35 &&
+    type !== 0x78
+  ) {
+    throw new TypeError(
+      `unsupported tar entry type: ${String.fromCharCode(type)}`,
+    );
+  }
+  return {
+    headerPath: validateArchivePath(prefix === "" ? name : `${prefix}/${name}`),
+    type,
+    size: readOctal(header, 124, 12),
+    mode: readOctal(header, 100, 8),
+    modifiedSeconds: readOctal(header, 136, 12),
+    linkTarget: readText(header, 157, tarNameBytes),
+  };
+};
+
+export const resolveArchivePath = (
+  headerPath: string,
+  extendedPath: string | undefined,
+): string => validateArchivePath(extendedPath ?? headerPath);
+
+export const resolveArchiveLinkTarget = (
+  path: string,
+  headerTarget: string,
+  extendedTarget: string | undefined,
+): string => validateArchiveLinkTarget(path, extendedTarget ?? headerTarget);
+
 export const parseTarArchive = (
   archive: Uint8Array,
 ): ReadonlyArray<ArchiveEntry> => {
   const entries: Array<ArchiveEntry> = [];
   let extended: PaxValues | undefined;
   let offset = 0;
-  while (offset + blockSize <= archive.length) {
-    const header = archive.subarray(offset, offset + blockSize);
+  while (offset + tarBlockSize <= archive.length) {
+    const header = archive.subarray(offset, offset + tarBlockSize);
     if (header.every((byte) => byte === 0)) {
       if (extended !== undefined) {
         throw new TypeError("PAX header is missing its archive entry");
       }
       return entries;
     }
-    const expectedChecksum = readOctal(header, 148, 8);
-    if (checksum(header) !== expectedChecksum) {
-      throw new TypeError("invalid tar checksum");
-    }
-    const name = readText(header, 0, tarNameBytes);
-    const prefix =
-      readText(header, 257, 6) === "ustar" && readText(header, 263, 2) === "00"
-        ? readText(header, 345, tarPrefixBytes)
-        : "";
-    const headerPath = validateArchivePath(
-      prefix === "" ? name : `${prefix}/${name}`,
-    );
-    const type = header[156];
-    if (
-      type !== 0 &&
-      type !== 0x30 &&
-      type !== 0x32 &&
-      type !== 0x35 &&
-      type !== 0x78
-    ) {
-      throw new TypeError(
-        `unsupported tar entry type: ${String.fromCharCode(type ?? 0)}`,
-      );
-    }
-    const size = readOctal(header, 124, 12);
-    const start = offset + blockSize;
+    const parsed = parseTarHeader(header);
+    const { type, size } = parsed;
+    const start = offset + tarBlockSize;
     const end = start + size;
     if (end > archive.length) {
       throw new TypeError("truncated tar entry");
@@ -384,10 +417,10 @@ export const parseTarArchive = (
     const contents = archive.slice(start, end);
     if (type === 0x78) {
       extended = { ...extended, ...parsePaxContents(contents) };
-      offset = start + Math.ceil(size / blockSize) * blockSize;
+      offset = start + Math.ceil(size / tarBlockSize) * tarBlockSize;
       continue;
     }
-    const path = validateArchivePath(extended?.path ?? headerPath);
+    const path = resolveArchivePath(parsed.headerPath, extended?.path);
     if (extended?.linkpath !== undefined && type !== 0x32) {
       throw new TypeError("PAX linkpath applies to a non-symlink entry");
     }
@@ -396,8 +429,8 @@ export const parseTarArchive = (
     }
     const common = {
       path,
-      mode: readOctal(header, 100, 8),
-      modifiedSeconds: readOctal(header, 136, 12),
+      mode: parsed.mode,
+      modifiedSeconds: parsed.modifiedSeconds,
     };
     entries.push(
       type === 0x32
@@ -405,9 +438,10 @@ export const parseTarArchive = (
             ...common,
             kind: "symlink",
             contents,
-            linkTarget: validateArchiveLinkTarget(
+            linkTarget: resolveArchiveLinkTarget(
               path,
-              extended?.linkpath ?? readText(header, 157, tarNameBytes),
+              parsed.linkTarget,
+              extended?.linkpath,
             ),
           }
         : type === 0x35
@@ -415,7 +449,7 @@ export const parseTarArchive = (
           : { ...common, contents },
     );
     extended = undefined;
-    offset = start + Math.ceil(size / blockSize) * blockSize;
+    offset = start + Math.ceil(size / tarBlockSize) * tarBlockSize;
   }
   throw new TypeError("tar archive is missing its end marker");
 };

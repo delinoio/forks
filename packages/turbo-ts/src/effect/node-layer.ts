@@ -9,7 +9,7 @@ import {
   randomBytes,
   timingSafeEqual,
 } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import {
   appendFile,
   chmod,
@@ -29,9 +29,10 @@ import {
 } from "node:fs/promises";
 import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Readable, Writable } from "node:stream";
+import { Readable, Transform, type Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
-import { zstdCompress, zstdDecompress } from "node:zlib";
+import { createZstdDecompress, zstdCompress, zstdDecompress } from "node:zlib";
 import { Cause, Effect, Exit, Layer, Option, Ref, Stream } from "effect";
 import { createXxhash64 } from "../hash/xxhash64.js";
 import { BoundaryError, ProcessExecutionError } from "./errors.js";
@@ -319,6 +320,30 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
       try: async () => new Uint8Array(await readFile(path)),
       catch: filesystemError,
     }),
+  readBytesRange: (path, offset, length) =>
+    Effect.tryPromise({
+      try: async () => {
+        const handle = await open(path, "r");
+        try {
+          const contents = Buffer.alloc(length);
+          let total = 0;
+          while (total < length) {
+            const result = await handle.read(
+              contents,
+              total,
+              length - total,
+              offset + total,
+            );
+            if (result.bytesRead === 0) break;
+            total += result.bytesRead;
+          }
+          return new Uint8Array(contents.subarray(0, total));
+        } finally {
+          await handle.close();
+        }
+      },
+      catch: filesystemError,
+    }),
   readLink: (path) =>
     Effect.tryPromise({
       try: () => readlink(path),
@@ -415,6 +440,35 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
   writeBytes: (path, contents) =>
     Effect.tryPromise({
       try: () => writeFile(path, contents),
+      catch: filesystemError,
+    }),
+  copyBytesRange: (source, offset, length, destination) =>
+    Effect.tryPromise({
+      try: async (signal) => {
+        let copied = 0;
+        const counter = new Transform({
+          transform(chunk: Buffer, _encoding, callback) {
+            copied += chunk.length;
+            callback(null, chunk);
+          },
+        });
+        const input =
+          length === 0
+            ? Readable.from([])
+            : createReadStream(source, {
+                start: offset,
+                end: offset + length - 1,
+                highWaterMark: 64 * 1024,
+              });
+        await pipeline(input, counter, createWriteStream(destination), {
+          signal,
+        });
+        if (copied !== length) {
+          throw new TypeError(
+            `source range is truncated: expected ${length} bytes, copied ${copied}`,
+          );
+        }
+      },
       catch: filesystemError,
     }),
   createSymlink: (target, path) =>
@@ -826,6 +880,8 @@ const compressionError = (cause: unknown): BoundaryError =>
 
 class HttpResponseBodyLimitError extends Error {}
 
+class CompressionOutputLimitError extends Error {}
+
 const readResponseBody = async (
   response: Response,
   maxBytes: number | undefined,
@@ -889,6 +945,34 @@ const compressionLayer = Layer.succeed(CompressionService, {
               : { maxOutputLength: maxOutputBytes },
           ),
         ),
+      catch: compressionError,
+    }),
+  decompressZstdToFile: (contents, destination, maxOutputBytes) =>
+    Effect.tryPromise({
+      try: async (signal) => {
+        let outputBytes = 0;
+        const limiter = new Transform({
+          transform(chunk: Buffer, _encoding, callback) {
+            outputBytes += chunk.length;
+            if (maxOutputBytes !== undefined && outputBytes > maxOutputBytes) {
+              callback(
+                new CompressionOutputLimitError(
+                  `decompressed output exceeds the ${maxOutputBytes} byte limit`,
+                ),
+              );
+              return;
+            }
+            callback(null, chunk);
+          },
+        });
+        await pipeline(
+          Readable.from([Buffer.from(contents)]),
+          createZstdDecompress(),
+          limiter,
+          createWriteStream(destination, { flags: "wx" }),
+          { signal },
+        );
+      },
       catch: compressionError,
     }),
 });

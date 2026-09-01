@@ -1393,6 +1393,31 @@ describe("core CLI execution", () => {
     }
   });
 
+  it("does not traverse unrelated directories outside workspace globs", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const vendorDirectory = `${directory}/vendor`;
+    try {
+      await mkdir(`${vendorDirectory}/large/unrelated/tree`, {
+        recursive: true,
+      });
+      await chmod(vendorDirectory, 0o000);
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(model.packages.map((packageModel) => packageModel.name)).toEqual([
+        "synthetic-app",
+        "synthetic-library",
+      ]);
+    } finally {
+      await chmod(vendorDirectory, 0o700).catch(() => undefined);
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("discovers repositories without parsing oversized lockfiles", async () => {
     const directory = await makeFixture();
     try {
@@ -5828,6 +5853,55 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("rejects restored symlinks through existing target symlink components", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-output-target-component-"),
+    );
+    const outside = await mkdtemp(
+      join(tmpdir(), "turbo-ts-output-target-outside-"),
+    );
+    const preserved = `${directory}/dist/preserved.txt`;
+    try {
+      await mkdir(`${directory}/dist`, { recursive: true });
+      await writeFile(`${outside}/secret.txt`, "outside\n");
+      await writeFile(preserved, "preserved\n");
+      await symlink(outside, `${directory}/dist/nested`);
+      const restored = await Effect.runPromise(
+        restoreArchiveEntries(
+          directory,
+          [
+            {
+              kind: "symlink",
+              path: "dist/link.txt",
+              linkTarget: "nested/secret.txt",
+              contents: new Uint8Array(),
+              mode: 0o777,
+              modifiedSeconds: 1,
+            },
+          ],
+          {
+            pathsToClear: ["dist/preserved.txt"],
+            allowedPathGroups: [
+              { directory: ".", patterns: ["dist/**/*.txt"] },
+            ],
+            regularFilePaths: [],
+          },
+        ).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
+      );
+      expect(restored._tag).toBe("Left");
+      if (restored._tag === "Left") {
+        expect(restored.left.message).toContain("symlink component");
+      }
+      expect(await readFile(preserved, "utf8")).toBe("preserved\n");
+      await expect(lstat(`${directory}/dist/link.txt`)).rejects.toThrow();
+      expect(await readFile(`${outside}/secret.txt`, "utf8")).toBe("outside\n");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+      await rm(outside, { force: true, recursive: true });
+    }
+  });
+
   it("rejects writes through archive-created output symlinks", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-output-link-"));
@@ -6353,6 +6427,8 @@ describe("cache interoperability and safety", () => {
       token: "dummy-token",
       teamId: "team_synthetic",
     };
+    const streamedPath = `packages/app/${"nested-segment/".repeat(12)}remote-large.txt`;
+    const streamedContents = new Uint8Array(2 * 1024 * 1024).fill(0x61);
     try {
       await Effect.runPromise(
         writeRemoteCache(
@@ -6362,6 +6438,12 @@ describe("cache interoperability and safety", () => {
             {
               path: "packages/app/remote.txt",
               contents: new TextEncoder().encode("remote"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+            {
+              path: streamedPath,
+              contents: streamedContents,
               mode: 0o644,
               modifiedSeconds: 1,
             },
@@ -6381,13 +6463,16 @@ describe("cache interoperability and safety", () => {
             restoreRoot,
             options,
             "0011223344556677",
-            allowCachePaths("packages/app/remote.txt"),
+            allowCachePaths("packages/app/**"),
           ).pipe(Effect.provide(nodeFoundationLayer)),
         ),
       ).toBe(true);
       expect(
         await readFile(`${directory}/packages/app/remote.txt`, "utf8"),
       ).toBe("remote");
+      expect((await lstat(`${directory}/${streamedPath}`)).size).toBe(
+        streamedContents.length,
+      );
       tag = "0".repeat(64);
       await expect(
         Effect.runPromise(
@@ -6395,7 +6480,7 @@ describe("cache interoperability and safety", () => {
             restoreRoot,
             options,
             "0011223344556677",
-            allowCachePaths("packages/app/remote.txt"),
+            allowCachePaths("packages/app/**"),
           ).pipe(Effect.provide(nodeFoundationLayer)),
         ),
       ).rejects.toThrow(/signature is invalid/);

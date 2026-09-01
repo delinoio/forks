@@ -8,6 +8,16 @@ export const matchesGlob = (path: string, pattern: string): boolean =>
     { dot: true },
   );
 
+export const canMatchGlobDescendant = (
+  path: string,
+  pattern: string,
+): boolean =>
+  minimatch(
+    toUnixPath(path).replace(/^\.\//, ""),
+    toUnixPath(pattern).replace(/^\.\//, ""),
+    { dot: true, partial: true },
+  );
+
 export const selectByGlobs = (
   values: ReadonlyArray<string>,
   patterns: ReadonlyArray<string>,

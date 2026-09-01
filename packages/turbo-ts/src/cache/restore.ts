@@ -8,7 +8,6 @@ import {
 } from "../core/path.js";
 import { CacheError, CacheRollbackError } from "../effect/errors.js";
 import { FileSystemService } from "../effect/services.js";
-import type { ArchiveEntry } from "./archive.js";
 
 const restoreError = (path: string, cause: unknown): CacheError =>
   new CacheError({ path, message: String(cause), retryable: false });
@@ -23,6 +22,45 @@ export interface CacheRestoreScope {
   readonly allowedPathGroups: ReadonlyArray<CacheRestorePathGroup>;
   readonly regularFilePaths: ReadonlyArray<string>;
 }
+
+export interface ArchiveFileContentsRange {
+  readonly sourcePath: string;
+  readonly offset: number;
+  readonly length: number;
+}
+
+interface RestorableArchiveFileEntry {
+  readonly kind?: "file";
+  readonly path: string;
+  readonly contents: Uint8Array | ArchiveFileContentsRange;
+  readonly mode: number;
+  readonly modifiedSeconds: number;
+}
+
+interface RestorableArchiveSymlinkEntry {
+  readonly kind: "symlink";
+  readonly path: string;
+  readonly linkTarget: string;
+  readonly contents: Uint8Array;
+  readonly mode: number;
+  readonly modifiedSeconds: number;
+}
+
+interface RestorableArchiveDirectoryEntry {
+  readonly kind: "directory";
+  readonly path: string;
+  readonly mode: number;
+  readonly modifiedSeconds: number;
+}
+
+export type RestorableArchiveEntry =
+  | RestorableArchiveFileEntry
+  | RestorableArchiveSymlinkEntry
+  | RestorableArchiveDirectoryEntry;
+
+const isArchiveFileContentsRange = (
+  contents: Uint8Array | ArchiveFileContentsRange,
+): contents is ArchiveFileContentsRange => !(contents instanceof Uint8Array);
 
 const comparablePath = (path: string): string =>
   /^[A-Za-z]:/.test(path) || path.startsWith("//") ? path.toLowerCase() : path;
@@ -94,9 +132,47 @@ const prepareParentDirectory = (
     }
   });
 
+const validateExistingPathComponents = (
+  root: string,
+  canonicalRoot: string,
+  path: string,
+): Effect.Effect<void, CacheError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const relative = relativePath(root, path);
+    let current = root;
+    for (const segment of relative.split("/").filter(Boolean)) {
+      if (segment === ".") continue;
+      current = joinPath(current, segment);
+      const exists = yield* fileSystem
+        .exists(current)
+        .pipe(Effect.mapError((error) => restoreError(current, error.message)));
+      if (!exists) return;
+      const metadata = yield* fileSystem
+        .metadata(current)
+        .pipe(Effect.mapError((error) => restoreError(current, error.message)));
+      if (metadata.kind === "symlink") {
+        return yield* Effect.fail(
+          restoreError(
+            current,
+            "archive symlink target has a symlink component",
+          ),
+        );
+      }
+      const resolved = yield* fileSystem
+        .realPath(current)
+        .pipe(Effect.mapError((error) => restoreError(current, error.message)));
+      if (!isPathContained(canonicalRoot, resolved)) {
+        return yield* Effect.fail(
+          restoreError(current, "archive symlink target escapes repository"),
+        );
+      }
+    }
+  });
+
 export const restoreArchiveEntries = (
   root: string,
-  entries: ReadonlyArray<ArchiveEntry>,
+  entries: ReadonlyArray<RestorableArchiveEntry>,
   scope: CacheRestoreScope,
 ): Effect.Effect<void, CacheError | CacheRollbackError, FileSystemService> =>
   Effect.gen(function* () {
@@ -176,6 +252,7 @@ export const restoreArchiveEntries = (
             ),
           );
         }
+        yield* validateExistingPathComponents(root, canonicalRoot, target);
       }
     }
     for (const [destination, count] of regularFileCounts) {
@@ -277,6 +354,7 @@ export const restoreArchiveEntries = (
               ),
             );
           }
+          yield* validateExistingPathComponents(root, canonicalRoot, target);
           yield* fileSystem
             .createSymlink(entry.linkTarget, destination)
             .pipe(
@@ -287,14 +365,30 @@ export const restoreArchiveEntries = (
           restoredPaths.push(entry.path);
           continue;
         }
-        yield* fileSystem
-          .writeBytes(destination, entry.contents)
-          .pipe(
-            Effect.mapError((error) =>
-              restoreError(destination, error.message),
-            ),
-          );
-        restoredPaths.push(entry.path);
+        if (isArchiveFileContentsRange(entry.contents)) {
+          restoredPaths.push(entry.path);
+          yield* fileSystem
+            .copyBytesRange(
+              entry.contents.sourcePath,
+              entry.contents.offset,
+              entry.contents.length,
+              destination,
+            )
+            .pipe(
+              Effect.mapError((error) =>
+                restoreError(destination, error.message),
+              ),
+            );
+        } else {
+          yield* fileSystem
+            .writeBytes(destination, entry.contents)
+            .pipe(
+              Effect.mapError((error) =>
+                restoreError(destination, error.message),
+              ),
+            );
+          restoredPaths.push(entry.path);
+        }
         yield* fileSystem
           .setFileMetadata(
             destination,
@@ -309,9 +403,7 @@ export const restoreArchiveEntries = (
       }
       const directories = entries
         .filter(
-          (
-            entry,
-          ): entry is Extract<ArchiveEntry, { readonly kind: "directory" }> =>
+          (entry): entry is RestorableArchiveDirectoryEntry =>
             entry.kind === "directory",
         )
         .sort(

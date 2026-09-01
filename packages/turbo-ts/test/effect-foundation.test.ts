@@ -248,6 +248,7 @@ describe("Effect foundation", () => {
     if (address === null || typeof address === "string") {
       throw new Error("missing loopback address");
     }
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-zstd-limit-"));
     try {
       const httpOutcome = await Effect.runPromise(
         HttpService.pipe(
@@ -280,8 +281,26 @@ describe("Effect foundation", () => {
         }).pipe(Effect.provide(nodeFoundationLayer)),
       );
       expect(decompressionOutcome._tag).toBe("Left");
+
+      const streamedDecompressionOutcome = await Effect.runPromise(
+        Effect.gen(function* () {
+          const compression = yield* CompressionService;
+          const compressed = yield* compression.compressZstd(
+            new TextEncoder().encode("12345"),
+          );
+          return yield* Effect.either(
+            compression.decompressZstdToFile(
+              compressed,
+              join(directory, "archive.tar"),
+              4,
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(streamedDecompressionOutcome._tag).toBe("Left");
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
     }
   });
 

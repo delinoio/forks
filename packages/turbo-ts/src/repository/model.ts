@@ -4,7 +4,7 @@ import { parse as parseToml } from "smol-toml";
 import { parse as parseYaml } from "yaml";
 import type { LoadedRootConfiguration } from "../config/runtime.js";
 import { loadPackageConfiguration, mergePipeline } from "../config/runtime.js";
-import { selectByGlobs } from "../core/glob.js";
+import { canMatchGlobDescendant, selectByGlobs } from "../core/glob.js";
 import {
   baseName,
   isAbsolutePath,
@@ -323,9 +323,13 @@ const findLockfile = (
 
 const walkDirectories = (
   root: string,
+  patterns: ReadonlyArray<string>,
 ): Effect.Effect<ReadonlyArray<string>, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
+    const positivePatterns = patterns.filter(
+      (pattern) => !pattern.startsWith("!"),
+    );
     const directories: Array<string> = [root];
     const pending: Array<string> = [root];
     while (pending.length > 0) {
@@ -346,6 +350,14 @@ const walkDirectories = (
           continue;
         }
         const path = joinPath(directory, entry.name);
+        const relative = relativePath(root, path);
+        if (
+          !positivePatterns.some((pattern) =>
+            canMatchGlobDescendant(relative, pattern),
+          )
+        ) {
+          continue;
+        }
         directories.push(path);
         pending.push(path);
       }
@@ -1029,16 +1041,16 @@ export const discoverRepository = (
       managerIdentity.name,
       rootManifest,
     );
-    const directories = yield* walkDirectories(root);
+    const workspaceDirectories = yield* walkDirectories(root, patterns);
     const candidateDirectoryPaths = new Set(
       selectByGlobs(
-        directories
+        workspaceDirectories
           .map((directory) => relativePath(root, directory))
           .filter((relative) => relative !== "."),
         patterns,
       ),
     );
-    const candidateDirectories = directories.filter((directory) =>
+    const candidateDirectories = workspaceDirectories.filter((directory) =>
       candidateDirectoryPaths.has(relativePath(root, directory)),
     );
     const packageDrafts = yield* Effect.forEach(
@@ -1102,6 +1114,10 @@ export const discoverRepository = (
     const pythonEnabled =
       rootConfiguration.value.futureFlags?.experimentalPythonWorkspaces ===
       true;
+    const directories =
+      cargoEnabled || pythonEnabled
+        ? yield* walkDirectories(root, ["**"])
+        : workspaceDirectories;
     const pythonWorkspaceDirectories = new Set<string>();
     if (pythonEnabled) {
       const fileSystem = yield* FileSystemService;

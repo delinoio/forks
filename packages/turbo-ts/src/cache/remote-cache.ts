@@ -1,4 +1,5 @@
 import { Effect, Schedule } from "effect";
+import { joinPath } from "../core/path.js";
 import { CacheError, CacheRollbackError } from "../effect/errors.js";
 import {
   CompressionService,
@@ -8,11 +9,8 @@ import {
   SigningService,
 } from "../effect/services.js";
 import { packageVersion } from "../version.js";
-import {
-  type ArchiveEntry,
-  createTarArchive,
-  parseTarArchive,
-} from "./archive.js";
+import { type ArchiveEntry, createTarArchive } from "./archive.js";
+import { parseTarArchiveFile } from "./archive-file.js";
 import {
   maximumCacheArchiveBytes,
   maximumCacheArtifactBytes,
@@ -122,6 +120,7 @@ export const restoreRemoteCache = (
   Effect.gen(function* () {
     const http = yield* HttpService;
     const compression = yield* CompressionService;
+    const fileSystem = yield* FileSystemService;
     const retry = yield* RetryScheduleService;
     const signing = yield* SigningService;
     const url = artifactUrl(options, hash);
@@ -175,16 +174,30 @@ export const restoreRemoteCache = (
         );
       }
     }
-    const archive = yield* compression
-      .decompressZstd(response.body, maximumCacheArchiveBytes)
-      .pipe(Effect.mapError((error) => remoteError(url, error.message)));
-    let entries: ReadonlyArray<ArchiveEntry>;
-    try {
-      entries = parseTarArchive(archive);
-    } catch (cause) {
-      return yield* Effect.fail(remoteError(url, cause));
-    }
-    yield* restoreArchiveEntries(root, entries, scope);
+    yield* fileSystem
+      .withTemporaryDirectory((directory) => {
+        const archivePath = joinPath(directory, "remote-cache.tar");
+        return compression
+          .decompressZstdToFile(
+            response.body,
+            archivePath,
+            maximumCacheArchiveBytes,
+          )
+          .pipe(
+            Effect.mapError((error) => remoteError(url, error.message)),
+            Effect.flatMap(() => parseTarArchiveFile(archivePath)),
+            Effect.flatMap((entries) =>
+              restoreArchiveEntries(root, entries, scope),
+            ),
+          );
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "CacheError" || error._tag === "CacheRollbackError"
+            ? error
+            : remoteError(url, error.message),
+        ),
+      );
     return true;
   });
 

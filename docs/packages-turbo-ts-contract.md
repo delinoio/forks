@@ -81,7 +81,10 @@ uses `pnpm-workspace.yaml`; other JavaScript managers use `package.json`
 workspaces. An existing pnpm workspace file never falls back to `package.json`:
 an absent `packages` declaration selects no JavaScript workspace members, and
 an invalid declaration fails discovery. Declared workspace members remain
-discoverable beneath directories named `dist` or `target`. Every requested task
+discoverable beneath directories named `dist` or `target`. JavaScript workspace
+traversal prunes subtrees that cannot match a positive workspace pattern before
+listing them; ordered exclusions are applied to the resulting candidates.
+Every requested task
 must resolve before any task executes, and
 strict entrypoint selection removes configured tasks without an executable
 package script even when every selected entrypoint is commandless. Every
@@ -143,6 +146,10 @@ restoration is limited to 256 MiB compressed and 1 GiB after decompression;
 preflight and upload response bodies have an independent 64 KiB limit.
 Restored task logs replay through scoped, bounded text chunks with terminal
 backpressure instead of loading the complete log into another string.
+Remote archives are decompressed into scoped temporary storage and regular-file
+payloads are restored through bounded range copies instead of materializing the
+complete decompressed archive in memory. Remote PAX metadata is limited to 64
+KiB per extended header.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact literal log path before clearing or writing
 files. Output negations are deny rules during both collection and restoration,
@@ -153,7 +160,8 @@ uppercase code points are encoded to prevent case-insensitive collisions.
 Restoration rejects symlink parents even when their targets remain inside the
 repository, preventing declared output paths from redirecting writes elsewhere.
 Restored symlink targets must remain within the same declared output group that
-authorized the symlink path.
+authorized the symlink path, and every existing target component must resolve
+inside the repository without traversing another symlink.
 Every archive must contain exactly one regular task-log entry. Cache writes
 whose aggregate uncompressed file content exceeds 64 MiB are skipped before
 contents are read, with a warning that preserves the successful task result.
