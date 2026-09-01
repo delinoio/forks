@@ -221,6 +221,15 @@ describe("configuration generation and compatibility ledger", () => {
       }),
     ).toEqual({ extends: ["//"], tasks: null });
     expect(
+      Schema.decodeUnknownSync(WorkspaceSchemaSchema)({
+        extends: ["//"],
+        tasks: { lint: { extends: false } },
+      }),
+    ).toEqual({
+      extends: ["//"],
+      tasks: { lint: { extends: false } },
+    });
+    expect(
       Schema.decodeUnknownSync(TurboConfigurationSchema)({
         extends: ["//"],
         tags: ["app"],

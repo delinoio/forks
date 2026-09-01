@@ -61,6 +61,7 @@ export interface RepositoryPackage {
   readonly scripts: Readonly<Record<string, string>>;
   readonly dependencyNames: ReadonlyArray<string>;
   readonly internalDependencies: ReadonlyArray<string>;
+  readonly excludedTasks: ReadonlySet<string>;
   readonly tasks: Readonly<Record<string, Pipeline>>;
   readonly manifest: PackageManifest;
 }
@@ -922,6 +923,7 @@ const cargoTasks = (
   packageName: string,
   metadata: CargoPackageMetadata | undefined,
   configured: Readonly<Record<string, Pipeline>>,
+  excludedTasks: ReadonlySet<string>,
   configuredBuildTarget: boolean,
 ): Readonly<Record<string, Pipeline>> => {
   const outputPrefix =
@@ -945,17 +947,22 @@ const cargoTasks = (
     const merged = mergePipeline(buildDefaults, configuredTask);
     return configuredBuildTarget ? { ...merged, cache: false } : merged;
   };
-  const tasks: Record<string, Pipeline> = {
-    ...configured,
-    build: buildTask(configured.build ?? {}),
-    format: mergePipeline(formatDefaults, configured.format ?? {}),
-  };
+  const tasks: Record<string, Pipeline> = { ...configured };
+  if (!excludedTasks.has("build")) {
+    tasks.build = buildTask(configured.build ?? {});
+  }
+  if (!excludedTasks.has("format")) {
+    tasks.format = mergePipeline(formatDefaults, configured.format ?? {});
+  }
   const qualifiedBuild = `${packageName}#build`;
-  if (configured[qualifiedBuild] !== undefined) {
+  if (!excludedTasks.has("build") && configured[qualifiedBuild] !== undefined) {
     tasks[qualifiedBuild] = buildTask(configured[qualifiedBuild]);
   }
   const qualifiedFormat = `${packageName}#format`;
-  if (configured[qualifiedFormat] !== undefined) {
+  if (
+    !excludedTasks.has("format") &&
+    configured[qualifiedFormat] !== undefined
+  ) {
     tasks[qualifiedFormat] = mergePipeline(
       formatDefaults,
       configured[qualifiedFormat],
@@ -1025,7 +1032,7 @@ export const discoverRepository = (
           }
           const manifest = decodeManifest(yield* readJsonObject(manifestPath));
           const name = manifest.name ?? baseName(directory);
-          const tasks = yield* loadPackageConfiguration(
+          const packageConfiguration = yield* loadPackageConfiguration(
             directory,
             name,
             rootConfiguration,
@@ -1047,7 +1054,8 @@ export const discoverRepository = (
             cargoDependencies:
               [] satisfies ReadonlyArray<CargoDependencyMetadata>,
             dependencyNames: dependencyNames(manifest),
-            tasks,
+            excludedTasks: packageConfiguration.excludedTasks,
+            tasks: packageConfiguration.tasks,
             manifest,
           };
         }),
@@ -1247,6 +1255,19 @@ export const discoverRepository = (
             const directory = parentPath(metadata.manifestPath);
             const configuredBuildTarget =
               yield* cargoBuildTargetConfigured(directory);
+            const packageConfiguration = yield* loadPackageConfiguration(
+              directory,
+              metadata.name,
+              rootConfiguration,
+            ).pipe(
+              Effect.mapError(
+                (error) =>
+                  new RepositoryError({
+                    path: error.path,
+                    message: error.message,
+                  }),
+              ),
+            );
             return {
               name: metadata.name,
               directory,
@@ -1256,11 +1277,13 @@ export const discoverRepository = (
               scripts: polyglotScripts("cargo", metadata.entrypointNames),
               cargoDependencies: metadata.dependencies,
               dependencyNames: metadata.dependencyNames,
+              excludedTasks: packageConfiguration.excludedTasks,
               tasks: cargoTasks(
                 root,
                 metadata.name,
                 metadata,
-                configuredTasks,
+                packageConfiguration.tasks,
+                packageConfiguration.excludedTasks,
                 configuredBuildTarget,
               ),
               manifest: {
@@ -1319,6 +1342,7 @@ export const discoverRepository = (
             cargoDependencies:
               [] satisfies ReadonlyArray<CargoDependencyMetadata>,
             dependencyNames: metadata.dependencyNames,
+            excludedTasks: new Set<string>(),
             uvDependencySources: metadata.dependencySources,
             tasks: uvTasks(metadata.name, configuredTasks),
             manifest: {
@@ -1401,34 +1425,80 @@ export const discoverRepository = (
             [normalizePath(packageDraft.directory), packageDraft] as const,
         ),
     );
-    const packages: ReadonlyArray<RepositoryPackage> = drafts
-      .map(({ cargoDependencies, ...packageDraft }) => ({
-        ...packageDraft,
-        internalDependencies:
-          packageDraft.manager === "uv"
-            ? packageDraft.dependencyNames.flatMap((name) => {
+    const uvFilesystemIdentitiesByName = new Map(
+      yield* Effect.forEach(
+        drafts.filter((packageDraft) => packageDraft.manager === "uv"),
+        (packageDraft) =>
+          canonicalFilesystemIdentity(packageDraft.directory).pipe(
+            Effect.map((identity) => [packageDraft.name, identity] as const),
+          ),
+        { concurrency: 8 },
+      ),
+    );
+    const uvInternalDependenciesByName = new Map(
+      yield* Effect.forEach(
+        drafts.filter((packageDraft) => packageDraft.manager === "uv"),
+        (packageDraft) =>
+          Effect.forEach(
+            packageDraft.dependencyNames,
+            (name) =>
+              Effect.gen(function* () {
                 const resolved = uvNames.get(normalizePythonPackageName(name));
                 const target =
                   resolved === undefined
                     ? undefined
                     : draftsByName.get(resolved);
+                if (target === undefined || target.manager !== "uv") {
+                  return undefined;
+                }
                 const sources =
                   packageDraft.uvDependencySources?.get(
                     normalizePythonPackageName(name),
                   ) ?? [];
-                return target !== undefined &&
-                  target.manager === "uv" &&
-                  sources.some(
-                    (source) =>
-                      source.workspace ||
-                      (source.path !== undefined &&
-                        normalizePath(
-                          joinPath(packageDraft.directory, source.path),
-                        ) === normalizePath(target.directory)),
-                  )
-                  ? [target.name]
-                  : [];
-              })
+                if (sources.some((source) => source.workspace)) {
+                  return target.name;
+                }
+                const targetIdentity = uvFilesystemIdentitiesByName.get(
+                  target.name,
+                );
+                if (targetIdentity === undefined) {
+                  return undefined;
+                }
+                const sourceIdentities = yield* Effect.forEach(
+                  sources.flatMap((source) =>
+                    source.path === undefined ? [] : [source.path],
+                  ),
+                  (path) =>
+                    canonicalFilesystemIdentity(
+                      joinPath(packageDraft.directory, path),
+                    ),
+                  { concurrency: 8 },
+                );
+                return sourceIdentities.includes(targetIdentity)
+                  ? target.name
+                  : undefined;
+              }),
+            { concurrency: 8 },
+          ).pipe(
+            Effect.map(
+              (internalDependencies) =>
+                [
+                  packageDraft.name,
+                  internalDependencies.filter(
+                    (name): name is string => name !== undefined,
+                  ),
+                ] as const,
+            ),
+          ),
+        { concurrency: 8 },
+      ),
+    );
+    const packages: ReadonlyArray<RepositoryPackage> = drafts
+      .map(({ cargoDependencies, ...packageDraft }) => ({
+        ...packageDraft,
+        internalDependencies:
+          packageDraft.manager === "uv"
+            ? (uvInternalDependenciesByName.get(packageDraft.name) ?? [])
             : packageDraft.manager === "cargo"
               ? cargoDependencies.flatMap((dependency) => {
                   if (
@@ -1469,6 +1539,7 @@ export const discoverRepository = (
       internalDependencies:
         javascriptInternalDependenciesByDirectory.get(normalizePath(root)) ??
         [],
+      excludedTasks: new Set<string>(),
       tasks: rootTasks,
       manifest: rootManifest,
     };

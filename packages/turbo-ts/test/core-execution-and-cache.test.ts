@@ -521,6 +521,41 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
+  it("streams large task logs when replaying cache hits", async () => {
+    const directory = await makeFixture();
+    try {
+      const manifestPath = `${directory}/packages/library/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"process.stdout.write('x'.repeat(200000))\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+      ];
+      const cold = await run(process.execPath, args, repositoryRoot);
+      const warm = await run(process.execPath, args, repositoryRoot);
+      expect(cold.exitCode).toBe(0);
+      expect(cold.stdout).toContain("cache miss");
+      expect(warm.exitCode).toBe(0);
+      expect(warm.stdout).toContain("cache hit");
+      expect(warm.stdout).toContain(
+        `synthetic-library:build: ${"x".repeat(100)}`,
+      );
+      expect(
+        warm.stdout.match(/synthetic-library:build: x{100}/g),
+      ).toHaveLength(1);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("excludes a configured workspace cache directory from inputs and outputs", async () => {
     const directory = await makeFixture();
     try {
@@ -734,6 +769,42 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
+  it("warns and continues when startup cache eviction fails", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.cacheDir = "blocked-cache";
+      configuration.cacheMaxAge = "1h";
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await writeFile(`${directory}/blocked-cache`, "not a directory\n");
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--cache=local:r",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("library build");
+      expect(result.stderr).toContain("local cache eviction failed");
+      expect(result.stderr).toContain("continuing without cache maintenance");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("evicts expired cache entries before read-only restores", async () => {
     const directory = await makeFixture();
     const cacheDirectory = `${directory}/.turbo/cache`;
@@ -877,6 +948,76 @@ describe("core CLI execution", () => {
       expect(invalid.stderr).toContain(
         "interactive tasks must disable caching",
       );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("honors package task exclusions and fresh definitions", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const workspacePath = `${directory}/packages/app/turbo.json`;
+      const workspace = JSON.parse(await readFile(workspacePath, "utf8")) as {
+        tasks: Record<string, Record<string, unknown>>;
+      };
+      workspace.tasks.build = { extends: false };
+      await writeFile(workspacePath, `${JSON.stringify(workspace, null, 2)}\n`);
+
+      const discover = () =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const rootConfiguration = yield* loadRootConfiguration(directory);
+            return yield* discoverRepository(directory, rootConfiguration);
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      const excluded = await discover();
+      const excludedApp = excluded.packagesByName.get("synthetic-app")!;
+      expect(excludedApp.excludedTasks).toContain("build");
+      expect(excludedApp.tasks.build).toBeUndefined();
+      expect(
+        buildTaskGraph(excluded, [excludedApp], ["build"], false).entrypoints,
+      ).toEqual([]);
+
+      const runWithoutApp = await run(
+        process.execPath,
+        [candidateEntrypoint, "run", "build", "--cwd", directory, "--no-cache"],
+        repositoryRoot,
+      );
+      expect(runWithoutApp.exitCode).toBe(0);
+      expect(runWithoutApp.stdout).toContain("library build");
+      expect(runWithoutApp.stdout).not.toContain("app build");
+
+      workspace.tasks.build = {
+        extends: false,
+        outputs: ["fresh/**"],
+      };
+      await writeFile(workspacePath, `${JSON.stringify(workspace, null, 2)}\n`);
+      const fresh = await discover();
+      const freshApp = fresh.packagesByName.get("synthetic-app")!;
+      expect(freshApp.excludedTasks).not.toContain("build");
+      expect(freshApp.tasks.build).toEqual({ outputs: ["fresh/**"] });
+      expect(
+        buildTaskGraph(fresh, [freshApp], ["build"], false).nodes.get(
+          "synthetic-app#build",
+        )?.dependencies,
+      ).toEqual([]);
+
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, Record<string, unknown>> };
+      configuration.tasks.build!.extends = false;
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const invalidRoot = await run(
+        process.execPath,
+        [candidateEntrypoint, "run", "build", "--cwd", directory],
+        repositoryRoot,
+      );
+      expect(invalidRoot.exitCode).not.toBe(0);
+      expect(invalidRoot.stderr).toContain("unknown key: extends");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1350,6 +1491,14 @@ describe("core CLI execution", () => {
         `${directory}/rust/Cargo.toml`,
         '[workspace]\nmembers = ["member"]\nexclude = ["excluded"]\nresolver = "3"\n',
       );
+      await writeFile(
+        `${directory}/rust/member/turbo.json`,
+        `${JSON.stringify(
+          { extends: ["//"], tasks: { build: { extends: false } } },
+          null,
+          2,
+        )}\n`,
+      );
       await cp(
         `${repositoryRoot}/rust-toolchain`,
         `${directory}/rust-toolchain`,
@@ -1365,6 +1514,12 @@ describe("core CLI execution", () => {
           .filter((packageModel) => packageModel.manager === "cargo")
           .map((packageModel) => packageModel.name),
       ).toEqual(["rust-member"]);
+      const member = model.packagesByName.get("rust-member")!;
+      expect(member.excludedTasks).toContain("build");
+      expect(member.tasks.build).toBeUndefined();
+      expect(
+        buildTaskGraph(model, [member], ["build"], false).entrypoints,
+      ).toEqual([]);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1576,6 +1731,11 @@ describe("core CLI execution", () => {
       await mkdir(`${directory}/python/registry`, { recursive: true });
       await mkdir(`${directory}/python/excluded`, { recursive: true });
       await mkdir(`${directory}/examples/unrelated`, { recursive: true });
+      const localHelperPath =
+        process.platform === "win32" ? "../HELPER" : "../helper-link";
+      if (process.platform !== "win32") {
+        await symlink("helper", `${directory}/python/helper-link`);
+      }
       if (process.platform !== "win32") {
         await mkdir(virtualEnvironmentDirectory, { recursive: true });
         await chmod(virtualEnvironmentDirectory, 0o000);
@@ -1591,7 +1751,7 @@ describe("core CLI execution", () => {
           `\n` +
           `[tool.uv.sources]\n` +
           `my-util = { workspace = true }\n` +
-          `local-helper = { path = "../helper" }\n` +
+          `local-helper = { path = ${JSON.stringify(localHelperPath)} }\n` +
           `requests = { index = "internal" }\n` +
           `\n` +
           `[project]\n` +

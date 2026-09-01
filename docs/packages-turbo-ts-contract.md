@@ -124,6 +124,9 @@ sharing a companion remain subject to the run's concurrency limit.
 
 Workspace task overrides merge with their effective package-qualified root
 definition and the merged task invariants are revalidated before execution.
+Task-level `extends: false` is package-only: without other fields it removes
+the inherited task, including synthesized Cargo tasks, while additional fields
+create a fresh definition without root-task inheritance.
 Workspace configuration inheritance accepts only the exact `["//"]` parent
 list.
 Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
@@ -138,6 +141,8 @@ failures warn without changing a successful task outcome, and a local failure
 does not suppress a configured remote upload. Local and remote cache
 restoration is limited to 256 MiB compressed and 1 GiB after decompression;
 preflight and upload response bodies have an independent 64 KiB limit.
+Restored task logs replay through scoped, bounded text chunks with terminal
+backpressure instead of loading the complete log into another string.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact literal log path before clearing or writing
 files. Output negations are deny rules during both collection and restoration,
@@ -155,7 +160,9 @@ contents are read, with a warning that preserves the successful task result.
 Companion task hashes participate in the owning task's cache key. Local eviction
 accepts week-based ages, runs before cache restoration only when local cache
 reads or writes are enabled, and counts archive and sidecar bytes, including
-orphaned sidecars. Cache archives use PAX extensions for paths beyond ustar
+orphaned sidecars. Startup eviction failures warn and continue without making
+cache maintenance a prerequisite for task execution. Cache archives use PAX
+extensions for paths beyond ustar
 limits, and interrupted or failed atomic writes remove their temporary files.
 Archives preserve empty declared output directories. Failed restoration removes
 every partially restored output before local execution, and rollback failure
@@ -171,7 +178,8 @@ configuration explicitly enables caching. uv tasks execute from their project
 directory, forward test arguments directly to `pytest`, and parse `uv.lock` as
 TOML. uv package-graph edges require a
 matching `tool.uv.sources` workspace declaration or local path resolving to the
-named workspace member; registry, Git, URL, and undeclared sources remain
+named workspace member by canonical, platform-aware filesystem identity;
+registry, Git, URL, and undeclared sources remain
 external. JavaScript package-graph edges
 require declared workspace or version-range compatibility, or a `file:` or
 `link:` path whose canonical, platform-aware filesystem identity resolves to

@@ -1,4 +1,4 @@
-import { Effect, Fiber, Queue } from "effect";
+import { Effect, Fiber, Queue, Stream } from "effect";
 import { maximumCacheArchiveInputBytes } from "../cache/archive.js";
 import {
   type CacheWriteEntry,
@@ -61,7 +61,12 @@ import {
   taskEnvironment,
 } from "../hash/task-hash.js";
 import { xxhash64Hex } from "../hash/xxhash64.js";
-import { renderLogEvent } from "../logging/events.js";
+import {
+  finishTaskOutput,
+  initialTaskOutputRenderState,
+  renderLogEvent,
+  renderTaskOutputChunk,
+} from "../logging/events.js";
 import {
   discoverRepository,
   listRepositoryFiles,
@@ -1478,16 +1483,26 @@ const executeTask = (
       ) {
         const hasLog = yield* fileSystem.exists(logPath);
         if (hasLog) {
-          yield* terminal.writeStdout(
-            renderLogEvent(
-              {
-                kind: "task-output",
-                task: taskLabel,
-                output: yield* fileSystem.readText(logPath),
-              },
-              color,
+          let renderState = initialTaskOutputRenderState;
+          yield* fileSystem.readTextChunks(logPath).pipe(
+            Stream.runForEach((output) =>
+              Effect.gen(function* () {
+                const rendered = renderTaskOutputChunk(
+                  renderState,
+                  taskLabel,
+                  output,
+                  color,
+                );
+                renderState = rendered.state;
+                for (const chunk of rendered.chunks) {
+                  yield* terminal.writeStdout(chunk);
+                }
+              }),
             ),
           );
+          for (const chunk of finishTaskOutput(renderState)) {
+            yield* terminal.writeStdout(chunk);
+          }
         }
       }
       return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
@@ -2077,7 +2092,27 @@ export const executeRun = (
         directory: options.cacheDirectory,
         maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
         maxSizeBytes: options.cacheMaxSizeBytes,
-      });
+      }).pipe(
+        Effect.catchTag("CacheError", (error) =>
+          Effect.gen(function* () {
+            const terminal = yield* TerminalService;
+            const warningColor = options.colorEnabled
+              ? yield* terminal.stderrColorEnabled
+              : false;
+            yield* terminal
+              .writeStderr(
+                renderLogEvent(
+                  {
+                    kind: "warning",
+                    message: `local cache eviction failed; continuing without cache maintenance: ${error.message}`,
+                  },
+                  warningColor,
+                ),
+              )
+              .pipe(Effect.ignore);
+          }),
+        ),
+      );
     }
     const repository = yield* discoverRepository(options.root, configuration);
     const packageManagerCheckDisabled =

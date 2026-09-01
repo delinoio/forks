@@ -1,12 +1,12 @@
 import { fstatSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, it } from "@rstest/core";
-import { Effect, Fiber, Schedule, Schema } from "effect";
+import { Effect, Fiber, Schedule, Schema, Stream } from "effect";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import {
@@ -19,6 +19,7 @@ import {
 } from "../src/effect/node-layer.js";
 import {
   CompressionService,
+  FileSystemService,
   HttpService,
   ProcessService,
   RandomnessService,
@@ -37,6 +38,30 @@ const waitForTextFile = async (path: string): Promise<string> => {
 };
 
 describe("Effect foundation", () => {
+  it("streams UTF-8 text through bounded filesystem chunks", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-text-stream-"));
+    const path = join(directory, "large.log");
+    const source = `${"🙂value".repeat(40_000)}\n`;
+    try {
+      await writeFile(path, source);
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          return yield* fileSystem.readTextChunks(path).pipe(
+            Stream.runFold({ chunks: 0, text: "" }, (state, chunk) => ({
+              chunks: state.chunks + 1,
+              text: state.text + chunk,
+            })),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(result.chunks).toBeGreaterThan(1);
+      expect(result.text).toBe(source);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("schema-validates tagged boundary errors", () => {
     const error = Schema.decodeUnknownSync(BoundaryError)({
       _tag: "BoundaryError",

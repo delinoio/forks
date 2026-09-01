@@ -181,6 +181,9 @@ export const buildTaskGraph = (
     packageModel: RepositoryPackage,
     task: string,
   ): string | undefined => {
+    if (packageModel.excludedTasks.has(task)) {
+      return undefined;
+    }
     const id = taskId(packageModel.name, task);
     const configuredDefinition = taskDefinition(packageModel, task);
     const definition = configuredDefinition ?? {};

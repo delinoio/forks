@@ -271,6 +271,7 @@ export const requiredLedgerVariants = {
     "root-configuration",
     "package-configuration",
     "package-inheritance",
+    "package-task-exclusion",
     "deprecated-accepted-keys",
     "schema-hidden-runtime-keys",
     "cli-over-environment-over-config",

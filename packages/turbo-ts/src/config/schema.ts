@@ -102,6 +102,18 @@ export const PipelineSchema = Schema.Struct({
   with: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
 }).annotations({ identifier: "Pipeline" });
 
+// Turbo 2.10.12 documents task-level `extends` for package configurations but
+// omits it from the distributed Pipeline definition. Keep the package-only
+// field in its own authoritative Effect schema so the public distributed
+// Schema can remain byte-for-byte compatible. This split can be removed when a
+// future compatibility baseline includes the field in its distributed schema.
+export const WorkspacePipelineSchema = Schema.extend(
+  PipelineSchema,
+  Schema.Struct({
+    extends: Schema.optional(Schema.Boolean),
+  }),
+).annotations({ identifier: "WorkspacePipeline" });
+
 export const RemoteCacheSchema = Schema.Struct({
   signature: Schema.optional(Schema.NullOr(Schema.Boolean)),
   enabled: Schema.optional(Schema.NullOr(Schema.Boolean)),
@@ -161,6 +173,11 @@ export const TasksSchema = Schema.Record({
   value: PipelineSchema,
 });
 
+export const WorkspaceTasksSchema = Schema.Record({
+  key: Schema.String,
+  value: WorkspacePipelineSchema,
+});
+
 export const BaseSchemaSchema = Schema.Struct({
   $schema: Schema.optional(Schema.NullOr(Schema.String)),
   tasks: Schema.optional(Schema.NullOr(TasksSchema)),
@@ -194,14 +211,13 @@ export const RootSchemaSchema = Schema.extend(
   }),
 ).annotations({ identifier: "RootSchema" });
 
-export const WorkspaceSchemaSchema = Schema.extend(
-  BaseSchemaSchema,
-  Schema.Struct({
-    extends: Schema.NullOr(Schema.Array(Schema.String)),
-    tags: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
-    boundaries: Schema.optional(Schema.NullOr(BoundariesConfigSchema)),
-  }),
-).annotations({ identifier: "WorkspaceSchema" });
+export const WorkspaceSchemaSchema = Schema.Struct({
+  $schema: Schema.optional(Schema.NullOr(Schema.String)),
+  tasks: Schema.optional(Schema.NullOr(WorkspaceTasksSchema)),
+  extends: Schema.NullOr(Schema.Array(Schema.String)),
+  tags: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
+  boundaries: Schema.optional(Schema.NullOr(BoundariesConfigSchema)),
+}).annotations({ identifier: "WorkspaceSchema" });
 
 export const TurboConfigurationSchema = Schema.extend(
   RootSchemaSchema,

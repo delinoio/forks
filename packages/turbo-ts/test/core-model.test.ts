@@ -23,6 +23,12 @@ import {
 } from "../src/graph/task-graph.js";
 import { selectEnvironment } from "../src/hash/task-hash.js";
 import { createXxhash64, xxhash64Hex } from "../src/hash/xxhash64.js";
+import {
+  finishTaskOutput,
+  initialTaskOutputRenderState,
+  renderLogEvent,
+  renderTaskOutputChunk,
+} from "../src/logging/events.js";
 import { parseLockfile } from "../src/repository/lockfiles.js";
 import type {
   RepositoryModel,
@@ -60,6 +66,7 @@ const packageModel = (
   },
   dependencyNames: dependencies,
   internalDependencies: dependencies,
+  excludedTasks: new Set(),
   tasks: { build: task, dev: { persistent: true } },
   manifest: { name, scripts: {} },
 });
@@ -92,6 +99,37 @@ const repository = (
 };
 
 describe("core repository model", () => {
+  it("renders streamed task output identically with bounded chunks", () => {
+    const output = `${"🙂value".repeat(20_000)}\nsecond line`;
+    const inputChunks = [
+      output.slice(0, 7),
+      output.slice(7, 70_003),
+      output.slice(70_003),
+    ];
+    let state = initialTaskOutputRenderState;
+    const renderedChunks: Array<string> = [];
+    for (const input of inputChunks) {
+      const rendered = renderTaskOutputChunk(
+        state,
+        "package:build",
+        input,
+        true,
+      );
+      state = rendered.state;
+      renderedChunks.push(...rendered.chunks);
+    }
+    renderedChunks.push(...finishTaskOutput(state));
+    expect(renderedChunks.join("")).toBe(
+      renderLogEvent(
+        { kind: "task-output", task: "package:build", output },
+        true,
+      ),
+    );
+    expect(
+      Math.max(...renderedChunks.map((chunk) => chunk.length)),
+    ).toBeLessThanOrEqual(64 * 1024);
+  });
+
   it(evidenceId.coreModel, () => {
     expect(xxhash64Hex("")).toBe("ef46db3751d8e999");
     expect(xxhash64Hex("a")).toBe("d24ec4f1a98c6e5b");
@@ -581,6 +619,7 @@ describe("core repository model", () => {
       scripts: { dev: "cargo run" },
       dependencyNames: [],
       internalDependencies: [],
+      excludedTasks: new Set<string>(),
       tasks: { dev: {} },
       manifest: { name: "app" },
     };

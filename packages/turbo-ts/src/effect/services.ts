@@ -1,4 +1,4 @@
-import type { Scope } from "effect";
+import type { Scope, Stream } from "effect";
 import { Context, Effect, Layer, Schedule } from "effect";
 import type { BoundaryError, ProcessExecutionError } from "./errors.js";
 
@@ -27,6 +27,9 @@ export interface ExecutionResult {
 
 export interface FileSystemOperations {
   readonly readText: (path: string) => Effect.Effect<string, BoundaryError>;
+  readonly readTextChunks: (
+    path: string,
+  ) => Stream.Stream<string, BoundaryError>;
   readonly readBytes: (
     path: string,
   ) => Effect.Effect<Uint8Array, BoundaryError>;

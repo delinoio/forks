@@ -9,6 +9,7 @@ import {
   randomBytes,
   timingSafeEqual,
 } from "node:crypto";
+import { createReadStream } from "node:fs";
 import {
   appendFile,
   chmod,
@@ -31,7 +32,7 @@ import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { promisify } from "node:util";
 import { zstdCompress, zstdDecompress } from "node:zlib";
-import { Cause, Effect, Exit, Layer, Option, Ref } from "effect";
+import { Cause, Effect, Exit, Layer, Option, Ref, Stream } from "effect";
 import { createXxhash64 } from "../hash/xxhash64.js";
 import { BoundaryError, ProcessExecutionError } from "./errors.js";
 import {
@@ -298,6 +299,21 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
       try: () => readFile(path, "utf8"),
       catch: filesystemError,
     }),
+  readTextChunks: (path) =>
+    Stream.acquireRelease(
+      Effect.sync(() =>
+        createReadStream(path, {
+          encoding: "utf8",
+          highWaterMark: 64 * 1024,
+        }),
+      ),
+      (stream) => Effect.sync(() => stream.destroy()),
+    ).pipe(
+      Stream.flatMap((stream) =>
+        Stream.fromAsyncIterable(stream, filesystemError),
+      ),
+      Stream.map((chunk) => String(chunk)),
+    ),
   readBytes: (path) =>
     Effect.tryPromise({
       try: async () => new Uint8Array(await readFile(path)),

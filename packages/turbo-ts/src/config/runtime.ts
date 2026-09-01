@@ -22,6 +22,11 @@ export interface LoadedRootConfiguration {
   readonly hiddenFutureFlags: Readonly<Record<string, boolean>>;
 }
 
+export interface LoadedPackageConfiguration {
+  readonly tasks: Readonly<Record<string, Pipeline>>;
+  readonly excludedTasks: ReadonlySet<string>;
+}
+
 const stripTrailingCommas = (source: string): string => {
   let output = "";
   let inString = false;
@@ -177,7 +182,7 @@ const workspaceKeys = new Set([
   "tasks",
 ]);
 
-const taskKeys = new Set([
+const rootTaskKeys = new Set([
   "cache",
   "dependsOn",
   "description",
@@ -191,6 +196,8 @@ const taskKeys = new Set([
   "persistent",
   "with",
 ]);
+
+const workspaceTaskKeys = new Set([...rootTaskKeys, "extends"]);
 
 const structuredInputKeys = new Set(["from", "globs", "mode", "withDefaults"]);
 
@@ -259,7 +266,11 @@ const assertKnownKeys = (
   }
 };
 
-const validateTaskStructure = (value: unknown, path: string): void => {
+const validateTaskStructure = (
+  value: unknown,
+  path: string,
+  allowedKeys: ReadonlySet<string> = rootTaskKeys,
+): void => {
   if (value === undefined || value === null) {
     return;
   }
@@ -267,7 +278,7 @@ const validateTaskStructure = (value: unknown, path: string): void => {
   for (const [name, definition] of Object.entries(tasks)) {
     const taskPath = `${path}:tasks.${name}`;
     const task = expectObject(definition, taskPath);
-    assertKnownKeys(task, taskKeys, taskPath);
+    assertKnownKeys(task, allowedKeys, taskPath);
     if (Array.isArray(task.inputs)) {
       for (const [index, input] of task.inputs.entries()) {
         if (typeof input === "object" && input !== null) {
@@ -553,7 +564,7 @@ export const loadPackageConfiguration = (
   packageName: string,
   root: LoadedRootConfiguration,
 ): Effect.Effect<
-  Readonly<Record<string, Pipeline>>,
+  LoadedPackageConfiguration,
   ConfigurationError,
   FileSystemService
 > =>
@@ -581,7 +592,7 @@ export const loadPackageConfiguration = (
       Record<string, Pipeline>
     >;
     if (!hasJson && !hasJsonc) {
-      return rootTasks;
+      return { tasks: rootTasks, excludedTasks: new Set<string>() };
     }
     if (hasJson && hasJsonc) {
       return yield* Effect.fail(
@@ -610,7 +621,7 @@ export const loadPackageConfiguration = (
         `${path}:boundaries`,
         false,
       );
-      validateTaskStructure(workspaceDocument.tasks, path);
+      validateTaskStructure(workspaceDocument.tasks, path, workspaceTaskKeys);
       return decodeConfiguration(
         WorkspaceSchemaSchema,
         workspaceDocument,
@@ -630,15 +641,26 @@ export const loadPackageConfiguration = (
       );
     }
     const tasks = { ...rootTasks };
+    const excludedTasks = new Set<string>();
     for (const [name, pipeline] of Object.entries(workspace.tasks ?? {})) {
       const qualifiedName = `${packageName}#${name}`;
       const targetName =
         rootTasks[qualifiedName] === undefined ? name : qualifiedName;
-      tasks[targetName] = mergePipeline(rootTasks[targetName], pipeline);
+      const { extends: taskExtends, ...definition } = pipeline;
+      if (taskExtends === false) {
+        delete tasks[targetName];
+        if (Object.keys(definition).length === 0) {
+          excludedTasks.add(name);
+        } else {
+          tasks[targetName] = definition;
+        }
+        continue;
+      }
+      tasks[targetName] = mergePipeline(rootTasks[targetName], definition);
     }
     return yield* validateConfigurationEffect(path, () => {
       validateTaskStructure(tasks, path);
       validateTaskInvariants(tasks, path);
-      return tasks;
+      return { tasks, excludedTasks };
     });
   });
