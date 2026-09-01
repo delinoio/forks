@@ -68,15 +68,20 @@ symlink attacks, signatures, command-injection arguments, and concurrent cache
 writers. `futureFlags.experimentalCargoSccache: true` always fails before task
 execution with a branded unsupported-compatibility diagnostic.
 
+JavaScript `file:`, `link:`, and relative pnpm `workspace:` dependencies resolve
+to discovered packages by canonical filesystem identity. A local path that
+does not resolve to a discovered JavaScript package disables caching for the
+declaring package and downstream hash scopes.
+
 Cargo builds that receive pass-through arguments selecting another package,
 release, profile, target, another manifest or alternate artifact layout, or an
 unmodeled library, binary, example, test, or benchmark target execute without
 cache reads or writes until those outputs are modeled explicitly. Pass-through
 `--config` arguments and mismatched metadata/task `CARGO_TARGET_DIR` values also
 disable Cargo build caching. Any effective Cargo-home configuration also
-disables build caching because those external controls are not task-hash
-inputs. Mixed library and binary crates default to uncached because
-binary-only output declarations cannot restore all of Cargo's default
+disables cacheable Cargo compilation tasks because those external controls are
+not task-hash inputs. Mixed library and binary crates default to uncached
+because binary-only output declarations cannot restore all of Cargo's default
 artifacts. Source-free local path dependencies that do not resolve to a
 same-workspace repository package also disable caching. Synthesized binary
 outputs cover the extensionless executable plus `.exe` and `.pdb` variants.

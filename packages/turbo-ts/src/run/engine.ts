@@ -1508,6 +1508,25 @@ const taskLogIdentifiers = (
   );
 };
 
+const cargoCompilationTaskNames = [
+  "build",
+  "check",
+  "dev",
+  "lint",
+  "run",
+  "test",
+] as const;
+
+type CargoCompilationTaskName = (typeof cargoCompilationTaskNames)[number];
+
+const cargoCompilationTasks = new Set<CargoCompilationTaskName>(
+  cargoCompilationTaskNames,
+);
+
+const isCargoCompilationTask = (node: TaskNode): boolean =>
+  node.package.manager === "cargo" &&
+  cargoCompilationTasks.has(node.task as CargoCompilationTaskName);
+
 export const isTaskScopeCacheable = (
   node: TaskNode,
   passThroughArguments: ReadonlyArray<string>,
@@ -1537,11 +1556,7 @@ export const isTaskScopeCacheable = (
     environment,
     caseInsensitiveEnvironmentNames,
   ) &&
-  !(
-    node.package.manager === "cargo" &&
-    node.task === "build" &&
-    cargoHomeHasConfiguration
-  );
+  !(isCargoCompilationTask(node) && cargoHomeHasConfiguration);
 
 export const taskIdsWithUnrestorableCacheInputs = (
   graph: TaskGraph,
@@ -1642,14 +1657,13 @@ const executeTask = (
       scope.kind === "cargo-workspace"
         ? scope.directory
         : node.package.directory;
-    const cargoHomeHasConfiguration =
-      node.package.manager === "cargo" && node.task === "build"
-        ? yield* cargoHomeConfigurationPresent(
-            executionDirectory,
-            executionEnvironment,
-            platform === "win32",
-          )
-        : false;
+    const cargoHomeHasConfiguration = isCargoCompilationTask(node)
+      ? yield* cargoHomeConfigurationPresent(
+          executionDirectory,
+          executionEnvironment,
+          platform === "win32",
+        )
+      : false;
     const cacheable =
       cacheInputsRestorable &&
       isTaskScopeCacheable(

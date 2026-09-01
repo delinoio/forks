@@ -273,8 +273,11 @@ external. JavaScript package-graph edges
 require declared workspace or version-range compatibility, or a `file:` or
 `link:` path whose canonical, platform-aware filesystem identity resolves to
 the local JavaScript package. Local path aliases record the resolved package's
-actual name even when the dependency key differs. pnpm workspace aliases
-resolve to the package name encoded in their `workspace:` specification;
+actual name even when the dependency key differs. Relative pnpm `workspace:`
+paths resolve by the same canonical filesystem identity. JavaScript packages
+with a local path dependency that does not resolve to a discovered JavaScript
+package make their task scopes and downstream hash scopes uncacheable. pnpm
+workspace aliases resolve to the package name encoded in their specification;
 same-named Cargo and uv packages are never JavaScript workspace targets. Cargo metadata
 paths are matched by canonical filesystem identity. Repository-root Cargo
 packages reuse the loaded root task configuration instead of interpreting it as
@@ -303,9 +306,10 @@ layout or manifest, or an unmodeled library, binary, example, test, or benchmark
 target bypass caching until those outputs are modeled explicitly. The
 additional-package selectors include `--workspace` and `--all`. Cargo build
 pass-through `--config` arguments also bypass caching because they can override
-the output layout. Cargo builds also bypass caching when any effective
-Cargo-home configuration is present because those external controls are not
-hashed. Ancestor configuration or the effective task environment setting a
+the output layout. Cacheable Cargo compilation tasks (`build`, `check`, `test`,
+`lint`, `run`, and `dev`) bypass caching when any effective Cargo-home
+configuration is present because those external controls are not hashed.
+Ancestor configuration or the effective task environment setting a
 build target, or different `CARGO_TARGET_DIR` values for Cargo metadata and
 strict task execution, likewise bypass caching. Cargo metadata discovery uses
 `--locked`, uses each response's workspace-member list, and does not probe

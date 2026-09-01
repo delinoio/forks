@@ -57,7 +57,7 @@ import {
   SigningService,
   TerminalService,
 } from "../src/effect/services.js";
-import { buildTaskGraph } from "../src/graph/task-graph.js";
+import { buildTaskGraph, type TaskNode } from "../src/graph/task-graph.js";
 import {
   decodeNullDelimitedGitOutput,
   hashTask,
@@ -1610,10 +1610,12 @@ describe("core CLI execution", () => {
           `${JSON.stringify(libraryManifest, null, 2)}\n`,
         );
         const localPathModel = await discover();
-        expect(
-          localPathModel.packagesByName.get("synthetic-app")
-            ?.internalDependencies,
-        ).toEqual(["synthetic-library"]);
+        const localPathApp =
+          localPathModel.packagesByName.get("synthetic-app")!;
+        expect(localPathApp.cacheInputsComplete).toBe(true);
+        expect(localPathApp.internalDependencies).toEqual([
+          "synthetic-library",
+        ]);
       }
 
       delete appManifest.dependencies["synthetic-library"];
@@ -1669,6 +1671,27 @@ describe("core CLI execution", () => {
           ?.internalDependencies,
       ).toEqual([]);
 
+      appManifest.dependencies["synthetic-library"] = "workspace:../library";
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, null, 2)}\n`,
+      );
+      const relativeWorkspace = await discover();
+      const relativeWorkspaceApp =
+        relativeWorkspace.packagesByName.get("synthetic-app")!;
+      expect(relativeWorkspaceApp.cacheInputsComplete).toBe(true);
+      expect(relativeWorkspaceApp.internalDependencies).toEqual([
+        "synthetic-library",
+      ]);
+      expect(
+        buildTaskGraph(
+          relativeWorkspace,
+          [relativeWorkspaceApp],
+          ["build"],
+          false,
+        ).nodes.has("synthetic-library#build"),
+      ).toBe(true);
+
       delete appManifest.dependencies["synthetic-library"];
       appManifest.dependencies["library-alias"] =
         "workspace:synthetic-library@*";
@@ -1688,6 +1711,68 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("disables caching for unresolved JavaScript path dependencies", async () => {
+    const outer = await mkdtemp(join(tmpdir(), "turbo-ts-javascript-path-"));
+    const directory = `${outer}/repository`;
+    const externalDirectory = `${outer}/external`;
+    try {
+      await cp(fixtureRoot, directory, { recursive: true });
+      await mkdir(externalDirectory, { recursive: true });
+      const rootManifestPath = `${directory}/package.json`;
+      const appManifestPath = `${directory}/packages/app/package.json`;
+      const rootManifest = JSON.parse(
+        await readFile(rootManifestPath, "utf8"),
+      ) as { dependencies?: Record<string, string> };
+      const appManifest = JSON.parse(
+        await readFile(appManifestPath, "utf8"),
+      ) as { dependencies: Record<string, string> };
+      const discover = () =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const rootConfiguration = yield* loadRootConfiguration(directory);
+            return yield* discoverRepository(directory, rootConfiguration);
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      for (const protocol of ["file:", "link:"] as const) {
+        rootManifest.dependencies = {
+          external: `${protocol}../external`,
+        };
+        appManifest.dependencies = {
+          external: `${protocol}../../../external`,
+        };
+        await writeFile(
+          rootManifestPath,
+          `${JSON.stringify(rootManifest, null, 2)}\n`,
+        );
+        await writeFile(
+          appManifestPath,
+          `${JSON.stringify(appManifest, null, 2)}\n`,
+        );
+        const model = await discover();
+        const app = model.packagesByName.get("synthetic-app")!;
+        expect(model.rootPackage.cacheInputsComplete).toBe(false);
+        expect(app.cacheInputsComplete).toBe(false);
+        expect(app.internalDependencies).toEqual([]);
+        const appNode = buildTaskGraph(
+          model,
+          [app],
+          ["build"],
+          false,
+        ).nodes.get("synthetic-app#build")!;
+        const rootNode = buildTaskGraph(
+          model,
+          [model.rootPackage],
+          ["build"],
+          false,
+        ).nodes.get("//#build")!;
+        expect(isTaskScopeCacheable(appNode, [])).toBe(false);
+        expect(isTaskScopeCacheable(rootNode, [])).toBe(false);
+      }
+    } finally {
+      await rm(outer, { force: true, recursive: true });
+    }
+  });
 
   it("discovers contained symlinked workspace members without following cycles", async () => {
     if (process.platform === "win32") return;
@@ -5206,6 +5291,55 @@ describe("core CLI execution", () => {
       await writeFile(`${precedenceCargoHome}/config`, "[build]\njobs = 1\n");
       expect(await detect({ CARGO_HOME: precedenceCargoHome })).toBe(true);
       expect(await detect({})).toBe(false);
+
+      const cargoPackage = {
+        name: "synthetic-cargo",
+        directory,
+        relativeDirectory: ".",
+        canonicalRelativeDirectory: ".",
+        cachePathRestorable: true,
+        cacheInputsComplete: true,
+        manager: "cargo" as const,
+        scripts: {},
+        dependencyNames: [],
+        internalDependencies: [],
+        excludedTasks: new Set<string>(),
+        tasks: {},
+        manifest: { name: "synthetic-cargo", private: true },
+      };
+      const cargoNode = (task: string): TaskNode => ({
+        id: `synthetic-cargo#${task}`,
+        package: cargoPackage,
+        task,
+        command: `cargo ${task}`,
+        definition: { cache: true },
+        dependencies: [],
+        with: [],
+      });
+      for (const task of ["build", "check", "dev", "lint", "run", "test"]) {
+        expect(
+          isTaskScopeCacheable(
+            cargoNode(task),
+            [],
+            { kind: "package" },
+            {},
+            false,
+            {},
+            true,
+          ),
+        ).toBe(false);
+      }
+      expect(
+        isTaskScopeCacheable(
+          cargoNode("format"),
+          [],
+          { kind: "package" },
+          {},
+          false,
+          {},
+          true,
+        ),
+      ).toBe(true);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

@@ -567,12 +567,26 @@ const referencesWorkspacePackage = (
 const localPathSpecification = (
   declaringDirectory: string,
   specification: string,
+  manager: PackageManagerName,
 ): string | undefined => {
   const protocol = (["file:", "link:"] as const).find((candidate) =>
     specification.startsWith(candidate),
   );
-  if (protocol === undefined) return undefined;
-  const path = specification.slice(protocol.length);
+  const workspacePath = specification.startsWith("workspace:")
+    ? specification.slice("workspace:".length)
+    : undefined;
+  const path =
+    protocol !== undefined
+      ? specification.slice(protocol.length)
+      : manager === "pnpm" &&
+          workspacePath !== undefined &&
+          (workspacePath === "." ||
+            workspacePath === ".." ||
+            workspacePath.startsWith("./") ||
+            workspacePath.startsWith("../"))
+        ? workspacePath
+        : undefined;
+  if (path === undefined) return undefined;
   if (path === "") return undefined;
   return isAbsolutePath(path)
     ? normalizePath(path)
@@ -609,7 +623,14 @@ const javascriptInternalDependencies = (
     string,
     { readonly directory: string; readonly manifest: PackageManifest }
   >,
-): Effect.Effect<ReadonlyArray<string>, never, FileSystemService> =>
+): Effect.Effect<
+  {
+    readonly internalDependencies: ReadonlyArray<string>;
+    readonly cacheInputsComplete: boolean;
+  },
+  never,
+  FileSystemService
+> =>
   Effect.gen(function* () {
     const packagesByFilesystemIdentity = new Map(
       (yield* Effect.forEach(
@@ -637,14 +658,20 @@ const javascriptInternalDependencies = (
         const localPath = localPathSpecification(
           declaringDirectory,
           specification,
+          manager,
         );
         if (localPath !== undefined) {
           return canonicalFilesystemIdentity(localPath).pipe(
-            Effect.map((identity) =>
-              identity === undefined
-                ? undefined
-                : packagesByFilesystemIdentity.get(identity),
-            ),
+            Effect.map((identity) => {
+              const internalDependency =
+                identity === undefined
+                  ? undefined
+                  : packagesByFilesystemIdentity.get(identity);
+              return {
+                internalDependency,
+                cacheInputsComplete: internalDependency !== undefined,
+              };
+            }),
           );
         }
         const reference =
@@ -653,25 +680,38 @@ const javascriptInternalDependencies = (
             : { name, specification };
         const target = packagesByName.get(reference.name);
         return target === undefined
-          ? Effect.succeed(undefined)
+          ? Effect.succeed({
+              internalDependency: undefined,
+              cacheInputsComplete: true,
+            })
           : referencesWorkspacePackage(
               declaringDirectory,
               reference.specification,
               target,
             ).pipe(
-              Effect.map((matches) => (matches ? reference.name : undefined)),
+              Effect.map((matches) => ({
+                internalDependency: matches ? reference.name : undefined,
+                cacheInputsComplete: true,
+              })),
             );
       },
       { concurrency: 8 },
     );
-    return [
-      ...new Set(
-        references.filter(
-          (name): name is string =>
-            name !== undefined && name !== declaringPackageName,
+    return {
+      internalDependencies: [
+        ...new Set(
+          references
+            .map(({ internalDependency }) => internalDependency)
+            .filter(
+              (name): name is string =>
+                name !== undefined && name !== declaringPackageName,
+            ),
         ),
+      ].sort(),
+      cacheInputsComplete: references.every(
+        (reference) => reference.cacheInputsComplete,
       ),
-    ].sort();
+    };
   });
 
 const polyglotScripts = (
@@ -1729,7 +1769,7 @@ export const discoverRepository = (
         (packageDraft) => [packageDraft.name, packageDraft] as const,
       ),
     );
-    const javascriptInternalDependenciesByDirectory = new Map(
+    const javascriptDependencyResolutionByDirectory = new Map(
       yield* Effect.forEach(
         [
           ...javascriptDrafts.map(({ directory, manifest }) => ({
@@ -1746,8 +1786,7 @@ export const discoverRepository = (
             javascriptDraftsByName,
           ).pipe(
             Effect.map(
-              (internalDependencies) =>
-                [normalizePath(directory), internalDependencies] as const,
+              (resolution) => [normalizePath(directory), resolution] as const,
             ),
           ),
         { concurrency: 8 },
@@ -1894,12 +1933,15 @@ export const discoverRepository = (
             internalDependencies: resolution?.internalDependencies ?? [],
           };
         }
+        const resolution = javascriptDependencyResolutionByDirectory.get(
+          normalizePath(packageDraft.directory),
+        );
         return {
           ...packageDraft,
-          internalDependencies:
-            javascriptInternalDependenciesByDirectory.get(
-              normalizePath(packageDraft.directory),
-            ) ?? [],
+          cacheInputsComplete:
+            packageDraft.cacheInputsComplete &&
+            (resolution?.cacheInputsComplete ?? true),
+          internalDependencies: resolution?.internalDependencies ?? [],
         };
       })
       .sort((left, right) => left.name.localeCompare(right.name));
@@ -1911,19 +1953,21 @@ export const discoverRepository = (
             : [],
       ),
     );
+    const rootDependencyResolution =
+      javascriptDependencyResolutionByDirectory.get(normalizePath(root));
     const rootPackage: RepositoryPackage = {
       name: "//",
       directory: root,
       relativeDirectory: ".",
       canonicalRelativeDirectory: ".",
       cachePathRestorable: true,
-      cacheInputsComplete: true,
+      cacheInputsComplete:
+        rootDependencyResolution?.cacheInputsComplete ?? true,
       manager: managerIdentity.name,
       scripts: rootManifest.scripts ?? {},
       dependencyNames: dependencyNames(rootManifest),
       internalDependencies:
-        javascriptInternalDependenciesByDirectory.get(normalizePath(root)) ??
-        [],
+        rootDependencyResolution?.internalDependencies ?? [],
       excludedTasks: new Set<string>(),
       tasks: rootTasks,
       manifest: rootManifest,
