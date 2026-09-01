@@ -134,9 +134,11 @@ run-wide foreground concurrency budget. Simultaneously ready non-persistent
 companions acquire foreground permits as an indivisible cohort, and a
 concurrency limit that cannot fit the cohort is rejected. Ready groups are
 refilled as individual groups finish rather than waiting for a whole scheduling
-wave. All non-interactive task output streams to the task log through bounded
-backpressure while retaining only a bounded diagnostic tail and incomplete
-display line in memory.
+wave. Foreground owners wait until their complete non-persistent companion
+cohort is dependency-ready; prerequisite companions may run first to unlock
+the cohort. All non-interactive task output streams to the task log through
+bounded backpressure while retaining only a bounded diagnostic tail and
+incomplete display line in memory.
 Persistent companions must remain alive until their foreground owners
 complete; any earlier natural exit fails the group, and foreground owners
 sharing a companion remain subject to the run's concurrency limit.
@@ -190,6 +192,9 @@ positive patterns. Task identifiers are
 encoded into portable single-component log filenames; lowercase portable task
 names retain their existing filenames, and
 uppercase code points are encoded to prevent case-insensitive collisions.
+When co-located package scopes share an execution directory and task name, the
+encoded package-qualified task identifier keeps their logs and cached replay
+separate.
 Encoded names that would exceed a 255-byte filename component retain a bounded
 encoded prefix and append a deterministic task-name hash.
 Restoration rejects symlink parents even when their targets remain inside the
@@ -213,8 +218,10 @@ Companion task hashes participate in the owning task's cache key. Local eviction
 accepts week-based ages, runs before cache restoration only when local cache
 reads or writes are enabled, and counts archive and sidecar bytes, including
 orphaned sidecars. Startup eviction failures warn and continue without making
-cache maintenance a prerequisite for task execution; selected-entry removal
-failures are aggregated after all of its archive and sidecar paths are tried.
+cache maintenance a prerequisite for task execution. Eviction acquires the
+per-entry writer lock before removal so it cannot expose a partially published
+entry; selected-entry removal failures are aggregated after all of its archive
+and sidecar paths are tried.
 Cache archives use PAX
 extensions for paths beyond ustar limits. Tar header paths, link targets, and
 PAX metadata must be valid UTF-8; unsupported raw-byte names reject the

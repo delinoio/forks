@@ -452,7 +452,11 @@ export const writeLocalCache = (
 
 export const evictLocalCache = (
   options: LocalCacheOptions,
-): Effect.Effect<void, CacheError, FileSystemService | ClockService> =>
+): Effect.Effect<
+  void,
+  CacheError,
+  FileSystemService | ClockService | RandomnessService
+> =>
   Effect.gen(function* () {
     if (
       options.maxAgeMilliseconds === undefined &&
@@ -536,7 +540,11 @@ export const evictLocalCache = (
       if (!expired && !oversized) {
         continue;
       }
-      yield* removeEntry(options.directory, entry.hash);
+      yield* withEntryLock(
+        options,
+        entry.hash,
+        removeEntry(options.directory, entry.hash),
+      );
       total -= entry.size;
     }
   });

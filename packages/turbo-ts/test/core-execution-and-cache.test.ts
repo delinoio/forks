@@ -17,7 +17,7 @@ import {
 } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it } from "@rstest/core";
@@ -429,6 +429,113 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("separates logs and cached replay for co-located package scopes", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const commandDirectory = `${directory}/commands`;
+    const cargoPackageId = `path+file://${directory}#rust-root@0.1.0`;
+    const cargoLog = `${directory}/.turbo/turbo-rust-root%0023build.log`;
+    const uvLog = `${directory}/.turbo/turbo-python-root%0023build.log`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, Record<string, unknown>>;
+      };
+      configuration.futureFlags = {
+        ...configuration.futureFlags,
+        experimentalCargoWorkspaces: true,
+        experimentalPythonWorkspaces: true,
+      };
+      configuration.tasks.build = {
+        ...configuration.tasks.build,
+        cache: true,
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${directory}/src`, { recursive: true });
+      await writeFile(
+        `${directory}/Cargo.toml`,
+        '[package]\nname = "rust-root"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(`${directory}/src/lib.rs`, "pub fn value() {}\n");
+      await writeFile(
+        `${directory}/Cargo.lock`,
+        'version = 4\n\n[[package]]\nname = "rust-root"\nversion = "0.1.0"\n',
+      );
+      await writeFile(
+        `${directory}/pyproject.toml`,
+        '[project]\nname = "python-root"\nversion = "0.1.0"\ndependencies = []\n\n[tool.uv.workspace]\nmembers = []\n',
+      );
+      await writeFile(`${directory}/uv.lock`, "version = 1\nrevision = 1\n");
+      await mkdir(commandDirectory, { recursive: true });
+      const metadata = JSON.stringify({
+        workspace_root: directory,
+        workspace_members: [cargoPackageId],
+        target_directory: `${directory}/target`,
+        packages: [
+          {
+            id: cargoPackageId,
+            name: "rust-root",
+            manifest_path: `${directory}/Cargo.toml`,
+            dependencies: [],
+            targets: [{ kind: ["lib"], name: "rust_root" }],
+          },
+        ],
+      });
+      const cargoCommand = `${commandDirectory}/cargo`;
+      const uvCommand = `${commandDirectory}/uv`;
+      await writeFile(
+        cargoCommand,
+        `#!/usr/bin/env node\nif (process.argv[2] === "metadata") process.stdout.write(${JSON.stringify(metadata)}); else console.log("cargo scope output");\n`,
+      );
+      await writeFile(
+        uvCommand,
+        '#!/usr/bin/env node\nconsole.log("uv scope output");\n',
+      );
+      await chmod(cargoCommand, 0o755);
+      await chmod(uvCommand, 0o755);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=rust-root",
+        "--filter=python-root",
+        "--concurrency=2",
+      ];
+      const env = {
+        PATH: `${commandDirectory}${delimiter}${process.env.PATH ?? ""}`,
+        NO_COLOR: "1",
+        TURBO_TELEMETRY_DISABLED: "1",
+      };
+      const first = await run(process.execPath, args, repositoryRoot, env);
+      expect(first.exitCode, first.stderr).toBe(0);
+      expect(await readFile(cargoLog, "utf8")).toContain("cargo scope output");
+      expect(await readFile(cargoLog, "utf8")).not.toContain("uv scope output");
+      expect(await readFile(uvLog, "utf8")).toContain("uv scope output");
+      expect(await readFile(uvLog, "utf8")).not.toContain("cargo scope output");
+
+      await rm(cargoLog);
+      await rm(uvLog);
+      const second = await run(process.execPath, args, repositoryRoot, env);
+      expect(second.exitCode, second.stderr).toBe(0);
+      expect(second.stdout).toContain("rust-root:build: cache hit");
+      expect(second.stdout).toContain("python-root:build: cache hit");
+      expect(await readFile(cargoLog, "utf8")).toContain("cargo scope output");
+      expect(await readFile(cargoLog, "utf8")).not.toContain("uv scope output");
+      expect(await readFile(uvLog, "utf8")).toContain("uv scope output");
+      expect(await readFile(uvLog, "utf8")).not.toContain("cargo scope output");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
 
   it("skips oversized cache inputs before retaining file contents", async () => {
     const directory = await makeFixture();
@@ -3919,6 +4026,63 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
+  it("waits for a complete foreground companion cohort", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.check = {
+        cache: false,
+        with: ["setup", "serve"],
+      };
+      configuration.tasks.setup = { cache: false };
+      configuration.tasks.serve = {
+        cache: false,
+        dependsOn: ["setup"],
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.setup =
+        "node -e \"setTimeout(() => require('node:fs').writeFileSync('setup.done','1'), 150)\"";
+      manifest.scripts.check =
+        "node -e \"const fs=require('node:fs'); if(!fs.existsSync('setup.done')) process.exit(7); fs.writeFileSync('check.started','1'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('serve.started')){clearInterval(timer); console.log('check alongside serve')}else if(Date.now()-started>3000){clearInterval(timer); process.exit(8)}},10)\"";
+      manifest.scripts.serve =
+        "node -e \"const fs=require('node:fs'); if(!fs.existsSync('setup.done')) process.exit(9); fs.writeFileSync('serve.started','1'); const started=Date.now(); const timer=setInterval(()=>{if(fs.existsSync('check.started')){clearInterval(timer); console.log('serve alongside check')}else if(Date.now()-started>3000){clearInterval(timer); process.exit(10)}},10)\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--concurrency=2",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode, result.stderr).toBe(0);
+      expect(await readFile(`${packageDirectory}/setup.done`, "utf8")).toBe(
+        "1",
+      );
+      expect(result.stdout).toContain("check alongside serve");
+      expect(result.stdout).toContain("serve alongside check");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("rejects concurrency too small for a ready with cohort", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;
@@ -6822,6 +6986,41 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("waits for active cache writers before evicting their entries", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-locked-"));
+    const cacheDirectory = `${directory}/cache`;
+    const hash = "0123456789abcdef";
+    const archivePath = `${cacheDirectory}/${hash}.tar.zst`;
+    const lockPath = `${cacheDirectory}/${hash}.turbo-ts.lock`;
+    try {
+      await mkdir(cacheDirectory, { recursive: true });
+      await writeFile(archivePath, "partially published archive");
+      await writeFile(
+        lockPath,
+        JSON.stringify({
+          owner: "00000000-0000-7000-8000-000000000000",
+          createdAt: Date.now(),
+        }),
+      );
+      const eviction = Effect.runPromise(
+        evictLocalCache({ directory: cacheDirectory, maxSizeBytes: 1 }).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 75));
+      try {
+        expect((await lstat(archivePath)).isFile()).toBe(true);
+      } finally {
+        await rm(lockPath, { force: true });
+      }
+      await eviction;
+      await expect(lstat(archivePath)).rejects.toThrow();
+      await expect(lstat(lockPath)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("aggregates cache entry removal failures during eviction", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-evict-"));
     const cacheDirectory = `${directory}/cache`;
@@ -6841,6 +7040,9 @@ describe("cache interoperability and safety", () => {
           const failingLayer = Layer.succeed(FileSystemService, {
             ...fileSystem,
             remove: (path) => {
+              if (path.endsWith(".turbo-ts.lock")) {
+                return fileSystem.remove(path);
+              }
               attempted.push(path);
               return Effect.fail(
                 new BoundaryError({

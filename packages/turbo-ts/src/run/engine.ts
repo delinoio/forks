@@ -1456,6 +1456,39 @@ const encodeTaskLogIdentifier = (task: string): string => {
   return `${prefix}${suffix}`;
 };
 
+const taskExecutionDirectory = (
+  node: TaskNode,
+  scope: TaskCommandScope | undefined,
+): string =>
+  scope?.kind === "cargo-workspace" ? scope.directory : node.package.directory;
+
+const taskLogIdentifiers = (
+  graph: TaskGraph,
+  scopes: ReadonlyMap<string, TaskCommandScope> = new Map(),
+  caseInsensitivePaths = false,
+): ReadonlyMap<string, string> => {
+  const nodesByLogPath = new Map<string, Array<TaskNode>>();
+  for (const node of graph.nodes.values()) {
+    const directory = normalizePath(
+      taskExecutionDirectory(node, scopes.get(node.id)),
+    );
+    const comparableDirectory = caseInsensitivePaths
+      ? directory.toLowerCase()
+      : directory;
+    const key = `${comparableDirectory}\0${encodeTaskLogIdentifier(node.task)}`;
+    const nodes = nodesByLogPath.get(key) ?? [];
+    nodes.push(node);
+    nodesByLogPath.set(key, nodes);
+  }
+  return new Map(
+    [...nodesByLogPath.values()].flatMap((nodes) =>
+      nodes.map(
+        (node) => [node.id, nodes.length > 1 ? node.id : node.task] as const,
+      ),
+    ),
+  );
+};
+
 export const isTaskScopeCacheable = (
   node: TaskNode,
   passThroughArguments: ReadonlyArray<string>,
@@ -1544,6 +1577,7 @@ const executeTask = (
   cacheInputsRestorable = true,
   withCachePublicationPermit: CachePublicationPermit = (publication) =>
     publication,
+  logIdentifier = node.task,
 ): Effect.Effect<TaskOutcome, unknown, RunRequirements> =>
   Effect.gen(function* () {
     const terminal = yield* TerminalService;
@@ -1610,7 +1644,7 @@ const executeTask = (
     const logPath = joinPath(
       executionDirectory,
       ".turbo",
-      `turbo-${encodeTaskLogIdentifier(node.task)}.log`,
+      `turbo-${encodeTaskLogIdentifier(logIdentifier)}.log`,
     );
     const pathsToClear =
       cacheable &&
@@ -2265,6 +2299,7 @@ export const executeRun = (
     const fileSystem = yield* FileSystemService;
     const processCwd = yield* environmentService.cwd;
     const environment = yield* environmentService.entries;
+    const platform = yield* environmentService.platform;
     const requestedRoot =
       parsed.cwd === undefined
         ? undefined
@@ -2515,6 +2550,11 @@ export const executeRun = (
       graph,
       cargoWorkspacePlan.scopes,
     );
+    const logIdentifiers = taskLogIdentifiers(
+      graph,
+      cargoWorkspacePlan.scopes,
+      platform === "win32",
+    );
     const groups = taskGroups(graph);
     const pending = new Map(groups.map((members) => [members[0]!, members]));
     const outcomes = new Map<string, TaskOutcome>();
@@ -2563,6 +2603,7 @@ export const executeRun = (
           cargoWorkspacePlan.scopes.get(id),
           !unrestorableCacheInputs.has(id),
           withCachePublicationPermit,
+          logIdentifiers.get(id),
         ).pipe(
           Effect.catchAll((cause) =>
             Effect.gen(function* () {
@@ -2651,18 +2692,34 @@ export const executeRun = (
               for (const { id } of started) startedBackground.add(id);
               yield* Effect.yieldNow();
             }
-            const readyForeground = [...remaining].filter((id) => {
-              const dependenciesReady =
-                options.parallel ||
-                graph.nodes
+            const dependencyReadyForeground = new Set(
+              [...remaining].filter(
+                (id) =>
+                  options.parallel ||
+                  graph.nodes
+                    .get(id)!
+                    .dependencies.filter((dependency) =>
+                      memberSet.has(dependency),
+                    )
+                    .every((dependency) => groupOutcomes.has(dependency)),
+              ),
+            );
+            const readyForeground = new Set(dependencyReadyForeground);
+            while (true) {
+              const blocked = [...readyForeground].filter((id) => {
+                if (!hasStartedCompanions(id)) return true;
+                return graph.nodes
                   .get(id)!
-                  .dependencies.filter((dependency) =>
-                    memberSet.has(dependency),
+                  .with.filter(
+                    (companion) =>
+                      !backgroundSet.has(companion) && remaining.has(companion),
                   )
-                  .every((dependency) => groupOutcomes.has(dependency));
-              return dependenciesReady && hasStartedCompanions(id);
-            });
-            if (readyForeground.length === 0) {
+                  .some((companion) => !readyForeground.has(companion));
+              });
+              if (blocked.length === 0) break;
+              for (const id of blocked) readyForeground.delete(id);
+            }
+            if (readyForeground.size === 0) {
               return yield* Effect.fail(
                 new RepositoryError({
                   path: options.root,
@@ -2670,7 +2727,9 @@ export const executeRun = (
                 }),
               );
             }
-            const readyCohorts = readyForegroundCohorts(graph, readyForeground);
+            const readyCohorts = readyForegroundCohorts(graph, [
+              ...readyForeground,
+            ]);
             const oversizedCohort = readyCohorts.find(
               (cohort) => cohort.length > options.concurrency,
             );
