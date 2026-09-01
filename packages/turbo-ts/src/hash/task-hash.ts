@@ -377,6 +377,20 @@ export const implicitTaskInputCandidates = (
   node: TaskNode,
 ): ReadonlyArray<string> => [
   ...new Set([
+    joinPath(
+      node.package.directory,
+      node.package.manager === "cargo"
+        ? "Cargo.toml"
+        : node.package.manager === "uv"
+          ? "pyproject.toml"
+          : "package.json",
+    ),
+    ...(node.package.relativeDirectory === "."
+      ? [repository.rootConfiguration.path]
+      : [
+          joinPath(node.package.directory, "turbo.json"),
+          joinPath(node.package.directory, "turbo.jsonc"),
+        ]),
     ...owningLockfileCandidates(repository, node),
     ...cargoControlInputCandidates(repository, node),
   ]),

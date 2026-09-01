@@ -938,9 +938,9 @@ const recordValue = (
     ? (value as Readonly<Record<string, unknown>>)
     : undefined;
 
-const cargoConfigurationBuildTargetConfigured = (
+const cargoConfigurationPath = (
   configurationDirectory: string,
-): Effect.Effect<boolean, RepositoryError, FileSystemService> =>
+): Effect.Effect<string | undefined, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const legacyPath = joinPath(configurationDirectory, "config");
@@ -969,6 +969,15 @@ const cargoConfigurationBuildTargetConfigured = (
       : modernExists
         ? modernPath
         : undefined;
+    return path;
+  });
+
+const cargoConfigurationBuildTargetConfigured = (
+  configurationDirectory: string,
+): Effect.Effect<boolean, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const path = yield* cargoConfigurationPath(configurationDirectory);
     if (path === undefined) return false;
     const source = yield* fileSystem
       .readText(path)
@@ -1024,7 +1033,7 @@ const configuredEnvironmentValue = (
   return selected;
 };
 
-export const cargoHomeBuildTargetConfigured = (
+export const cargoHomeConfigurationPresent = (
   executionDirectory: string,
   environment: Readonly<Record<string, string | undefined>>,
   caseInsensitiveEnvironmentNames: boolean,
@@ -1051,7 +1060,9 @@ export const cargoHomeBuildTargetConfigured = (
   const resolvedCargoHome = isAbsolutePath(cargoHome)
     ? normalizePath(cargoHome)
     : joinPath(executionDirectory, cargoHome);
-  return cargoConfigurationBuildTargetConfigured(resolvedCargoHome);
+  return cargoConfigurationPath(resolvedCargoHome).pipe(
+    Effect.map((path) => path !== undefined),
+  );
 };
 
 const stringArrayValue = (value: unknown): ReadonlyArray<string> =>

@@ -73,7 +73,7 @@ import {
   renderTaskOutputChunk,
 } from "../logging/events.js";
 import {
-  cargoHomeBuildTargetConfigured,
+  cargoHomeConfigurationPresent,
   discoverRepository,
   listRepositoryFiles,
   type RepositoryModel,
@@ -1498,7 +1498,7 @@ export const isTaskScopeCacheable = (
   environment: Readonly<Record<string, string | undefined>> = {},
   caseInsensitiveEnvironmentNames = false,
   sourceEnvironment: Readonly<Record<string, string | undefined>> = environment,
-  cargoHomeHasBuildTarget = false,
+  cargoHomeHasConfiguration = false,
 ): boolean =>
   (scope.kind === "cargo-workspace" ? scope.members : [node]).every(
     (member) =>
@@ -1522,7 +1522,7 @@ export const isTaskScopeCacheable = (
   !(
     node.package.manager === "cargo" &&
     node.task === "build" &&
-    cargoHomeHasBuildTarget
+    cargoHomeHasConfiguration
   );
 
 export const taskIdsWithUnrestorableCacheInputs = (
@@ -1624,9 +1624,9 @@ const executeTask = (
       scope.kind === "cargo-workspace"
         ? scope.directory
         : node.package.directory;
-    const cargoHomeHasBuildTarget =
+    const cargoHomeHasConfiguration =
       node.package.manager === "cargo" && node.task === "build"
-        ? yield* cargoHomeBuildTargetConfigured(
+        ? yield* cargoHomeConfigurationPresent(
             executionDirectory,
             executionEnvironment,
             platform === "win32",
@@ -1641,7 +1641,7 @@ const executeTask = (
         executionEnvironment,
         platform === "win32",
         sourceEnvironment,
-        cargoHomeHasBuildTarget,
+        cargoHomeHasConfiguration,
       );
     const localOptions = {
       directory: options.cacheDirectory,
@@ -1653,16 +1653,38 @@ const executeTask = (
       ".turbo",
       `turbo-${encodeTaskLogIdentifier(logIdentifier)}.log`,
     );
-    const pathsToClear =
+    const cacheRestoreRequested =
       cacheable &&
       !options.force &&
-      (options.cachePolicy.localRead || options.cachePolicy.remoteRead)
-        ? (yield* collectOutputPaths(
-            repository,
-            cacheNodes,
-            options.cacheExclusionDirectory,
-          )).map((path) => relativePath(repository.root, path))
-        : [];
+      (options.cachePolicy.localRead ||
+        (options.cachePolicy.remoteRead && options.remote !== undefined));
+    const existingOutputPaths = cacheRestoreRequested
+      ? yield* collectOutputPaths(
+          repository,
+          cacheNodes,
+          options.cacheExclusionDirectory,
+        ).pipe(
+          Effect.map((paths) =>
+            paths.map((path) => relativePath(repository.root, path)),
+          ),
+          Effect.catchTag("RepositoryError", (error) =>
+            terminal
+              .writeStderr(
+                renderLogEvent(
+                  {
+                    kind: "warning",
+                    message: `cache restore preparation failed for ${taskLabel}; executing task locally without cache reads: ${error.message}`,
+                  },
+                  warningColor,
+                ),
+              )
+              .pipe(Effect.ignore, Effect.as(undefined)),
+          ),
+        )
+      : [];
+    const cacheRestoreEnabled =
+      cacheRestoreRequested && existingOutputPaths !== undefined;
+    const pathsToClear = existingOutputPaths ?? [];
     const restoreScope = cacheRestoreScope(
       repository,
       cacheNodes,
@@ -1670,7 +1692,7 @@ const executeTask = (
       pathsToClear,
     );
     let cacheHit = false;
-    if (cacheable && !options.force && options.cachePolicy.localRead) {
+    if (cacheRestoreEnabled && options.cachePolicy.localRead) {
       cacheHit = yield* restoreLocalCache(
         repository.root,
         localOptions,
@@ -1694,8 +1716,7 @@ const executeTask = (
     }
     if (
       !cacheHit &&
-      cacheable &&
-      !options.force &&
+      cacheRestoreEnabled &&
       options.cachePolicy.remoteRead &&
       options.remote !== undefined
     ) {

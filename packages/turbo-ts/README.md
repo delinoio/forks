@@ -73,8 +73,9 @@ release, profile, target, another manifest or alternate artifact layout, or an
 unmodeled library, binary, example, test, or benchmark target execute without
 cache reads or writes until those outputs are modeled explicitly. Pass-through
 `--config` arguments and mismatched metadata/task `CARGO_TARGET_DIR` values also
-disable Cargo build caching, as does a build target in the effective Cargo-home
-configuration. Mixed library and binary crates default to uncached because
+disable Cargo build caching. Any effective Cargo-home configuration also
+disables build caching because those external controls are not task-hash
+inputs. Mixed library and binary crates default to uncached because
 binary-only output declarations cannot restore all of Cargo's default
 artifacts. Single-binary Cargo `run` and `dev` tasks also default to uncached
 unless task configuration explicitly enables caching. Repository-root Cargo
@@ -86,12 +87,14 @@ task.
 Local and remote cache restoration is limited to 256 MiB compressed and 1 GiB
 after decompression. Artifacts beyond either limit are rejected; invalid local
 entries are removed with a warning and become misses, while remote entries use
-the normal local-execution fallback. Decompressed archives are parsed from
-scoped temporary storage, and cache writes independently limit file content and
-tar metadata overhead to 64 MiB each. Cache publication is serialized within a
-run to bound writer memory independently of task concurrency. Remote downloads,
-signature verification, and decompression use scoped files so concurrent cache
-hits do not retain or duplicate complete compressed response bodies in memory.
+the normal local-execution fallback. Existing-output scan failures likewise
+warn and execute the task locally without cache reads. Decompressed archives
+are parsed from scoped temporary storage, and cache writes independently limit
+file content and tar metadata overhead to 64 MiB each. Cache publication is
+serialized within a run to bound writer memory independently of task
+concurrency. Remote downloads, signature verification, and decompression use
+scoped files so concurrent cache hits do not retain or duplicate complete
+compressed response bodies in memory.
 
 Configured cache directories may be inside or outside the repository, but the
 repository root and its ancestors are rejected because treating them as cache

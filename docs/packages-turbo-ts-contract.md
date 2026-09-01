@@ -110,16 +110,18 @@ task-aware selection is disabled, `global.inputs` as repository-global inputs.
 Task-input selection uses the same effective global and task inputs as hashing,
 evaluates task owners before Git-range package narrowing, applies negative Git
 ranges after positive task matches, and includes `with` companions. Owning
-lockfiles and Cargo control or toolchain files participate in both task-aware
-selection and hashing. A changed workspace gitlink path is treated as the
-package-relative `.` input. Task hashes preserve Git symlink, gitlink, and
-dependency semantics, exclude the resolved cache directory, and use each
-task's owning ecosystem lockfile. Regular input files are streamed through
-bounded-memory Git blob digests, and owning lockfiles are streamed through
-bounded-memory xxHash64 digests. NUL-delimited Git discovery output is consumed
-as bytes and filenames that are not valid UTF-8 fail affected selection and
-hashing instead of being silently omitted. Git-discovered POSIX filenames
-preserve literal backslashes as filename characters. Cargo
+manifests and package task configurations participate in task-aware selection
+independently of user input globs. Owning lockfiles and Cargo control or
+toolchain files participate in both task-aware selection and hashing. A changed
+workspace gitlink path is treated as the package-relative `.` input. Task
+hashes preserve Git symlink, gitlink, and dependency semantics, exclude the
+resolved cache directory, and use each task's owning ecosystem lockfile.
+Regular input files are streamed through bounded-memory Git blob digests, and
+owning lockfiles are streamed through bounded-memory xxHash64 digests.
+NUL-delimited Git discovery output is consumed as bytes and filenames that are
+not valid UTF-8 fail affected selection and hashing instead of being silently
+omitted. Git-discovered POSIX filenames preserve literal backslashes as
+filename characters. Cargo
 task hashes additionally include repository-contained
 ancestor manifests, Cargo configuration, and Rust toolchain files that can
 change task execution. Environment-name selection follows Windows
@@ -166,11 +168,13 @@ configurations without an API URL do not require a signing key. Every active
 signed remote requires a non-empty key, while the 32-character minimum applies
 only when `futureFlags.longerSignatureKey` is enabled. Local and remote
 restoration failures warn and fall back to task execution, except that a failed
-restoration rollback aborts execution. Local cache write and remote upload
+restoration rollback aborts execution. Failure to enumerate existing outputs
+while preparing restoration warns, disables local and remote reads for that
+task scope, and executes the task locally. Local cache write and remote upload
 failures warn without changing a successful task outcome, and a local failure
-does not suppress a configured remote upload. Local and remote cache
-restoration is limited to 256 MiB compressed and 1 GiB after decompression;
-preflight and upload response bodies have an independent 64 KiB limit.
+does not suppress a configured remote upload. Local and remote cache restoration
+is limited to 256 MiB compressed and 1 GiB after decompression; preflight and
+upload response bodies have an independent 64 KiB limit.
 Restored task logs replay through scoped, bounded text chunks with terminal
 backpressure instead of loading the complete log into another string. A task-log
 replay I/O failure warns without changing the successful cache-hit outcome.
@@ -229,7 +233,9 @@ extensions for paths beyond ustar limits. Tar header paths, link targets, and
 PAX metadata must be valid UTF-8; unsupported raw-byte names reject the
 artifact. Interrupted or failed atomic writes attempt to remove their temporary
 files. An atomic-write cleanup failure is surfaced as a local cache
-write failure, including when the write or rename also failed.
+write failure, including when the write or rename also failed. A cache
+writer-lock release failure is likewise surfaced and preserves any preceding
+write or eviction failure.
 Archives preserve empty declared output directories. Failed restoration removes
 every partially restored output before local execution, and rollback failure
 aborts execution instead of exposing partial cache state.
@@ -285,13 +291,13 @@ layout or manifest, or an unmodeled library, binary, example, test, or benchmark
 target bypass caching until those outputs are modeled explicitly. The
 additional-package selectors include `--workspace` and `--all`. Cargo build
 pass-through `--config` arguments also bypass caching because they can override
-the output layout. Cargo builds also bypass caching when an ancestor or
-effective Cargo-home configuration, or the effective task environment, sets a
-build target, or when Cargo metadata and strict task execution receive
-different `CARGO_TARGET_DIR` values. Cargo metadata discovery uses `--locked`,
-uses each response's
-workspace-member list, and does not probe excluded or unrelated nested
-manifests. Combined workspace task
+the output layout. Cargo builds also bypass caching when any effective
+Cargo-home configuration is present because those external controls are not
+hashed. Ancestor configuration or the effective task environment setting a
+build target, or different `CARGO_TARGET_DIR` values for Cargo metadata and
+strict task execution, likewise bypass caching. Cargo metadata discovery uses
+`--locked`, uses each response's workspace-member list, and does not probe
+excluded or unrelated nested manifests. Combined workspace task
 hashes are propagated into every downstream task hash.
 Cargo builds with colliding synthesized binary destinations bypass caching,
 including when task configuration explicitly enables it.
