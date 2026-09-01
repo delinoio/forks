@@ -693,6 +693,98 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
+  it("enforces the cache input cap when an output grows after metadata", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const outputPath = `${packageDirectory}/dist/growing.bin`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks["growing-cache"] = { outputs: ["dist/**"] };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts["growing-cache"] =
+        "node -e \"const fs=require('node:fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/growing.bin','small'); console.log('growing cache output')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const stdout: Array<string> = [];
+      const stderr: Array<string> = [];
+      let outputMetadataReads = 0;
+      let requestedOutputBytes = 0;
+      const exitCode = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const overrides = Layer.merge(
+            Layer.succeed(FileSystemService, {
+              ...fileSystem,
+              metadata: (path) =>
+                path !== outputPath
+                  ? fileSystem.metadata(path)
+                  : Effect.gen(function* () {
+                      const metadata = yield* fileSystem.metadata(path);
+                      outputMetadataReads += 1;
+                      if (outputMetadataReads === 2) {
+                        yield* Effect.promise(() =>
+                          truncate(
+                            outputPath,
+                            maximumCacheArchiveInputBytes + 1,
+                          ),
+                        );
+                      }
+                      return metadata;
+                    }),
+              readBytesRange: (path, offset, length) => {
+                if (path === outputPath) requestedOutputBytes = length;
+                return fileSystem.readBytesRange(path, offset, length);
+              },
+            }),
+            Layer.succeed(TerminalService, {
+              writeStdout: (text) =>
+                Effect.sync(() => {
+                  stdout.push(text);
+                }),
+              writeStderr: (text) =>
+                Effect.sync(() => {
+                  stderr.push(text);
+                }),
+              stdoutColorEnabled: Effect.succeed(false),
+              stderrColorEnabled: Effect.succeed(false),
+            }),
+          );
+          return yield* executeRun(
+            parseRunArguments([
+              "run",
+              "growing-cache",
+              "--cwd",
+              directory,
+              "--filter=synthetic-library",
+              "--cache=local:w",
+              "--no-color",
+            ]),
+          ).pipe(Effect.provide(overrides));
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(exitCode).toBe(0);
+      expect(stdout.join("")).toContain("growing cache output");
+      expect(stderr.join("")).toContain("cache write skipped");
+      expect(outputMetadataReads).toBe(2);
+      expect(requestedOutputBytes).toBeGreaterThan(0);
+      expect(requestedOutputBytes).toBeLessThanOrEqual(
+        maximumCacheArchiveInputBytes + 1,
+      );
+      await expect(readdir(`${directory}/.turbo/cache`)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
   it("serializes cache publication across concurrent task completions", async () => {
     let activePublications = 0;
     let maximumActivePublications = 0;

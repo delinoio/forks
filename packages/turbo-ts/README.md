@@ -83,13 +83,13 @@ Cargo builds that receive pass-through arguments selecting another package,
 release, profile, target, another manifest or alternate artifact layout, or an
 unmodeled library, binary, example, test, or benchmark target execute without
 cache reads or writes until those outputs are modeled explicitly. Pass-through
-`--config` arguments and mismatched metadata/task `CARGO_TARGET_DIR` values also
-disable Cargo build caching. Any effective Cargo-home configuration also
-disables cacheable Cargo compilation tasks because those external controls are
-not task-hash inputs. An effective `CARGO_BUILD_TARGET` likewise disables every
-cacheable Cargo compilation task. Mixed library and binary crates default to uncached
-because binary-only output declarations cannot restore all of Cargo's default
-artifacts. Source-free local path dependencies that do not resolve to a
+`--config` arguments disable every cacheable Cargo compilation task because
+external configuration paths are not task-hash inputs. Mismatched metadata/task
+`CARGO_TARGET_DIR` values also disable Cargo build caching. Any effective
+Cargo-home configuration or `CARGO_BUILD_TARGET` likewise disables every
+cacheable Cargo compilation task. Mixed library and binary crates default to
+uncached because binary-only output declarations cannot restore all of Cargo's
+default artifacts. Source-free local path dependencies that do not resolve to a
 same-workspace repository package also disable caching. Synthesized binary
 outputs cover the extensionless executable plus `.exe` and `.pdb` variants.
 Single-binary Cargo `run` and `dev` tasks also default to uncached
@@ -105,14 +105,18 @@ entries are removed with a warning and become misses, while remote entries use
 the normal local-execution fallback. Existing-output scan failures likewise
 warn and execute the task locally without cache reads. Decompressed archives
 are parsed from scoped temporary storage, and cache writes independently limit
-file content and tar metadata overhead to 64 MiB each. Cache publication is
+file content and tar metadata overhead to 64 MiB each. Cache output files are
+read sequentially against the remaining content budget, so growth after a
+metadata snapshot cannot exceed the collection bound. Cache publication is
 serialized within a run to bound writer memory independently of task
 concurrency. Remote downloads, signature verification, and decompression use
 scoped files so concurrent cache hits do not retain or duplicate complete
-compressed response bodies in memory. Local execution rejects symlinked task-log
-directories and exact log destinations before starting the task, and replaces
-existing regular log files before writing so hard links cannot redirect
-truncation.
+compressed response bodies in memory. Local execution rejects symlinked
+task-log directories and exact log destinations before starting the task, and
+replaces existing regular log files before writing so hard links cannot
+redirect truncation. On Windows, scoped process tracking retains descendant
+identities after command wrappers exit so finalization can terminate detached
+task processes.
 
 Configured cache directories may be inside or outside the repository, but the
 repository root, its ancestors, and directories containing discovered packages

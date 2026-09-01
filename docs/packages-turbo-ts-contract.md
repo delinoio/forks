@@ -167,8 +167,9 @@ Persistent task scopes always bypass local and remote caching, regardless of
 their configured cache value.
 On Windows, npm, pnpm, and Yarn task commands use their standard command shims
 through a narrowly escaped command-interpreter adapter; POSIX task execution
-does not use a shell. Scope finalization terminates the Windows wrapper and its
-descendant process tree.
+does not use a shell. A scoped Windows process-event tracker retains descendant
+identity after wrappers exit, and scope finalization terminates every remaining
+tracked process in the task tree.
 
 Workspace task overrides merge with their effective package-qualified root
 definition and the merged task invariants are revalidated before execution.
@@ -232,8 +233,11 @@ with non-restorable symlink targets are skipped. Restoration rejects duplicate
 comparable destinations before clearing outputs, including paths that differ
 only by case on case-insensitive target filesystems.
 Every archive must contain exactly one regular task-log entry. Cache writes
-whose aggregate uncompressed file content exceeds 64 MiB are skipped before
-contents are read, with a warning that preserves the successful task result.
+whose metadata reports more than 64 MiB of aggregate uncompressed file content
+are skipped before contents are read. Sequential bounded reads enforce the
+remaining aggregate budget when an output grows after metadata collection; an
+over-limit read skips publication with a warning that preserves the successful
+task result.
 Output collection and cache publication are serialized within a run so
 concurrent task completion cannot multiply the archive writer's bounded memory
 footprint.
@@ -320,14 +324,14 @@ pass-through arguments that select an additional package, an alternate output
 layout or manifest, or an unmodeled library, binary, example, test, or benchmark
 target bypass caching until those outputs are modeled explicitly. The
 additional-package selectors include `--workspace` and `--all`. Cargo build
-pass-through `--config` arguments also bypass caching because they can override
-the output layout. Cacheable Cargo compilation tasks (`build`, `check`, `test`,
-`lint`, `run`, and `dev`) bypass caching when any effective Cargo-home
-configuration is present because those external controls are not hashed. The
-same compilation-task set bypasses caching when the effective task environment
-sets a build target. Ancestor configuration setting a build target, or
-different `CARGO_TARGET_DIR` values for Cargo metadata and strict task
-execution, likewise bypass caching. Cargo metadata discovery uses
+pass-through `--config` arguments also bypass caching for every cacheable Cargo
+compilation task (`build`, `check`, `test`, `lint`, `run`, and `dev`) because
+they can load or set external compilation controls that are not hashed. The
+same compilation-task set bypasses caching when any effective Cargo-home
+configuration is present or when the effective task environment sets a build
+target. Ancestor configuration setting a build target, or different
+`CARGO_TARGET_DIR` values for Cargo metadata and strict task execution,
+likewise bypass caching. Cargo metadata discovery uses
 `--locked`, uses each response's workspace-member list, and does not probe
 excluded or unrelated nested manifests. Combined workspace task
 hashes are propagated into every downstream task hash.

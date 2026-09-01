@@ -1191,7 +1191,7 @@ const collectCacheEntries = (
         ),
       { concurrency: 8 },
     );
-    const inputBytes = selectedMetadata.reduce(
+    const metadataInputBytes = selectedMetadata.reduce(
       (total, { metadata }) =>
         total +
         (metadata.kind === "directory" || metadata.kind === "symlink"
@@ -1199,49 +1199,51 @@ const collectCacheEntries = (
           : metadata.size),
       0,
     );
-    if (inputBytes > maximumCacheArchiveInputBytes) {
-      return { kind: "too-large", inputBytes } as const;
+    if (metadataInputBytes > maximumCacheArchiveInputBytes) {
+      return { kind: "too-large", inputBytes: metadataInputBytes } as const;
     }
-    const entries = yield* Effect.forEach(
-      selectedMetadata,
-      ({ path, metadata }) =>
-        Effect.gen(function* () {
-          const common = {
-            path: relativePath(repository.root, path),
-            mode: metadata.mode,
-            modifiedSeconds: metadata.modifiedMilliseconds / 1_000,
-          };
-          if (metadata.kind === "directory") {
-            return { ...common, kind: "directory" as const };
-          }
-          if (metadata.kind === "symlink") {
-            const linkTarget = yield* fileSystem
-              .readLink(path)
-              .pipe(
-                Effect.mapError(
-                  (error) =>
-                    new RepositoryError({ path, message: error.message }),
-                ),
-              );
-            return {
-              ...common,
-              kind: "symlink" as const,
-              linkTarget,
-              contents: new Uint8Array(),
-            };
-          }
-          const contents = yield* fileSystem
-            .readBytes(path)
-            .pipe(
-              Effect.mapError(
-                (error) =>
-                  new RepositoryError({ path, message: error.message }),
-              ),
-            );
-          return { ...common, contents };
-        }),
-      { concurrency: 8 },
-    );
+    const entries: Array<CacheWriteEntry> = [];
+    let inputBytes = 0;
+    for (const { path, metadata } of selectedMetadata) {
+      const common = {
+        path: relativePath(repository.root, path),
+        mode: metadata.mode,
+        modifiedSeconds: metadata.modifiedMilliseconds / 1_000,
+      };
+      if (metadata.kind === "directory") {
+        entries.push({ ...common, kind: "directory" });
+        continue;
+      }
+      if (metadata.kind === "symlink") {
+        const linkTarget = yield* fileSystem
+          .readLink(path)
+          .pipe(
+            Effect.mapError(
+              (error) => new RepositoryError({ path, message: error.message }),
+            ),
+          );
+        entries.push({
+          ...common,
+          kind: "symlink",
+          linkTarget,
+          contents: new Uint8Array(),
+        });
+        continue;
+      }
+      const remainingBytes = maximumCacheArchiveInputBytes - inputBytes;
+      const contents = yield* fileSystem
+        .readBytesRange(path, 0, remainingBytes + 1)
+        .pipe(
+          Effect.mapError(
+            (error) => new RepositoryError({ path, message: error.message }),
+          ),
+        );
+      inputBytes += contents.length;
+      if (inputBytes > maximumCacheArchiveInputBytes) {
+        return { kind: "too-large", inputBytes } as const;
+      }
+      entries.push({ ...common, contents });
+    }
     yield* validateArchiveEntriesForRestore(
       repository.root,
       entries,
@@ -1373,8 +1375,6 @@ const usesAlternateCargoBuildOutputs = (
       argument === "--release" ||
       argument === "-r" ||
       argument.startsWith("-p") ||
-      argument === "--config" ||
-      argument.startsWith("--config=") ||
       [...cargoAlternateOutputFlags, ...cargoUnmodeledTargetFlags].some(
         (flag) => argument === flag || argument.startsWith(`${flag}=`),
       ),
@@ -1525,6 +1525,15 @@ const isCargoCompilationTask = (node: TaskNode): boolean =>
   node.package.manager === "cargo" &&
   cargoCompilationTasks.has(node.task as CargoCompilationTaskName);
 
+const usesCargoConfigurationOverride = (
+  node: TaskNode,
+  passThroughArguments: ReadonlyArray<string>,
+): boolean =>
+  isCargoCompilationTask(node) &&
+  passThroughArguments.some(
+    (argument) => argument === "--config" || argument.startsWith("--config="),
+  );
+
 export const isTaskScopeCacheable = (
   node: TaskNode,
   passThroughArguments: ReadonlyArray<string>,
@@ -1542,6 +1551,7 @@ export const isTaskScopeCacheable = (
       member.definition.persistent !== true,
   ) &&
   !usesAlternateCargoBuildOutputs(node, passThroughArguments) &&
+  !usesCargoConfigurationOverride(node, passThroughArguments) &&
   !usesAlternateUvBuildOutputs(node, passThroughArguments) &&
   !(
     isCargoCompilationTask(node) &&

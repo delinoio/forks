@@ -1021,6 +1021,17 @@ describe("core repository model", () => {
         command: `cargo ${task}`,
       };
       expect(
+        isTaskScopeCacheable(compilationNode, [
+          "--config",
+          "../external-cargo.toml",
+        ]),
+      ).toBe(false);
+      expect(
+        isTaskScopeCacheable(compilationNode, [
+          "--config=../external-cargo.toml",
+        ]),
+      ).toBe(false);
+      expect(
         isTaskScopeCacheable(
           compilationNode,
           [],

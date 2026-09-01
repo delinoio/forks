@@ -15,6 +15,7 @@ import {
   makeChildEnvironment,
   makeTerminalOperations,
   makeTerminalWriter,
+  makeWindowsProcessTreeState,
   makeWithTemporaryDirectory,
   nodeFoundationLayer,
   resolveSpawnInvocation,
@@ -492,6 +493,20 @@ describe("Effect foundation", () => {
     });
   });
 
+  it("retains live Windows descendants after parent exit without PID reuse", () => {
+    const state = makeWindowsProcessTreeState();
+    state.recordStart(102, 101);
+    state.registerRoot(100);
+    state.recordStart(101, 100);
+    state.recordStop(100);
+    state.recordStop(101);
+    expect(state.liveDescendantProcessIds()).toEqual([102]);
+
+    state.recordStop(102);
+    state.recordStart(102, 999);
+    expect(state.liveDescendantProcessIds()).toEqual([]);
+  });
+
   it("reports synchronous spawn failures as typed errors", async () => {
     const command = `${process.execPath}\u0000`;
     const outcome = await Effect.runPromise(
@@ -624,26 +639,27 @@ describe("Effect foundation", () => {
       );
       await writeFile(
         parentPath,
-        'const { spawn } = require("node:child_process"); spawn(process.execPath, [process.argv[2], process.argv[3], process.argv[4]], { stdio: "inherit" }); setInterval(() => {}, 1_000);\n',
+        'const { spawn } = require("node:child_process"); const fs = require("node:fs"); const worker = spawn(process.execPath, [process.argv[2], process.argv[3], process.argv[4]], { detached: true, stdio: "ignore" }); worker.unref(); const deadline = Date.now() + 2_000; while (!fs.existsSync(process.argv[3]) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); if (!fs.existsSync(process.argv[3])) process.exitCode = 1;\n',
       );
       await writeFile(
         shimPath,
         `@echo off\r\n"${process.execPath}" "${parentPath}" "${workerPath}" "${workerPidPath}" "${heartbeatPath}"\r\n`,
       );
-      const execution = Effect.scoped(
-        Effect.gen(function* () {
-          const processService = yield* ProcessService;
-          return yield* processService.run({
-            command: shimPath,
-            args: [],
-            cwd: directory,
-          });
-        }),
-      ).pipe(Effect.provide(nodeFoundationLayer));
-      const fiber = Effect.runFork(execution);
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            return yield* processService.run({
+              command: shimPath,
+              args: [],
+              cwd: directory,
+            });
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(result.exitCode).toBe(0);
       workerPid = Number(await waitForTextFile(workerPidPath));
       await waitForTextFile(heartbeatPath);
-      await Effect.runPromise(Fiber.interrupt(fiber));
       const heartbeat = await readFile(heartbeatPath, "utf8");
       await delay(100);
       expect(await readFile(heartbeatPath, "utf8")).toBe(heartbeat);

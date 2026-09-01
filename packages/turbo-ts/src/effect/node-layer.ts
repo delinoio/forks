@@ -167,6 +167,7 @@ interface ScopedChildProcess {
   readonly closed: Promise<void>;
   readonly isClosed: () => boolean;
   readonly processGroupId: number | undefined;
+  readonly windowsProcessTracker: WindowsProcessTracker | undefined;
   readonly capturesOutput: boolean;
 }
 
@@ -277,6 +278,288 @@ export const windowsProcessTreeTerminationInvocation = (
   args: ["/pid", String(processId), "/t", "/f"],
 });
 
+interface WindowsProcessRecord {
+  readonly generation: number;
+  readonly processId: number;
+  readonly parentProcessId: number | undefined;
+  parentGeneration: number | undefined;
+  live: boolean;
+  tracked: boolean;
+}
+
+export interface WindowsProcessTreeState {
+  readonly registerRoot: (processId: number) => void;
+  readonly recordStart: (processId: number, parentProcessId: number) => void;
+  readonly recordStop: (processId: number) => void;
+  readonly liveDescendantProcessIds: () => ReadonlyArray<number>;
+}
+
+export const makeWindowsProcessTreeState = (): WindowsProcessTreeState => {
+  let nextGeneration = 1;
+  let rootGeneration: number | undefined;
+  const records = new Map<number, WindowsProcessRecord>();
+  const latestGenerationByProcessId = new Map<number, number>();
+  const pendingChildrenByParentProcessId = new Map<number, Set<number>>();
+
+  const propagateTracked = (generation: number): void => {
+    const pending = [...records.values()].filter(
+      (record) => record.parentGeneration === generation,
+    );
+    for (const child of pending) {
+      if (!child.tracked) {
+        child.tracked = true;
+        propagateTracked(child.generation);
+      }
+    }
+  };
+
+  const attachPendingChildren = (record: WindowsProcessRecord): void => {
+    const pending = pendingChildrenByParentProcessId.get(record.processId);
+    if (pending === undefined) return;
+    pendingChildrenByParentProcessId.delete(record.processId);
+    for (const childGeneration of pending) {
+      const child = records.get(childGeneration);
+      if (child === undefined || !child.live) continue;
+      child.parentGeneration = record.generation;
+      if (record.tracked) {
+        child.tracked = true;
+        propagateTracked(child.generation);
+      }
+    }
+  };
+
+  const recordStart = (
+    processId: number,
+    parentProcessId: number,
+  ): WindowsProcessRecord => {
+    const currentGeneration = latestGenerationByProcessId.get(processId);
+    const current =
+      currentGeneration === undefined
+        ? undefined
+        : records.get(currentGeneration);
+    if (current?.live === true) {
+      return current;
+    }
+    const parentGeneration = latestGenerationByProcessId.get(parentProcessId);
+    const parent =
+      parentGeneration === undefined
+        ? undefined
+        : records.get(parentGeneration);
+    const record: WindowsProcessRecord = {
+      generation: nextGeneration,
+      processId,
+      parentProcessId,
+      parentGeneration: parent?.live === true ? parent.generation : undefined,
+      live: true,
+      tracked: parent?.live === true && parent.tracked,
+    };
+    nextGeneration += 1;
+    records.set(record.generation, record);
+    latestGenerationByProcessId.set(processId, record.generation);
+    if (record.parentGeneration === undefined) {
+      const pending =
+        pendingChildrenByParentProcessId.get(parentProcessId) ?? new Set();
+      pending.add(record.generation);
+      pendingChildrenByParentProcessId.set(parentProcessId, pending);
+    }
+    attachPendingChildren(record);
+    return record;
+  };
+
+  return {
+    registerRoot: (processId) => {
+      const currentGeneration = latestGenerationByProcessId.get(processId);
+      const current =
+        currentGeneration === undefined
+          ? undefined
+          : records.get(currentGeneration);
+      const root =
+        current?.live === true ? current : recordStart(processId, process.ppid);
+      root.tracked = true;
+      rootGeneration = root.generation;
+      propagateTracked(root.generation);
+    },
+    recordStart: (processId, parentProcessId) => {
+      recordStart(processId, parentProcessId);
+    },
+    recordStop: (processId) => {
+      const generation = latestGenerationByProcessId.get(processId);
+      const record =
+        generation === undefined ? undefined : records.get(generation);
+      if (record !== undefined) record.live = false;
+    },
+    liveDescendantProcessIds: () =>
+      [...records.values()]
+        .filter(
+          (record) =>
+            record.live &&
+            record.tracked &&
+            record.generation !== rootGeneration,
+        )
+        .sort((left, right) => right.generation - left.generation)
+        .map((record) => record.processId),
+  };
+};
+
+interface WindowsProcessTracker {
+  readonly state: WindowsProcessTreeState;
+  readonly failed: () => boolean;
+  readonly waitForActivityToSettle: (
+    minimumMilliseconds: number,
+    maximumMilliseconds: number,
+  ) => Promise<void>;
+  readonly close: () => Promise<void>;
+}
+
+const windowsProcessTrackerStartupTimeoutMilliseconds = 5_000;
+const windowsProcessTrackerQuietMilliseconds = 50;
+const windowsProcessTrackerInitialDrainMilliseconds = 250;
+
+// Node does not expose Windows job objects. Keep a scoped process-event
+// subscriber alive before task spawn so descendants remain identifiable after
+// their wrapper exits. This can be removed when Node exposes equivalent
+// process-tree ownership without a native runtime dependency.
+const windowsProcessTrackerScript = [
+  "$ErrorActionPreference = 'Stop'",
+  "$start = Register-CimIndicationEvent -ClassName Win32_ProcessStartTrace -SourceIdentifier turboTsProcessStart",
+  "$stop = Register-CimIndicationEvent -ClassName Win32_ProcessStopTrace -SourceIdentifier turboTsProcessStop",
+  "[Console]::Out.WriteLine('READY')",
+  "while ($true) {",
+  "  $event = Wait-Event",
+  "  $value = $event.SourceEventArgs.NewEvent",
+  "  if ($event.SourceIdentifier -eq 'turboTsProcessStart') {",
+  "    [Console]::Out.WriteLine(('S`t{0}`t{1}' -f $value.ProcessID, $value.ParentProcessID))",
+  "  } elseif ($event.SourceIdentifier -eq 'turboTsProcessStop') {",
+  "    [Console]::Out.WriteLine(('X`t{0}' -f $value.ProcessID))",
+  "  }",
+  "  Remove-Event -EventIdentifier $event.EventIdentifier",
+  "}",
+].join("\n");
+
+const startWindowsProcessTracker = (): Promise<WindowsProcessTracker> =>
+  new Promise((resolve, reject) => {
+    const state = makeWindowsProcessTreeState();
+    let output = "";
+    let ready = false;
+    let closed = false;
+    let failed = false;
+    let activity = 0;
+    let settled = false;
+    let tracker: ChildProcess;
+    try {
+      tracker = spawn(
+        "powershell.exe",
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          windowsProcessTrackerScript,
+        ],
+        {
+          shell: false,
+          stdio: ["ignore", "pipe", "ignore"],
+          windowsHide: true,
+        },
+      );
+    } catch (cause) {
+      reject(cause);
+      return;
+    }
+    const startupTimeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      tracker.kill();
+      reject(new Error("Windows process tracker did not become ready"));
+    }, windowsProcessTrackerStartupTimeoutMilliseconds);
+    const closePromise = new Promise<void>((closeResolve) => {
+      tracker.once("close", () => {
+        closed = true;
+        failed = ready;
+        closeResolve();
+        if (!settled) {
+          settled = true;
+          clearTimeout(startupTimeout);
+          reject(new Error("Windows process tracker exited before startup"));
+        }
+      });
+    });
+    tracker.once("error", (cause) => {
+      failed = true;
+      if (!settled) {
+        settled = true;
+        clearTimeout(startupTimeout);
+        reject(cause);
+      }
+    });
+    const processLine = (line: string): void => {
+      if (line === "READY") {
+        ready = true;
+        if (!settled) {
+          settled = true;
+          clearTimeout(startupTimeout);
+          resolve({
+            state,
+            failed: () => failed,
+            waitForActivityToSettle: async (
+              minimumMilliseconds,
+              maximumMilliseconds,
+            ) => {
+              const started = Date.now();
+              let observedActivity = activity;
+              let quietSince = started;
+              while (Date.now() - started < maximumMilliseconds) {
+                await new Promise((settleActivity) =>
+                  setTimeout(settleActivity, 10),
+                );
+                if (activity !== observedActivity) {
+                  observedActivity = activity;
+                  quietSince = Date.now();
+                }
+                if (
+                  Date.now() - started >= minimumMilliseconds &&
+                  Date.now() - quietSince >=
+                    windowsProcessTrackerQuietMilliseconds
+                ) {
+                  return;
+                }
+              }
+            },
+            close: async () => {
+              if (!closed) tracker.kill();
+              await closePromise;
+            },
+          });
+        }
+        return;
+      }
+      const [kind, processIdText, parentProcessIdText] = line.split("\t");
+      const processId = Number(processIdText);
+      if (!Number.isSafeInteger(processId) || processId <= 0) return;
+      if (kind === "S") {
+        const parentProcessId = Number(parentProcessIdText);
+        if (!Number.isSafeInteger(parentProcessId) || parentProcessId < 0) {
+          return;
+        }
+        state.recordStart(processId, parentProcessId);
+        activity += 1;
+      } else if (kind === "X") {
+        state.recordStop(processId);
+        activity += 1;
+      }
+    };
+    tracker.stdout!.on("data", (chunk: Buffer | string) => {
+      output += String(chunk);
+      let lineBreak = output.indexOf("\n");
+      while (lineBreak !== -1) {
+        const line = output.slice(0, lineBreak).replace(/\r$/, "");
+        output = output.slice(lineBreak + 1);
+        processLine(line);
+        lineBreak = output.indexOf("\n");
+      }
+    });
+  });
+
 const isChildRunning = (child: ChildProcess): boolean =>
   child.exitCode === null && child.signalCode === null;
 
@@ -378,6 +661,7 @@ const terminateChild = ({
   closed,
   isClosed,
   processGroupId,
+  windowsProcessTracker,
   capturesOutput,
 }: ScopedChildProcess): Effect.Effect<void> =>
   Effect.promise(async () => {
@@ -386,6 +670,7 @@ const terminateChild = ({
       closed,
       isClosed,
       processGroupId,
+      windowsProcessTracker,
       capturesOutput,
     };
     let windowsTreeCleanupFailed = false;
@@ -398,22 +683,47 @@ const terminateChild = ({
       if (!groupClosedGracefully) {
         signalChildProcess(scopedChild, "SIGKILL");
       }
-    } else if (!isClosed()) {
-      if (process.platform === "win32") {
-        const treeTerminated =
-          child.pid !== undefined &&
-          (await terminateWindowsProcessTree(child.pid));
-        windowsTreeCleanupFailed = !treeTerminated && !isClosed();
-      }
-      if (!isClosed()) {
-        signalChildProcess(scopedChild, "SIGTERM");
-        const closedGracefully = await waitForCloseUntil(
-          closed,
+    } else if (windowsProcessTracker !== undefined) {
+      try {
+        await windowsProcessTracker.waitForActivityToSettle(
+          windowsProcessTrackerInitialDrainMilliseconds,
           gracefulTerminationTimeoutMilliseconds,
         );
-        if (!closedGracefully && !isClosed()) {
-          signalChildProcess(scopedChild, "SIGKILL");
+        const processIds = [
+          ...(!isClosed() && child.pid !== undefined ? [child.pid] : []),
+          ...windowsProcessTracker.state.liveDescendantProcessIds(),
+        ];
+        for (const processId of new Set(processIds)) {
+          await terminateWindowsProcessTree(processId);
         }
+        if (!isClosed()) {
+          signalChildProcess(scopedChild, "SIGTERM");
+          const closedGracefully = await waitForCloseUntil(
+            closed,
+            gracefulTerminationTimeoutMilliseconds,
+          );
+          if (!closedGracefully && !isClosed()) {
+            signalChildProcess(scopedChild, "SIGKILL");
+          }
+        }
+        await windowsProcessTracker.waitForActivityToSettle(
+          0,
+          windowsProcessTrackerQuietMilliseconds * 2,
+        );
+        windowsTreeCleanupFailed ||=
+          windowsProcessTracker.failed() ||
+          windowsProcessTracker.state.liveDescendantProcessIds().length > 0;
+      } finally {
+        await windowsProcessTracker.close();
+      }
+    } else if (!isClosed()) {
+      signalChildProcess(scopedChild, "SIGTERM");
+      const closedGracefully = await waitForCloseUntil(
+        closed,
+        gracefulTerminationTimeoutMilliseconds,
+      );
+      if (!closedGracefully && !isClosed()) {
+        signalChildProcess(scopedChild, "SIGKILL");
       }
     }
     await closed;
@@ -896,27 +1206,43 @@ const acquireChildProcess = (
   request: ExecutionRequest | BinaryExecutionRequest,
   capturesOutput: boolean,
 ): Effect.Effect<ScopedChildProcess, ProcessExecutionError> =>
-  Effect.try({
-    try: () => {
+  Effect.tryPromise({
+    try: async () => {
       const ownsProcessGroup = process.platform !== "win32";
+      const windowsProcessTracker = ownsProcessGroup
+        ? undefined
+        : await startWindowsProcessTracker();
       const invocation = resolveSpawnInvocation(
         request.command,
         request.args,
         process.platform,
         configuredWindowsCommandInterpreter(),
       );
-      const child = spawn(invocation.command, [...invocation.args], {
-        cwd: request.cwd,
-        detached: ownsProcessGroup,
-        env: makeChildEnvironment(
-          request.inheritEnvironment === false ? {} : process.env,
-          request.env,
-          process.platform,
-        ),
-        shell: false,
-        stdio: capturesOutput ? "pipe" : "inherit",
-        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-      });
+      let child: ChildProcess;
+      try {
+        child = spawn(invocation.command, [...invocation.args], {
+          cwd: request.cwd,
+          detached: ownsProcessGroup,
+          env: makeChildEnvironment(
+            request.inheritEnvironment === false ? {} : process.env,
+            request.env,
+            process.platform,
+          ),
+          shell: false,
+          stdio: capturesOutput ? "pipe" : "inherit",
+          windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+        });
+      } catch (cause) {
+        await windowsProcessTracker?.close();
+        throw cause;
+      }
+      if (windowsProcessTracker !== undefined) {
+        if (child.pid === undefined) {
+          await windowsProcessTracker.close();
+          throw new Error("Windows task process has no process identifier");
+        }
+        windowsProcessTracker.state.registerRoot(child.pid);
+      }
       let childClosed = false;
       const closed = new Promise<void>((resolve) => {
         child.once("close", () => {
@@ -929,6 +1255,7 @@ const acquireChildProcess = (
         closed,
         isClosed: () => childClosed,
         processGroupId: ownsProcessGroup ? child.pid : undefined,
+        windowsProcessTracker,
         capturesOutput,
       };
     },
