@@ -329,6 +329,8 @@ export const createTarArchive = (
   return archive;
 };
 
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+
 const readText = (
   source: Uint8Array,
   offset: number,
@@ -336,7 +338,7 @@ const readText = (
 ): string => {
   const field = source.subarray(offset, offset + length);
   const end = field.indexOf(0);
-  return new TextDecoder().decode(end === -1 ? field : field.subarray(0, end));
+  return utf8Decoder.decode(end === -1 ? field : field.subarray(0, end));
 };
 
 const readOctal = (
@@ -359,7 +361,6 @@ export interface PaxValues {
 
 export const parsePaxContents = (contents: Uint8Array): PaxValues => {
   const values: { path?: string; linkpath?: string } = {};
-  const decoder = new TextDecoder("utf-8", { fatal: true });
   let offset = 0;
   while (offset < contents.length) {
     let separator = offset;
@@ -369,7 +370,7 @@ export const parsePaxContents = (contents: Uint8Array): PaxValues => {
     if (separator === offset || separator >= contents.length) {
       throw new TypeError("invalid PAX record length");
     }
-    const lengthText = decoder.decode(contents.subarray(offset, separator));
+    const lengthText = utf8Decoder.decode(contents.subarray(offset, separator));
     if (!/^\d+$/.test(lengthText)) {
       throw new TypeError("invalid PAX record length");
     }
@@ -386,8 +387,8 @@ export const parsePaxContents = (contents: Uint8Array): PaxValues => {
     const body = contents.subarray(separator + 1, end - 1);
     const equals = body.indexOf(0x3d);
     if (equals <= 0) throw new TypeError("invalid PAX record");
-    const key = decoder.decode(body.subarray(0, equals));
-    const value = decoder.decode(body.subarray(equals + 1));
+    const key = utf8Decoder.decode(body.subarray(0, equals));
+    const value = utf8Decoder.decode(body.subarray(equals + 1));
     if (key === "path" || key === "linkpath") values[key] = value;
     offset = end;
   }

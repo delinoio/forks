@@ -99,7 +99,8 @@ explicit `with` reference must resolve to an existing package task before its
 owner can execute. Requested task names are validated after ordinary package
 filters but before Git-range and affected filters are applied, so a valid task
 with no affected packages is a successful no-op. An explicit `--cwd` must exist
-and resolve to a directory before nested repository discovery begins.
+and resolve to a directory before nested repository discovery begins from its
+canonical target, including when the requested path is a symlink.
 Task-aware Git selectors retain union semantics with positive package
 selectors; negative Git selectors are applied after that union.
 Package-level affected selection treats legacy `globalDependencies` and, when
@@ -154,7 +155,9 @@ reject malformed entries. Remote artifact routes preserve configured API path
 prefixes. Active remote URLs must use HTTP or HTTPS, and URLs and timeout values
 are validated before cache or task work begins. Signature-key requirements
 apply only when a remote transport is active; disabled remotes and
-configurations without an API URL do not require a signing key. Local and remote
+configurations without an API URL do not require a signing key. Every active
+signed remote requires a non-empty key, while the 32-character minimum applies
+only when `futureFlags.longerSignatureKey` is enabled. Local and remote
 restoration failures warn and fall back to task execution, except that a failed
 restoration rollback aborts execution. Local cache write and remote upload
 failures warn without changing a successful task outcome, and a local failure
@@ -163,7 +166,8 @@ restoration is limited to 256 MiB compressed and 1 GiB after decompression;
 preflight and upload response bodies have an independent 64 KiB limit.
 Restored task logs replay through scoped, bounded text chunks with terminal
 backpressure instead of loading the complete log into another string.
-Local and remote archives are decompressed into scoped temporary storage and
+Local cache artifacts are streamed from their compressed files into scoped
+temporary storage. Local and remote archives are decompressed there, and
 regular-file payloads are restored through bounded range copies instead of
 materializing the complete decompressed archive in memory. PAX metadata is
 limited to 64 KiB per extended header, and cumulative tar headers, padding, and
@@ -203,9 +207,10 @@ accepts week-based ages, runs before cache restoration only when local cache
 reads or writes are enabled, and counts archive and sidecar bytes, including
 orphaned sidecars. Startup eviction failures warn and continue without making
 cache maintenance a prerequisite for task execution. Cache archives use PAX
-extensions for paths beyond ustar
-limits, and interrupted or failed atomic writes attempt to remove their
-temporary files. An atomic-write cleanup failure is surfaced as a local cache
+extensions for paths beyond ustar limits. Tar header paths, link targets, and
+PAX metadata must be valid UTF-8; unsupported raw-byte names reject the
+artifact. Interrupted or failed atomic writes attempt to remove their temporary
+files. An atomic-write cleanup failure is surfaced as a local cache
 write failure, including when the write or rename also failed.
 Archives preserve empty declared output directories. Failed restoration removes
 every partially restored output before local execution, and rollback failure

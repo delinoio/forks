@@ -368,16 +368,24 @@ const resolveOptions = (
     if (apiUrl === undefined || remoteConfiguration?.enabled === false) {
       return undefined;
     }
-    if (
-      value.futureFlags?.longerSignatureKey === true &&
-      remoteConfiguration?.signature === true &&
-      (signatureKey?.length ?? 0) < 32
-    ) {
-      throw new ConfigurationError({
-        path: configuration.path,
-        message:
-          "TURBO_REMOTE_CACHE_SIGNATURE_KEY must contain at least 32 characters",
-      });
+    if (remoteConfiguration?.signature === true) {
+      if (signatureKey === undefined || signatureKey.length === 0) {
+        throw new ConfigurationError({
+          path: configuration.path,
+          message:
+            "TURBO_REMOTE_CACHE_SIGNATURE_KEY is required when remote cache signatures are enabled",
+        });
+      }
+      if (
+        value.futureFlags?.longerSignatureKey === true &&
+        signatureKey.length < 32
+      ) {
+        throw new ConfigurationError({
+          path: configuration.path,
+          message:
+            "TURBO_REMOTE_CACHE_SIGNATURE_KEY must contain at least 32 characters",
+        });
+      }
     }
     const apiUrlPath =
       parsed.apiUrl !== undefined
@@ -2198,6 +2206,7 @@ export const executeRun = (
         : isAbsolutePath(parsed.cwd)
           ? parsed.cwd
           : joinPath(processCwd, parsed.cwd);
+    let resolvedRequestedRoot: string | undefined;
     if (requestedRoot !== undefined) {
       const exists = yield* fileSystem.exists(requestedRoot).pipe(
         Effect.mapError(
@@ -2216,17 +2225,15 @@ export const executeRun = (
           }),
         );
       }
-      const resolvedRequestedRoot = yield* fileSystem
-        .realPath(requestedRoot)
-        .pipe(
-          Effect.mapError(
-            (error) =>
-              new ConfigurationError({
-                path: requestedRoot,
-                message: error.message,
-              }),
-          ),
-        );
+      resolvedRequestedRoot = yield* fileSystem.realPath(requestedRoot).pipe(
+        Effect.mapError(
+          (error) =>
+            new ConfigurationError({
+              path: requestedRoot,
+              message: error.message,
+            }),
+        ),
+      );
       const metadata = yield* fileSystem.metadata(resolvedRequestedRoot).pipe(
         Effect.mapError(
           (error) =>
@@ -2246,7 +2253,7 @@ export const executeRun = (
       }
     }
     const preliminaryRoot = yield* discoverRepositoryRoot(
-      requestedRoot ?? processCwd,
+      resolvedRequestedRoot ?? processCwd,
     );
     const configuration = yield* loadRootConfiguration(
       preliminaryRoot,

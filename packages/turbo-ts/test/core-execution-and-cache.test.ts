@@ -192,6 +192,34 @@ describe("core CLI execution", () => {
     }
   });
 
+  it("discovers the owning repository from a symlinked working directory", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const linkedPackage = `${directory}-library-link`;
+    try {
+      await symlink(`${directory}/packages/library`, linkedPackage);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          linkedPackage,
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode, result.combinedOutput).toBe(0);
+      expect(result.stdout.indexOf("library build")).toBeLessThan(
+        result.stdout.indexOf("app build"),
+      );
+    } finally {
+      await rm(linkedPackage, { force: true });
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("streams ordinary task output to logs with bounded diagnostics", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;
@@ -6586,6 +6614,7 @@ describe("cache interoperability and safety", () => {
     const cacheDirectory = `${directory}/cache`;
     const hash = "0123456789abcdef";
     const outputPath = "packages/app/output.txt";
+    let compressedArtifactPath: string | undefined;
     let temporaryArchivePath: string | undefined;
     try {
       await Effect.runPromise(
@@ -6616,10 +6645,19 @@ describe("cache interoperability and safety", () => {
                   retryable: false,
                 }),
               ),
-            decompressZstdToFile: (contents, destination, maxOutputBytes) => {
+            decompressZstdToFile: () =>
+              Effect.fail(
+                new BoundaryError({
+                  boundary: "compression",
+                  message: "buffered local decompression must not be used",
+                  retryable: false,
+                }),
+              ),
+            decompressZstdFileToFile: (source, destination, maxOutputBytes) => {
+              compressedArtifactPath = source;
               temporaryArchivePath = destination;
-              return compression.decompressZstdToFile(
-                contents,
+              return compression.decompressZstdFileToFile(
+                source,
                 destination,
                 maxOutputBytes,
               );
@@ -6637,6 +6675,7 @@ describe("cache interoperability and safety", () => {
       expect(await readFile(`${directory}/${outputPath}`, "utf8")).toBe(
         "streamed local output\n",
       );
+      expect(compressedArtifactPath).toBe(`${cacheDirectory}/${hash}.tar.zst`);
       expect(temporaryArchivePath).toBeDefined();
       await expect(lstat(temporaryArchivePath!)).rejects.toThrow();
     } finally {
@@ -8163,7 +8202,7 @@ describe("cache interoperability and safety", () => {
     }
   }, 10_000);
 
-  it("validates longer signature keys only for active remote caching", async () => {
+  it("requires keys for active signed remotes and scopes longer keys", async () => {
     const directory = await makeFixture();
     const configurationPath = `${directory}/turbo.json`;
     const arguments_ = [
@@ -8212,21 +8251,65 @@ describe("cache interoperability and safety", () => {
         apiUrl: "http://127.0.0.1:9",
         signature: true,
       };
+      configuration.futureFlags = {
+        ...configuration.futureFlags,
+        longerSignatureKey: false,
+      };
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
       );
-      const active = await run(process.execPath, arguments_, repositoryRoot, {
-        TURBO_REMOTE_CACHE_SIGNATURE_KEY: undefined,
-      });
-      expect(active.exitCode).not.toBe(0);
-      expect(active.stderr).toContain(
+      for (const signatureKey of [undefined, ""]) {
+        const missing = await run(
+          process.execPath,
+          arguments_,
+          repositoryRoot,
+          { TURBO_REMOTE_CACHE_SIGNATURE_KEY: signatureKey },
+        );
+        expect(missing.exitCode).not.toBe(0);
+        expect(missing.stderr).toContain(
+          "TURBO_REMOTE_CACHE_SIGNATURE_KEY is required",
+        );
+      }
+      const legacyShort = await run(
+        process.execPath,
+        arguments_,
+        repositoryRoot,
+        { TURBO_REMOTE_CACHE_SIGNATURE_KEY: "short" },
+      );
+      expect(legacyShort.exitCode, legacyShort.combinedOutput).toBe(0);
+
+      configuration.futureFlags = {
+        ...configuration.futureFlags,
+        longerSignatureKey: true,
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const futureShort = await run(
+        process.execPath,
+        arguments_,
+        repositoryRoot,
+        { TURBO_REMOTE_CACHE_SIGNATURE_KEY: "short" },
+      );
+      expect(futureShort.exitCode).not.toBe(0);
+      expect(futureShort.stderr).toContain(
         "TURBO_REMOTE_CACHE_SIGNATURE_KEY must contain at least 32 characters",
       );
+      const futureLong = await run(
+        process.execPath,
+        arguments_,
+        repositoryRoot,
+        {
+          TURBO_REMOTE_CACHE_SIGNATURE_KEY: "0123456789abcdef0123456789abcdef",
+        },
+      );
+      expect(futureLong.exitCode, futureLong.combinedOutput).toBe(0);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  }, 10_000);
+  }, 30_000);
 
   it("validates remote cache URLs and timeout environment values before execution", async () => {
     const directory = await makeFixture();

@@ -106,27 +106,12 @@ export const restoreLocalCache = (
             ),
           );
         }
-        const compressed = yield* fileSystem
-          .readBytes(paths.archive)
-          .pipe(
-            Effect.mapError((error) =>
-              cacheError(paths.archive, error.message),
-            ),
-          );
-        if (compressed.length > maximumCacheArtifactBytes) {
-          return yield* Effect.fail(
-            cacheError(
-              paths.archive,
-              `local cache artifact exceeds the ${maximumCacheArtifactBytes} byte limit`,
-            ),
-          );
-        }
         yield* fileSystem
           .withTemporaryDirectory((directory) => {
             const archivePath = joinPath(directory, "local-cache.tar");
             return compression
-              .decompressZstdToFile(
-                compressed,
+              .decompressZstdFileToFile(
+                paths.archive,
                 archivePath,
                 maximumCacheArchiveBytes,
               )

@@ -1117,6 +1117,54 @@ describe("cache archive safety", () => {
     ]);
   });
 
+  it("rejects tar header text that is not valid UTF-8", () => {
+    const withInvalidHeaderText = (
+      archive: Uint8Array,
+      offset: number,
+    ): Uint8Array => {
+      const invalid = archive.slice();
+      invalid[offset] = 0xff;
+      const checksum = invalid
+        .subarray(0, tarBlockSize)
+        .reduce(
+          (total, byte, index) =>
+            total + (index >= 148 && index < 156 ? 0x20 : byte),
+          0,
+        );
+      invalid.set(encoder.encode(checksum.toString(8).padStart(6, "0")), 148);
+      invalid[154] = 0;
+      invalid[155] = 0x20;
+      return invalid;
+    };
+    const file = {
+      path: "packages/app/dist/output.txt",
+      contents: encoder.encode("output"),
+      mode: 0o644,
+      modifiedSeconds: 1,
+    };
+    const prefixedFile = {
+      ...file,
+      path: `packages/app/${"nested-segment/".repeat(7)}dist/output.txt`,
+    };
+    const symlink = {
+      kind: "symlink" as const,
+      path: "packages/app/dist/current.txt",
+      linkTarget: "output.txt",
+      contents: new Uint8Array(),
+      mode: 0o777,
+      modifiedSeconds: 1,
+    };
+    for (const [archive, offset] of [
+      [createTarArchive([file]), 0],
+      [createTarArchive([prefixedFile]), 345],
+      [createTarArchive([symlink]), 157],
+    ] as const) {
+      expect(() =>
+        parseTarArchive(withInvalidHeaderText(archive, offset)),
+      ).toThrow(/valid for encoding utf-8/i);
+    }
+  });
+
   it(evidenceId.coreSecurity, () => {
     for (const path of [
       "../escape",
