@@ -656,6 +656,7 @@ const findAffectedPackages = (
       (path) =>
         !repository.packages.some(
           (packageModel) =>
+            packageModel.relativeDirectory !== "." &&
             packageRelativeChangedFile(packageModel, path) !== undefined,
         ),
     );
@@ -1672,6 +1673,16 @@ const prepareTaskLogPath = (
           message: "task log destination must not be a symlink",
         }),
       );
+    }
+    if (logMetadata.kind === "file") {
+      yield* fileSystem
+        .remove(logPath)
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({ path: logPath, message: error.message }),
+          ),
+        );
     }
   });
 

@@ -73,8 +73,11 @@ to discovered packages by canonical filesystem identity. A local path that
 does not resolve to a discovered JavaScript package disables caching for the
 declaring package and downstream hash scopes. JavaScript task hashes always
 include their owning `package.json`, independently of configured task globs.
+When that manifest is a symlink, its task hash includes both the link and the
+resolved contents consumed during discovery and execution.
 Enabled JavaScript, Cargo, and uv discovery passes retain co-located package
-scopes in the same workspace directory.
+scopes in the same workspace directory. Repository-root Cargo and uv scopes do
+not absorb ordinary root files during package-level affected selection.
 
 Cargo builds that receive pass-through arguments selecting another package,
 release, profile, target, another manifest or alternate artifact layout, or an
@@ -107,7 +110,9 @@ serialized within a run to bound writer memory independently of task
 concurrency. Remote downloads, signature verification, and decompression use
 scoped files so concurrent cache hits do not retain or duplicate complete
 compressed response bodies in memory. Local execution rejects symlinked task-log
-directories and exact log destinations before starting the task.
+directories and exact log destinations before starting the task, and replaces
+existing regular log files before writing so hard links cannot redirect
+truncation.
 
 Configured cache directories may be inside or outside the repository, but the
 repository root, its ancestors, and directories containing discovered packages

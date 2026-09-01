@@ -618,6 +618,36 @@ describe("core CLI execution", () => {
     await executeCase("file");
   }, 20_000);
 
+  it("replaces hard-linked task logs before execution", async () => {
+    const directory = await makeFixture();
+    const externalLog = `${directory}-external.log`;
+    const logPath = `${directory}/packages/library/.turbo/turbo-build.log`;
+    try {
+      await writeFile(externalLog, "external contents\n");
+      await mkdir(dirname(logPath), { recursive: true });
+      await link(externalLog, logPath);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode, result.combinedOutput).toBe(0);
+      expect(await readFile(externalLog, "utf8")).toBe("external contents\n");
+      expect(await readFile(logPath, "utf8")).toContain("library build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+      await rm(externalLog, { force: true });
+    }
+  });
+
   it("skips oversized cache inputs before retaining file contents", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;
@@ -2215,6 +2245,64 @@ describe("core CLI execution", () => {
       ) as Record<string, unknown>;
       manifest.type = "module";
       await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      expect((await compute()).hash).not.toBe(before.hash);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("hashes contents behind a symlinked owning JavaScript manifest", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["src/**"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${packageDirectory}/src`, { recursive: true });
+      await writeFile(`${packageDirectory}/src/input.js`, "export {};\n");
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifestTargetPath = `${packageDirectory}/manifest-target.json`;
+      await writeFile(manifestTargetPath, await readFile(manifestPath, "utf8"));
+      await rm(manifestPath);
+      await symlink("manifest-target.json", manifestPath);
+      const rootConfiguration = await Effect.runPromise(
+        loadRootConfiguration(directory).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const model = await Effect.runPromise(
+        discoverRepository(directory, rootConfiguration).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      const compute = () =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const before = await compute();
+      expect(before.inputFiles).toContain("package.json");
+      expect(before.inputFiles).not.toContain("manifest-target.json");
+      const manifest = JSON.parse(
+        await readFile(manifestTargetPath, "utf8"),
+      ) as Record<string, unknown>;
+      manifest.type = "module";
+      await writeFile(
+        manifestTargetPath,
+        `${JSON.stringify(manifest, null, 2)}\n`,
+      );
       expect((await compute()).hash).not.toBe(before.hash);
     } finally {
       await rm(directory, { force: true, recursive: true });
@@ -4306,6 +4394,88 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 15_000);
+
+  it("treats root files as affected with a root Cargo package", async () => {
+    const directory = await makeGitFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, unknown>;
+      };
+      configuration.futureFlags = { experimentalCargoWorkspaces: true };
+      configuration.tasks["synthetic-app#check"] = { cache: false };
+      configuration.tasks["synthetic-library#check"] = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      for (const packageName of ["app", "library"]) {
+        const manifestPath = `${directory}/packages/${packageName}/package.json`;
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          scripts: Record<string, string>;
+        };
+        manifest.scripts.check = `node -e "console.log('${packageName} check')"`;
+        await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      }
+      await mkdir(`${directory}/src`, { recursive: true });
+      await writeFile(
+        `${directory}/Cargo.toml`,
+        '[package]\nname = "synthetic-rust-root"\nversion = "0.1.0"\nedition = "2024"\n\n[workspace]\n',
+      );
+      await writeFile(`${directory}/src/lib.rs`, "pub fn value() {}\n");
+      await writeFile(
+        `${directory}/Cargo.lock`,
+        '# This file is automatically @generated by Cargo.\nversion = 4\n\n[[package]]\nname = "synthetic-rust-root"\nversion = "0.1.0"\n',
+      );
+      await writeFile(
+        `${directory}/pnpm-lock.yaml`,
+        "lockfileVersion: '9.0'\n",
+      );
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "base"],
+      ]) {
+        const result = await run("git", args, directory);
+        expect(result.exitCode, `${args.join(" ")}: ${result.stderr}`).toBe(0);
+      }
+      await writeFile(
+        `${directory}/pnpm-lock.yaml`,
+        "lockfileVersion: '9.0'\nsettings: {}\n",
+      );
+      expect(
+        (await run("git", ["add", "pnpm-lock.yaml"], directory)).exitCode,
+      ).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "lockfile"], directory)).exitCode,
+      ).toBe(0);
+      const affected = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--affected",
+          "--only",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(affected.exitCode, affected.combinedOutput).toBe(0);
+      expect(affected.stdout).toContain("app check");
+      expect(affected.stdout).toContain("library check");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
 
   it("discovers the root from a nested workspace and applies exclusions", async () => {
     const directory = await makeFixture();

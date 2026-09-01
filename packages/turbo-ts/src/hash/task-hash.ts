@@ -108,6 +108,7 @@ interface TaskInputFile {
   readonly hashPath: string;
   readonly matchPath: string;
   readonly gitMode?: GitTrackedMode;
+  readonly hashResolvedSymlinkContents?: boolean;
 }
 
 type GitTrackedMode = "100644" | "100755" | "120000" | "160000";
@@ -458,6 +459,7 @@ const alwaysHashedControlInputFiles = (
             : `${turboRootInputPrefix}${matchPath}`,
           matchPath,
           gitMode: gitModes.get(absolutePath),
+          hashResolvedSymlinkContents: true,
         };
       })
       .sort((left, right) => left.hashPath.localeCompare(right.hashPath));
@@ -689,6 +691,7 @@ export const hashTask = (
       path: string,
       relative: string,
       gitMode?: GitTrackedMode,
+      hashResolvedSymlinkContents = false,
     ) =>
       Effect.gen(function* () {
         const metadata = yield* fileSystem
@@ -724,12 +727,28 @@ export const hashTask = (
             (error) => new RepositoryError({ path, message: error.message }),
           ),
         );
+        if (metadata.kind === "symlink" && hashResolvedSymlinkContents) {
+          const resolvedContentsHash = yield* digest
+            .gitBlobSha1File(path)
+            .pipe(
+              Effect.mapError(
+                (error) =>
+                  new RepositoryError({ path, message: error.message }),
+              ),
+            );
+          return [relative, mode, hash, resolvedContentsHash] as const;
+        }
         return [relative, mode, hash] as const;
       });
     const hashedInputFiles = (yield* Effect.forEach(
       inputFiles,
       (input) =>
-        hashFile(input.absolutePath, input.hashPath, input.gitMode).pipe(
+        hashFile(
+          input.absolutePath,
+          input.hashPath,
+          input.gitMode,
+          input.hashResolvedSymlinkContents,
+        ).pipe(
           Effect.map((hash) =>
             hash === undefined ? undefined : { hash, input },
           ),

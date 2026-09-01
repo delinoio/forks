@@ -110,13 +110,18 @@ Task-aware Git selectors retain union semantics with positive package
 selectors; negative Git selectors are applied after that union.
 Package-level affected selection treats legacy `globalDependencies` and, when
 task-aware selection is disabled, `global.inputs` as repository-global inputs.
+Repository-root Cargo and uv package scopes do not claim ordinary root files
+for package ownership; those changes retain repository-global package-level
+affected selection.
 Task-input selection uses the same effective global and task inputs as hashing,
 evaluates task owners before Git-range package narrowing, applies negative Git
 ranges after positive task matches, and includes `with` companions. Owning
 manifests participate in task-aware selection and hashing independently of user
-input globs, while package task configurations participate independently in
-task-aware selection. Owning lockfiles and Cargo control or toolchain files
-participate in both task-aware selection and hashing. A changed
+input globs. Symlinked owning control manifests retain their link identity and
+also hash the resolved file contents consumed by discovery and execution.
+Package task configurations participate independently in task-aware selection.
+Owning lockfiles and Cargo control or toolchain files participate in both
+task-aware selection and hashing. A changed
 workspace gitlink path is treated as the package-relative `.` input. Task
 hashes preserve Git symlink, gitlink, and dependency semantics, exclude the
 resolved cache directory, and use each task's owning ecosystem lockfile.
@@ -152,7 +157,9 @@ bounded backpressure while retaining only a bounded diagnostic tail and
 incomplete display line in memory.
 Before local task execution, an existing task-log directory and exact log
 destination are rejected when either is a symlink, preventing log writes from
-escaping the execution directory.
+escaping the execution directory. An existing regular log destination is
+unlinked before task output is written so a hard link cannot redirect
+truncation outside the execution directory.
 Persistent companions must remain alive until their foreground owners
 complete; any earlier natural exit fails the group, and foreground owners
 sharing a companion remain subject to the run's concurrency limit.
