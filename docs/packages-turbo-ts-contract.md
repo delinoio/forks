@@ -89,7 +89,8 @@ when their canonical target is a directory inside the repository; canonical
 ancestor tracking prevents symlink cycles.
 Tasks owned by a logical workspace path containing a symlink component execute
 without local or remote caching because restoration intentionally rejects
-symlink parents.
+symlink parents. Task scopes whose hashes depend on those tasks, including
+`with` companions, also bypass caching transitively.
 Every requested task
 must resolve before any task executes, and
 strict entrypoint selection removes configured tasks without an executable
@@ -107,12 +108,14 @@ Task-input selection uses the same effective global and task inputs as hashing,
 evaluates task owners before Git-range package narrowing, applies negative Git
 ranges after positive task matches, and includes `with` companions. Owning
 lockfiles and Cargo control or toolchain files participate in both task-aware
-selection and hashing. Task hashes preserve Git symlink, gitlink, and dependency
-semantics, exclude the resolved cache directory, and use each task's owning
-ecosystem lockfile. Regular input files are streamed through bounded-memory Git
-blob digests, and owning lockfiles are streamed through bounded-memory xxHash64
-digests. NUL-delimited Git discovery output is consumed as bytes and filenames
-that are not valid UTF-8 fail hashing instead of being silently omitted. Cargo
+selection and hashing. A changed workspace gitlink path is treated as the
+package-relative `.` input. Task hashes preserve Git symlink, gitlink, and
+dependency semantics, exclude the resolved cache directory, and use each
+task's owning ecosystem lockfile. Regular input files are streamed through
+bounded-memory Git blob digests, and owning lockfiles are streamed through
+bounded-memory xxHash64 digests. NUL-delimited Git discovery output is consumed
+as bytes and filenames that are not valid UTF-8 fail hashing instead of being
+silently omitted. Cargo
 task hashes additionally include repository-contained
 ancestor manifests, Cargo configuration, and Rust toolchain files that can
 change task execution. Environment-name selection follows Windows
@@ -136,7 +139,8 @@ complete; any earlier natural exit fails the group, and foreground owners
 sharing a companion remain subject to the run's concurrency limit.
 On Windows, npm, pnpm, and Yarn task commands use their standard command shims
 through a narrowly escaped command-interpreter adapter; POSIX task execution
-does not use a shell.
+does not use a shell. Scope finalization terminates the Windows wrapper and its
+descendant process tree.
 
 Workspace task overrides merge with their effective package-qualified root
 definition and the merged task invariants are revalidated before execution.
@@ -171,8 +175,10 @@ storage; signature verification and decompression consume the compressed file
 without materializing or duplicating the complete response in memory.
 Cache restoration validates every archive entry against the current task's
 declared output globs or exact literal log path before clearing or writing
-files. Output negations are deny rules during both collection and restoration,
-regardless of their order relative to positive patterns. Task identifiers are
+files. It rejects duplicate destinations and any non-directory archive entry
+that is an ancestor of another destination. Output negations are deny rules
+during both collection and restoration, regardless of their order relative to
+positive patterns. Task identifiers are
 encoded into portable single-component log filenames; lowercase portable task
 names retain their existing filenames, and
 uppercase code points are encoded to prevent case-insensitive collisions.
@@ -243,10 +249,11 @@ pass-through arguments that select an additional package, an alternate output
 layout, or an unmodeled library, binary, example, test, or benchmark target
 bypass caching until those outputs are modeled explicitly. Cargo build
 pass-through `--config` arguments also bypass caching because they can override
-the output layout. Cargo builds also bypass caching when an ancestor Cargo
-configuration or the effective task environment sets a build target, or when
-Cargo metadata and strict task execution receive different `CARGO_TARGET_DIR`
-values. Cargo metadata discovery uses `--locked`, uses each response's
+the output layout. Cargo builds also bypass caching when an ancestor or
+effective Cargo-home configuration, or the effective task environment, sets a
+build target, or when Cargo metadata and strict task execution receive
+different `CARGO_TARGET_DIR` values. Cargo metadata discovery uses `--locked`,
+uses each response's
 workspace-member list, and does not probe excluded or unrelated nested
 manifests. Combined workspace task
 hashes are propagated into every downstream task hash.

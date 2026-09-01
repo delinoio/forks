@@ -18,6 +18,7 @@ import {
   makeWithTemporaryDirectory,
   nodeFoundationLayer,
   resolveSpawnInvocation,
+  windowsProcessTreeTerminationInvocation,
 } from "../src/effect/node-layer.js";
 import {
   CompressionService,
@@ -485,6 +486,10 @@ describe("Effect foundation", () => {
       args: ["run", "build"],
       windowsVerbatimArguments: false,
     });
+    expect(windowsProcessTreeTerminationInvocation(42)).toEqual({
+      command: "taskkill.exe",
+      args: ["/pid", "42", "/t", "/f"],
+    });
   });
 
   it("reports synchronous spawn failures as typed errors", async () => {
@@ -597,6 +602,58 @@ describe("Effect foundation", () => {
           process.kill(pid, "SIGKILL");
         } catch {
           // The scoped finalizer already terminated the expected process tree.
+        }
+      }
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("terminates descendants launched through Windows command shims", async () => {
+    if (process.platform !== "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-shim-tree-"));
+    const workerPath = join(directory, "worker.cjs");
+    const parentPath = join(directory, "parent.cjs");
+    const shimPath = join(directory, "task.cmd");
+    const workerPidPath = join(directory, "worker-pid");
+    const heartbeatPath = join(directory, "heartbeat");
+    let workerPid: number | undefined;
+    try {
+      await writeFile(
+        workerPath,
+        'const fs = require("node:fs"); fs.writeFileSync(process.argv[2], String(process.pid)); setInterval(() => fs.writeFileSync(process.argv[3], String(Date.now())), 10);\n',
+      );
+      await writeFile(
+        parentPath,
+        'const { spawn } = require("node:child_process"); spawn(process.execPath, [process.argv[2], process.argv[3], process.argv[4]], { stdio: "inherit" }); setInterval(() => {}, 1_000);\n',
+      );
+      await writeFile(
+        shimPath,
+        `@echo off\r\n"${process.execPath}" "${parentPath}" "${workerPath}" "${workerPidPath}" "${heartbeatPath}"\r\n`,
+      );
+      const execution = Effect.scoped(
+        Effect.gen(function* () {
+          const processService = yield* ProcessService;
+          return yield* processService.run({
+            command: shimPath,
+            args: [],
+            cwd: directory,
+          });
+        }),
+      ).pipe(Effect.provide(nodeFoundationLayer));
+      const fiber = Effect.runFork(execution);
+      workerPid = Number(await waitForTextFile(workerPidPath));
+      await waitForTextFile(heartbeatPath);
+      await Effect.runPromise(Fiber.interrupt(fiber));
+      const heartbeat = await readFile(heartbeatPath, "utf8");
+      await delay(100);
+      expect(await readFile(heartbeatPath, "utf8")).toBe(heartbeat);
+      expect(() => process.kill(workerPid as number, 0)).toThrow();
+    } finally {
+      if (workerPid !== undefined) {
+        try {
+          process.kill(workerPid, "SIGKILL");
+        } catch {
+          // The scoped finalizer already terminated the expected descendant.
         }
       }
       await rm(directory, { force: true, recursive: true });

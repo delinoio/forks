@@ -73,7 +73,8 @@ release, profile, target, another alternate artifact layout, or an unmodeled
 library, binary, example, test, or benchmark target execute without cache reads
 or writes until those outputs are modeled explicitly. Pass-through `--config`
 arguments and mismatched metadata/task `CARGO_TARGET_DIR` values also disable
-Cargo build caching. Mixed library and binary crates default to uncached because
+Cargo build caching, as does a build target in the effective Cargo-home
+configuration. Mixed library and binary crates default to uncached because
 binary-only output declarations cannot restore all of Cargo's default
 artifacts. Unfiltered Cargo workspace commands merge the effective environments
 of every grouped member and remain package-scoped when any repository member

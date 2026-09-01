@@ -121,6 +121,40 @@ export const duplicateArchiveEntryDestination = (
   return undefined;
 };
 
+const nonDirectoryArchiveEntryAncestor = (
+  root: string,
+  entries: ReadonlyArray<RestorableArchiveEntry>,
+  caseInsensitive: boolean,
+):
+  | { readonly destination: string; readonly kind: "file" | "symlink" }
+  | undefined => {
+  const destinations = entries.map((entry) => {
+    const destination = joinPath(root, entry.path);
+    return {
+      entry,
+      destination,
+      comparableDestination: comparablePath(destination, caseInsensitive),
+    };
+  });
+  for (const candidate of destinations) {
+    if (candidate.entry.kind === "directory") continue;
+    const descendantPrefix = `${candidate.comparableDestination}/`;
+    if (
+      destinations.some(
+        (other) =>
+          other !== candidate &&
+          other.comparableDestination.startsWith(descendantPrefix),
+      )
+    ) {
+      return {
+        destination: candidate.destination,
+        kind: candidate.entry.kind ?? "file",
+      };
+    }
+  }
+  return undefined;
+};
+
 const groupAllowsEntry = (
   root: string,
   destination: string,
@@ -257,6 +291,19 @@ export const validateArchiveEntriesForRestore = (
         restoreError(
           duplicateDestination,
           "archive destination occurs more than once",
+        ),
+      );
+    }
+    const nonDirectoryAncestor = nonDirectoryArchiveEntryAncestor(
+      root,
+      entries,
+      caseInsensitive,
+    );
+    if (nonDirectoryAncestor !== undefined) {
+      return yield* Effect.fail(
+        restoreError(
+          nonDirectoryAncestor.destination,
+          `archive ${nonDirectoryAncestor.kind} entry contains another destination`,
         ),
       );
     }

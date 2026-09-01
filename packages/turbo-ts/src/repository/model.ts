@@ -936,63 +936,121 @@ const recordValue = (
     ? (value as Readonly<Record<string, unknown>>)
     : undefined;
 
+const cargoConfigurationBuildTargetConfigured = (
+  configurationDirectory: string,
+): Effect.Effect<boolean, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const legacyPath = joinPath(configurationDirectory, "config");
+    const modernPath = joinPath(configurationDirectory, "config.toml");
+    const legacyExists = yield* fileSystem
+      .exists(legacyPath)
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({ path: legacyPath, message: error.message }),
+        ),
+      );
+    const modernExists = legacyExists
+      ? false
+      : yield* fileSystem.exists(modernPath).pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({
+                path: modernPath,
+                message: error.message,
+              }),
+          ),
+        );
+    const path = legacyExists
+      ? legacyPath
+      : modernExists
+        ? modernPath
+        : undefined;
+    if (path === undefined) return false;
+    const source = yield* fileSystem
+      .readText(path)
+      .pipe(
+        Effect.mapError(
+          (error) => new RepositoryError({ path, message: error.message }),
+        ),
+      );
+    try {
+      const document = recordValue(parseToml(source));
+      return recordValue(document?.build)?.target !== undefined;
+    } catch (cause) {
+      return yield* Effect.fail(
+        new RepositoryError({ path, message: String(cause) }),
+      );
+    }
+  });
+
 const cargoBuildTargetConfigured = (
   directory: string,
 ): Effect.Effect<boolean, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
-    const fileSystem = yield* FileSystemService;
     let current = normalizePath(directory);
     while (true) {
-      const modernPath = joinPath(current, ".cargo/config.toml");
-      const legacyPath = joinPath(current, ".cargo/config");
-      const modernExists = yield* fileSystem
-        .exists(modernPath)
-        .pipe(
-          Effect.mapError(
-            (error) =>
-              new RepositoryError({ path: modernPath, message: error.message }),
-          ),
-        );
-      const legacyExists = modernExists
-        ? false
-        : yield* fileSystem.exists(legacyPath).pipe(
-            Effect.mapError(
-              (error) =>
-                new RepositoryError({
-                  path: legacyPath,
-                  message: error.message,
-                }),
-            ),
-          );
-      const path = modernExists
-        ? modernPath
-        : legacyExists
-          ? legacyPath
-          : undefined;
-      if (path !== undefined) {
-        const source = yield* fileSystem
-          .readText(path)
-          .pipe(
-            Effect.mapError(
-              (error) => new RepositoryError({ path, message: error.message }),
-            ),
-          );
-        try {
-          const document = recordValue(parseToml(source));
-          if (recordValue(document?.build)?.target !== undefined) {
-            return true;
-          }
-        } catch (cause) {
-          return yield* Effect.fail(
-            new RepositoryError({ path, message: String(cause) }),
-          );
-        }
+      if (
+        yield* cargoConfigurationBuildTargetConfigured(
+          joinPath(current, ".cargo"),
+        )
+      ) {
+        return true;
       }
       const parent = parentPath(current);
       if (parent === current) return false;
       current = parent;
     }
   });
+
+const configuredEnvironmentValue = (
+  environment: Readonly<Record<string, string | undefined>>,
+  name: string,
+  caseInsensitiveNames: boolean,
+): string | undefined => {
+  const normalizedName = caseInsensitiveNames ? name.toLowerCase() : name;
+  let selected: string | undefined;
+  for (const [candidate, value] of Object.entries(environment)) {
+    if (
+      (caseInsensitiveNames ? candidate.toLowerCase() : candidate) ===
+      normalizedName
+    ) {
+      selected = value;
+    }
+  }
+  return selected;
+};
+
+export const cargoHomeBuildTargetConfigured = (
+  executionDirectory: string,
+  environment: Readonly<Record<string, string | undefined>>,
+  caseInsensitiveEnvironmentNames: boolean,
+): Effect.Effect<boolean, RepositoryError, FileSystemService> => {
+  const configuredCargoHome = configuredEnvironmentValue(
+    environment,
+    "CARGO_HOME",
+    caseInsensitiveEnvironmentNames,
+  );
+  const home = configuredEnvironmentValue(
+    environment,
+    "HOME",
+    caseInsensitiveEnvironmentNames,
+  );
+  const userHome = caseInsensitiveEnvironmentNames
+    ? (configuredEnvironmentValue(environment, "USERPROFILE", true) ?? home)
+    : home;
+  const cargoHome =
+    configuredCargoHome ??
+    (userHome === undefined ? undefined : joinPath(userHome, ".cargo"));
+  if (cargoHome === undefined || cargoHome === "") {
+    return Effect.succeed(false);
+  }
+  const resolvedCargoHome = isAbsolutePath(cargoHome)
+    ? normalizePath(cargoHome)
+    : joinPath(executionDirectory, cargoHome);
+  return cargoConfigurationBuildTargetConfigured(resolvedCargoHome);
+};
 
 const stringArrayValue = (value: unknown): ReadonlyArray<string> =>
   Array.isArray(value)

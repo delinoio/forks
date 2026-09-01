@@ -61,7 +61,10 @@ import {
   hashTask,
 } from "../src/hash/task-hash.js";
 import { xxhash64Hex } from "../src/hash/xxhash64.js";
-import { discoverRepository } from "../src/repository/model.js";
+import {
+  cargoHomeBuildTargetConfigured,
+  discoverRepository,
+} from "../src/repository/model.js";
 import {
   isTaskScopeCacheable,
   packageManagerCommand,
@@ -1344,6 +1347,20 @@ describe("core CLI execution", () => {
         `${directory}/pnpm-workspace.yaml`,
         "packages:\n  - packages/**\n",
       );
+      const appManifestPath = `${directory}/packages/app/package.json`;
+      const appManifest = JSON.parse(
+        await readFile(appManifestPath, "utf8"),
+      ) as {
+        dependencies: Record<string, string>;
+        scripts: Record<string, string>;
+      };
+      appManifest.dependencies = { "synthetic-linked": "workspace:*" };
+      appManifest.scripts.build =
+        "node -e \"require('node:fs').appendFileSync('runs.txt','run\\n')\"";
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, null, 2)}\n`,
+      );
       const model = await Effect.runPromise(
         Effect.gen(function* () {
           const rootConfiguration = yield* loadRootConfiguration(directory);
@@ -1369,15 +1386,19 @@ describe("core CLI execution", () => {
             "build",
             "--cwd",
             directory,
-            "--filter=synthetic-linked",
+            "--filter=synthetic-app",
           ],
           repositoryRoot,
         );
       expect((await execute()).exitCode).toBe(0);
+      await writeFile(`${target}/source.txt`, "changed\n");
       const second = await execute();
       expect(second.exitCode).toBe(0);
       expect(second.stderr).not.toContain("cache restore failed");
       expect(await readFile(`${target}/runs.txt`, "utf8")).toBe("run\nrun\n");
+      expect(await readFile(`${directory}/packages/app/runs.txt`, "utf8")).toBe(
+        "run\nrun\n",
+      );
       await expect(lstat(`${directory}/.turbo/cache`)).rejects.toThrow();
     } finally {
       await rm(directory, { force: true, recursive: true });
@@ -2933,6 +2954,138 @@ describe("core CLI execution", () => {
     }
   }, 20_000);
 
+  it("selects workspace gitlink changes as task inputs", async () => {
+    const directory = await mkdtemp(
+      join(packageRoot, "test-workspace-gitlink-"),
+    );
+    try {
+      await cp(fixtureRoot, directory, { recursive: true });
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+      };
+      configuration.futureFlags = {
+        affectedUsingTaskInputs: true,
+        filterUsingTasks: true,
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "fixture base"],
+      ]) {
+        const result = await run("git", args, directory);
+        expect(result.exitCode, `${args.join(" ")}: ${result.stderr}`).toBe(0);
+      }
+      const firstCommit = (
+        await run("git", ["rev-parse", "HEAD"], directory)
+      ).stdout.trim();
+      await writeFile(`${directory}/revision.txt`, "second\n");
+      expect(
+        (await run("git", ["add", "revision.txt"], directory)).exitCode,
+      ).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "second revision"], directory))
+          .exitCode,
+      ).toBe(0);
+      const secondCommit = (
+        await run("git", ["rev-parse", "HEAD"], directory)
+      ).stdout.trim();
+      expect(
+        (
+          await run(
+            "git",
+            ["rm", "--cached", "-r", "packages/library"],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      expect(
+        (
+          await run(
+            "git",
+            [
+              "update-index",
+              "--add",
+              "--cacheinfo",
+              `160000,${firstCommit},packages/library`,
+            ],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      expect(
+        (
+          await run(
+            "git",
+            ["commit", "-m", "record workspace gitlink"],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      expect(
+        (
+          await run(
+            "git",
+            [
+              "update-index",
+              "--add",
+              "--cacheinfo",
+              `160000,${secondCommit},packages/library`,
+            ],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      expect(
+        (
+          await run(
+            "git",
+            ["commit", "-m", "advance workspace gitlink"],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      expect(
+        (
+          await run("git", ["diff", "--name-only", "HEAD~1...HEAD"], directory)
+        ).stdout.trim(),
+      ).toBe("packages/library");
+
+      for (const selection of [
+        ["--affected"],
+        ["--filter=...[HEAD~1...HEAD]"],
+      ]) {
+        const result = await run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "build",
+            "--cwd",
+            directory,
+            "--no-cache",
+            ...selection,
+          ],
+          repositoryRoot,
+          { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+        );
+        expect(result.exitCode, result.stderr).toBe(0);
+        expect(result.stdout).toContain("library build");
+        expect(result.stdout).toContain("app build");
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
   it("rejects a missing explicit root configuration", async () => {
     const directory = await makeFixture();
     try {
@@ -4218,6 +4371,51 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 15_000);
+
+  it("detects build targets in the effective Cargo home", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cargo-home-"));
+    const homeDirectory = `${directory}/home`;
+    const relativeCargoHome = `${directory}/custom-cargo-home`;
+    const precedenceCargoHome = `${directory}/precedence-cargo-home`;
+    const detect = (
+      environment: Readonly<Record<string, string | undefined>>,
+      caseInsensitiveEnvironmentNames = false,
+    ) =>
+      Effect.runPromise(
+        cargoHomeBuildTargetConfigured(
+          directory,
+          environment,
+          caseInsensitiveEnvironmentNames,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+    try {
+      await mkdir(`${homeDirectory}/.cargo`, { recursive: true });
+      await writeFile(
+        `${homeDirectory}/.cargo/config.toml`,
+        '[build]\ntarget = "synthetic-target"\n',
+      );
+      expect(await detect({ HOME: homeDirectory })).toBe(true);
+      expect(await detect({ home: homeDirectory }, true)).toBe(true);
+
+      await mkdir(relativeCargoHome, { recursive: true });
+      await writeFile(
+        `${relativeCargoHome}/config.toml`,
+        '[build]\ntarget = "synthetic-target"\n',
+      );
+      expect(await detect({ CARGO_HOME: "custom-cargo-home" })).toBe(true);
+
+      await mkdir(precedenceCargoHome, { recursive: true });
+      await writeFile(
+        `${precedenceCargoHome}/config.toml`,
+        '[build]\ntarget = "synthetic-target"\n',
+      );
+      await writeFile(`${precedenceCargoHome}/config`, "[build]\njobs = 1\n");
+      expect(await detect({ CARGO_HOME: precedenceCargoHome })).toBe(false);
+      expect(await detect({})).toBe(false);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("keeps Cargo discovery locked and disables configured target caching", async () => {
     const directory = await makeFixture();
@@ -6804,6 +7002,83 @@ describe("cache interoperability and safety", () => {
       );
       expect(await readFile(`${directory}/dist/public.txt`, "utf8")).toBe(
         "secret\n",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects non-directory archive ancestors before clearing outputs", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-tree-"));
+    const preserved = `${directory}/preserved.txt`;
+    const child = {
+      path: "dist/a/result.txt",
+      contents: new TextEncoder().encode("child\n"),
+      mode: 0o644,
+      modifiedSeconds: 1,
+    };
+    const ancestors = [
+      {
+        path: "dist/a",
+        contents: new TextEncoder().encode("parent\n"),
+        mode: 0o644,
+        modifiedSeconds: 1,
+      },
+      {
+        kind: "symlink" as const,
+        path: "dist/a",
+        linkTarget: "result.txt",
+        contents: new Uint8Array(),
+        mode: 0o777,
+        modifiedSeconds: 1,
+      },
+    ];
+    const scope: CacheRestoreScope = {
+      pathsToClear: ["preserved.txt"],
+      allowedPathGroups: [{ directory: ".", patterns: ["dist/**"] }],
+      regularFilePaths: [],
+    };
+    try {
+      await writeFile(`${directory}/package.json`, "{}\n");
+      await writeFile(preserved, "preserved\n");
+      for (const ancestor of ancestors) {
+        for (const entries of [
+          [child, ancestor],
+          [ancestor, child],
+        ]) {
+          const outcome = await Effect.runPromise(
+            restoreArchiveEntries(directory, entries, scope).pipe(
+              Effect.either,
+              Effect.provide(nodeFoundationLayer),
+            ),
+          );
+          expect(outcome._tag).toBe("Left");
+          if (outcome._tag === "Left") {
+            expect(outcome.left.message).toContain(
+              "contains another destination",
+            );
+          }
+          expect(await readFile(preserved, "utf8")).toBe("preserved\n");
+        }
+      }
+
+      await Effect.runPromise(
+        restoreArchiveEntries(
+          directory,
+          [
+            {
+              kind: "directory",
+              path: "dist/a",
+              mode: 0o755,
+              modifiedSeconds: 1,
+            },
+            child,
+          ],
+          { ...scope, pathsToClear: [] },
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(await readFile(`${directory}/${child.path}`, "utf8")).toBe(
+        "child\n",
       );
     } finally {
       await rm(directory, { force: true, recursive: true });

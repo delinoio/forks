@@ -71,6 +71,7 @@ import {
   renderTaskOutputChunk,
 } from "../logging/events.js";
 import {
+  cargoHomeBuildTargetConfigured,
   discoverRepository,
   listRepositoryFiles,
   type RepositoryModel,
@@ -719,9 +720,11 @@ const taskMatchesChangedFiles = (
     if (implicitInputs.has(repositoryRelativeFile)) return true;
     const packageRelativeFile = isRootPackage
       ? repositoryRelativeFile
-      : repositoryRelativeFile.startsWith(packagePrefix)
-        ? repositoryRelativeFile.slice(packagePrefix.length)
-        : undefined;
+      : repositoryRelativeFile === node.package.relativeDirectory
+        ? "."
+        : repositoryRelativeFile.startsWith(packagePrefix)
+          ? repositoryRelativeFile.slice(packagePrefix.length)
+          : undefined;
     const matchesInput = (pattern: string): boolean => {
       const rootRelative = pattern.startsWith(rootRelativeInputPrefix);
       const file = rootRelative ? repositoryRelativeFile : packageRelativeFile;
@@ -1404,6 +1407,7 @@ export const isTaskScopeCacheable = (
   environment: Readonly<Record<string, string | undefined>> = {},
   caseInsensitiveEnvironmentNames = false,
   sourceEnvironment: Readonly<Record<string, string | undefined>> = environment,
+  cargoHomeHasBuildTarget = false,
 ): boolean =>
   (scope.kind === "cargo-workspace" ? scope.members : [node]).every(
     (member) =>
@@ -1420,7 +1424,46 @@ export const isTaskScopeCacheable = (
     sourceEnvironment,
     environment,
     caseInsensitiveEnvironmentNames,
+  ) &&
+  !(
+    node.package.manager === "cargo" &&
+    node.task === "build" &&
+    cargoHomeHasBuildTarget
   );
+
+export const taskIdsWithUnrestorableCacheInputs = (
+  graph: TaskGraph,
+  scopes: ReadonlyMap<string, TaskCommandScope> = new Map(),
+): ReadonlySet<string> => {
+  const uncacheable = new Set<string>();
+  const hashGraph: TaskGraph = {
+    ...graph,
+    nodes: new Map(
+      [...graph.nodes].map(([id, node]) => [
+        id,
+        {
+          ...node,
+          dependencies: [...new Set([...node.dependencies, ...node.with])],
+        },
+      ]),
+    ),
+  };
+  for (const id of topologicalOrder(hashGraph)) {
+    const node = graph.nodes.get(id)!;
+    const scope = scopes.get(id);
+    const scopeNodes =
+      scope?.kind === "cargo-workspace" ? scope.members : [node];
+    if (
+      scopeNodes.some((member) => !member.package.cachePathRestorable) ||
+      [...node.dependencies, ...node.with].some((upstream) =>
+        uncacheable.has(upstream),
+      )
+    ) {
+      uncacheable.add(id);
+    }
+  }
+  return uncacheable;
+};
 
 const executeTask = (
   repository: RepositoryModel,
@@ -1429,6 +1472,7 @@ const executeTask = (
   hash: TaskHashResult,
   sourceEnvironment: Readonly<Record<string, string | undefined>>,
   scope: TaskCommandScope = packageTaskCommandScope,
+  cacheInputsRestorable = true,
 ): Effect.Effect<TaskOutcome, unknown, RunRequirements> =>
   Effect.gen(function* () {
     const terminal = yield* TerminalService;
@@ -1464,23 +1508,34 @@ const executeTask = (
     );
     const cacheNodes =
       scope.kind === "cargo-workspace" ? scope.members : [node];
-    const cacheable = isTaskScopeCacheable(
-      node,
-      options.passThroughArguments,
-      scope,
-      executionEnvironment,
-      platform === "win32",
-      sourceEnvironment,
-    );
+    const executionDirectory =
+      scope.kind === "cargo-workspace"
+        ? scope.directory
+        : node.package.directory;
+    const cargoHomeHasBuildTarget =
+      node.package.manager === "cargo" && node.task === "build"
+        ? yield* cargoHomeBuildTargetConfigured(
+            executionDirectory,
+            executionEnvironment,
+            platform === "win32",
+          )
+        : false;
+    const cacheable =
+      cacheInputsRestorable &&
+      isTaskScopeCacheable(
+        node,
+        options.passThroughArguments,
+        scope,
+        executionEnvironment,
+        platform === "win32",
+        sourceEnvironment,
+        cargoHomeHasBuildTarget,
+      );
     const localOptions = {
       directory: options.cacheDirectory,
       maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
       maxSizeBytes: options.cacheMaxSizeBytes,
     };
-    const executionDirectory =
-      scope.kind === "cargo-workspace"
-        ? scope.directory
-        : node.package.directory;
     const logPath = joinPath(
       executionDirectory,
       ".turbo",
@@ -2384,6 +2439,10 @@ export const executeRun = (
       cargoWorkspacePlan.scopes,
       options,
     );
+    const unrestorableCacheInputs = taskIdsWithUnrestorableCacheInputs(
+      graph,
+      cargoWorkspacePlan.scopes,
+    );
     const groups = taskGroups(graph);
     const pending = new Map(groups.map((members) => [members[0]!, members]));
     const outcomes = new Map<string, TaskOutcome>();
@@ -2429,6 +2488,7 @@ export const executeRun = (
           hashes.get(id)!,
           environment,
           cargoWorkspacePlan.scopes.get(id),
+          !unrestorableCacheInputs.has(id),
         ).pipe(
           Effect.catchAll((cause) =>
             Effect.gen(function* () {

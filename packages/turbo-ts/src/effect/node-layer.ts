@@ -270,6 +270,13 @@ const configuredWindowsCommandInterpreter = (): string =>
     ([name, value]) => name.toLowerCase() === "comspec" && value !== undefined,
   )?.[1] ?? "cmd.exe";
 
+export const windowsProcessTreeTerminationInvocation = (
+  processId: number,
+): { readonly command: string; readonly args: ReadonlyArray<string> } => ({
+  command: "taskkill.exe",
+  args: ["/pid", String(processId), "/t", "/f"],
+});
+
 const isChildRunning = (child: ChildProcess): boolean =>
   child.exitCode === null && child.signalCode === null;
 
@@ -306,6 +313,35 @@ const waitForCloseUntil = (
       clearTimeout(timeout);
       resolve(true);
     });
+  });
+
+const terminateWindowsProcessTree = (processId: number): Promise<boolean> =>
+  new Promise((resolve) => {
+    const invocation = windowsProcessTreeTerminationInvocation(processId);
+    let settled = false;
+    const complete = (result: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(result);
+    };
+    let termination: ChildProcess;
+    try {
+      termination = spawn(invocation.command, [...invocation.args], {
+        shell: false,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+    const timeout = setTimeout(() => {
+      termination.kill();
+      complete(false);
+    }, gracefulTerminationTimeoutMilliseconds);
+    termination.once("error", () => complete(false));
+    termination.once("close", (exitCode) => complete(exitCode === 0));
   });
 
 const isProcessGroupRunning = (processGroupId: number): boolean => {
@@ -352,6 +388,7 @@ const terminateChild = ({
       processGroupId,
       capturesOutput,
     };
+    let windowsTreeCleanupFailed = false;
     if (processGroupId !== undefined) {
       signalChildProcess(scopedChild, "SIGTERM");
       const groupClosedGracefully = await waitForProcessGroupExitUntil(
@@ -362,16 +399,27 @@ const terminateChild = ({
         signalChildProcess(scopedChild, "SIGKILL");
       }
     } else if (!isClosed()) {
-      signalChildProcess(scopedChild, "SIGTERM");
-      const closedGracefully = await waitForCloseUntil(
-        closed,
-        gracefulTerminationTimeoutMilliseconds,
-      );
-      if (!closedGracefully && !isClosed()) {
-        signalChildProcess(scopedChild, "SIGKILL");
+      if (process.platform === "win32") {
+        const treeTerminated =
+          child.pid !== undefined &&
+          (await terminateWindowsProcessTree(child.pid));
+        windowsTreeCleanupFailed = !treeTerminated && !isClosed();
+      }
+      if (!isClosed()) {
+        signalChildProcess(scopedChild, "SIGTERM");
+        const closedGracefully = await waitForCloseUntil(
+          closed,
+          gracefulTerminationTimeoutMilliseconds,
+        );
+        if (!closedGracefully && !isClosed()) {
+          signalChildProcess(scopedChild, "SIGKILL");
+        }
       }
     }
     await closed;
+    if (windowsTreeCleanupFailed) {
+      throw new Error("failed to terminate the complete Windows process tree");
+    }
   });
 
 const fileSystemLayer = Layer.succeed(FileSystemService, {

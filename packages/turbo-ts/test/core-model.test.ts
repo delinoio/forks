@@ -23,6 +23,7 @@ import { GraphError } from "../src/effect/errors.js";
 import {
   buildTaskGraph,
   selectPackages,
+  type TaskGraph,
   type TaskNode,
   topologicalOrder,
 } from "../src/graph/task-graph.js";
@@ -53,6 +54,7 @@ import {
   parseCacheSpecification,
   planCargoWorkspaceTasks,
   takePersistentDisplayOutput,
+  taskIdsWithUnrestorableCacheInputs,
   taskScopeEnvironment,
 } from "../src/run/engine.js";
 import { parseConcurrency, parseRunArguments } from "../src/run/options.js";
@@ -967,7 +969,46 @@ describe("core repository model", () => {
         { CARGO_TARGET_DIR: "/repo/custom-target" },
       ),
     ).toBe(true);
+    expect(
+      isTaskScopeCacheable(node, [], { kind: "package" }, {}, false, {}, true),
+    ).toBe(false);
     expect(isTaskScopeCacheable(node, ["--features=integration"])).toBe(true);
+  });
+
+  it("propagates unrestorable workspace inputs through hash edges", () => {
+    const unrestorablePackage: RepositoryPackage = {
+      ...packageModel("linked", []),
+      cachePathRestorable: false,
+    };
+    const node = (
+      packageModelValue: RepositoryPackage,
+      dependencies: ReadonlyArray<string> = [],
+      withTasks: ReadonlyArray<string> = [],
+    ): TaskNode => ({
+      id: `${packageModelValue.name}#build`,
+      package: packageModelValue,
+      task: "build",
+      command: packageModelValue.scripts.build,
+      definition: packageModelValue.tasks.build!,
+      dependencies,
+      with: withTasks,
+    });
+    const linked = node(unrestorablePackage);
+    const dependent = node(packageModel("dependent", ["linked"]), [linked.id]);
+    const companionOwner = node(packageModel("owner", []), [], [linked.id]);
+    const unrelated = node(packageModel("unrelated", []));
+    const graph: TaskGraph = {
+      nodes: new Map(
+        [linked, dependent, companionOwner, unrelated].map((task) => [
+          task.id,
+          task,
+        ]),
+      ),
+      entrypoints: [dependent.id, companionOwner.id, unrelated.id],
+    };
+    expect([...taskIdsWithUnrestorableCacheInputs(graph)].sort()).toEqual(
+      [companionOwner.id, dependent.id, linked.id].sort(),
+    );
   });
 
   it("rejects unknown output log modes", () => {
