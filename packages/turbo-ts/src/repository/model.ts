@@ -1165,6 +1165,7 @@ const cargoTasks = (
       : (metadata?.entrypointNames ?? []).flatMap((name) => [
           `${outputPrefix}/${name}`,
           `${outputPrefix}/${name}.exe`,
+          `${outputPrefix}/${name}.pdb`,
         ]);
   const buildDefaults: Pipeline =
     metadata?.hasLibraryTarget === true || outputs.length === 0
@@ -1758,6 +1759,24 @@ export const discoverRepository = (
             [normalizePath(packageDraft.directory), packageDraft] as const,
         ),
     );
+    const cargoDependencyTarget = (
+      packageDraft: Pick<RepositoryPackageDraft, "workspaceDirectory">,
+      dependency: CargoDependencyMetadata,
+    ): RepositoryPackageDraft | undefined => {
+      if (
+        dependency.source !== undefined ||
+        dependency.path === undefined ||
+        packageDraft.workspaceDirectory === undefined
+      ) {
+        return undefined;
+      }
+      const target = cargoDraftsByDirectory.get(normalizePath(dependency.path));
+      return target !== undefined &&
+        target.name === dependency.name &&
+        target.workspaceDirectory === packageDraft.workspaceDirectory
+        ? target
+        : undefined;
+    };
     const uvFilesystemIdentitiesByName = new Map(
       yield* Effect.forEach(
         drafts.filter((packageDraft) => packageDraft.manager === "uv"),
@@ -1827,32 +1846,37 @@ export const discoverRepository = (
       ),
     );
     const packages: ReadonlyArray<RepositoryPackage> = drafts
-      .map(({ cargoDependencies, ...packageDraft }) => ({
-        ...packageDraft,
-        internalDependencies:
-          packageDraft.manager === "uv"
-            ? (uvInternalDependenciesByName.get(packageDraft.name) ?? [])
-            : packageDraft.manager === "cargo"
-              ? cargoDependencies.flatMap((dependency) => {
-                  if (
-                    dependency.source !== undefined ||
-                    dependency.path === undefined
-                  ) {
-                    return [];
-                  }
-                  const target = cargoDraftsByDirectory.get(dependency.path);
-                  return target !== undefined &&
-                    target.name === dependency.name &&
-                    packageDraft.workspaceDirectory !== undefined &&
-                    target.workspaceDirectory ===
-                      packageDraft.workspaceDirectory
-                    ? [target.name]
-                    : [];
-                })
+      .map(({ cargoDependencies, ...packageDraft }) => {
+        if (packageDraft.manager === "cargo") {
+          const resolvedDependencies = cargoDependencies.map((dependency) => ({
+            dependency,
+            target: cargoDependencyTarget(packageDraft, dependency),
+          }));
+          return {
+            ...packageDraft,
+            cacheInputsComplete:
+              packageDraft.cacheInputsComplete &&
+              resolvedDependencies.every(
+                ({ dependency, target }) =>
+                  dependency.source !== undefined ||
+                  dependency.path === undefined ||
+                  target !== undefined,
+              ),
+            internalDependencies: resolvedDependencies.flatMap(({ target }) =>
+              target === undefined ? [] : [target.name],
+            ),
+          };
+        }
+        return {
+          ...packageDraft,
+          internalDependencies:
+            packageDraft.manager === "uv"
+              ? (uvInternalDependenciesByName.get(packageDraft.name) ?? [])
               : (javascriptInternalDependenciesByDirectory.get(
                   normalizePath(packageDraft.directory),
                 ) ?? []),
-      }))
+        };
+      })
       .sort((left, right) => left.name.localeCompare(right.name));
     const rootTasks = Object.fromEntries(
       Object.entries(rootConfiguration.value.tasks ?? {}).flatMap(

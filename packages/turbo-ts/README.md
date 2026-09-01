@@ -77,7 +77,10 @@ disable Cargo build caching. Any effective Cargo-home configuration also
 disables build caching because those external controls are not task-hash
 inputs. Mixed library and binary crates default to uncached because
 binary-only output declarations cannot restore all of Cargo's default
-artifacts. Single-binary Cargo `run` and `dev` tasks also default to uncached
+artifacts. Source-free local path dependencies that do not resolve to a
+same-workspace repository package also disable caching. Synthesized binary
+outputs cover the extensionless executable plus `.exe` and `.pdb` variants.
+Single-binary Cargo `run` and `dev` tasks also default to uncached
 unless task configuration explicitly enables caching. Repository-root Cargo
 packages reuse the loaded root task configuration. Unfiltered Cargo workspace
 commands merge the effective environments of every grouped member and remain

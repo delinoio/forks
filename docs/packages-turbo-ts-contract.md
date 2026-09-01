@@ -116,6 +116,9 @@ toolchain files participate in both task-aware selection and hashing. A changed
 workspace gitlink path is treated as the package-relative `.` input. Task
 hashes preserve Git symlink, gitlink, and dependency semantics, exclude the
 resolved cache directory, and use each task's owning ecosystem lockfile.
+Only indexed mode `160000` directories are hashed as gitlinks; an indexed
+regular file replaced by a working-tree directory is omitted while its
+discovered descendants remain task inputs.
 Regular input files are streamed through bounded-memory Git blob digests, and
 owning lockfiles are streamed through bounded-memory xxHash64 digests.
 NUL-delimited Git discovery output is consumed as bytes and filenames that are
@@ -277,7 +280,9 @@ participating members retain package targeting so task exclusions are honored.
 Members of an enclosing Cargo workspace outside
 the repository always retain package targeting and bypass caching, as do task
 scopes whose hashes depend on them, because their external Cargo controls are
-not repository hash inputs. Grouped Cargo commands receive
+not repository hash inputs. Cargo packages with source-free local path
+dependencies that do not resolve to a same-workspace repository package also
+bypass caching. Grouped Cargo commands receive
 the union of all member task environments. Cargo package-graph edges require a
 source-free metadata dependency path that resolves to the named member in the
 same workspace; registry and Git dependencies remain external. Cargo `run` and
@@ -301,6 +306,8 @@ excluded or unrelated nested manifests. Combined workspace task
 hashes are propagated into every downstream task hash.
 Cargo builds with colliding synthesized binary destinations bypass caching,
 including when task configuration explicitly enables it.
+Synthesized Cargo binary outputs cover the extensionless executable plus
+`.exe` and `.pdb` variants.
 
 Structured task input globs apply ordered inclusion and negation consistently
 to task hashing and task-aware affected selection. Task-aware Git filters

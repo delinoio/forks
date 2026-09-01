@@ -663,13 +663,13 @@ export const hashTask = (
           const match = /^160000 ([0-9a-fA-F]+) 0\t/.exec(entry);
           return match?.[1] === undefined ? [] : [match[1]];
         })[0];
-        if (result.exitCode !== 0 || objectId === undefined) {
+        if (result.exitCode !== 0) {
           return yield* Effect.fail(
             new RepositoryError({
               path,
               message:
                 new TextDecoder().decode(result.stderr) ||
-                "directory input is not a Git gitlink",
+                "failed to inspect directory input in the Git index",
             }),
           );
         }
@@ -689,7 +689,11 @@ export const hashTask = (
             ),
           );
         if (metadata.kind === "directory") {
-          return [relative, "160000", yield* gitlinkObjectId(path)] as const;
+          if (gitMode !== undefined && gitMode !== "160000") return undefined;
+          const objectId = yield* gitlinkObjectId(path);
+          return objectId === undefined
+            ? undefined
+            : ([relative, "160000", objectId] as const);
         }
         const mode =
           gitMode ??
@@ -712,11 +716,19 @@ export const hashTask = (
         );
         return [relative, mode, hash] as const;
       });
-    const fileHashes = yield* Effect.forEach(
+    const hashedInputFiles = (yield* Effect.forEach(
       inputFiles,
-      (input) => hashFile(input.absolutePath, input.hashPath, input.gitMode),
+      (input) =>
+        hashFile(input.absolutePath, input.hashPath, input.gitMode).pipe(
+          Effect.map((hash) =>
+            hash === undefined ? undefined : { hash, input },
+          ),
+        ),
       { concurrency: 8 },
+    )).filter(
+      (entry): entry is NonNullable<typeof entry> => entry !== undefined,
     );
+    const fileHashes = hashedInputFiles.map((entry) => entry.hash);
     const globalSettings = activeGlobalSettings(repository);
     const hashedEnvironment = selectEnvironment(
       environment,
@@ -764,14 +776,14 @@ export const hashTask = (
       [...globalInputFilesByRelativePath.keys()],
       globalDependencyPatterns,
     );
-    const globalFileHashes = yield* Effect.forEach(
+    const globalFileHashes = (yield* Effect.forEach(
       globalInputFiles,
       (relative) => {
         const file = globalInputFilesByRelativePath.get(relative)!;
         return hashFile(file.absolutePath, relative, file.gitMode);
       },
       { concurrency: 8 },
-    );
+    )).flatMap((hash) => (hash === undefined ? [] : [hash]));
     const hash = xxhash64Hex(
       canonicalStringify({
         packageManager: `${repository.manager}@${repository.managerVersion ?? ""}`,
@@ -796,7 +808,7 @@ export const hashTask = (
     return {
       hash,
       environment: hashedEnvironment,
-      inputFiles: inputFiles.map((input) => input.hashPath),
+      inputFiles: hashedInputFiles.map((entry) => entry.input.hashPath),
     };
   });
 

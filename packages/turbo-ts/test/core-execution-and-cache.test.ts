@@ -2183,6 +2183,7 @@ describe("core CLI execution", () => {
       );
       const pathModel = await discover();
       const pathApp = pathModel.packagesByName.get("rust-app")!;
+      expect(pathApp.cacheInputsComplete).toBe(true);
       expect(pathApp.internalDependencies).toEqual(["itoa"]);
       expect(
         buildTaskGraph(pathModel, [pathApp], ["build"], false).nodes.has(
@@ -2191,6 +2192,82 @@ describe("core CLI execution", () => {
       ).toBe(true);
     } finally {
       await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
+  it("disables caching for external Cargo path dependencies", async () => {
+    const outer = await mkdtemp(join(tmpdir(), "turbo-ts-cargo-path-"));
+    const directory = `${outer}/repository`;
+    const packageDirectory = `${directory}/rust/app`;
+    const externalDirectory = `${outer}/external`;
+    try {
+      await cp(fixtureRoot, directory, { recursive: true });
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, Record<string, unknown>>;
+      };
+      configuration.futureFlags = { experimentalCargoWorkspaces: true };
+      for (const task of ["build", "check", "test"]) {
+        configuration.tasks[task] = { cache: true };
+      }
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${packageDirectory}/src`, { recursive: true });
+      await mkdir(`${externalDirectory}/src`, { recursive: true });
+      await writeFile(
+        `${directory}/rust/Cargo.toml`,
+        '[workspace]\nmembers = ["app"]\nresolver = "3"\n',
+      );
+      await writeFile(
+        `${packageDirectory}/Cargo.toml`,
+        '[package]\nname = "rust-app"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\nexternal = { path = "../../../external" }\n',
+      );
+      await writeFile(
+        `${externalDirectory}/Cargo.toml`,
+        '[package]\nname = "external"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(`${packageDirectory}/src/main.rs`, "fn main() {}\n");
+      await writeFile(`${externalDirectory}/src/lib.rs`, "pub fn value() {}\n");
+      await cp(
+        `${repositoryRoot}/rust-toolchain`,
+        `${directory}/rust-toolchain`,
+      );
+      const lockfile = await run(
+        "cargo",
+        [
+          "generate-lockfile",
+          "--manifest-path",
+          `${packageDirectory}/Cargo.toml`,
+        ],
+        packageDirectory,
+      );
+      expect(lockfile.exitCode, lockfile.stderr).toBe(0);
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const cargoPackage = model.packagesByName.get("rust-app")!;
+      expect(cargoPackage.workspaceDirectory).toBe(`${directory}/rust`);
+      expect(cargoPackage.cacheInputsComplete).toBe(false);
+      expect(cargoPackage.internalDependencies).toEqual([]);
+      for (const task of ["build", "check", "test"]) {
+        const node = buildTaskGraph(
+          model,
+          [cargoPackage],
+          [task],
+          false,
+        ).nodes.get(`rust-app#${task}`)!;
+        expect(isTaskScopeCacheable(node, [])).toBe(false);
+      }
+    } finally {
+      await rm(outer, { force: true, recursive: true });
     }
   }, 20_000);
 
@@ -3423,6 +3500,81 @@ describe("core CLI execution", () => {
         ).exitCode,
       ).toBe(0);
       expect((await compute()).hash).not.toBe(first.hash);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
+  it("hashes descendants when an indexed file becomes a directory", async () => {
+    const directory = await mkdtemp(
+      join(packageRoot, "test-replacement-directory-"),
+    );
+    const packageDirectory = `${directory}/packages/library`;
+    const replacementPath = `${packageDirectory}/replacement`;
+    try {
+      await cp(fixtureRoot, directory, { recursive: true });
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["replacement", "replacement/**"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await writeFile(replacementPath, "indexed file\n");
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "record indexed file"],
+      ]) {
+        const result = await run("git", args, directory);
+        expect(result.exitCode, `${args.join(" ")}: ${result.stderr}`).toBe(0);
+      }
+      await rm(replacementPath);
+      await mkdir(replacementPath);
+      const childPath = `${replacementPath}/child.txt`;
+      await writeFile(childPath, "first\n");
+      const discovered = await run(
+        "git",
+        [
+          "ls-files",
+          "--cached",
+          "--others",
+          "--exclude-standard",
+          "--",
+          "packages/library",
+        ],
+        directory,
+      );
+      expect(discovered.exitCode, discovered.stderr).toBe(0);
+      expect(discovered.stdout).toContain(
+        "packages/library/replacement/child.txt",
+      );
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      expect(node.definition.inputs).toEqual(["replacement", "replacement/**"]);
+      const compute = () =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const initial = await compute();
+      expect(initial.inputFiles).not.toContain("replacement");
+      expect(initial.inputFiles).toContain("replacement/child.txt");
+      await writeFile(childPath, "second\n");
+      expect((await compute()).hash).not.toBe(initial.hash);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -5215,7 +5367,7 @@ describe("core CLI execution", () => {
           model.packagesByName.get(packageName)?.tasks.build,
         ).toMatchObject({
           cache: false,
-          outputs: [output, `${output}.exe`],
+          outputs: [output, `${output}.exe`, `${output}.pdb`],
         });
       }
     } finally {
@@ -5297,9 +5449,11 @@ describe("core CLI execution", () => {
       );
       expect(
         model.packagesByName.get("synthetic-rust-tool")?.tasks.build?.outputs,
-      ).toContain(
+      ).toEqual([
         "$TURBO_ROOT$/packages/rust-tool/target/debug/synthetic-rust-tool",
-      );
+        "$TURBO_ROOT$/packages/rust-tool/target/debug/synthetic-rust-tool.exe",
+        "$TURBO_ROOT$/packages/rust-tool/target/debug/synthetic-rust-tool.pdb",
+      ]);
       expect(
         model.packagesByName.get("synthetic-rust-library")?.tasks.build,
       ).toMatchObject({ cache: false });
@@ -5377,12 +5531,19 @@ describe("core CLI execution", () => {
       const executable = `${packageDirectory}/target/debug/synthetic-rust-tool${
         process.platform === "win32" ? ".exe" : ""
       }`;
+      const pdb = `${packageDirectory}/target/debug/synthetic-rust-tool.pdb`;
       expect((await lstat(executable)).isFile()).toBe(true);
+      const archivedPdb = await readFile(pdb).catch(() => undefined);
       await rm(`${packageDirectory}/target`, { force: true, recursive: true });
       const warm = await run(process.execPath, args, repositoryRoot);
       expect(warm.exitCode).toBe(0);
       expect(warm.stdout).toContain("cache hit");
       expect((await lstat(executable)).isFile()).toBe(true);
+      if (archivedPdb === undefined) {
+        await expect(lstat(pdb)).rejects.toThrow();
+      } else {
+        expect(await readFile(pdb)).toEqual(archivedPdb);
+      }
       const releaseArgs = [...args, "--", "--release"];
       const releaseExecutable = `${packageDirectory}/target/release/synthetic-rust-tool${
         process.platform === "win32" ? ".exe" : ""
