@@ -92,7 +92,7 @@ explicit `with` reference must resolve to an existing package task before its
 owner can execute. Requested task names are validated after ordinary package
 filters but before Git-range and affected filters are applied, so a valid task
 with no affected packages is a successful no-op. An explicit `--cwd` must exist
-before nested repository discovery begins.
+and resolve to a directory before nested repository discovery begins.
 Task-aware Git selectors retain union semantics with positive package
 selectors; negative Git selectors are applied after that union.
 Package-level affected selection treats legacy `globalDependencies` and, when

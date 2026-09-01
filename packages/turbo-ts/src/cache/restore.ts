@@ -380,6 +380,7 @@ export const restoreArchiveEntries = (
               ),
             );
         } else {
+          restoredPaths.push(entry.path);
           yield* fileSystem
             .writeBytes(destination, entry.contents)
             .pipe(
@@ -387,7 +388,6 @@ export const restoreArchiveEntries = (
                 restoreError(destination, error.message),
               ),
             );
-          restoredPaths.push(entry.path);
         }
         yield* fileSystem
           .setFileMetadata(

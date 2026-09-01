@@ -137,10 +137,7 @@ export const restoreLocalCache = (
     );
     if (outcome._tag === "Left") {
       yield* removeEntry(options.directory, hash);
-      if (outcome.left._tag === "CacheRollbackError") {
-        return yield* Effect.fail(outcome.left);
-      }
-      return false;
+      return yield* Effect.fail(outcome.left);
     }
     return true;
   });

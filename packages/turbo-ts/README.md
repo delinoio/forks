@@ -78,8 +78,9 @@ declarations cannot restore all of Cargo's default artifacts. Unfiltered Cargo
 workspace commands merge the effective environments of every grouped member.
 
 Local and remote cache restoration is limited to 256 MiB compressed and 1 GiB
-after decompression. Artifacts beyond either limit are rejected; local entries
-become misses and remote entries use the normal local-execution fallback.
+after decompression. Artifacts beyond either limit are rejected; invalid local
+entries are removed with a warning and become misses, while remote entries use
+the normal local-execution fallback.
 
 Configured cache directories may be inside or outside the repository, but the
 repository root and its ancestors are rejected because treating them as cache

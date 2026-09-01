@@ -108,6 +108,9 @@ interface TaskInputFile {
 
 const turboRootInputPrefix = "$TURBO_ROOT$/";
 
+const compareCodeUnits = (left: string, right: string): number =>
+  left < right ? -1 : left > right ? 1 : 0;
+
 const isIgnoredInputPath = (path: string, cacheDirectory: string): boolean =>
   path.includes("/.turbo/") ||
   path.includes("/node_modules/") ||
@@ -476,7 +479,7 @@ export const hashTask = (
           ...(yield* cargoControlInputFiles(repository, node, cacheDirectory)),
         ].map((input) => [input.absolutePath, input] as const),
       ).values(),
-    ].sort((left, right) => left.hashPath.localeCompare(right.hashPath));
+    ].sort((left, right) => compareCodeUnits(left.hashPath, right.hashPath));
     const gitlinkObjectId = (path: string) =>
       Effect.gen(function* () {
         const result = yield* Effect.scoped(

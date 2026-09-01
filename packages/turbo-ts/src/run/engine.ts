@@ -120,6 +120,7 @@ interface ResolvedRunOptions {
   readonly continueMode: "always" | "dependencies-successful" | "never";
   readonly environmentMode: "loose" | "strict";
   readonly cacheDirectory: string;
+  readonly cacheExclusionDirectory: string;
   readonly cacheMaxAgeMilliseconds?: number;
   readonly cacheMaxSizeBytes?: number;
   readonly cachePolicy: CachePolicy;
@@ -325,6 +326,9 @@ const resolveOptions = (
     value.cacheDir ??
     global?.cacheDir ??
     ".turbo/cache";
+  const cacheDirectory = isAbsolutePath(cacheDirectoryValue)
+    ? cacheDirectoryValue
+    : joinPath(root, cacheDirectoryValue);
   const remoteConfiguration = value.remoteCache ?? global?.remoteCache;
   const apiUrl =
     parsed.apiUrl ??
@@ -444,9 +448,8 @@ const resolveOptions = (
     ),
     continueMode: parsed.continueMode ?? "never",
     environmentMode: environmentModeValue,
-    cacheDirectory: isAbsolutePath(cacheDirectoryValue)
-      ? cacheDirectoryValue
-      : joinPath(root, cacheDirectoryValue),
+    cacheDirectory,
+    cacheExclusionDirectory: cacheDirectory,
     cacheMaxAgeMilliseconds: parseQuantity(
       value.cacheMaxAge ?? global?.cacheMaxAge,
       {
@@ -1039,7 +1042,7 @@ const collectOutputPaths = (
       Effect.gen(function* () {
         const fileSystem = yield* FileSystemService;
         const files = yield* listRepositoryFiles(directory, {
-          ignoredDirectories: new Set([".git", ".turbo", "node_modules"]),
+          ignoredDirectories: new Set([".git", ".turbo"]),
           includeDirectories: true,
         });
         for (const path of files) {
@@ -1406,7 +1409,7 @@ const executeTask = (
         ? (yield* collectOutputPaths(
             repository,
             cacheNodes,
-            options.cacheDirectory,
+            options.cacheExclusionDirectory,
           )).map((path) => relativePath(repository.root, path))
         : [];
     const restoreScope = cacheRestoreScope(
@@ -1639,7 +1642,7 @@ const executeTask = (
         repository,
         cacheNodes,
         logPath,
-        options.cacheDirectory,
+        options.cacheExclusionDirectory,
       ).pipe(
         Effect.catchAll((error) =>
           terminal
@@ -1753,7 +1756,7 @@ const computeTaskHashes = (
         upstreamIds.map((upstream) => hashes.get(upstream)!.hash),
         options.frameworkInference,
         options.passThroughArguments,
-        options.cacheDirectory,
+        options.cacheExclusionDirectory,
       );
       hashes.set(id, result);
     }
@@ -1902,7 +1905,7 @@ const applyCargoWorkspaceHashes = (
           upstreamIds.map((upstream) => combined.get(upstream)!.hash),
           options.frameworkInference,
           options.passThroughArguments,
-          options.cacheDirectory,
+          options.cacheExclusionDirectory,
         ),
       );
       changed.add(id);
@@ -2036,9 +2039,8 @@ export const executeRun = (
         : isAbsolutePath(parsed.cwd)
           ? parsed.cwd
           : joinPath(processCwd, parsed.cwd);
-    if (
-      requestedRoot !== undefined &&
-      !(yield* fileSystem.exists(requestedRoot).pipe(
+    if (requestedRoot !== undefined) {
+      const exists = yield* fileSystem.exists(requestedRoot).pipe(
         Effect.mapError(
           (error) =>
             new ConfigurationError({
@@ -2046,14 +2048,43 @@ export const executeRun = (
               message: error.message,
             }),
         ),
-      ))
-    ) {
-      return yield* Effect.fail(
-        new ConfigurationError({
-          path: requestedRoot,
-          message: "working directory does not exist",
-        }),
       );
+      if (!exists) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: requestedRoot,
+            message: "working directory does not exist",
+          }),
+        );
+      }
+      const resolvedRequestedRoot = yield* fileSystem
+        .realPath(requestedRoot)
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new ConfigurationError({
+                path: requestedRoot,
+                message: error.message,
+              }),
+          ),
+        );
+      const metadata = yield* fileSystem.metadata(resolvedRequestedRoot).pipe(
+        Effect.mapError(
+          (error) =>
+            new ConfigurationError({
+              path: requestedRoot,
+              message: error.message,
+            }),
+        ),
+      );
+      if (metadata.kind !== "directory") {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: requestedRoot,
+            message: "working directory is not a directory",
+          }),
+        );
+      }
     }
     const preliminaryRoot = yield* discoverRepositoryRoot(
       requestedRoot ?? processCwd,
@@ -2067,7 +2098,7 @@ export const executeRun = (
           : joinPath(preliminaryRoot, parsed.rootTurboJson),
     );
     const availableParallelism = yield* concurrencyService.availableParallelism;
-    const options = resolveOptions(
+    const unresolvedOptions = resolveOptions(
       parsed,
       preliminaryRoot,
       environment,
@@ -2075,18 +2106,30 @@ export const executeRun = (
       availableParallelism,
     );
     const [canonicalRoot, canonicalCacheDirectory] = yield* Effect.all([
-      canonicalContainmentPath(options.root),
-      canonicalContainmentPath(options.cacheDirectory),
+      canonicalContainmentPath(unresolvedOptions.root),
+      canonicalContainmentPath(unresolvedOptions.cacheDirectory),
     ]);
     if (isPathContained(canonicalCacheDirectory, canonicalRoot)) {
       return yield* Effect.fail(
         new ConfigurationError({
-          path: options.cacheDirectory,
+          path: unresolvedOptions.cacheDirectory,
           message:
             "cache directory must not be the repository root or one of its ancestors",
         }),
       );
     }
+    const options: ResolvedRunOptions = {
+      ...unresolvedOptions,
+      cacheExclusionDirectory: isPathContained(
+        canonicalRoot,
+        canonicalCacheDirectory,
+      )
+        ? joinPath(
+            unresolvedOptions.root,
+            relativePath(canonicalRoot, canonicalCacheDirectory),
+          )
+        : unresolvedOptions.cacheDirectory,
+    };
     if (options.cachePolicy.localRead || options.cachePolicy.localWrite) {
       yield* evictLocalCache({
         directory: options.cacheDirectory,

@@ -148,6 +148,25 @@ describe("core CLI execution", () => {
     }
   });
 
+  it("rejects a regular file as an explicit working directory", async () => {
+    const directory = await makeFixture();
+    const file = `${directory}/not-a-directory`;
+    try {
+      await writeFile(file, "not a directory\n");
+      const result = await run(
+        process.execPath,
+        [candidateEntrypoint, "run", "build", "--cwd", file, "--no-cache"],
+        repositoryRoot,
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("working directory is not a directory");
+      expect(result.stdout).not.toContain("library build");
+      expect(result.stdout).not.toContain("app build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("streams ordinary task output to logs with bounded diagnostics", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;
@@ -604,6 +623,51 @@ describe("core CLI execution", () => {
         (await readdir(`${directory}/packages/library/task-cache`)).some(
           (name) => name.endsWith(".tar.zst"),
         ),
+      ).toBe(true);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("excludes the in-repository target of a cache-directory symlink", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const cacheTarget = `${directory}/packages/library/task-cache`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: { build: { outputs: Array<string> } } };
+      configuration.tasks.build.outputs.push(
+        "$TURBO_ROOT$/packages/library/task-cache/**",
+      );
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(cacheTarget, { recursive: true });
+      await symlink("packages/library/task-cache", `${directory}/cache-link`);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--cache-dir=cache-link",
+        "--output-logs=hash-only",
+      ];
+      const cold = await run(process.execPath, args, repositoryRoot);
+      const warm = await run(process.execPath, args, repositoryRoot);
+      const repeated = await run(process.execPath, args, repositoryRoot);
+      expect(cold.exitCode).toBe(0);
+      expect(cold.stdout).toContain("cache miss");
+      expect(warm.exitCode).toBe(0);
+      expect(warm.stdout).toContain("cache hit");
+      expect(repeated.exitCode).toBe(0);
+      expect(repeated.stdout).toContain("cache hit");
+      expect(
+        (await readdir(cacheTarget)).some((name) => name.endsWith(".tar.zst")),
       ).toBe(true);
     } finally {
       await rm(directory, { force: true, recursive: true });
@@ -1291,6 +1355,46 @@ describe("core CLI execution", () => {
         "two\n",
       );
       expect((await compute()).hash).not.toBe(second.hash);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("orders non-ASCII task hash inputs by code unit", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["ä-input.txt", "z-input.txt"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await writeFile(`${packageDirectory}/ä-input.txt`, "unicode\n");
+      await writeFile(`${packageDirectory}/z-input.txt`, "ascii\n");
+      const rootConfiguration = await Effect.runPromise(
+        loadRootConfiguration(directory).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const model = await Effect.runPromise(
+        discoverRepository(directory, rootConfiguration).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      const result = await Effect.runPromise(
+        hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(result.inputFiles).toEqual(["z-input.txt", "ä-input.txt"]);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -3973,6 +4077,50 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
+  it("restores nested node_modules within declared outputs", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const bundledDependency = `${packageDirectory}/bundle/node_modules/synthetic-dependency/index.js`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: { build: { outputs: Array<string> } } };
+      configuration.tasks.build.outputs = ["bundle/**"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); fs.mkdirSync('bundle/node_modules/synthetic-dependency',{recursive:true}); fs.writeFileSync('bundle/node_modules/synthetic-dependency/index.js','bundled'); console.log('built bundle')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      const cold = await run(process.execPath, args, repositoryRoot);
+      expect(cold.exitCode).toBe(0);
+      expect(cold.stdout).toContain("cache miss");
+      await rm(`${packageDirectory}/bundle`, { force: true, recursive: true });
+      await rm(`${packageDirectory}/.turbo`, { force: true, recursive: true });
+      const warm = await run(process.execPath, args, repositoryRoot);
+      expect(warm.exitCode).toBe(0);
+      expect(warm.stdout).toContain("cache hit");
+      expect(await readFile(bundledDependency, "utf8")).toBe("bundled");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("restores empty declared output directories from cache", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;
@@ -5491,6 +5639,43 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("warns and falls back when a local cache artifact is corrupt", async () => {
+    const directory = await makeFixture();
+    const cacheDirectory = `${directory}/.turbo/cache`;
+    try {
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      const cold = await run(process.execPath, args, repositoryRoot);
+      expect(cold.exitCode).toBe(0);
+      expect(cold.stdout).toContain("cache miss");
+      const archiveName = (await readdir(cacheDirectory)).find((name) =>
+        name.endsWith(".tar.zst"),
+      );
+      expect(archiveName).toBeDefined();
+      const archivePath = `${cacheDirectory}/${archiveName!}`;
+      await writeFile(archivePath, "corrupt");
+      const fallback = await run(
+        process.execPath,
+        [...args, "--cache=local:r"],
+        repositoryRoot,
+      );
+      expect(fallback.exitCode).toBe(0);
+      expect(fallback.stdout).toContain("cache miss");
+      expect(fallback.stderr).toContain("local cache restore failed");
+      expect(fallback.stderr).toContain("continuing without local cache");
+      await expect(lstat(archivePath)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it(evidenceId.coreCache, async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-race-"));
     const cacheDirectory = `${directory}/.turbo/cache`;
@@ -5525,8 +5710,8 @@ describe("cache interoperability and safety", () => {
         ),
       ).toBe(true);
       await writeFile(`${cacheDirectory}/0123456789abcdef.tar.zst`, "corrupt");
-      expect(
-        await Effect.runPromise(
+      await expect(
+        Effect.runPromise(
           restoreLocalCache(
             directory,
             { directory: cacheDirectory },
@@ -5534,7 +5719,7 @@ describe("cache interoperability and safety", () => {
             allowCachePaths("**"),
           ).pipe(Effect.provide(nodeFoundationLayer)),
         ),
-      ).toBe(false);
+      ).rejects.toThrow();
       await expect(
         lstat(`${cacheDirectory}/0123456789abcdef.tar.zst`),
       ).rejects.toThrow();
@@ -5552,8 +5737,8 @@ describe("cache interoperability and safety", () => {
       await mkdir(cacheDirectory, { recursive: true });
       await writeFile(archivePath, "");
       await truncate(archivePath, maximumCacheArtifactBytes + 1);
-      expect(
-        await Effect.runPromise(
+      await expect(
+        Effect.runPromise(
           restoreLocalCache(
             directory,
             { directory: cacheDirectory },
@@ -5561,7 +5746,7 @@ describe("cache interoperability and safety", () => {
             allowCachePaths("**"),
           ).pipe(Effect.provide(nodeFoundationLayer)),
         ),
-      ).toBe(false);
+      ).rejects.toThrow(/exceeds/);
       await expect(lstat(archivePath)).rejects.toThrow();
     } finally {
       await rm(directory, { force: true, recursive: true });
@@ -5592,12 +5777,16 @@ describe("cache interoperability and safety", () => {
             ...fileSystem,
             writeBytes: (path, contents) =>
               path.endsWith("second.txt")
-                ? Effect.fail(
-                    new BoundaryError({
-                      boundary: "filesystem",
-                      message: "synthetic restore failure",
-                      retryable: false,
-                    }),
+                ? fileSystem.writeBytes(path, contents.subarray(0, 1)).pipe(
+                    Effect.zipRight(
+                      Effect.fail(
+                        new BoundaryError({
+                          boundary: "filesystem",
+                          message: "synthetic restore failure",
+                          retryable: false,
+                        }),
+                      ),
+                    ),
                   )
                 : fileSystem.writeBytes(path, contents),
             remove: (path) =>
@@ -5622,6 +5811,7 @@ describe("cache interoperability and safety", () => {
       const safeFailure = await restore(false);
       expect(safeFailure._tag).toBe("Left");
       await expect(lstat(`${directory}/output/first.txt`)).rejects.toThrow();
+      await expect(lstat(`${directory}/output/second.txt`)).rejects.toThrow();
       const unsafeFailure = await restore(true);
       expect(unsafeFailure._tag).toBe("Left");
       if (unsafeFailure._tag === "Left") {
@@ -5748,8 +5938,8 @@ describe("cache interoperability and safety", () => {
         ).pipe(Effect.provide(nodeFoundationLayer)),
       );
       await symlink(outside, `${directory}/packages`);
-      expect(
-        await Effect.runPromise(
+      await expect(
+        Effect.runPromise(
           restoreLocalCache(
             directory,
             { directory: cacheDirectory },
@@ -5757,7 +5947,7 @@ describe("cache interoperability and safety", () => {
             allowCachePaths("**"),
           ).pipe(Effect.provide(nodeFoundationLayer)),
         ),
-      ).toBe(false);
+      ).rejects.toThrow(/escaping symlink/);
       await expect(lstat(`${outside}/app`)).rejects.toThrow();
     } finally {
       await rm(directory, { force: true, recursive: true });
