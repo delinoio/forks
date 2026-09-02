@@ -578,6 +578,7 @@ const findAffectedPackages = (
   environment: Readonly<Record<string, string | undefined>>,
   range?: GitRange,
   globalInputsAreTaskAware = false,
+  windowsPathSeparators = false,
 ): Effect.Effect<AffectedPackages, ConfigurationError, ProcessService> =>
   Effect.gen(function* () {
     const processService = yield* ProcessService;
@@ -655,7 +656,11 @@ const findAffectedPackages = (
           : (repository.rootConfiguration.value.global?.inputs ?? [])
         : (repository.rootConfiguration.value.globalDependencies ?? []);
     const globalDependencyChanged =
-      selectByGlobs(changedFiles, globalDependencyPatterns).length > 0;
+      selectByGlobs(
+        changedFiles,
+        globalDependencyPatterns,
+        windowsPathSeparators,
+      ).length > 0;
     const ordinaryRootChanged = changedFiles.some(
       (path) =>
         !repository.packages.some(
@@ -696,6 +701,7 @@ const resolveAffectedPackages = (
   repository: RepositoryModel,
   options: ResolvedRunOptions,
   environment: Readonly<Record<string, string | undefined>>,
+  windowsPathSeparators: boolean,
 ): Effect.Effect<
   {
     readonly filters: ReadonlyArray<string>;
@@ -724,6 +730,7 @@ const resolveAffectedPackages = (
         environment,
         parseGitRange(selector),
         flags?.filterUsingTasks === true,
+        windowsPathSeparators,
       );
       ranges.set(selector, affected.packages);
       affectedBySelector.set(selector, affected);
@@ -734,6 +741,7 @@ const resolveAffectedPackages = (
         environment,
         undefined,
         flags?.affectedUsingTaskInputs === true,
+        windowsPathSeparators,
       );
       ranges.set(defaultAffectedSelector, affected.packages);
       affectedBySelector.set(defaultAffectedSelector, affected);
@@ -752,6 +760,7 @@ const taskMatchesChangedFiles = (
   repository: RepositoryModel,
   node: TaskNode,
   changedFiles: ReadonlyArray<string>,
+  windowsPathSeparators: boolean,
 ): boolean => {
   const rootRelativeInputPrefix = "$TURBO_ROOT$/";
   const isRootPackage = node.package.relativeDirectory === ".";
@@ -788,6 +797,7 @@ const taskMatchesChangedFiles = (
           rootRelative
             ? pattern.slice(rootRelativeInputPrefix.length)
             : pattern,
+          windowsPathSeparators,
         )
       );
     };
@@ -822,12 +832,18 @@ const affectedTaskEntrypoints = (
   changedFiles: ReadonlyArray<string>,
   rootChanged: boolean,
   filter: string,
+  windowsPathSeparators: boolean,
 ): ReadonlySet<string> => {
   if (rootChanged) return new Set(graph.entrypoints);
   const matchingNodes = new Set(
     [...graph.nodes]
       .filter(([, node]) =>
-        taskMatchesChangedFiles(repository, node, changedFiles),
+        taskMatchesChangedFiles(
+          repository,
+          node,
+          changedFiles,
+          windowsPathSeparators,
+        ),
       )
       .map(([id]) => id),
   );
@@ -931,6 +947,7 @@ const selectAffectedTasks = (
   filters: ReadonlyArray<string>,
   affectedBySelector: ReadonlyMap<string, AffectedPackages>,
   retainedPackageNames: ReadonlySet<string> = new Set(),
+  windowsPathSeparators = false,
 ): TaskGraph => {
   const rangeFilters = filters.flatMap((filter) => {
     const selector = gitRangeSelector(filter);
@@ -957,6 +974,7 @@ const selectAffectedTasks = (
       affected.changedFiles,
       affected.rootChanged,
       filter,
+      windowsPathSeparators,
     )) {
       retainedEntrypoints.add(id);
     }
@@ -970,6 +988,7 @@ const selectAffectedTasks = (
       affected.changedFiles,
       affected.rootChanged,
       filter,
+      windowsPathSeparators,
     )) {
       retainedEntrypoints.delete(id);
     }
@@ -1319,29 +1338,7 @@ type TaskOutputQueueEvent =
   | { readonly kind: "end" };
 
 const persistentOutputCaptureCharacters = 64 * 1024;
-const persistentDisplayBufferCharacters = 64 * 1024;
 const persistentOutputQueueCapacity = 16;
-
-export const takePersistentDisplayOutput = (
-  pending: string,
-): { readonly output: string; readonly remainder: string } | undefined => {
-  const lastLineBreak = pending.lastIndexOf(
-    "\n",
-    persistentDisplayBufferCharacters - 1,
-  );
-  const flushLength =
-    lastLineBreak !== -1
-      ? lastLineBreak + 1
-      : pending.length >= persistentDisplayBufferCharacters
-        ? persistentDisplayBufferCharacters
-        : 0;
-  return flushLength === 0
-    ? undefined
-    : {
-        output: pending.slice(0, flushLength),
-        remainder: pending.slice(flushLength),
-      };
-};
 
 const cargoAlternateOutputFlags = [
   "--artifact-dir",
@@ -1691,16 +1688,22 @@ const prepareTaskLogPath = (
         }),
       );
     }
-    if (logMetadata.kind === "file") {
-      yield* fileSystem
-        .remove(logPath)
-        .pipe(
-          Effect.mapError(
-            (error) =>
-              new RepositoryError({ path: logPath, message: error.message }),
-          ),
-        );
+    if (logMetadata.kind !== "file") {
+      return yield* Effect.fail(
+        new RepositoryError({
+          path: logPath,
+          message: "task log destination must be a regular file",
+        }),
+      );
     }
+    yield* fileSystem
+      .remove(logPath)
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({ path: logPath, message: error.message }),
+        ),
+      );
   });
 
 const executeTask = (
@@ -1979,41 +1982,28 @@ const executeTask = (
             yield* Effect.addFinalizer(() => Queue.shutdown(outputQueue));
             const outputFiber = yield* Effect.forkScoped(
               Effect.gen(function* () {
-                let pendingDisplay = "";
+                let renderState = initialTaskOutputRenderState;
                 while (true) {
                   const event = yield* Queue.take(outputQueue);
                   if (event.kind === "end") {
-                    if (displaysStreamedOutput && pendingDisplay !== "") {
-                      yield* terminal.writeStdout(
-                        renderLogEvent(
-                          {
-                            kind: "task-output",
-                            task: taskLabel,
-                            output: pendingDisplay,
-                          },
-                          color,
-                        ),
-                      );
+                    if (displaysStreamedOutput) {
+                      for (const chunk of finishTaskOutput(renderState)) {
+                        yield* terminal.writeStdout(chunk);
+                      }
                     }
                     return;
                   }
                   yield* fileSystem.appendText(logPath, event.output);
                   if (!displaysStreamedOutput) continue;
-                  pendingDisplay += event.output;
-                  while (pendingDisplay !== "") {
-                    const display = takePersistentDisplayOutput(pendingDisplay);
-                    if (display === undefined) break;
-                    pendingDisplay = display.remainder;
-                    yield* terminal.writeStdout(
-                      renderLogEvent(
-                        {
-                          kind: "task-output",
-                          task: taskLabel,
-                          output: display.output,
-                        },
-                        color,
-                      ),
-                    );
+                  const rendered = renderTaskOutputChunk(
+                    renderState,
+                    taskLabel,
+                    event.output,
+                    color,
+                  );
+                  renderState = rendered.state;
+                  for (const chunk of rendered.chunks) {
+                    yield* terminal.writeStdout(chunk);
                   }
                 }
               }),
@@ -2627,6 +2617,7 @@ export const executeRun = (
       repository,
       options,
       environment,
+      platform === "win32",
     );
     const flags = repository.rootConfiguration.value.futureFlags;
     const useTaskInputs =
@@ -2708,6 +2699,7 @@ export const executeRun = (
           affected.filters,
           affected.affectedBySelector,
           retainedPackageNames,
+          platform === "win32",
         )
       : unfilteredGraph;
     const cargoWorkspacePlan = planCargoWorkspaceTasks(

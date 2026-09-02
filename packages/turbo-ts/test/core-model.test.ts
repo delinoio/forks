@@ -54,7 +54,6 @@ import {
   packageManagerCommand,
   parseCacheSpecification,
   planCargoWorkspaceTasks,
-  takePersistentDisplayOutput,
   taskIdsWithUnrestorableCacheInputs,
   taskScopeEnvironment,
 } from "../src/run/engine.js";
@@ -143,6 +142,17 @@ describe("core repository model", () => {
     expect(
       Math.max(...renderedChunks.map((chunk) => chunk.length)),
     ).toBeLessThanOrEqual(64 * 1024);
+    expect(
+      renderTaskOutputChunk(
+        initialTaskOutputRenderState,
+        "package:build",
+        "ready\n",
+        false,
+      ),
+    ).toEqual({
+      state: { atLineStart: true, pending: "" },
+      chunks: ["package:build: ready\n"],
+    });
   });
 
   it(evidenceId.coreModel, () => {
@@ -204,6 +214,11 @@ describe("core repository model", () => {
     expect(matchesGlob("src/app.tsx", "src/**/*.{ts,tsx}")).toBe(true);
     expect(matchesGlob("assets/7-logo.png", "assets/[0-9]*.png")).toBe(true);
     expect(matchesGlob("assets/a-logo.png", "assets/[0-9]*.png")).toBe(false);
+    expect(matchesGlob("src\\config.json", "src/**")).toBe(false);
+    expect(matchesGlob("src\\config.json", "src/**", true)).toBe(true);
+    expect(
+      selectByGlobs(["src\\config.json", "src/config.json"], ["**", "!src/**"]),
+    ).toEqual(["src\\config.json"]);
   });
 
   it("parses JSONC without interpreting comment markers inside strings", () => {
@@ -607,19 +622,6 @@ describe("core repository model", () => {
         false,
       ),
     ).toThrow(/cannot resolve with task library#serve/);
-  });
-
-  it("bounds persistent output without a newline", () => {
-    const pending = "x".repeat(64 * 1024 + 7);
-    expect(takePersistentDisplayOutput(pending)).toEqual({
-      output: "x".repeat(64 * 1024),
-      remainder: "x".repeat(7),
-    });
-    expect(takePersistentDisplayOutput("partial")).toBeUndefined();
-    expect(takePersistentDisplayOutput("complete\npartial")).toEqual({
-      output: "complete\n",
-      remainder: "partial",
-    });
   });
 
   it("models root task entrypoints and dependencies in the //# namespace", () => {

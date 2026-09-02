@@ -292,6 +292,12 @@ const writeAtomically = (
   });
 
 const staleLockMilliseconds = 5 * 60 * 1_000;
+const lockRenewalMilliseconds = 60 * 1_000;
+
+interface EntryLock {
+  readonly path: string;
+  readonly contents: string;
+}
 
 const lockOwner = (contents: string): string => {
   try {
@@ -358,6 +364,52 @@ const reclaimStaleLock = (
     }
     yield* fileSystem.remove(reclaimPath).pipe(Effect.ignore);
   });
+
+const renewEntryLock = (
+  lock: EntryLock,
+): Effect.Effect<void, CacheError, FileSystemService | ClockService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const clock = yield* ClockService;
+    const current = yield* fileSystem
+      .readText(lock.path)
+      .pipe(Effect.mapError((error) => cacheError(lock.path, error.message)));
+    if (current !== lock.contents) {
+      return yield* Effect.fail(
+        cacheError(lock.path, "cache writer lock ownership was lost"),
+      );
+    }
+    const now = yield* clock.now;
+    yield* fileSystem
+      .setFileMetadata(lock.path, 0o600, now)
+      .pipe(
+        Effect.mapError((error) =>
+          cacheError(
+            lock.path,
+            `cache writer lock renewal failed: ${error.message}`,
+          ),
+        ),
+      );
+    const renewed = yield* fileSystem
+      .readText(lock.path)
+      .pipe(Effect.mapError((error) => cacheError(lock.path, error.message)));
+    if (renewed !== lock.contents) {
+      return yield* Effect.fail(
+        cacheError(lock.path, "cache writer lock ownership was lost"),
+      );
+    }
+  });
+
+const maintainEntryLock = (
+  lock: EntryLock,
+): Effect.Effect<never, CacheError, FileSystemService | ClockService> =>
+  Effect.forever(
+    Effect.gen(function* () {
+      const clock = yield* ClockService;
+      yield* clock.sleep(lockRenewalMilliseconds);
+      yield* renewEntryLock(lock);
+    }),
+  );
 
 const withEntryLock = <A, E, R>(
   options: LocalCacheOptions,
@@ -443,7 +495,9 @@ const withEntryLock = <A, E, R>(
               ),
             ),
         ).pipe(
-          Effect.flatMap(() => restore(use)),
+          Effect.flatMap((lock) =>
+            Effect.raceFirst(restore(use), restore(maintainEntryLock(lock))),
+          ),
           Effect.exit,
         ),
       );

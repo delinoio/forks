@@ -92,6 +92,10 @@ export const renderTaskOutputChunk = (
       output.slice(offset, lineBreak + 1),
       chunks,
     );
+    if (pending !== "") {
+      chunks.push(pending);
+      pending = "";
+    }
     atLineStart = true;
     offset = lineBreak + 1;
   }

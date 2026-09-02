@@ -21,7 +21,7 @@ import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it } from "@rstest/core";
-import { Cause, Effect, Exit, Layer, Stream } from "effect";
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect";
 import {
   createTarArchive,
   maximumCacheArchiveInputBytes,
@@ -48,6 +48,7 @@ import { loadRootConfiguration } from "../src/config/runtime.js";
 import { BoundaryError, CacheError } from "../src/effect/errors.js";
 import { nodeFoundationLayer } from "../src/effect/node-layer.js";
 import {
+  ClockService,
   CompressionService,
   DigestService,
   EnvironmentService,
@@ -270,6 +271,55 @@ describe("core CLI execution", () => {
       );
       expect(log.length).toBeGreaterThan(96 * 1024);
       expect(log).toContain("END-MARKER");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("preserves continuous lines across bounded display flushes", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const output = "x".repeat(96 * 1024);
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks["long-line"] = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts["long-line"] =
+        "node -e \"process.stdout.write('x'.repeat(96 * 1024))\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "long-line",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--no-cache",
+          "--output-logs=full",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode, result.combinedOutput).toBe(0);
+      const prefix = "synthetic-library:long-line: ";
+      expect(result.stdout).toContain(`${prefix}${output}\n`);
+      expect(
+        await readFile(
+          `${packageDirectory}/.turbo/turbo-long-line.log`,
+          "utf8",
+        ),
+      ).toContain(output);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -618,6 +668,46 @@ describe("core CLI execution", () => {
     await executeCase("directory");
     await executeCase("file");
   }, 20_000);
+
+  it("rejects FIFO task log destinations before execution", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const logPath = `${packageDirectory}/.turbo/turbo-build.log`;
+    const marker = `${packageDirectory}/task-ran`;
+    try {
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"require('node:fs').writeFileSync('task-ran','ran')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      await mkdir(dirname(logPath), { recursive: true });
+      const fifo = await run("mkfifo", [logPath], directory);
+      expect(fifo.exitCode, fifo.combinedOutput).toBe(0);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(
+        "task log destination must be a regular file",
+      );
+      await expect(lstat(marker)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
 
   it("replaces hard-linked task logs before execution", async () => {
     const directory = await makeFixture();
@@ -3670,11 +3760,30 @@ describe("core CLI execution", () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(join(packageRoot, "test-backslash-input-"));
     await cp(fixtureRoot, directory, { recursive: true });
-    const inputPath = `${directory}/packages/library/src/a\\b.ts`;
+    const inputPath = `${directory}/packages/library/src\\config.json`;
     try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, { inputs?: Array<string> }>;
+      };
+      configuration.futureFlags = { filterUsingTasks: true };
+      configuration.tasks.build!.inputs = ["$TURBO_DEFAULT$", "!src/**"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
       await mkdir(dirname(inputPath), { recursive: true });
       await writeFile(inputPath, "first\n");
-      for (const args of [["init"], ["add", "."]]) {
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "fixture@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "fixture base"],
+      ]) {
         const result = await run("git", args, directory);
         expect(result.exitCode, `${args.join(" ")}: ${result.stderr}`).toBe(0);
       }
@@ -3695,13 +3804,39 @@ describe("core CLI execution", () => {
           ),
         );
       const initial = await compute();
-      expect(initial.inputFiles).toContain("src/a\\b.ts");
+      expect(initial.inputFiles).toContain("src\\config.json");
       await writeFile(inputPath, "second\n");
       expect((await compute()).hash).not.toBe(initial.hash);
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      expect(
+        (
+          await run(
+            "git",
+            ["commit", "-m", "literal backslash input"],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      const selected = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=[HEAD~1]",
+          "--only",
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(selected.exitCode, selected.combinedOutput).toBe(0);
+      expect(selected.stdout).toContain("synthetic-library:build");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  });
+  }, 20_000);
 
   it("excludes deleted tracked files from task hash inputs", async () => {
     const directory = await mkdtemp(join(packageRoot, "test-deleted-input-"));
@@ -8230,6 +8365,97 @@ describe("cache interoperability and safety", () => {
       await rm(directory, { force: true, recursive: true });
     }
   });
+
+  it("renews active cache writer locks before stale reclamation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-lock-renewal-"));
+    const cacheDirectory = `${directory}/cache`;
+    const hash = "1918171615141312";
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const fileSystem = yield* FileSystemService;
+            const firstArchiveWrite = yield* Deferred.make<void>();
+            const releaseFirstWrite = yield* Deferred.make<void>();
+            const renewedBeyondStaleAge = yield* Deferred.make<void>();
+            const secondArchiveWrite = yield* Deferred.make<void>();
+            let now = Date.now();
+            let renewalCount = 0;
+            let archiveWriteCount = 0;
+            const clockLayer = Layer.succeed(ClockService, {
+              now: Effect.sync(() => now),
+              sleep: (milliseconds) =>
+                milliseconds === 60 * 1_000
+                  ? renewalCount >= 6
+                    ? Effect.never
+                    : Effect.gen(function* () {
+                        now += milliseconds;
+                        renewalCount += 1;
+                        if (renewalCount === 6) {
+                          yield* Deferred.succeed(
+                            renewedBeyondStaleAge,
+                            undefined,
+                          );
+                        }
+                        yield* Effect.yieldNow();
+                      })
+                  : Effect.sleep("1 millis"),
+            });
+            const blockingLayer = Layer.succeed(FileSystemService, {
+              ...fileSystem,
+              writeBytes: (path, contents) =>
+                path.includes(`${hash}.tar.zst.`)
+                  ? Effect.gen(function* () {
+                      archiveWriteCount += 1;
+                      if (archiveWriteCount === 1) {
+                        yield* Deferred.succeed(firstArchiveWrite, undefined);
+                        yield* Deferred.await(releaseFirstWrite);
+                      } else {
+                        yield* Deferred.succeed(secondArchiveWrite, undefined);
+                      }
+                      yield* fileSystem.writeBytes(path, contents);
+                    })
+                  : fileSystem.writeBytes(path, contents),
+            });
+            const write = () =>
+              writeLocalCache(
+                { directory: cacheDirectory },
+                hash,
+                [
+                  {
+                    path: "packages/app/out.txt",
+                    contents: new TextEncoder().encode("cached"),
+                    mode: 0o644,
+                    modifiedSeconds: 1,
+                  },
+                ],
+                1,
+              ).pipe(Effect.provide(blockingLayer), Effect.provide(clockLayer));
+            const first = yield* Effect.forkScoped(write());
+            yield* Deferred.await(firstArchiveWrite);
+            yield* Deferred.await(renewedBeyondStaleAge);
+            const second = yield* Effect.forkScoped(write());
+            const enteredBeforeRelease = yield* Effect.raceFirst(
+              Deferred.await(secondArchiveWrite).pipe(Effect.as(true)),
+              Effect.sleep("50 millis").pipe(Effect.as(false)),
+            );
+            yield* Deferred.succeed(releaseFirstWrite, undefined);
+            yield* Fiber.join(first);
+            yield* Fiber.join(second);
+            return { archiveWriteCount, enteredBeforeRelease, renewalCount };
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(result.enteredBeforeRelease).toBe(false);
+      expect(result.renewalCount).toBe(6);
+      expect(result.archiveWriteCount).toBe(2);
+      await expect(
+        lstat(`${cacheDirectory}/${hash}.turbo-ts.lock`),
+      ).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
 
   it("reclaims stale atomic temporaries under their entry lock", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-temp-"));

@@ -179,6 +179,7 @@ const taskInputFiles = (
   repositoryFiles: ReadonlyArray<DiscoveredFile>,
   inputs: ReadonlyArray<TaskInput>,
   cacheDirectory: string,
+  windowsPathSeparators: boolean,
 ): ReadonlyArray<TaskInputFile> => {
   const defaults = packageFiles
     .filter((file) => !isIgnoredInputPath(file.absolutePath, cacheDirectory))
@@ -211,7 +212,7 @@ const taskInputFiles = (
       ? pattern.slice(turboRootInputPrefix.length)
       : pattern;
     return (rootRelative ? rootFiles : defaults).filter((file) =>
-      matchesGlob(file.matchPath, matcher),
+      matchesGlob(file.matchPath, matcher, windowsPathSeparators),
     );
   };
   const include = (files: ReadonlyArray<TaskInputFile>): void => {
@@ -675,6 +676,7 @@ export const hashTask = (
       repositoryFiles,
       inputs,
       cacheDirectory,
+      platform === "win32",
     );
     const inputFiles = [
       ...new Map(
@@ -845,6 +847,7 @@ export const hashTask = (
     const globalInputFiles = selectByGlobs(
       [...globalInputFilesByRelativePath.keys()],
       globalDependencyPatterns,
+      platform === "win32",
     );
     const globalFileHashes = (yield* Effect.forEach(
       globalInputFiles,

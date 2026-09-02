@@ -157,12 +157,13 @@ wave. Foreground owners wait until their complete non-persistent companion
 cohort is dependency-ready; prerequisite companions may run first to unlock
 the cohort. All non-interactive task output streams to the task log through
 bounded backpressure while retaining only a bounded diagnostic tail and
-incomplete display line in memory.
-Before local task execution, an existing task-log directory and exact log
-destination are rejected when either is a symlink, preventing log writes from
-escaping the execution directory. An existing regular log destination is
-unlinked before task output is written so a hard link cannot redirect
-truncation outside the execution directory.
+incomplete display line in memory. Bounded display flushes retain streaming
+render state, so a continuous line receives one prefix and no synthetic line
+breaks. Before local task execution, the task-log parent must be a real
+directory and an existing exact log destination must be a regular file.
+Symlinks and other non-regular destinations are rejected. An existing regular
+log destination is unlinked before task output is written so a hard link cannot
+redirect truncation outside the execution directory.
 Persistent companions must remain alive until their foreground owners
 complete; any earlier natural exit fails the group, and foreground owners
 sharing a companion remain subject to the run's concurrency limit.
@@ -257,7 +258,9 @@ entry; selected-entry removal failures are aggregated after all of its archive
 and sidecar paths are tried. Eviction also reclaims stale atomic-write
 temporaries under the corresponding entry lock. Restoration of an existing
 entry holds the same lock through validation and rejected-entry cleanup so it
-cannot remove a concurrent publication.
+cannot remove a concurrent publication. Active entry locks renew their lease
+before the stale-lock threshold, and renewal or ownership loss interrupts the
+protected operation. Locks left by terminated writers remain reclaimable.
 Cache archives use PAX
 extensions for paths beyond ustar limits. Tar header paths, link targets, and
 PAX metadata must be valid UTF-8; unsupported raw-byte names reject the
