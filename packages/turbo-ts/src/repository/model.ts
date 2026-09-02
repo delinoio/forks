@@ -2014,10 +2014,12 @@ export const listRepositoryFiles = (
     readonly ignoredDirectories?: ReadonlySet<string>;
     readonly includeDirectories?: boolean;
     readonly shouldTraverseDirectory?: (relativeDirectory: string) => boolean;
+    readonly windowsPathSeparators?: boolean;
   } = {},
 ): Effect.Effect<ReadonlyArray<string>, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
+    const windowsPathSeparators = options.windowsPathSeparators === true;
     const files: Array<string> = [];
     const pending = [directory];
     while (pending.length > 0) {
@@ -2032,13 +2034,17 @@ export const listRepositoryFiles = (
         );
       for (const entry of entries) {
         if (entry.kind === "directory") {
-          const path = joinPath(current, entry.name);
+          const path = normalizePath(
+            `${current.endsWith("/") ? current : `${current}/`}${entry.name}`,
+            windowsPathSeparators,
+          );
           if (
             (options.ignoredDirectories ?? fileTraversalIgnoredDirectories).has(
               entry.name,
             ) ||
-            options.shouldTraverseDirectory?.(relativePath(directory, path)) ===
-              false
+            options.shouldTraverseDirectory?.(
+              relativePath(directory, path, windowsPathSeparators),
+            ) === false
           ) {
             continue;
           }
@@ -2047,7 +2053,12 @@ export const listRepositoryFiles = (
           }
           pending.push(path);
         } else if (entry.kind === "file" || entry.kind === "symlink") {
-          files.push(joinPath(current, entry.name));
+          files.push(
+            normalizePath(
+              `${current.endsWith("/") ? current : `${current}/`}${entry.name}`,
+              windowsPathSeparators,
+            ),
+          );
         }
       }
     }

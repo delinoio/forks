@@ -1115,6 +1115,7 @@ const collectOutputPaths = (
   repository: RepositoryModel,
   nodes: ReadonlyArray<TaskNode>,
   cacheDirectory: string,
+  windowsPathSeparators: boolean,
 ): Effect.Effect<ReadonlyArray<string>, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
     const selected = new Set<string>();
@@ -1133,14 +1134,19 @@ const collectOutputPaths = (
           includeDirectories: true,
           shouldTraverseDirectory: (relativeDirectory) =>
             positivePatterns.some((pattern) =>
-              canMatchGlobDescendant(relativeDirectory, pattern),
+              canMatchGlobDescendant(
+                relativeDirectory,
+                pattern,
+                windowsPathSeparators,
+              ),
             ),
+          windowsPathSeparators,
         });
         for (const path of files) {
-          if (isPathContained(cacheDirectory, path)) {
+          if (isPathContained(cacheDirectory, path, windowsPathSeparators)) {
             continue;
           }
-          const relative = relativePath(directory, path);
+          const relative = relativePath(directory, path, windowsPathSeparators);
           const metadata = yield* fileSystem
             .metadata(path)
             .pipe(
@@ -1153,7 +1159,13 @@ const collectOutputPaths = (
             metadata.kind === "directory"
               ? [relative, `${relative}/`]
               : [relative];
-          if (matchesGlobsWithExclusions(candidates, patterns)) {
+          if (
+            matchesGlobsWithExclusions(
+              candidates,
+              patterns,
+              windowsPathSeparators,
+            )
+          ) {
             selected.add(path);
           }
         }
@@ -1186,6 +1198,7 @@ const collectCacheEntries = (
   logPath: string,
   cacheDirectory: string,
   restoreScope: CacheRestoreScope,
+  windowsPathSeparators: boolean,
 ): Effect.Effect<
   | {
       readonly kind: "ready";
@@ -1199,7 +1212,12 @@ const collectCacheEntries = (
     const selected = [
       ...new Set([
         logPath,
-        ...(yield* collectOutputPaths(repository, nodes, cacheDirectory)),
+        ...(yield* collectOutputPaths(
+          repository,
+          nodes,
+          cacheDirectory,
+          windowsPathSeparators,
+        )),
       ]),
     ].sort();
     const fileSystem = yield* FileSystemService;
@@ -1229,7 +1247,7 @@ const collectCacheEntries = (
     let inputBytes = 0;
     for (const { path, metadata } of selectedMetadata) {
       const common = {
-        path: relativePath(repository.root, path),
+        path: relativePath(repository.root, path, windowsPathSeparators),
         mode: metadata.mode,
         modifiedSeconds: metadata.modifiedMilliseconds / 1_000,
       };
@@ -1794,9 +1812,12 @@ const executeTask = (
           repository,
           cacheNodes,
           options.cacheExclusionDirectory,
+          platform === "win32",
         ).pipe(
           Effect.map((paths) =>
-            paths.map((path) => relativePath(repository.root, path)),
+            paths.map((path) =>
+              relativePath(repository.root, path, platform === "win32"),
+            ),
           ),
           Effect.catchTag("RepositoryError", (error) =>
             terminal
@@ -2056,6 +2077,7 @@ const executeTask = (
             logPath,
             options.cacheExclusionDirectory,
             restoreScope,
+            platform === "win32",
           ).pipe(
             Effect.catchAll((error) =>
               terminal
@@ -2171,6 +2193,22 @@ const cargoWorkspaceVerificationTasks = new Set([
   "test",
 ]);
 
+const hasCompatibleCargoWorkspaceRuntime = (
+  members: ReadonlyArray<TaskNode>,
+): boolean => {
+  const representative = members[0];
+  if (representative === undefined) return false;
+  return members.every(
+    (member) =>
+      (member.definition.interactive === true) ===
+        (representative.definition.interactive === true) &&
+      (member.definition.outputLogs ?? undefined) ===
+        (representative.definition.outputLogs ?? undefined) &&
+      (member.definition.persistent === true) ===
+        (representative.definition.persistent === true),
+  );
+};
+
 export interface CargoWorkspaceTaskPlan {
   readonly graph: TaskGraph;
   readonly scopes: ReadonlyMap<string, TaskCommandScope>;
@@ -2222,6 +2260,7 @@ export const planCargoWorkspaceTasks = (
       members.map((member) => member.package.name),
     );
     if (
+      !hasCompatibleCargoWorkspaceRuntime(members) ||
       workspaceMembers.some(
         (packageModel) =>
           packageModel.tasks[representative.task] === undefined ||

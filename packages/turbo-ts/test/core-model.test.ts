@@ -184,6 +184,13 @@ describe("core repository model", () => {
     expect(isAbsolutePath("C:\\repo")).toBe(true);
     expect(isAbsolutePath("packages/app")).toBe(false);
     expect(isAbsolutePath("\\\\server\\share\\repo")).toBe(true);
+    expect(normalizePath("/repo/dist\\artifact", false)).toBe(
+      "/repo/dist\\artifact",
+    );
+    expect(relativePath("/repo", "/repo/dist\\artifact", false)).toBe(
+      "dist\\artifact",
+    );
+    expect(isPathContained("/repo", "/repo/dist\\artifact", false)).toBe(true);
     expect(normalizePath("\\\\server\\share\\repo\\packages\\..\\app")).toBe(
       "//server/share/repo/app",
     );
@@ -896,6 +903,35 @@ describe("core repository model", () => {
       cwd: "/repo",
     });
     expect(isTaskScopeCacheable(workspaceNode, [], workspaceScope)).toBe(false);
+
+    for (const definition of [
+      { cache: false, interactive: true },
+      { outputLogs: "errors-only" as const },
+      { cache: false, persistent: true },
+    ]) {
+      const incompatibleLibrary = {
+        ...library,
+        tasks: { format: {}, test: definition },
+      };
+      const incompatibleModel = repository([app, incompatibleLibrary]);
+      const incompatibleGraph = buildTaskGraph(
+        incompatibleModel,
+        incompatibleModel.packages,
+        ["test"],
+        false,
+      );
+      const incompatiblePlan = planCargoWorkspaceTasks(
+        incompatibleModel,
+        incompatibleGraph,
+        ["test"],
+        true,
+      );
+      expect(incompatiblePlan.graph.entrypoints).toEqual([
+        "app#test",
+        "library#test",
+      ]);
+      expect(incompatiblePlan.scopes.size).toBe(0);
+    }
 
     if (workspaceScope.kind !== "cargo-workspace") {
       throw new Error("expected a Cargo workspace scope");

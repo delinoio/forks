@@ -3840,6 +3840,79 @@ describe("core CLI execution", () => {
     }
   }, 20_000);
 
+  it("preserves literal backslashes in POSIX filesystem traversal", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const inputPath = `${directory}/packages/library/src\\config.json`;
+    try {
+      await writeFile(inputPath, "first\n");
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      const compute = () =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const initial = await compute();
+      expect(initial.inputFiles).toContain("src\\config.json");
+      await writeFile(inputPath, "second\n");
+      expect((await compute()).hash).not.toBe(initial.hash);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("publishes POSIX cache outputs whose names contain backslashes", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const outputPath = `${packageDirectory}/dist/output\\artifact`;
+    const cacheDirectory = `${directory}/.turbo/cache`;
+    try {
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/output'+String.fromCharCode(92)+'artifact','cached')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--cache=local:rw",
+          "--output-logs=hash-only",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode, result.combinedOutput).toBe(0);
+      expect(result.stdout).toContain("cache miss");
+      expect(result.stderr).not.toContain("cache output collection failed");
+      expect(await readFile(outputPath, "utf8")).toBe("cached");
+      expect(
+        (await readdir(cacheDirectory)).some((name) =>
+          name.endsWith(".tar.zst"),
+        ),
+      ).toBe(true);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("excludes deleted tracked files from task hash inputs", async () => {
     const directory = await mkdtemp(join(packageRoot, "test-deleted-input-"));
     await cp(fixtureRoot, directory, { recursive: true });

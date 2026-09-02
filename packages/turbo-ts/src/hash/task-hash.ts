@@ -517,7 +517,7 @@ const discoverFiles = (
   repository: RepositoryModel,
   directory: string,
   cacheDirectory: string,
-  useTrackedGitModes: boolean,
+  windowsPathSeparators: boolean,
 ): Effect.Effect<
   ReadonlyArray<DiscoveredFile>,
   RepositoryError,
@@ -527,7 +527,7 @@ const discoverFiles = (
     const processService = yield* ProcessService;
     const fileSystem = yield* FileSystemService;
     const relativeDirectory = relativePath(repository.root, directory);
-    const gitModes = useTrackedGitModes
+    const gitModes = windowsPathSeparators
       ? yield* trackedGitModes(repository, [relativeDirectory])
       : new Map<string, GitTrackedMode>();
     const git = yield* Effect.either(
@@ -554,7 +554,7 @@ const discoverFiles = (
         repository.root,
       ))
         .map((path) => {
-          const absolutePath = useTrackedGitModes
+          const absolutePath = windowsPathSeparators
             ? joinPath(repository.root, path)
             : `${repository.root.endsWith("/") ? repository.root : `${repository.root}/`}${path}`;
           return {
@@ -587,11 +587,15 @@ const discoverFiles = (
           !isIgnoredInputPath(file.absolutePath, cacheDirectory),
       );
     }
-    return (yield* listRepositoryFiles(directory))
+    return (yield* listRepositoryFiles(directory, { windowsPathSeparators }))
       .filter((path) => !isIgnoredInputPath(path, cacheDirectory))
       .map((absolutePath) => ({
         absolutePath,
-        repositoryRelativePath: relativePath(repository.root, absolutePath),
+        repositoryRelativePath: relativePath(
+          repository.root,
+          absolutePath,
+          windowsPathSeparators,
+        ),
         gitMode: undefined,
       }));
   });

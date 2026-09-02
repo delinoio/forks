@@ -9,8 +9,11 @@ export const isAbsolutePath = (value: string): boolean => {
   return unix.startsWith("/") || /^[A-Za-z]:\//.test(unix);
 };
 
-export const normalizePath = (value: string): string => {
-  const unix = toUnixPath(value);
+export const normalizePath = (
+  value: string,
+  windowsPathSeparators = true,
+): string => {
+  const unix = windowsPathSeparators ? toUnixPath(value) : value;
   const unc = uncPath(unix);
   const drive = /^[A-Za-z]:/.exec(unix)?.[0] ?? "";
   const absolute = unc !== null || unix.startsWith("/") || drive !== "";
@@ -70,9 +73,16 @@ export const baseName = (value: string): string => {
   return normalized.slice(normalized.lastIndexOf("/") + 1);
 };
 
-export const relativePath = (root: string, value: string): string => {
-  const normalizedRoot = normalizePath(root).replace(/\/$/, "");
-  const normalizedValue = normalizePath(value);
+export const relativePath = (
+  root: string,
+  value: string,
+  windowsPathSeparators = true,
+): string => {
+  const normalizedRoot = normalizePath(root, windowsPathSeparators).replace(
+    /\/$/,
+    "",
+  );
+  const normalizedValue = normalizePath(value, windowsPathSeparators);
   return normalizedValue === normalizedRoot
     ? "."
     : normalizedValue.startsWith(`${normalizedRoot}/`)
@@ -80,9 +90,16 @@ export const relativePath = (root: string, value: string): string => {
       : normalizedValue;
 };
 
-export const isPathContained = (root: string, value: string): boolean => {
-  const normalizedRoot = normalizePath(root).replace(/\/$/, "");
-  const normalizedValue = normalizePath(value);
+export const isPathContained = (
+  root: string,
+  value: string,
+  windowsPathSeparators = true,
+): boolean => {
+  const normalizedRoot = normalizePath(root, windowsPathSeparators).replace(
+    /\/$/,
+    "",
+  );
+  const normalizedValue = normalizePath(value, windowsPathSeparators);
   const caseInsensitive =
     /^[A-Za-z]:/.test(normalizedRoot) || normalizedRoot.startsWith("//");
   const comparisonRoot = caseInsensitive

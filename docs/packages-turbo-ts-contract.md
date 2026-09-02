@@ -134,9 +134,9 @@ Regular input files are streamed through bounded-memory Git blob digests, and
 owning lockfiles are streamed through bounded-memory xxHash64 digests.
 NUL-delimited Git discovery output is consumed as bytes and filenames that are
 not valid UTF-8 fail affected selection and hashing instead of being silently
-omitted. Git-discovered POSIX filenames preserve literal backslashes as
-filename characters. Cargo task hashes additionally include
-repository-contained ancestor manifests, Cargo configuration, and Rust
+omitted. Git-discovered and filesystem-traversed POSIX filenames preserve
+literal backslashes as filename characters. Cargo task hashes additionally
+include repository-contained ancestor manifests, Cargo configuration, and Rust
 toolchain files that can change task execution. An effective ancestor Cargo
 configuration outside the repository makes the Cargo package and downstream
 hash scopes uncacheable. Environment-name selection follows Windows
@@ -313,8 +313,10 @@ a workspace configuration. Unfiltered Cargo `test`,
 `check`, `lint`, and `format` tasks execute once per Cargo workspace and bypass
 caching when any grouped member disables it; filtered and package-qualified
 runs retain package targeting. A workspace is grouped only when every
-repository-contained member exposes the requested verification task; otherwise
-participating members retain package targeting so task exclusions are honored.
+repository-contained member exposes the requested verification task and their
+interactive, output-log, and persistent runtime settings are compatible;
+otherwise participating members retain package targeting so task exclusions
+and runtime overrides are honored.
 Members of an enclosing Cargo workspace outside
 the repository always retain package targeting and bypass caching, as do task
 scopes whose hashes depend on them, because their external Cargo controls are
