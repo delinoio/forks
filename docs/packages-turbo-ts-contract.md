@@ -140,10 +140,13 @@ code-unit ordering.
 When the Git index and working tree disagree on regular-file or symlink kind,
 the working-tree kind determines the hashed mode. An indexed executable bit is
 retained only while both representations remain regular files.
-An npm or pnpm task bypasses caching when its effective user configuration
-exists, using `NPM_CONFIG_USERCONFIG` when set and the platform user home's
-`.npmrc` otherwise, because that external configuration is not a repository
-hash input.
+Repository-contained ancestor `.npmrc` files are always hashed for npm and
+pnpm workspace tasks independently of configured input globs. An npm or pnpm
+task bypasses caching when its effective user configuration exists, using
+`NPM_CONFIG_USERCONFIG` when set and the platform user home's `.npmrc`
+otherwise, because that external configuration is not a repository hash input.
+Yarn tasks likewise bypass caching when the platform user home contains an
+effective `.yarnrc` or `.yarnrc.yml` configuration.
 Only indexed mode `160000` directories are hashed as gitlinks; an indexed
 regular file replaced by a working-tree directory is omitted while its
 discovered descendants remain task inputs.
@@ -152,9 +155,10 @@ owning lockfiles are streamed through bounded-memory xxHash64 digests.
 NUL-delimited Git discovery output is consumed as bytes and filenames that are
 not valid UTF-8 fail affected selection and hashing instead of being silently
 omitted. Git-discovered and filesystem-traversed POSIX filenames preserve
-literal backslashes as filename characters. Cache archive paths and symlink
-targets preserve the same POSIX distinction while Windows-originated paths use
-Windows separator semantics. Cargo task hashes additionally
+literal backslashes as filename characters. Generic repository discovery,
+path joining, cache archive paths, and symlink targets preserve the same POSIX
+distinction while Windows-originated paths use Windows separator semantics.
+Cargo task hashes additionally
 include repository-contained ancestor manifests, Cargo configuration, and Rust
 toolchain files that can change task execution. Cached Cargo format tasks also
 include ancestor `rustfmt.toml` and `.rustfmt.toml` controls. They are
@@ -312,7 +316,9 @@ Cache output collection prunes directory subtrees that cannot match a positive
 output pattern, while matching patterns may explicitly retain `node_modules`
 or other normally ignored directories. A matching FIFO, socket, device, or
 other unsupported filesystem entry skips cache publication without changing a
-successful task result.
+successful task result. A symlink that is an untraversed ancestor of a positive
+output pattern also skips publication so a log-only artifact cannot represent
+missing declared outputs.
 uv packages are discovered from the root
 `pyproject.toml` workspace root and member globs after applying workspace
 exclusions; unrelated Python projects and `.venv` trees are ignored.
@@ -320,15 +326,19 @@ Synthesized uv packages
 expose `build` and `test`, and implicit builds default to uncached unless task
 configuration explicitly enables caching. Explicitly cached uv builds bypass
 caching when `-o`, an attached `-o` value, or `--out-dir` selects an unmodeled
-output directory, and when pass-through `--config-file` selects an unmodeled
+output directory, when `--project` or `--directory` selects an unmodeled
+project root, and when pass-through `--config-file` selects an unmodeled
 configuration file. uv
 tasks execute from their project directory, forward test arguments directly to
 `pytest`, and parse `uv.lock` as TOML. Each task hash includes the owning
 `pyproject.toml`, the workspace-root `pyproject.toml`, and effective
 repository-contained `uv.toml`, `.python-version`, or `UV_CONFIG_FILE` controls
 independently of configured input globs; these controls also participate in
-task-aware affected selection. Effective uv user configuration or an external
-`UV_CONFIG_FILE` makes the package and downstream hash scopes uncacheable. uv
+task-aware affected selection. uv task hashes are partitioned by normalized uv
+and effective Python identities. If either identity cannot be determined
+without downloading an interpreter, the task and downstream hash scopes bypass
+caching. Effective uv user configuration or an external `UV_CONFIG_FILE` makes
+the package and downstream hash scopes uncacheable. uv
 path dependencies that do not resolve to the named discovered workspace member
 make the package and hash scopes that depend on them uncacheable, regardless of
 editable mode. uv package-graph edges require a
@@ -376,11 +386,11 @@ Pass-through arguments are forwarded to Cargo without an implicit
 target-argument separator. Cargo builds
 for mixed library and binary crates default to uncached. Every cacheable Cargo
 compilation task bypasses caching when pass-through arguments add a package
-selector, including `-p`, `--package`, `--workspace`, and `--all`. Cargo builds
-with an alternate output layout or manifest, or an unmodeled library, binary,
-example, test, or benchmark target also bypass caching until those outputs are
-modeled explicitly. Cargo build
-pass-through `--config` arguments also bypass caching for every cacheable Cargo
+selector, including `-p`, `--package`, `--workspace`, and `--all`. Every
+cacheable Cargo compilation task with an alternate output layout or manifest,
+or an unmodeled library, binary, example, test, or benchmark target, bypasses
+caching until those outputs are modeled explicitly. Cargo pass-through
+`--config` arguments also bypass caching for every cacheable Cargo
 compilation task (`build`, `check`, `test`, `lint`, `run`, and `dev`) because
 they can load or set external compilation controls that are not hashed. The
 same compilation-task set bypasses caching when any effective Cargo-home

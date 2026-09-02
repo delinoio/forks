@@ -81,27 +81,30 @@ inputs, including when the active lockfile is deleted.
 Repository-contained Yarn `yarnPath` executables are package-manager inputs;
 missing or external executables disable JavaScript caching. Effective npm and
 pnpm user `.npmrc` files likewise disable caching because they are external
-inputs.
+inputs, while repository-contained ancestor `.npmrc` files are always hashed.
+Yarn home `.yarnrc` and `.yarnrc.yml` files also disable caching.
 Enabled JavaScript, Cargo, and uv discovery passes retain co-located package
 scopes in the same workspace directory. Repository-root Cargo and uv scopes do
 not absorb ordinary root files during package-level affected selection.
 
-Cargo builds that receive pass-through arguments selecting another package,
-release, profile, target, another manifest or alternate artifact layout, or an
-unmodeled library, binary, example, test, or benchmark target execute without
-cache reads or writes until those outputs are modeled explicitly. Pass-through
+Cargo compilation tasks that receive pass-through arguments selecting another
+package, release, profile, target, another manifest or alternate artifact
+layout, or an unmodeled library, binary, example, test, or benchmark target
+execute without cache reads or writes until those outputs are modeled
+explicitly. Pass-through
 `--config` arguments disable every cacheable Cargo compilation task because
 external configuration paths are not task-hash inputs. Mismatched metadata/task
-`CARGO_TARGET_DIR` values also disable Cargo build caching. Any effective
-Cargo-home configuration or `CARGO_BUILD_TARGET` likewise disables every
-cacheable Cargo compilation task. Cargo configuration above the repository
-disables the affected Cargo and downstream cache scopes. Mixed library and
-binary crates default to uncached because binary-only output declarations
-cannot restore all of Cargo's default artifacts. Source-free local path
-dependencies that do not resolve to a same-workspace repository package also
-disable caching. Synthesized binary outputs cover the extensionless executable
-plus `.exe` and `.pdb` variants. Single-binary Cargo `run` and `dev` tasks also
-default to uncached unless task configuration explicitly enables caching.
+`CARGO_TARGET_DIR` values also disable Cargo compilation-task caching. Any
+effective Cargo-home configuration or `CARGO_BUILD_TARGET` likewise disables
+every cacheable Cargo compilation task. Cargo configuration above the
+repository disables the affected Cargo and downstream cache scopes. Mixed
+library and binary crates default to uncached because binary-only output
+declarations cannot restore all of Cargo's default artifacts. Source-free local
+path dependencies that do not resolve to a same-workspace repository package
+also disable caching. Synthesized binary outputs cover the extensionless
+executable plus `.exe` and `.pdb` variants. Single-binary Cargo `run` and `dev`
+tasks also default to uncached unless task configuration explicitly enables
+caching.
 Repository-root Cargo packages reuse the loaded root task configuration.
 Unfiltered Cargo workspace commands merge the effective environments of every
 grouped member and remain package-scoped when any repository member excludes
@@ -130,6 +133,10 @@ writing so hard links cannot redirect truncation. On Windows, scoped process
 tracking retains descendant identities after command wrappers exit so
 finalization can terminate detached task processes.
 
+Cache publication is skipped when a declared output glob would require
+traversing an output-directory symlink, preventing a log-only cache artifact
+from standing in for omitted declared outputs.
+
 Configured cache directories may be inside or outside the repository, but the
 repository root, its ancestors, and directories containing discovered packages
 are rejected because treating them as cache content would exclude source files
@@ -140,9 +147,12 @@ uv task hashes always include the owning and workspace-root `pyproject.toml`
 plus effective repository-contained `uv.toml`, `.python-version`, and
 `UV_CONFIG_FILE` controls. These controls remain task-aware inputs. Effective
 user configuration or an external `UV_CONFIG_FILE`, explicitly cached uv builds
-using `-o` or `--out-dir`, and uv packages with unresolved external local path
-dependencies bypass cache reads and writes until those inputs and outputs are
-modeled, regardless of editable mode.
+using `-o`, `--out-dir`, `--project`, or `--directory`, and uv packages with
+unresolved external local path dependencies bypass cache reads and writes until
+those inputs and outputs are modeled, regardless of editable mode. uv task
+hashes include normalized uv and effective Python identities; caching is
+bypassed when either identity cannot be determined without downloading an
+interpreter.
 
 ## License and Attribution
 

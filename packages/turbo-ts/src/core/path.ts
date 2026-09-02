@@ -1,21 +1,31 @@
 export const toUnixPath = (value: string): string =>
   value.replaceAll("\\", "/");
 
+const nativeWindowsPathSeparators = process.platform === "win32";
+
 const uncPath = (value: string): RegExpExecArray | null =>
   /^\/\/([^/]+)\/([^/]+)(?:\/(.*))?$/.exec(value);
 
-export const isAbsolutePath = (value: string): boolean => {
-  const unix = toUnixPath(value);
-  return unix.startsWith("/") || /^[A-Za-z]:\//.test(unix);
+export const isAbsolutePath = (
+  value: string,
+  windowsPathSeparators = nativeWindowsPathSeparators,
+): boolean => {
+  const normalized = windowsPathSeparators ? toUnixPath(value) : value;
+  return (
+    normalized.startsWith("/") ||
+    (windowsPathSeparators && /^[A-Za-z]:\//.test(normalized))
+  );
 };
 
 export const normalizePath = (
   value: string,
-  windowsPathSeparators = true,
+  windowsPathSeparators = nativeWindowsPathSeparators,
 ): string => {
   const unix = windowsPathSeparators ? toUnixPath(value) : value;
-  const unc = uncPath(unix);
-  const drive = /^[A-Za-z]:/.exec(unix)?.[0] ?? "";
+  const unc = windowsPathSeparators ? uncPath(unix) : null;
+  const drive = windowsPathSeparators
+    ? (/^[A-Za-z]:/.exec(unix)?.[0] ?? "")
+    : "";
   const absolute = unc !== null || unix.startsWith("/") || drive !== "";
   const start =
     unc !== null
@@ -59,11 +69,11 @@ export const joinPathWithSeparators = (
   );
 
 export const joinPath = (...values: ReadonlyArray<string>): string =>
-  joinPathWithSeparators(true, ...values);
+  joinPathWithSeparators(nativeWindowsPathSeparators, ...values);
 
 export const parentPath = (
   value: string,
-  windowsPathSeparators = true,
+  windowsPathSeparators = nativeWindowsPathSeparators,
 ): string => {
   const normalized = normalizePath(value, windowsPathSeparators);
   const uncRoot = /^\/\/[^/]+\/[^/]+/.exec(normalized)?.[0];
@@ -80,15 +90,18 @@ export const parentPath = (
   return normalized.slice(0, index);
 };
 
-export const baseName = (value: string): string => {
-  const normalized = normalizePath(value);
+export const baseName = (
+  value: string,
+  windowsPathSeparators = nativeWindowsPathSeparators,
+): string => {
+  const normalized = normalizePath(value, windowsPathSeparators);
   return normalized.slice(normalized.lastIndexOf("/") + 1);
 };
 
 export const relativePath = (
   root: string,
   value: string,
-  windowsPathSeparators = true,
+  windowsPathSeparators = nativeWindowsPathSeparators,
 ): string => {
   const normalizedRoot = normalizePath(root, windowsPathSeparators).replace(
     /\/$/,
@@ -105,7 +118,7 @@ export const relativePath = (
 export const isPathContained = (
   root: string,
   value: string,
-  windowsPathSeparators = true,
+  windowsPathSeparators = nativeWindowsPathSeparators,
 ): boolean => {
   const normalizedRoot = normalizePath(root, windowsPathSeparators).replace(
     /\/$/,

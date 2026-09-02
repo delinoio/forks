@@ -1263,6 +1263,35 @@ export const npmUserConfigurationPresent = (
       );
   });
 
+export const yarnUserConfigurationPresent = (
+  environment: Readonly<Record<string, string | undefined>>,
+  caseInsensitiveEnvironmentNames: boolean,
+): Effect.Effect<boolean, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const home = configuredEnvironmentValue(
+      environment,
+      "HOME",
+      caseInsensitiveEnvironmentNames,
+    );
+    const userHome = caseInsensitiveEnvironmentNames
+      ? (configuredEnvironmentValue(environment, "USERPROFILE", true) ?? home)
+      : home;
+    if (userHome === undefined || userHome === "") return false;
+    const fileSystem = yield* FileSystemService;
+    for (const name of [".yarnrc", ".yarnrc.yml"] as const) {
+      const path = joinPath(userHome, name);
+      const exists = yield* fileSystem
+        .exists(path)
+        .pipe(
+          Effect.mapError(
+            (error) => new RepositoryError({ path, message: error.message }),
+          ),
+        );
+      if (exists) return true;
+    }
+    return false;
+  });
+
 export const cargoHomeConfigurationPresent = (
   executionDirectory: string,
   environment: Readonly<Record<string, string | undefined>>,
@@ -1354,6 +1383,51 @@ export interface UvControlInputs {
   readonly repositoryPaths: ReadonlyArray<string>;
   readonly external: boolean;
 }
+
+export interface UvRuntimeIdentity {
+  readonly uvVersion: string;
+  readonly pythonVersion: string;
+}
+
+export const resolveUvRuntimeIdentity = (
+  executionDirectory: string,
+  environment: Readonly<Record<string, string | undefined>>,
+): Effect.Effect<UvRuntimeIdentity | undefined, never, ProcessService> =>
+  Effect.gen(function* () {
+    const processService = yield* ProcessService;
+    const probe = (args: ReadonlyArray<string>) =>
+      Effect.either(
+        Effect.scoped(
+          processService.run({
+            command: "uv",
+            args,
+            cwd: executionDirectory,
+            env: environment,
+            inheritEnvironment: false,
+          }),
+        ),
+      );
+    const uvResult = yield* probe(["--version"]);
+    if (uvResult._tag === "Left" || uvResult.right.exitCode !== 0) {
+      return undefined;
+    }
+    const pythonResult = yield* probe([
+      "python",
+      "find",
+      "--show-version",
+      "--no-python-downloads",
+    ]);
+    if (pythonResult._tag === "Left" || pythonResult.right.exitCode !== 0) {
+      return undefined;
+    }
+    const uvVersion = uvResult.right.stdout.replace(/\r\n?/g, "\n").trim();
+    const pythonVersion = pythonResult.right.stdout
+      .replace(/\r\n?/g, "\n")
+      .trim();
+    return uvVersion === "" || pythonVersion === ""
+      ? undefined
+      : { uvVersion, pythonVersion };
+  });
 
 export const uvControlInputs = (
   repositoryRoot: string,

@@ -15,6 +15,7 @@ import {
   isAbsolutePath,
   isPathContained,
   joinPath,
+  joinPathWithSeparators,
   normalizePath,
   parentPath,
   relativePath,
@@ -198,9 +199,9 @@ describe("core repository model", () => {
     expect(relativePath("/repo", "/repo/packages/app")).toBe("packages/app");
     expect(isPathContained("/repo", "/repo/packages/app")).toBe(true);
     expect(isPathContained("/repo", "/outside")).toBe(false);
-    expect(isAbsolutePath("C:\\repo")).toBe(true);
+    expect(isAbsolutePath("C:\\repo", true)).toBe(true);
     expect(isAbsolutePath("packages/app")).toBe(false);
-    expect(isAbsolutePath("\\\\server\\share\\repo")).toBe(true);
+    expect(isAbsolutePath("\\\\server\\share\\repo", true)).toBe(true);
     expect(normalizePath("/repo/dist\\artifact", false)).toBe(
       "/repo/dist\\artifact",
     );
@@ -208,21 +209,29 @@ describe("core repository model", () => {
       "dist\\artifact",
     );
     expect(isPathContained("/repo", "/repo/dist\\artifact", false)).toBe(true);
-    expect(normalizePath("\\\\server\\share\\repo\\packages\\..\\app")).toBe(
-      "//server/share/repo/app",
+    expect(
+      normalizePath("\\\\server\\share\\repo\\packages\\..\\app", true),
+    ).toBe("//server/share/repo/app");
+    expect(
+      joinPathWithSeparators(true, "\\\\server\\share", "repo", "app"),
+    ).toBe("//server/share/repo/app");
+    expect(parentPath("//server/share", true)).toBe("//server/share");
+    expect(parentPath("//server/share/repo", true)).toBe("//server/share");
+    expect(
+      relativePath("//server/share/repo", "//server/share/repo/app", true),
+    ).toBe("app");
+    expect(isPathContained("//SERVER/Share", "//server/share/repo", true)).toBe(
+      true,
     );
-    expect(joinPath("\\\\server\\share", "repo", "app")).toBe(
-      "//server/share/repo/app",
-    );
-    expect(parentPath("//server/share")).toBe("//server/share");
-    expect(parentPath("//server/share/repo")).toBe("//server/share");
-    expect(relativePath("//server/share/repo", "//server/share/repo/app")).toBe(
-      "app",
-    );
-    expect(isPathContained("//SERVER/Share", "//server/share/repo")).toBe(true);
-    expect(isPathContained("//server/share", "//server/other/repo")).toBe(
+    expect(isPathContained("//server/share", "//server/other/repo", true)).toBe(
       false,
     );
+    if (process.platform !== "win32") {
+      expect(joinPath("/tmp/repo\\copy", "package.json")).toBe(
+        "/tmp/repo\\copy/package.json",
+      );
+      expect(normalizePath("/tmp/repo\\copy")).toBe("/tmp/repo\\copy");
+    }
   });
 
   it("matches workspace and input globs with negation", () => {
@@ -1150,6 +1159,30 @@ describe("core repository model", () => {
     expect(isTaskScopeCacheable(node, ["-owheelhouse"])).toBe(false);
     expect(isTaskScopeCacheable(node, ["--out-dir", "wheelhouse"])).toBe(false);
     expect(isTaskScopeCacheable(node, ["--out-dir=wheelhouse"])).toBe(false);
+    expect(isTaskScopeCacheable(node, ["--project", "../alternate"])).toBe(
+      false,
+    );
+    expect(isTaskScopeCacheable(node, ["--project=../alternate"])).toBe(false);
+    expect(isTaskScopeCacheable(node, ["--directory", "../alternate"])).toBe(
+      false,
+    );
+    expect(isTaskScopeCacheable(node, ["--directory=../alternate"])).toBe(
+      false,
+    );
+    expect(
+      isTaskScopeCacheable(
+        node,
+        [],
+        { kind: "package" },
+        {},
+        false,
+        {},
+        false,
+        false,
+        false,
+        false,
+      ),
+    ).toBe(false);
   });
 
   it("disables uv build caching for explicit configuration files", () => {
@@ -1221,6 +1254,17 @@ describe("core repository model", () => {
         task,
         command: `cargo ${task}`,
       };
+      for (const arguments_ of [
+        ["--release"],
+        ["-r"],
+        ["--manifest-path", "../alternate/Cargo.toml"],
+        ["--manifest-path=../alternate/Cargo.toml"],
+        ["--profile", "release"],
+        ["--target=synthetic-target"],
+        ["--target-dir", "../alternate-target"],
+      ]) {
+        expect(isTaskScopeCacheable(compilationNode, arguments_)).toBe(false);
+      }
       expect(
         isTaskScopeCacheable(compilationNode, [
           "--config",
@@ -1247,6 +1291,16 @@ describe("core repository model", () => {
           { kind: "package" },
           { cargo_build_target: "synthetic-target" },
           true,
+        ),
+      ).toBe(false);
+      expect(
+        isTaskScopeCacheable(
+          compilationNode,
+          [],
+          { kind: "package" },
+          {},
+          false,
+          { CARGO_TARGET_DIR: "/repo/custom-target" },
         ),
       ).toBe(false);
     }

@@ -19,6 +19,7 @@ import type { TaskNode } from "../graph/task-graph.js";
 import type {
   PackageManagerName,
   RepositoryModel,
+  UvRuntimeIdentity,
 } from "../repository/model.js";
 import {
   configuredEnvironmentValue,
@@ -305,12 +306,18 @@ const repositoryPackageManagerControlInputCandidates = (
   }
   const manager = repository.manager;
   if (manager === "cargo" || manager === "uv") return [];
+  const npmConfigurationPaths =
+    manager === "npm" || manager === "pnpm"
+      ? ancestorDirectories(repository, node.package.directory).map(
+          (directory) => joinPath(directory, ".npmrc"),
+        )
+      : [joinPath(repository.root, ".npmrc")];
   return [
-    ...[
-      "package.json",
-      ".npmrc",
-      ...repositoryControlNamesByJavaScriptManager[manager],
-    ].map((name) => joinPath(repository.root, name)),
+    joinPath(repository.root, "package.json"),
+    ...npmConfigurationPaths,
+    ...repositoryControlNamesByJavaScriptManager[manager].map((name) =>
+      joinPath(repository.root, name),
+    ),
     ...(repository.packageManagerExecutableInput === undefined
       ? []
       : [repository.packageManagerExecutableInput]),
@@ -704,6 +711,7 @@ export const hashTask = (
   passThroughArguments: ReadonlyArray<string>,
   cacheDirectory: string,
   runtimeEnvironment?: Readonly<Record<string, string | undefined>>,
+  uvRuntimeIdentity?: UvRuntimeIdentity,
 ): Effect.Effect<
   TaskHashResult,
   RepositoryError,
@@ -952,6 +960,7 @@ export const hashTask = (
         ...(uvControls === undefined
           ? {}
           : {
+              uvRuntimeIdentity: uvRuntimeIdentity ?? null,
               uvControlPaths: uvControls.repositoryPaths.map((path) =>
                 relativePath(repository.root, path),
               ),

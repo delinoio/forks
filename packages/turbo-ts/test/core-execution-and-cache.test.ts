@@ -73,7 +73,10 @@ import {
   cargoHomeConfigurationPresent,
   discoverRepository,
   npmUserConfigurationPresent,
+  resolveUvRuntimeIdentity,
+  type UvRuntimeIdentity,
   uvControlInputs,
+  yarnUserConfigurationPresent,
 } from "../src/repository/model.js";
 import {
   discoverRepositoryRoot,
@@ -232,6 +235,30 @@ describe("core CLI execution", () => {
       );
     } finally {
       await rm(linkedPackage, { force: true });
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("preserves literal backslashes in POSIX repository directories", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-repo\\copy-"));
+    try {
+      await cp(fixtureRoot, directory, { recursive: true });
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          `${directory}/packages/library`,
+          "--no-cache",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode, result.combinedOutput).toBe(0);
+      expect(result.stdout).toContain("library build");
+    } finally {
       await rm(directory, { force: true, recursive: true });
     }
   });
@@ -639,7 +666,7 @@ describe("core CLI execution", () => {
       );
       await writeFile(
         uvCommand,
-        '#!/usr/bin/env node\nconsole.log("uv scope output");\n',
+        '#!/usr/bin/env node\nif (process.argv[2] === "--version") console.log("uv synthetic"); else if (process.argv[2] === "python" && process.argv[3] === "find") console.log("cpython-3.12.8-linux-x86_64-gnu"); else console.log("uv scope output");\n',
       );
       await chmod(cargoCommand, 0o755);
       await chmod(rustcCommand, 0o755);
@@ -2907,6 +2934,7 @@ describe("core CLI execution", () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;
     const npmConfigurationPath = `${directory}/.npmrc`;
+    const packageNpmConfigurationPath = `${packageDirectory}/.npmrc`;
     try {
       const configurationPath = `${directory}/turbo.json`;
       const configuration = JSON.parse(
@@ -2920,6 +2948,7 @@ describe("core CLI execution", () => {
       await mkdir(`${packageDirectory}/src`, { recursive: true });
       await writeFile(`${packageDirectory}/src/input.js`, "export {};\n");
       await writeFile(npmConfigurationPath, "script-shell=/bin/sh\n");
+      await writeFile(packageNpmConfigurationPath, "fund=false\n");
       const model = await Effect.runPromise(
         Effect.gen(function* () {
           const rootConfiguration = yield* loadRootConfiguration(directory);
@@ -2939,6 +2968,7 @@ describe("core CLI execution", () => {
       const before = await compute();
       expect(before.inputFiles).toEqual(
         expect.arrayContaining([
+          ".npmrc",
           "$TURBO_ROOT$/.npmrc",
           "$TURBO_ROOT$/package.json",
           "$TURBO_ROOT$/pnpm-workspace.yaml",
@@ -2947,7 +2977,10 @@ describe("core CLI execution", () => {
         ]),
       );
       await writeFile(npmConfigurationPath, "script-shell=/bin/bash\n");
-      expect((await compute()).hash).not.toBe(before.hash);
+      const afterRootConfiguration = await compute();
+      expect(afterRootConfiguration.hash).not.toBe(before.hash);
+      await writeFile(packageNpmConfigurationPath, "fund=true\n");
+      expect((await compute()).hash).not.toBe(afterRootConfiguration.hash);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -3852,7 +3885,7 @@ describe("core CLI execution", () => {
       );
       await writeFile(
         uvCommand,
-        '#!/usr/bin/env node\nif (process.env.UV_NO_CONFIG) process.exit(9);\nconsole.log("uv test output");\n',
+        '#!/usr/bin/env node\nif (process.argv[2] === "--version") console.log("uv synthetic"); else if (process.argv[2] === "python" && process.argv[3] === "find") console.log("cpython-3.12.8-linux-x86_64-gnu"); else { if (process.env.UV_NO_CONFIG) process.exit(9); console.log("uv test output"); }\n',
       );
       await chmod(cargoCommand, 0o755);
       await chmod(rustcCommand, 0o755);
@@ -4227,6 +4260,12 @@ describe("core CLI execution", () => {
       const compute = (
         id: string,
         runtimeEnvironment?: Readonly<Record<string, string | undefined>>,
+        uvIdentity: UvRuntimeIdentity | undefined = id === "python-app#test"
+          ? {
+              uvVersion: "uv 0.12.7 (synthetic-target)",
+              pythonVersion: "cpython-3.12.8-linux-x86_64-gnu",
+            }
+          : undefined,
       ) =>
         Effect.runPromise(
           hashTask(
@@ -4237,6 +4276,7 @@ describe("core CLI execution", () => {
             [],
             `${directory}/.turbo/cache`,
             runtimeEnvironment,
+            uvIdentity,
           ).pipe(Effect.provide(nodeFoundationLayer)),
         );
       const cargoBefore = await compute("rust-tool#test");
@@ -4279,6 +4319,22 @@ describe("core CLI execution", () => {
       );
       expect(alternateTarget.hash).not.toBe(cargoBefore.hash);
       const uvBefore = await compute("python-app#test");
+      expect(
+        (
+          await compute("python-app#test", undefined, {
+            uvVersion: "uv 0.12.7 (synthetic-target)",
+            pythonVersion: "cpython-3.13.1-linux-x86_64-gnu",
+          })
+        ).hash,
+      ).not.toBe(uvBefore.hash);
+      expect(
+        (
+          await compute("python-app#test", undefined, {
+            uvVersion: "uv 0.13.0 (synthetic-target)",
+            pythonVersion: "cpython-3.12.8-linux-x86_64-gnu",
+          })
+        ).hash,
+      ).not.toBe(uvBefore.hash);
       expect(uvBefore.inputFiles).toContain("$TURBO_ROOT$/pyproject.toml");
       expect(
         implicitTaskInputCandidates(model, graph.nodes.get("python-app#test")!),
@@ -6110,6 +6166,54 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
+  it("skips cache publication for untraversed output directory symlinks", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { outputs?: Array<string> }> };
+      configuration.tasks.build = { outputs: ["dist/**"] };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); fs.appendFileSync('.turbo/symlink-runs.txt','run\\n'); fs.mkdirSync('node_modules/output-target',{recursive:true}); fs.writeFileSync('node_modules/output-target/value.txt','value'); fs.symlinkSync('node_modules/output-target','dist','dir')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--only",
+        "--output-logs=hash-only",
+      ];
+      const first = await run(process.execPath, args, repositoryRoot);
+      expect(first.exitCode, first.stderr).toBe(0);
+      expect(first.stdout).toContain("cache miss");
+      expect(first.stderr).toContain("untraversed symlink ancestor");
+      await rm(`${packageDirectory}/dist`);
+      const second = await run(process.execPath, args, repositoryRoot);
+      expect(second.exitCode, second.stderr).toBe(0);
+      expect(second.stdout).toContain("cache miss");
+      expect(second.stderr).toContain("untraversed symlink ancestor");
+      expect(
+        await readFile(`${packageDirectory}/.turbo/symlink-runs.txt`, "utf8"),
+      ).toBe("run\nrun\n");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("skips cache publication for output symlinks outside their output group", async () => {
     if (process.platform === "win32") return;
     const directory = await makeFixture();
@@ -7066,6 +7170,29 @@ describe("core CLI execution", () => {
     }
   });
 
+  it("detects effective Yarn home configuration", async () => {
+    const homeDirectory = await mkdtemp(join(tmpdir(), "turbo-ts-yarn-home-"));
+    try {
+      expect(
+        await Effect.runPromise(
+          yarnUserConfigurationPresent({ HOME: homeDirectory }, false).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        ),
+      ).toBe(false);
+      await writeFile(`${homeDirectory}/.yarnrc.yml`, "enableColors: false\n");
+      expect(
+        await Effect.runPromise(
+          yarnUserConfigurationPresent({ home: homeDirectory }, true).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        ),
+      ).toBe(true);
+    } finally {
+      await rm(homeDirectory, { force: true, recursive: true });
+    }
+  });
+
   it("resolves repository and external uv controls", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-uv-controls-"));
     const packageDirectory = `${directory}/python/app`;
@@ -7163,6 +7290,43 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
       await rm(externalHome, { force: true, recursive: true });
+    }
+  });
+
+  it("resolves normalized uv and effective Python identities", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-uv-identity-"));
+    const uvCommand = `${directory}/uv`;
+    try {
+      await writeFile(
+        uvCommand,
+        "#!/usr/bin/env node\nif (process.argv[2] === '--version') process.stdout.write('uv synthetic\\r\\n'); else if (process.argv[2] === 'python' && process.argv[3] === 'find') process.stdout.write((process.env.SYNTHETIC_PYTHON ?? '') + '\\r\\n'); else process.exit(9);\n",
+      );
+      await chmod(uvCommand, 0o755);
+      const environment = (pythonVersion: string) => ({
+        PATH: `${directory}${delimiter}${process.env.PATH ?? ""}`,
+        SYNTHETIC_PYTHON: pythonVersion,
+      });
+      expect(
+        await Effect.runPromise(
+          resolveUvRuntimeIdentity(
+            directory,
+            environment("cpython-3.12.8-linux-x86_64-gnu"),
+          ).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).toEqual({
+        uvVersion: "uv synthetic",
+        pythonVersion: "cpython-3.12.8-linux-x86_64-gnu",
+      });
+      expect(
+        await Effect.runPromise(
+          resolveUvRuntimeIdentity(directory, { PATH: "" }).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        ),
+      ).toBeUndefined();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
     }
   });
 
@@ -7274,6 +7438,72 @@ describe("core CLI execution", () => {
       expect(second.exitCode, second.stderr).toBe(0);
       expect(second.stdout).not.toContain("cache hit");
       expect(await readFile(`${directory}/pnpm-user-runs.txt`, "utf8")).toBe(
+        "2",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+      await rm(homeDirectory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("bypasses Yarn caching when effective home configuration is present", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const homeDirectory = await mkdtemp(join(tmpdir(), "turbo-ts-yarn-run-"));
+    const commandDirectory = `${directory}/commands`;
+    try {
+      const rootManifestPath = `${directory}/package.json`;
+      const rootManifest = JSON.parse(
+        await readFile(rootManifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      rootManifest.packageManager = "yarn@4.14.1";
+      rootManifest.workspaces = ["packages/*"];
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, null, 2)}\n`,
+      );
+      await writeFile(
+        `${homeDirectory}/.yarnrc.yml`,
+        "injectEnvironmentFiles: []\n",
+      );
+      await mkdir(commandDirectory, { recursive: true });
+      const yarnCommand = `${commandDirectory}/yarn`;
+      await writeFile(
+        yarnCommand,
+        "#!/usr/bin/env node\nconst fs=require('node:fs'); const path='../../yarn-user-runs.txt'; const count=fs.existsSync(path)?Number(fs.readFileSync(path,'utf8')):0; fs.writeFileSync(path,String(count+1));\n",
+      );
+      await chmod(yarnCommand, 0o755);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      const environment = {
+        HOME: homeDirectory,
+        PATH: `${commandDirectory}${delimiter}${process.env.PATH ?? ""}`,
+        NO_COLOR: "1",
+        TURBO_TELEMETRY_DISABLED: "1",
+      };
+      const first = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
+      const second = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
+      expect(first.exitCode, first.stderr).toBe(0);
+      expect(second.exitCode, second.stderr).toBe(0);
+      expect(second.stdout).not.toContain("cache hit");
+      expect(await readFile(`${directory}/yarn-user-runs.txt`, "utf8")).toBe(
         "2",
       );
     } finally {

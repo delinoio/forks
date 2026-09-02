@@ -85,7 +85,10 @@ import {
   npmUserConfigurationPresent,
   type RepositoryModel,
   type RepositoryPackage,
+  resolveUvRuntimeIdentity,
+  type UvRuntimeIdentity,
   uvControlInputs,
+  yarnUserConfigurationPresent,
 } from "../repository/model.js";
 import { type ParsedRunOptions, parseConcurrency } from "./options.js";
 
@@ -1218,13 +1221,27 @@ const collectOutputPaths = (
             metadata.kind === "directory"
               ? [relative, `${relative}/`]
               : [relative];
+          const matchesOutput = matchesGlobsWithExclusions(
+            candidates,
+            patterns,
+            windowsPathSeparators,
+          );
           if (
-            matchesGlobsWithExclusions(
-              candidates,
-              patterns,
-              windowsPathSeparators,
+            metadata.kind === "symlink" &&
+            !matchesOutput &&
+            positivePatterns.some((pattern) =>
+              canMatchGlobDescendant(relative, pattern, windowsPathSeparators),
             )
           ) {
+            return yield* Effect.fail(
+              new RepositoryError({
+                path,
+                message:
+                  "declared task output has an untraversed symlink ancestor",
+              }),
+            );
+          }
+          if (matchesOutput) {
             selected.add(path);
           }
         }
@@ -1426,6 +1443,25 @@ type TaskOutputQueueEvent =
 const persistentOutputCaptureCharacters = 64 * 1024;
 const persistentOutputQueueCapacity = 16;
 
+const cargoCompilationTaskNames = [
+  "build",
+  "check",
+  "dev",
+  "lint",
+  "run",
+  "test",
+] as const;
+
+type CargoCompilationTaskName = (typeof cargoCompilationTaskNames)[number];
+
+const cargoCompilationTasks = new Set<CargoCompilationTaskName>(
+  cargoCompilationTaskNames,
+);
+
+const isCargoCompilationTask = (node: TaskNode): boolean =>
+  node.package.manager === "cargo" &&
+  cargoCompilationTasks.has(node.task as CargoCompilationTaskName);
+
 const cargoAlternateOutputFlags = [
   "--artifact-dir",
   "--manifest-path",
@@ -1455,12 +1491,11 @@ const cargoUnmodeledTargetFlags = [
   ...cargoAdditionalPackageFlags,
 ] as const;
 
-const usesAlternateCargoBuildOutputs = (
+const usesAlternateCargoCompilationOutputs = (
   node: TaskNode,
   passThroughArguments: ReadonlyArray<string>,
 ): boolean =>
-  node.package.manager === "cargo" &&
-  node.task === "build" &&
+  isCargoCompilationTask(node) &&
   passThroughArguments.some(
     (argument) =>
       argument === "--release" ||
@@ -1470,6 +1505,8 @@ const usesAlternateCargoBuildOutputs = (
         (flag) => argument === flag || argument.startsWith(`${flag}=`),
       ),
   );
+
+const uvAlternateProjectFlags = ["--directory", "--project"] as const;
 
 const usesAlternateUvBuildOutputs = (
   node: TaskNode,
@@ -1481,7 +1518,10 @@ const usesAlternateUvBuildOutputs = (
     (argument) =>
       argument.startsWith("-o") ||
       argument === "--out-dir" ||
-      argument.startsWith("--out-dir="),
+      argument.startsWith("--out-dir=") ||
+      uvAlternateProjectFlags.some(
+        (flag) => argument === flag || argument.startsWith(`${flag}=`),
+      ),
   );
 
 const usesUvConfigurationOverride = (
@@ -1531,8 +1571,7 @@ const usesMismatchedCargoTargetDirectory = (
   executionEnvironment: Readonly<Record<string, string | undefined>>,
   caseInsensitiveEnvironmentNames: boolean,
 ): boolean =>
-  node.package.manager === "cargo" &&
-  node.task === "build" &&
+  isCargoCompilationTask(node) &&
   environmentValue(
     sourceEnvironment,
     "CARGO_TARGET_DIR",
@@ -1611,25 +1650,6 @@ const taskLogIdentifiers = (
   );
 };
 
-const cargoCompilationTaskNames = [
-  "build",
-  "check",
-  "dev",
-  "lint",
-  "run",
-  "test",
-] as const;
-
-type CargoCompilationTaskName = (typeof cargoCompilationTaskNames)[number];
-
-const cargoCompilationTasks = new Set<CargoCompilationTaskName>(
-  cargoCompilationTaskNames,
-);
-
-const isCargoCompilationTask = (node: TaskNode): boolean =>
-  node.package.manager === "cargo" &&
-  cargoCompilationTasks.has(node.task as CargoCompilationTaskName);
-
 const usesAdditionalCargoPackageSelection = (
   node: TaskNode,
   passThroughArguments: ReadonlyArray<string>,
@@ -1671,10 +1691,11 @@ export const isTaskScopeDynamicallyCacheable = (
   caseInsensitiveEnvironmentNames = false,
   sourceEnvironment: Readonly<Record<string, string | undefined>> = environment,
   cargoHomeHasConfiguration = false,
-  npmUserHasConfiguration = false,
+  packageManagerUserHasConfiguration = false,
   uvHasExternalControls = false,
+  uvRuntimeIdentityAvailable = true,
 ): boolean =>
-  !usesAlternateCargoBuildOutputs(node, passThroughArguments) &&
+  !usesAlternateCargoCompilationOutputs(node, passThroughArguments) &&
   !usesAdditionalCargoPackageSelection(node, passThroughArguments) &&
   !usesCargoConfigurationOverride(node, passThroughArguments) &&
   !usesAlternateUvBuildOutputs(node, passThroughArguments) &&
@@ -1694,10 +1715,15 @@ export const isTaskScopeDynamicallyCacheable = (
   ) &&
   !(isCargoCompilationTask(node) && cargoHomeHasConfiguration) &&
   !(
-    (node.package.manager === "npm" || node.package.manager === "pnpm") &&
-    npmUserHasConfiguration
+    (node.package.manager === "npm" ||
+      node.package.manager === "pnpm" ||
+      node.package.manager === "yarn") &&
+    packageManagerUserHasConfiguration
   ) &&
-  !(node.package.manager === "uv" && uvHasExternalControls);
+  !(
+    node.package.manager === "uv" &&
+    (uvHasExternalControls || !uvRuntimeIdentityAvailable)
+  );
 
 export const isTaskScopeCacheable = (
   node: TaskNode,
@@ -1707,8 +1733,9 @@ export const isTaskScopeCacheable = (
   caseInsensitiveEnvironmentNames = false,
   sourceEnvironment: Readonly<Record<string, string | undefined>> = environment,
   cargoHomeHasConfiguration = false,
-  npmUserHasConfiguration = false,
+  packageManagerUserHasConfiguration = false,
   uvHasExternalControls = false,
+  uvRuntimeIdentityAvailable = true,
 ): boolean =>
   isTaskScopeStaticallyCacheable(node, scope) &&
   isTaskScopeDynamicallyCacheable(
@@ -1718,8 +1745,9 @@ export const isTaskScopeCacheable = (
     caseInsensitiveEnvironmentNames,
     sourceEnvironment,
     cargoHomeHasConfiguration,
-    npmUserHasConfiguration,
+    packageManagerUserHasConfiguration,
     uvHasExternalControls,
+    uvRuntimeIdentityAvailable,
   );
 
 const hashDependencyGraph = (graph: TaskGraph): TaskGraph => ({
@@ -1861,6 +1889,7 @@ const prepareTaskLogPath = (
 interface TaskScopeCacheability {
   readonly cacheable: boolean;
   readonly runtimeInputsRestorable: boolean;
+  readonly uvRuntimeIdentity?: UvRuntimeIdentity;
 }
 
 const resolveTaskScopeCacheability = (
@@ -1870,7 +1899,11 @@ const resolveTaskScopeCacheability = (
   sourceEnvironment: Readonly<Record<string, string | undefined>>,
   scope: TaskCommandScope = packageTaskCommandScope,
   caseInsensitiveEnvironmentNames = false,
-): Effect.Effect<TaskScopeCacheability, RepositoryError, FileSystemService> =>
+): Effect.Effect<
+  TaskScopeCacheability,
+  RepositoryError,
+  FileSystemService | ProcessService
+> =>
   Effect.gen(function* () {
     const executionEnvironment = taskScopeEnvironment(
       repository,
@@ -1889,14 +1922,19 @@ const resolveTaskScopeCacheability = (
           caseInsensitiveEnvironmentNames,
         )
       : false;
-    const npmUserHasConfiguration =
+    const packageManagerUserHasConfiguration =
       node.package.manager === "npm" || node.package.manager === "pnpm"
         ? yield* npmUserConfigurationPresent(
             executionDirectory,
             executionEnvironment,
             caseInsensitiveEnvironmentNames,
           )
-        : false;
+        : node.package.manager === "yarn"
+          ? yield* yarnUserConfigurationPresent(
+              executionEnvironment,
+              caseInsensitiveEnvironmentNames,
+            )
+          : false;
     const uvHasExternalControls =
       node.package.manager === "uv"
         ? (yield* uvControlInputs(
@@ -1907,6 +1945,13 @@ const resolveTaskScopeCacheability = (
             caseInsensitiveEnvironmentNames,
           )).external
         : false;
+    const resolvedUvRuntimeIdentity =
+      node.package.manager === "uv"
+        ? yield* resolveUvRuntimeIdentity(
+            executionDirectory,
+            executionEnvironment,
+          )
+        : undefined;
     const runtimeInputsRestorable = isTaskScopeDynamicallyCacheable(
       node,
       options.passThroughArguments,
@@ -1914,13 +1959,17 @@ const resolveTaskScopeCacheability = (
       caseInsensitiveEnvironmentNames,
       sourceEnvironment,
       cargoHomeHasConfiguration,
-      npmUserHasConfiguration,
+      packageManagerUserHasConfiguration,
       uvHasExternalControls,
+      resolvedUvRuntimeIdentity !== undefined,
     );
     return {
       cacheable:
         isTaskScopeStaticallyCacheable(node, scope) && runtimeInputsRestorable,
       runtimeInputsRestorable,
+      ...(resolvedUvRuntimeIdentity === undefined
+        ? {}
+        : { uvRuntimeIdentity: resolvedUvRuntimeIdentity }),
     };
   });
 
@@ -2346,6 +2395,7 @@ const computeTaskHashes = (
   options: ResolvedRunOptions,
   sourceEnvironment: Readonly<Record<string, string | undefined>>,
   caseInsensitiveEnvironmentNames: boolean,
+  cacheabilityByTask: ReadonlyMap<string, TaskScopeCacheability>,
 ): Effect.Effect<
   ReadonlyMap<string, TaskHashResult>,
   RepositoryError,
@@ -2374,6 +2424,7 @@ const computeTaskHashes = (
           packageTaskCommandScope,
           caseInsensitiveEnvironmentNames,
         ),
+        cacheabilityByTask.get(id)?.uvRuntimeIdentity,
       );
       hashes.set(id, result);
     }
@@ -2517,6 +2568,7 @@ const applyCargoWorkspaceHashes = (
   options: ResolvedRunOptions,
   sourceEnvironment: Readonly<Record<string, string | undefined>>,
   caseInsensitiveEnvironmentNames: boolean,
+  cacheabilityByTask: ReadonlyMap<string, TaskScopeCacheability>,
 ): Effect.Effect<
   ReadonlyMap<string, TaskHashResult>,
   RepositoryError,
@@ -2570,6 +2622,7 @@ const applyCargoWorkspaceHashes = (
             packageTaskCommandScope,
             caseInsensitiveEnvironmentNames,
           ),
+          cacheabilityByTask.get(id)?.uvRuntimeIdentity,
         ),
       );
       changed.add(id);
@@ -2988,11 +3041,13 @@ export const executeRun = (
         options,
         environment,
         platform === "win32",
+        cacheabilityByTask,
       ),
       cargoWorkspacePlan.scopes,
       options,
       environment,
       platform === "win32",
+      cacheabilityByTask,
     );
     const unrestorableCacheInputs = taskIdsWithUnrestorableCacheInputs(
       graph,
