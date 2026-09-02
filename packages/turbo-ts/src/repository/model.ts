@@ -288,7 +288,7 @@ const discoverManager = (
 export const lockfileNamesByManager: Readonly<
   Record<PackageManagerName, ReadonlyArray<string>>
 > = {
-  npm: ["package-lock.json", "npm-shrinkwrap.json"],
+  npm: ["npm-shrinkwrap.json", "package-lock.json"],
   pnpm: ["pnpm-lock.yaml"],
   yarn: ["yarn.lock", ".pnp.cjs"],
   bun: ["bun.lock", "bun.lockb"],

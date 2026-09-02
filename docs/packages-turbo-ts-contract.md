@@ -84,6 +84,9 @@ an invalid declaration fails discovery. Declared workspace members remain
 discoverable beneath directories named `dist` or `target`. JavaScript workspace
 traversal prunes subtrees that cannot match a positive workspace pattern before
 listing them; ordered exclusions are applied to the resulting candidates.
+Nested JavaScript root discovery recognizes `npm-shrinkwrap.json` and Yarn PnP
+`.pnp.cjs` lockfile markers. When both npm lockfiles exist,
+`npm-shrinkwrap.json` takes precedence over `package-lock.json`.
 Enabled JavaScript, Cargo, and uv discovery passes operate independently, so a
 declared JavaScript workspace may also contain co-located Cargo and uv package
 scopes. Package names are unique within an ecosystem but may be shared across

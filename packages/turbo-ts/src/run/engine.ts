@@ -234,10 +234,12 @@ const parseCachePolicy = (
 
 const repositoryRootMarkers = [
   ".git",
+  ".pnp.cjs",
   "aube.lock",
   "bun.lock",
   "bun.lockb",
   "nub.lock",
+  "npm-shrinkwrap.json",
   "package-lock.json",
   "pnpm-lock.yaml",
   "pnpm-workspace.yaml",

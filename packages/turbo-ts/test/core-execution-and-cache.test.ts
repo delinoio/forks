@@ -76,6 +76,7 @@ import {
   uvControlInputs,
 } from "../src/repository/model.js";
 import {
+  discoverRepositoryRoot,
   executeRun,
   isTaskScopeCacheable,
   makeCachePublicationPermit,
@@ -231,6 +232,38 @@ describe("core CLI execution", () => {
       );
     } finally {
       await rm(linkedPackage, { force: true });
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("recognizes npm shrinkwrap and Yarn PnP repository roots", async () => {
+    const directory = await makeFixture();
+    try {
+      for (const [name, marker] of [
+        ["shrinkwrap", "npm-shrinkwrap.json"],
+        ["pnp", ".pnp.cjs"],
+      ] as const) {
+        const nestedRoot = `${directory}/nested-${name}`;
+        const nestedPackage = `${nestedRoot}/packages/app`;
+        await mkdir(nestedPackage, { recursive: true });
+        await writeFile(
+          `${nestedRoot}/package.json`,
+          `${JSON.stringify({ name: `nested-${name}`, private: true })}\n`,
+        );
+        await writeFile(`${nestedRoot}/${marker}`, "");
+        await writeFile(
+          `${nestedPackage}/package.json`,
+          `${JSON.stringify({ name: `nested-${name}-app`, private: true })}\n`,
+        );
+
+        const root = await Effect.runPromise(
+          discoverRepositoryRoot(nestedPackage).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+        expect(root).toBe(nestedRoot);
+      }
+    } finally {
       await rm(directory, { force: true, recursive: true });
     }
   });
@@ -2839,6 +2872,32 @@ describe("core CLI execution", () => {
       expect(model.packages.map((packageModel) => packageModel.name)).toEqual([
         "synthetic-app",
       ]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("prefers npm-shrinkwrap.json when both npm lockfiles exist", async () => {
+    const directory = await makeFixture();
+    try {
+      const manifestPath = `${directory}/package.json`;
+      const manifest = JSON.parse(
+        await readFile(manifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      manifest.packageManager = "npm@11.19.1";
+      manifest.workspaces = ["packages/*"];
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      await writeFile(`${directory}/package-lock.json`, "{}\n");
+      const shrinkwrapPath = `${directory}/npm-shrinkwrap.json`;
+      await writeFile(shrinkwrapPath, "{}\n");
+
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(model.lockfile).toBe(shrinkwrapPath);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
