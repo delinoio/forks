@@ -2,7 +2,7 @@ import { Effect } from "effect";
 import { matchesGlobsWithExclusions } from "../core/glob.js";
 import {
   isPathContained,
-  joinPath,
+  joinPathWithSeparators,
   parentPath,
   relativePath,
 } from "../core/path.js";
@@ -78,6 +78,7 @@ const alternateAsciiCase = (value: string): string | undefined => {
 
 const pathNamesAreCaseInsensitive = (
   directory: string,
+  windowsPathSeparators: boolean,
 ): Effect.Effect<boolean, CacheError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -88,7 +89,11 @@ const pathNamesAreCaseInsensitive = (
     for (const entry of entries) {
       const alternate = alternateAsciiCase(entry.name);
       if (alternate === undefined || names.has(alternate)) continue;
-      const alternatePath = joinPath(directory, alternate);
+      const alternatePath = joinPathWithSeparators(
+        windowsPathSeparators,
+        directory,
+        alternate,
+      );
       const exists = yield* fileSystem
         .exists(alternatePath)
         .pipe(
@@ -111,10 +116,15 @@ export const duplicateArchiveEntryDestination = (
   root: string,
   entries: ReadonlyArray<RestorableArchiveEntry>,
   caseInsensitive: boolean,
+  windowsPathSeparators = true,
 ): string | undefined => {
   const destinations = new Set<string>();
   for (const entry of entries) {
-    const destination = joinPath(root, entry.path);
+    const destination = joinPathWithSeparators(
+      windowsPathSeparators,
+      root,
+      entry.path,
+    );
     const comparableDestination = comparablePath(destination, caseInsensitive);
     if (destinations.has(comparableDestination)) return destination;
     destinations.add(comparableDestination);
@@ -126,11 +136,16 @@ const nonDirectoryArchiveEntryAncestor = (
   root: string,
   entries: ReadonlyArray<RestorableArchiveEntry>,
   caseInsensitive: boolean,
+  windowsPathSeparators: boolean,
 ):
   | { readonly destination: string; readonly kind: "file" | "symlink" }
   | undefined => {
   const destinations = entries.map((entry) => {
-    const destination = joinPath(root, entry.path);
+    const destination = joinPathWithSeparators(
+      windowsPathSeparators,
+      root,
+      entry.path,
+    );
     return {
       entry,
       destination,
@@ -161,14 +176,23 @@ const groupAllowsEntry = (
   destination: string,
   group: CacheRestorePathGroup,
   directoryEntry: boolean,
+  windowsPathSeparators: boolean,
 ): boolean => {
-  const directory = joinPath(root, group.directory);
-  const relative = relativePath(directory, destination);
+  const directory = joinPathWithSeparators(
+    windowsPathSeparators,
+    root,
+    group.directory,
+  );
+  const relative = relativePath(directory, destination, windowsPathSeparators);
   const candidates = directoryEntry ? [relative, `${relative}/`] : [relative];
   return (
-    isPathContained(root, directory) &&
-    isPathContained(directory, destination) &&
-    matchesGlobsWithExclusions(candidates, group.patterns)
+    isPathContained(root, directory, windowsPathSeparators) &&
+    isPathContained(directory, destination, windowsPathSeparators) &&
+    matchesGlobsWithExclusions(
+      candidates,
+      group.patterns,
+      windowsPathSeparators,
+    )
   );
 };
 
@@ -177,9 +201,16 @@ const matchingAllowedGroups = (
   destination: string,
   groups: ReadonlyArray<CacheRestorePathGroup>,
   directoryEntry: boolean,
+  windowsPathSeparators: boolean,
 ): ReadonlyArray<CacheRestorePathGroup> =>
   groups.filter((group) =>
-    groupAllowsEntry(root, destination, group, directoryEntry),
+    groupAllowsEntry(
+      root,
+      destination,
+      group,
+      directoryEntry,
+      windowsPathSeparators,
+    ),
   );
 
 const prepareParentDirectory = (
@@ -187,14 +218,19 @@ const prepareParentDirectory = (
   canonicalRoot: string,
   destination: string,
   restoredPaths: Array<string>,
+  windowsPathSeparators: boolean,
 ): Effect.Effect<void, CacheError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
-    const relativeParent = relativePath(root, parentPath(destination));
+    const relativeParent = relativePath(
+      root,
+      parentPath(destination, windowsPathSeparators),
+      windowsPathSeparators,
+    );
     let current = root;
     for (const segment of relativeParent.split("/").filter(Boolean)) {
       if (segment === ".") continue;
-      current = joinPath(current, segment);
+      current = joinPathWithSeparators(windowsPathSeparators, current, segment);
       const exists = yield* fileSystem
         .exists(current)
         .pipe(Effect.mapError((error) => restoreError(current, error.message)));
@@ -204,7 +240,7 @@ const prepareParentDirectory = (
           .pipe(
             Effect.mapError((error) => restoreError(current, error.message)),
           );
-        restoredPaths.push(relativePath(root, current));
+        restoredPaths.push(relativePath(root, current, windowsPathSeparators));
       }
       const metadata = yield* fileSystem
         .metadata(current)
@@ -217,7 +253,7 @@ const prepareParentDirectory = (
       const resolved = yield* fileSystem
         .realPath(current)
         .pipe(Effect.mapError((error) => restoreError(current, error.message)));
-      if (!isPathContained(canonicalRoot, resolved)) {
+      if (!isPathContained(canonicalRoot, resolved, windowsPathSeparators)) {
         return yield* Effect.fail(
           restoreError(current, "archive parent is an escaping symlink"),
         );
@@ -229,14 +265,15 @@ const validateExistingPathComponents = (
   root: string,
   canonicalRoot: string,
   path: string,
+  windowsPathSeparators: boolean,
 ): Effect.Effect<void, CacheError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
-    const relative = relativePath(root, path);
+    const relative = relativePath(root, path, windowsPathSeparators);
     let current = root;
     for (const segment of relative.split("/").filter(Boolean)) {
       if (segment === ".") continue;
-      current = joinPath(current, segment);
+      current = joinPathWithSeparators(windowsPathSeparators, current, segment);
       const exists = yield* fileSystem
         .exists(current)
         .pipe(Effect.mapError((error) => restoreError(current, error.message)));
@@ -255,7 +292,7 @@ const validateExistingPathComponents = (
       const resolved = yield* fileSystem
         .realPath(current)
         .pipe(Effect.mapError((error) => restoreError(current, error.message)));
-      if (!isPathContained(canonicalRoot, resolved)) {
+      if (!isPathContained(canonicalRoot, resolved, windowsPathSeparators)) {
         return yield* Effect.fail(
           restoreError(current, "archive symlink target escapes repository"),
         );
@@ -267,16 +304,23 @@ export const validateArchiveEntriesForRestore = (
   root: string,
   entries: ReadonlyArray<RestorableArchiveEntry>,
   scope: CacheRestoreScope,
+  windowsPathSeparators = true,
 ): Effect.Effect<string, CacheError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const canonicalRoot = yield* fileSystem
       .realPath(root)
       .pipe(Effect.mapError((error) => restoreError(root, error.message)));
-    const caseInsensitive = yield* pathNamesAreCaseInsensitive(root);
+    const caseInsensitive = yield* pathNamesAreCaseInsensitive(
+      root,
+      windowsPathSeparators,
+    );
     const regularFileDestinations = new Set(
       scope.regularFilePaths.map((path) =>
-        comparablePath(joinPath(root, path), caseInsensitive),
+        comparablePath(
+          joinPathWithSeparators(windowsPathSeparators, root, path),
+          caseInsensitive,
+        ),
       ),
     );
     const regularFileCounts = new Map<string, number>(
@@ -286,6 +330,7 @@ export const validateArchiveEntriesForRestore = (
       root,
       entries,
       caseInsensitive,
+      windowsPathSeparators,
     );
     if (duplicateDestination !== undefined) {
       return yield* Effect.fail(
@@ -299,6 +344,7 @@ export const validateArchiveEntriesForRestore = (
       root,
       entries,
       caseInsensitive,
+      windowsPathSeparators,
     );
     if (nonDirectoryAncestor !== undefined) {
       return yield* Effect.fail(
@@ -309,7 +355,11 @@ export const validateArchiveEntriesForRestore = (
       );
     }
     for (const entry of entries) {
-      const destination = joinPath(root, entry.path);
+      const destination = joinPathWithSeparators(
+        windowsPathSeparators,
+        root,
+        entry.path,
+      );
       const comparableDestination = comparablePath(
         destination,
         caseInsensitive,
@@ -319,8 +369,9 @@ export const validateArchiveEntriesForRestore = (
         destination,
         scope.allowedPathGroups,
         entry.kind === "directory",
+        windowsPathSeparators,
       );
-      if (!isPathContained(root, destination)) {
+      if (!isPathContained(root, destination, windowsPathSeparators)) {
         return yield* Effect.fail(
           restoreError(destination, "archive path escapes repository"),
         );
@@ -328,8 +379,12 @@ export const validateArchiveEntriesForRestore = (
       if (
         scope.excludedDirectories.some((directory) =>
           isPathContained(
-            comparablePath(joinPath(root, directory), caseInsensitive),
+            comparablePath(
+              joinPathWithSeparators(windowsPathSeparators, root, directory),
+              caseInsensitive,
+            ),
             comparableDestination,
+            windowsPathSeparators,
           ),
         )
       ) {
@@ -370,8 +425,12 @@ export const validateArchiveEntriesForRestore = (
         regularFileCounts.set(comparableDestination, count);
       }
       if (entry.kind === "symlink") {
-        const target = joinPath(parentPath(destination), entry.linkTarget);
-        if (!isPathContained(root, target)) {
+        const target = joinPathWithSeparators(
+          windowsPathSeparators,
+          parentPath(destination, windowsPathSeparators),
+          entry.linkTarget,
+        );
+        if (!isPathContained(root, target, windowsPathSeparators)) {
           return yield* Effect.fail(
             restoreError(destination, "archive link target escapes repository"),
           );
@@ -379,8 +438,20 @@ export const validateArchiveEntriesForRestore = (
         if (
           !matchingGroups.some(
             (group) =>
-              groupAllowsEntry(root, target, group, false) ||
-              groupAllowsEntry(root, target, group, true),
+              groupAllowsEntry(
+                root,
+                target,
+                group,
+                false,
+                windowsPathSeparators,
+              ) ||
+              groupAllowsEntry(
+                root,
+                target,
+                group,
+                true,
+                windowsPathSeparators,
+              ),
           )
         ) {
           return yield* Effect.fail(
@@ -390,7 +461,12 @@ export const validateArchiveEntriesForRestore = (
             ),
           );
         }
-        yield* validateExistingPathComponents(root, canonicalRoot, target);
+        yield* validateExistingPathComponents(
+          root,
+          canonicalRoot,
+          target,
+          windowsPathSeparators,
+        );
       }
     }
     for (const [destination, count] of regularFileCounts) {
@@ -401,16 +477,32 @@ export const validateArchiveEntriesForRestore = (
       }
     }
     for (const path of scope.pathsToClear) {
-      const destination = joinPath(root, path);
-      if (path === "" || path === "." || !isPathContained(root, destination)) {
+      const destination = joinPathWithSeparators(
+        windowsPathSeparators,
+        root,
+        path,
+      );
+      if (
+        path === "" ||
+        path === "." ||
+        !isPathContained(root, destination, windowsPathSeparators)
+      ) {
         return yield* Effect.fail(
           restoreError(destination, "cache output path escapes repository"),
         );
       }
     }
     for (const path of scope.regularFilePaths) {
-      const destination = joinPath(root, path);
-      if (path === "" || path === "." || !isPathContained(root, destination)) {
+      const destination = joinPathWithSeparators(
+        windowsPathSeparators,
+        root,
+        path,
+      );
+      if (
+        path === "" ||
+        path === "." ||
+        !isPathContained(root, destination, windowsPathSeparators)
+      ) {
         return yield* Effect.fail(
           restoreError(
             destination,
@@ -431,6 +523,7 @@ export const restoreArchiveEntries = (
     CacheError,
     FileSystemService
   > = Effect.void,
+  windowsPathSeparators = true,
 ): Effect.Effect<void, CacheError | CacheRollbackError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -438,11 +531,16 @@ export const restoreArchiveEntries = (
       root,
       entries,
       scope,
+      windowsPathSeparators,
     );
     const restoredPaths: Array<string> = [];
     const restoration = Effect.gen(function* () {
       for (const path of scope.pathsToClear) {
-        const destination = joinPath(root, path);
+        const destination = joinPathWithSeparators(
+          windowsPathSeparators,
+          root,
+          path,
+        );
         yield* fileSystem
           .remove(destination)
           .pipe(
@@ -452,12 +550,17 @@ export const restoreArchiveEntries = (
           );
       }
       for (const entry of entries) {
-        const destination = joinPath(root, entry.path);
+        const destination = joinPathWithSeparators(
+          windowsPathSeparators,
+          root,
+          entry.path,
+        );
         yield* prepareParentDirectory(
           root,
           canonicalRoot,
           destination,
           restoredPaths,
+          windowsPathSeparators,
         );
         let exists = yield* fileSystem
           .exists(destination)
@@ -504,8 +607,12 @@ export const restoreArchiveEntries = (
           continue;
         }
         if (entry.kind === "symlink") {
-          const target = joinPath(parentPath(destination), entry.linkTarget);
-          if (!isPathContained(root, target)) {
+          const target = joinPathWithSeparators(
+            windowsPathSeparators,
+            parentPath(destination, windowsPathSeparators),
+            entry.linkTarget,
+          );
+          if (!isPathContained(root, target, windowsPathSeparators)) {
             return yield* Effect.fail(
               restoreError(
                 destination,
@@ -513,7 +620,12 @@ export const restoreArchiveEntries = (
               ),
             );
           }
-          yield* validateExistingPathComponents(root, canonicalRoot, target);
+          yield* validateExistingPathComponents(
+            root,
+            canonicalRoot,
+            target,
+            windowsPathSeparators,
+          );
           yield* fileSystem
             .createSymlink(entry.linkTarget, destination)
             .pipe(
@@ -570,7 +682,11 @@ export const restoreArchiveEntries = (
             right.path.split("/").length - left.path.split("/").length,
         );
       for (const entry of directories) {
-        const destination = joinPath(root, entry.path);
+        const destination = joinPathWithSeparators(
+          windowsPathSeparators,
+          root,
+          entry.path,
+        );
         yield* fileSystem
           .setFileMetadata(
             destination,
@@ -599,16 +715,22 @@ export const restoreArchiveEntries = (
     const rollback = yield* Effect.either(
       Effect.forEach(
         rollbackPaths,
-        (path) =>
-          fileSystem.remove(joinPath(root, path)).pipe(
+        (path) => {
+          const destination = joinPathWithSeparators(
+            windowsPathSeparators,
+            root,
+            path,
+          );
+          return fileSystem.remove(destination).pipe(
             Effect.mapError(
               (error) =>
                 new CacheRollbackError({
-                  path: joinPath(root, path),
+                  path: destination,
                   message: `cache restoration failed: ${outcome.left.message}; rollback failed: ${error.message}`,
                 }),
             ),
-          ),
+          );
+        },
         { concurrency: 1, discard: true },
       ),
     );

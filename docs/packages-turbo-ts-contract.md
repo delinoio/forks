@@ -141,7 +141,9 @@ owning lockfiles are streamed through bounded-memory xxHash64 digests.
 NUL-delimited Git discovery output is consumed as bytes and filenames that are
 not valid UTF-8 fail affected selection and hashing instead of being silently
 omitted. Git-discovered and filesystem-traversed POSIX filenames preserve
-literal backslashes as filename characters. Cargo task hashes additionally
+literal backslashes as filename characters. Cache archive paths and symlink
+targets preserve the same POSIX distinction while Windows-originated paths use
+Windows separator semantics. Cargo task hashes additionally
 include repository-contained ancestor manifests, Cargo configuration, and Rust
 toolchain files that can change task execution. They are partitioned by the
 effective Rust host target reported for the package execution directory. A
@@ -300,10 +302,14 @@ configuration explicitly enables caching. Explicitly cached uv builds bypass
 caching when `-o` or `--out-dir` selects an unmodeled output directory. uv
 tasks execute from their project directory, forward test arguments directly to
 `pytest`, and parse `uv.lock` as TOML. Each task hash includes the owning
-`pyproject.toml` independently of configured input globs. uv path dependencies that do not
-resolve to the named discovered workspace member make the package and hash
-scopes that depend on them uncacheable, regardless of editable mode. uv
-package-graph edges require a
+`pyproject.toml`, the workspace-root `pyproject.toml`, and effective
+repository-contained `uv.toml`, `.python-version`, or `UV_CONFIG_FILE` controls
+independently of configured input globs; these controls also participate in
+task-aware affected selection. Effective uv user configuration or an external
+`UV_CONFIG_FILE` makes the package and downstream hash scopes uncacheable. uv
+path dependencies that do not resolve to the named discovered workspace member
+make the package and hash scopes that depend on them uncacheable, regardless of
+editable mode. uv package-graph edges require a
 matching `tool.uv.sources` workspace declaration or local path resolving to the
 named workspace member by canonical, platform-aware filesystem identity;
 registry, Git, URL, and undeclared sources remain

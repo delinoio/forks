@@ -83,6 +83,7 @@ import {
   npmUserConfigurationPresent,
   type RepositoryModel,
   type RepositoryPackage,
+  uvControlInputs,
 } from "../repository/model.js";
 import { type ParsedRunOptions, parseConcurrency } from "./options.js";
 
@@ -767,15 +768,19 @@ const taskMatchesChangedFiles = (
   repository: RepositoryModel,
   node: TaskNode,
   changedFiles: ReadonlyArray<string>,
+  runtimeEnvironment: Readonly<Record<string, string | undefined>>,
   windowsPathSeparators: boolean,
 ): boolean => {
   const rootRelativeInputPrefix = "$TURBO_ROOT$/";
   const isRootPackage = node.package.relativeDirectory === ".";
   const inputs = effectiveTaskInputs(repository, node);
   const implicitInputs = new Set(
-    implicitTaskInputCandidates(repository, node).map((path) =>
-      relativePath(repository.root, path),
-    ),
+    implicitTaskInputCandidates(
+      repository,
+      node,
+      runtimeEnvironment,
+      windowsPathSeparators,
+    ).map((path) => relativePath(repository.root, path)),
   );
   return changedFiles.some((repositoryRelativeFile) => {
     const packageRelativeFile = packageRelativeChangedFile(
@@ -839,6 +844,9 @@ const affectedTaskEntrypoints = (
   changedFiles: ReadonlyArray<string>,
   rootChanged: boolean,
   filter: string,
+  sourceEnvironment: Readonly<Record<string, string | undefined>>,
+  environmentMode: "loose" | "strict",
+  frameworkInference: boolean,
   windowsPathSeparators: boolean,
 ): ReadonlySet<string> => {
   if (rootChanged) return new Set(graph.entrypoints);
@@ -849,6 +857,16 @@ const affectedTaskEntrypoints = (
           repository,
           node,
           changedFiles,
+          node.package.manager === "uv"
+            ? taskEnvironment(
+                repository,
+                node,
+                sourceEnvironment,
+                environmentMode,
+                frameworkInference,
+                windowsPathSeparators,
+              )
+            : {},
           windowsPathSeparators,
         ),
       )
@@ -956,6 +974,9 @@ const selectAffectedTasks = (
   filters: ReadonlyArray<string>,
   affectedBySelector: ReadonlyMap<string, AffectedPackages>,
   retainedPackageIdentities: ReadonlySet<string> = new Set(),
+  sourceEnvironment: Readonly<Record<string, string | undefined>> = {},
+  environmentMode: "loose" | "strict" = "strict",
+  frameworkInference = true,
   windowsPathSeparators = false,
 ): TaskGraph => {
   const rangeFilters = filters.flatMap((filter) => {
@@ -983,6 +1004,9 @@ const selectAffectedTasks = (
       affected.changedFiles,
       affected.rootChanged,
       filter,
+      sourceEnvironment,
+      environmentMode,
+      frameworkInference,
       windowsPathSeparators,
     )) {
       retainedEntrypoints.add(id);
@@ -997,6 +1021,9 @@ const selectAffectedTasks = (
       affected.changedFiles,
       affected.rootChanged,
       filter,
+      sourceEnvironment,
+      environmentMode,
+      frameworkInference,
       windowsPathSeparators,
     )) {
       retainedEntrypoints.delete(id);
@@ -1307,6 +1334,7 @@ const collectCacheEntries = (
       repository.root,
       entries,
       restoreScope,
+      windowsPathSeparators,
     ).pipe(
       Effect.mapError(
         (error) =>
@@ -1594,6 +1622,7 @@ export const isTaskScopeDynamicallyCacheable = (
   sourceEnvironment: Readonly<Record<string, string | undefined>> = environment,
   cargoHomeHasConfiguration = false,
   npmUserHasConfiguration = false,
+  uvHasExternalControls = false,
 ): boolean =>
   !usesAlternateCargoBuildOutputs(node, passThroughArguments) &&
   !usesCargoConfigurationOverride(node, passThroughArguments) &&
@@ -1612,7 +1641,8 @@ export const isTaskScopeDynamicallyCacheable = (
     caseInsensitiveEnvironmentNames,
   ) &&
   !(isCargoCompilationTask(node) && cargoHomeHasConfiguration) &&
-  !(node.package.manager === "npm" && npmUserHasConfiguration);
+  !(node.package.manager === "npm" && npmUserHasConfiguration) &&
+  !(node.package.manager === "uv" && uvHasExternalControls);
 
 export const isTaskScopeCacheable = (
   node: TaskNode,
@@ -1623,6 +1653,7 @@ export const isTaskScopeCacheable = (
   sourceEnvironment: Readonly<Record<string, string | undefined>> = environment,
   cargoHomeHasConfiguration = false,
   npmUserHasConfiguration = false,
+  uvHasExternalControls = false,
 ): boolean =>
   isTaskScopeStaticallyCacheable(node, scope) &&
   isTaskScopeDynamicallyCacheable(
@@ -1633,6 +1664,7 @@ export const isTaskScopeCacheable = (
     sourceEnvironment,
     cargoHomeHasConfiguration,
     npmUserHasConfiguration,
+    uvHasExternalControls,
   );
 
 const hashDependencyGraph = (graph: TaskGraph): TaskGraph => ({
@@ -1810,6 +1842,16 @@ const resolveTaskScopeCacheability = (
             caseInsensitiveEnvironmentNames,
           )
         : false;
+    const uvHasExternalControls =
+      node.package.manager === "uv"
+        ? (yield* uvControlInputs(
+            repository.root,
+            executionDirectory,
+            node.package.workspaceDirectory ?? executionDirectory,
+            executionEnvironment,
+            caseInsensitiveEnvironmentNames,
+          )).external
+        : false;
     const runtimeInputsRestorable = isTaskScopeDynamicallyCacheable(
       node,
       options.passThroughArguments,
@@ -1818,6 +1860,7 @@ const resolveTaskScopeCacheability = (
       sourceEnvironment,
       cargoHomeHasConfiguration,
       npmUserHasConfiguration,
+      uvHasExternalControls,
     );
     return {
       cacheable:
@@ -1932,6 +1975,7 @@ const executeTask = (
         localOptions,
         hash.hash,
         restoreScope,
+        platform === "win32",
       ).pipe(
         Effect.catchTag("CacheError", (error) =>
           terminal
@@ -1959,6 +2003,7 @@ const executeTask = (
         options.remote,
         hash.hash,
         restoreScope,
+        platform === "win32",
       ).pipe(
         Effect.catchTag("CacheError", (error) =>
           terminal
@@ -2194,6 +2239,7 @@ const executeTask = (
               hash.hash,
               collected.entries,
               duration,
+              platform === "win32",
             ).pipe(
               Effect.catchAll((error) =>
                 terminal
@@ -2216,6 +2262,7 @@ const executeTask = (
               hash.hash,
               collected.entries,
               duration,
+              platform === "win32",
             ).pipe(
               Effect.catchAll((error) =>
                 terminal
@@ -2248,6 +2295,9 @@ const computeTaskHashes = (
   FileSystemService | EnvironmentService | DigestService | ProcessService
 > =>
   Effect.gen(function* () {
+    const environmentService = yield* EnvironmentService;
+    const sourceEnvironment = yield* environmentService.entries;
+    const platform = yield* environmentService.platform;
     const hashes = new Map<string, TaskHashResult>();
     for (const id of topologicalOrder(hashDependencyGraph(graph))) {
       const node = graph.nodes.get(id)!;
@@ -2261,6 +2311,15 @@ const computeTaskHashes = (
         options.frameworkInference,
         options.passThroughArguments,
         options.cacheExclusionDirectory,
+        taskScopeEnvironment(
+          repository,
+          node,
+          sourceEnvironment,
+          options.environmentMode,
+          options.frameworkInference,
+          packageTaskCommandScope,
+          platform === "win32",
+        ),
       );
       hashes.set(id, result);
     }
@@ -2827,6 +2886,9 @@ export const executeRun = (
           affected.filters,
           affected.affectedBySelector,
           retainedPackageIdentities,
+          environment,
+          options.environmentMode,
+          options.frameworkInference,
           platform === "win32",
         )
       : unfilteredGraph;

@@ -108,6 +108,7 @@ export const restoreRemoteCache = (
   options: RemoteCacheOptions,
   hash: string,
   scope: CacheRestoreScope,
+  windowsPathSeparators = true,
 ): Effect.Effect<
   boolean,
   CacheError | CacheRollbackError,
@@ -214,6 +215,7 @@ export const restoreRemoteCache = (
                               ),
                             ),
                           ),
+                        windowsPathSeparators,
                       ),
                     ),
                   );
@@ -236,6 +238,7 @@ export const writeRemoteCache = (
   hash: string,
   entries: ReadonlyArray<ArchiveEntry>,
   durationMilliseconds: number,
+  windowsPathSeparators = true,
 ): Effect.Effect<
   void,
   CacheError,
@@ -250,7 +253,7 @@ export const writeRemoteCache = (
     yield* preflight(url, options);
     let archive: Uint8Array;
     try {
-      archive = createTarArchive(entries);
+      archive = createTarArchive(entries, windowsPathSeparators);
     } catch (cause) {
       return yield* Effect.fail(remoteError(url, cause));
     }

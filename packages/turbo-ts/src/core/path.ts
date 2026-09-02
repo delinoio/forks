@@ -49,11 +49,23 @@ export const normalizePath = (
   return `${prefix}${segments.join("/")}` || (absolute ? prefix : ".");
 };
 
-export const joinPath = (...values: ReadonlyArray<string>): string =>
-  normalizePath(values.filter((value) => value !== "").join("/"));
+export const joinPathWithSeparators = (
+  windowsPathSeparators: boolean,
+  ...values: ReadonlyArray<string>
+): string =>
+  normalizePath(
+    values.filter((value) => value !== "").join("/"),
+    windowsPathSeparators,
+  );
 
-export const parentPath = (value: string): string => {
-  const normalized = normalizePath(value);
+export const joinPath = (...values: ReadonlyArray<string>): string =>
+  joinPathWithSeparators(true, ...values);
+
+export const parentPath = (
+  value: string,
+  windowsPathSeparators = true,
+): string => {
+  const normalized = normalizePath(value, windowsPathSeparators);
   const uncRoot = /^\/\/[^/]+\/[^/]+/.exec(normalized)?.[0];
   if (uncRoot !== undefined && normalized.length <= uncRoot.length) {
     return uncRoot;

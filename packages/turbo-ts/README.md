@@ -129,10 +129,13 @@ are rejected because treating them as cache content would exclude source files
 from task hashes. Explicit `dist/**` and `target/**` task inputs remain hashable
 when Git metadata is unavailable.
 
-uv task hashes always include the owning `pyproject.toml`. Explicitly cached uv
-builds using `-o` or `--out-dir` and uv packages with unresolved external local
-path dependencies bypass cache reads and writes until those inputs and outputs
-are modeled, regardless of editable mode.
+uv task hashes always include the owning and workspace-root `pyproject.toml`
+plus effective repository-contained `uv.toml`, `.python-version`, and
+`UV_CONFIG_FILE` controls. These controls remain task-aware inputs. Effective
+user configuration or an external `UV_CONFIG_FILE`, explicitly cached uv builds
+using `-o` or `--out-dir`, and uv packages with unresolved external local path
+dependencies bypass cache reads and writes until those inputs and outputs are
+modeled, regardless of editable mode.
 
 ## License and Attribution
 

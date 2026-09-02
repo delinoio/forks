@@ -93,6 +93,7 @@ export const restoreLocalCache = (
   options: LocalCacheOptions,
   hash: string,
   scope: CacheRestoreScope,
+  windowsPathSeparators = true,
 ): Effect.Effect<
   boolean,
   CacheError | CacheRollbackError,
@@ -171,6 +172,7 @@ export const restoreLocalCache = (
                               ),
                             ),
                           ),
+                        windowsPathSeparators,
                       ),
                     ),
                   );
@@ -519,6 +521,7 @@ export const writeLocalCache = (
   hash: string,
   entries: ReadonlyArray<CacheWriteEntry>,
   durationMilliseconds: number,
+  windowsPathSeparators = true,
 ): Effect.Effect<
   void,
   CacheError,
@@ -528,7 +531,7 @@ export const writeLocalCache = (
     const compression = yield* CompressionService;
     let archive: Uint8Array;
     try {
-      archive = createTarArchive(entries);
+      archive = createTarArchive(entries, windowsPathSeparators);
     } catch (cause) {
       return yield* Effect.fail(cacheError(options.directory, cause));
     }

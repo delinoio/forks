@@ -70,8 +70,11 @@ const checksum = (header: Uint8Array): number =>
     0,
   );
 
-const validateArchivePath = (path: string): string => {
-  const unix = toUnixPath(path);
+const validateArchivePath = (
+  path: string,
+  windowsPathSeparators = false,
+): string => {
+  const unix = windowsPathSeparators ? toUnixPath(path) : path;
   if (
     unix === "" ||
     unix.startsWith("/") ||
@@ -81,7 +84,7 @@ const validateArchivePath = (path: string): string => {
   ) {
     throw new TypeError(`unsafe archive path: ${path}`);
   }
-  const normalized = normalizePath(unix);
+  const normalized = normalizePath(unix, false);
   if (normalized === "." || normalized.startsWith("../")) {
     throw new TypeError(`unsafe archive path: ${path}`);
   }
@@ -111,8 +114,12 @@ const splitArchivePath = (
   return undefined;
 };
 
-const validateArchiveLinkTarget = (path: string, target: string): string => {
-  const unix = toUnixPath(target);
+const validateArchiveLinkTarget = (
+  path: string,
+  target: string,
+  windowsPathSeparators = false,
+): string => {
+  const unix = windowsPathSeparators ? toUnixPath(target) : target;
   if (
     unix === "" ||
     unix.startsWith("/") ||
@@ -121,7 +128,7 @@ const validateArchiveLinkTarget = (path: string, target: string): string => {
   ) {
     throw new TypeError(`unsafe archive link target: ${target}`);
   }
-  const resolved = normalizePath(`${parentPath(path)}/${unix}`);
+  const resolved = normalizePath(`${parentPath(path, false)}/${unix}`, false);
   if (resolved === ".." || resolved.startsWith("../")) {
     throw new TypeError(`archive link target escapes repository: ${target}`);
   }
@@ -222,18 +229,19 @@ interface PreparedArchiveEntry {
 
 export const createTarArchive = (
   entries: ReadonlyArray<ArchiveEntry>,
+  windowsPathSeparators = false,
 ): Uint8Array => {
   const preparedEntries: Array<PreparedArchiveEntry> = [];
   let inputBytes = 0;
   let overheadBytes = tarBlockSize * 2;
   for (const entry of entries) {
-    const path = validateArchivePath(entry.path);
+    const path = validateArchivePath(entry.path, windowsPathSeparators);
     const pathFields = splitArchivePath(path);
     const symlink = entry.kind === "symlink";
     const directory = entry.kind === "directory";
     const contents = symlink || directory ? new Uint8Array() : entry.contents;
     const linkTarget = symlink
-      ? validateArchiveLinkTarget(path, entry.linkTarget)
+      ? validateArchiveLinkTarget(path, entry.linkTarget, windowsPathSeparators)
       : "";
     const extensions = {
       ...(pathFields === undefined ? { path } : {}),

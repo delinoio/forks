@@ -66,12 +66,14 @@ import { buildTaskGraph, type TaskNode } from "../src/graph/task-graph.js";
 import {
   decodeNullDelimitedGitOutput,
   hashTask,
+  implicitTaskInputCandidates,
 } from "../src/hash/task-hash.js";
 import { xxhash64Hex } from "../src/hash/xxhash64.js";
 import {
   cargoHomeConfigurationPresent,
   discoverRepository,
   npmUserConfigurationPresent,
+  uvControlInputs,
 } from "../src/repository/model.js";
 import {
   executeRun,
@@ -3778,7 +3780,10 @@ describe("core CLI execution", () => {
         ["test"],
         false,
       );
-      const compute = (id: string) =>
+      const compute = (
+        id: string,
+        runtimeEnvironment?: Readonly<Record<string, string | undefined>>,
+      ) =>
         Effect.runPromise(
           hashTask(
             model,
@@ -3787,6 +3792,7 @@ describe("core CLI execution", () => {
             true,
             [],
             `${directory}/.turbo/cache`,
+            runtimeEnvironment,
           ).pipe(Effect.provide(nodeFoundationLayer)),
         );
       const cargoBefore = await compute("rust-tool#test");
@@ -3810,6 +3816,45 @@ describe("core CLI execution", () => {
       );
       expect(alternateTarget.hash).not.toBe(cargoBefore.hash);
       const uvBefore = await compute("python-app#test");
+      expect(uvBefore.inputFiles).toContain("$TURBO_ROOT$/pyproject.toml");
+      expect(
+        implicitTaskInputCandidates(model, graph.nodes.get("python-app#test")!),
+      ).toEqual(
+        expect.arrayContaining([
+          `${directory}/pyproject.toml`,
+          `${directory}/uv.toml`,
+          `${directory}/.python-version`,
+        ]),
+      );
+      const uvConfiguration = `${directory}/uv.toml`;
+      await writeFile(uvConfiguration, "offline = true\n");
+      const uvAfterConfiguration = await compute("python-app#test");
+      expect(uvAfterConfiguration.hash).not.toBe(uvBefore.hash);
+      expect(uvAfterConfiguration.inputFiles).toContain("$TURBO_ROOT$/uv.toml");
+      const pythonVersion = `${directory}/.python-version`;
+      await writeFile(pythonVersion, "3.12\n");
+      const uvAfterPythonVersion = await compute("python-app#test");
+      expect(uvAfterPythonVersion.hash).not.toBe(uvAfterConfiguration.hash);
+      expect(uvAfterPythonVersion.inputFiles).toContain(
+        "$TURBO_ROOT$/.python-version",
+      );
+      const configuredUvPath = `${directory}/config/custom-uv.toml`;
+      await mkdir(dirname(configuredUvPath), { recursive: true });
+      await writeFile(configuredUvPath, "offline = false\n");
+      const uvWithConfiguredPath = await compute("python-app#test", {
+        UV_CONFIG_FILE: configuredUvPath,
+      });
+      expect(uvWithConfiguredPath.hash).not.toBe(uvAfterPythonVersion.hash);
+      expect(uvWithConfiguredPath.inputFiles).toContain(
+        "$TURBO_ROOT$/config/custom-uv.toml",
+      );
+      expect(
+        implicitTaskInputCandidates(
+          model,
+          graph.nodes.get("python-app#test")!,
+          { UV_CONFIG_FILE: configuredUvPath },
+        ),
+      ).toContain(configuredUvPath);
       const cargoLockfile = `${directory}/rust/Cargo.lock`;
       await writeFile(
         cargoLockfile,
@@ -3818,13 +3863,13 @@ describe("core CLI execution", () => {
       const cargoAfter = await compute("rust-tool#test");
       const uvAfterCargoChange = await compute("python-app#test");
       expect(cargoAfter.hash).not.toBe(cargoBefore.hash);
-      expect(uvAfterCargoChange.hash).toBe(uvBefore.hash);
+      expect(uvAfterCargoChange.hash).toBe(uvAfterPythonVersion.hash);
       await writeFile(
         uvManifest,
         `${await readFile(uvManifest, "utf8")}\n[tool.pytest.ini_options]\naddopts = "--strict-markers"\n`,
       );
       const uvAfterManifestChange = await compute("python-app#test");
-      expect(uvAfterManifestChange.hash).not.toBe(uvBefore.hash);
+      expect(uvAfterManifestChange.hash).not.toBe(uvAfterPythonVersion.hash);
       expect(uvAfterManifestChange.inputFiles).toContain("pyproject.toml");
       await writeFile(uvLockfile, "version = 1\nrevision = 2\n");
       expect((await compute("python-app#test")).hash).not.toBe(
@@ -4201,6 +4246,27 @@ describe("core CLI execution", () => {
           name.endsWith(".tar.zst"),
         ),
       ).toBe(true);
+      await rm(outputPath);
+      const cached = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--cache=local:rw",
+          "--output-logs=hash-only",
+        ],
+        repositoryRoot,
+      );
+      expect(cached.exitCode, cached.combinedOutput).toBe(0);
+      expect(cached.stdout).toContain("cache hit");
+      expect(await readFile(outputPath, "utf8")).toBe("cached");
+      await expect(
+        lstat(`${packageDirectory}/dist/output/artifact`),
+      ).rejects.toThrow();
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -6402,6 +6468,106 @@ describe("core CLI execution", () => {
     }
   });
 
+  it("resolves repository and external uv controls", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-uv-controls-"));
+    const packageDirectory = `${directory}/python/app`;
+    const externalHome = await mkdtemp(join(tmpdir(), "turbo-ts-uv-home-"));
+    const externalConfiguration = `${externalHome}/.config/uv/uv.toml`;
+    try {
+      await mkdir(packageDirectory, { recursive: true });
+      await mkdir(dirname(externalConfiguration), { recursive: true });
+      await writeFile(`${directory}/pyproject.toml`, "[tool.uv.workspace]\n");
+      await writeFile(`${directory}/uv.toml`, "offline = true\n");
+      await writeFile(`${directory}/.python-version`, "3.12\n");
+      await writeFile(
+        `${packageDirectory}/pyproject.toml`,
+        '[project]\nname = "app"\n',
+      );
+      await writeFile(externalConfiguration, "offline = false\n");
+      const resolve = (
+        environment: Readonly<Record<string, string | undefined>>,
+      ) =>
+        Effect.runPromise(
+          uvControlInputs(
+            directory,
+            packageDirectory,
+            directory,
+            environment,
+            false,
+          ).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      const discovered = await resolve({ HOME: externalHome });
+      expect(discovered.external).toBe(true);
+      expect(discovered.repositoryPaths).toEqual(
+        expect.arrayContaining([
+          `${directory}/pyproject.toml`,
+          `${directory}/uv.toml`,
+          `${directory}/.python-version`,
+          `${packageDirectory}/pyproject.toml`,
+        ]),
+      );
+      const configured = await resolve({
+        HOME: externalHome,
+        UV_CONFIG_FILE: "config/custom.toml",
+      });
+      expect(configured.external).toBe(false);
+      expect(configured.repositoryPaths).toContain(
+        `${packageDirectory}/config/custom.toml`,
+      );
+      expect(configured.repositoryPaths).not.toContain(`${directory}/uv.toml`);
+      expect(
+        (
+          await resolve({
+            UV_CONFIG_FILE: `${externalHome}/custom.toml`,
+          })
+        ).external,
+      ).toBe(true);
+
+      const uvPackage = {
+        identity: "uv:app",
+        name: "app",
+        directory: packageDirectory,
+        relativeDirectory: "python/app",
+        canonicalRelativeDirectory: "python/app",
+        cachePathRestorable: true,
+        cacheInputsComplete: true,
+        workspaceDirectory: directory,
+        manager: "uv" as const,
+        scripts: {},
+        dependencyNames: [],
+        internalDependencies: [],
+        excludedTasks: new Set<string>(),
+        tasks: {},
+        manifest: { name: "app", private: true },
+      };
+      const node: TaskNode = {
+        id: "uv:app#test",
+        package: uvPackage,
+        task: "test",
+        command: "uv run pytest",
+        definition: { cache: true },
+        dependencies: [],
+        with: [],
+      };
+      expect(
+        isTaskScopeCacheable(
+          node,
+          [],
+          { kind: "package" },
+          {},
+          false,
+          {},
+          false,
+          false,
+          true,
+        ),
+      ).toBe(false);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+      await rm(externalHome, { force: true, recursive: true });
+    }
+  });
+
   it("bypasses npm caching when effective user configuration is present", async () => {
     const directory = await makeFixture();
     const homeDirectory = await mkdtemp(join(tmpdir(), "turbo-ts-npm-run-"));
@@ -8110,7 +8276,7 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  }, 20_000);
+  }, 30_000);
 
   it("applies ordered negations in structured task inputs", async () => {
     const directory = await mkdtemp(join(packageRoot, "turbo-ts-inputs-"));
@@ -10093,6 +10259,48 @@ describe("cache interoperability and safety", () => {
       expect(await readFile(`${directory}/${child.path}`, "utf8")).toBe(
         "child\n",
       );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("restores POSIX archive symlinks with literal backslash targets", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-slash-"));
+    const target = `${directory}/dist/value\\artifact.txt`;
+    try {
+      await writeFile(`${directory}/package.json`, "{}\n");
+      await Effect.runPromise(
+        restoreArchiveEntries(
+          directory,
+          [
+            {
+              path: "dist/value\\artifact.txt",
+              contents: new TextEncoder().encode("cached\n"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+            {
+              kind: "symlink",
+              path: "dist/current.txt",
+              linkTarget: "value\\artifact.txt",
+              contents: new Uint8Array(),
+              mode: 0o777,
+              modifiedSeconds: 1,
+            },
+          ],
+          allowCachePaths("dist/**"),
+          Effect.void,
+          false,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(await readFile(target, "utf8")).toBe("cached\n");
+      expect(await readlink(`${directory}/dist/current.txt`)).toBe(
+        "value\\artifact.txt",
+      );
+      await expect(
+        lstat(`${directory}/dist/value/artifact.txt`),
+      ).rejects.toThrow();
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

@@ -1114,7 +1114,7 @@ const cargoBuildTargetConfigured = (
     }
   });
 
-const configuredEnvironmentValue = (
+export const configuredEnvironmentValue = (
   environment: Readonly<Record<string, string | undefined>>,
   name: string,
   caseInsensitiveNames: boolean,
@@ -1205,6 +1205,151 @@ export const cargoHomeConfigurationPresent = (
     Effect.map((path) => path !== undefined),
   );
 };
+
+const configuredEnvironmentFlag = (
+  environment: Readonly<Record<string, string | undefined>>,
+  name: string,
+  caseInsensitiveNames: boolean,
+): boolean => {
+  const value = configuredEnvironmentValue(
+    environment,
+    name,
+    caseInsensitiveNames,
+  )?.toLowerCase();
+  return (
+    value !== undefined && value !== "" && value !== "0" && value !== "false"
+  );
+};
+
+const resolveEnvironmentPath = (
+  executionDirectory: string,
+  value: string,
+): string =>
+  isAbsolutePath(value)
+    ? normalizePath(value)
+    : joinPath(executionDirectory, value);
+
+const ancestorFileCandidates = (
+  directory: string,
+  boundary: string,
+  name: string,
+): ReadonlyArray<string> => {
+  const candidates: Array<string> = [];
+  let current = normalizePath(directory);
+  const normalizedBoundary = normalizePath(boundary);
+  while (isPathContained(normalizedBoundary, current)) {
+    candidates.push(joinPath(current, name));
+    if (current === normalizedBoundary) break;
+    const parent = parentPath(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return candidates;
+};
+
+export const uvTaskControlInputCandidates = (
+  executionDirectory: string,
+  workspaceDirectory: string,
+): ReadonlyArray<string> => [
+  joinPath(executionDirectory, "pyproject.toml"),
+  joinPath(workspaceDirectory, "pyproject.toml"),
+  joinPath(workspaceDirectory, "uv.toml"),
+  ...ancestorFileCandidates(
+    executionDirectory,
+    workspaceDirectory,
+    ".python-version",
+  ),
+];
+
+export interface UvControlInputs {
+  readonly repositoryPaths: ReadonlyArray<string>;
+  readonly external: boolean;
+}
+
+export const uvControlInputs = (
+  repositoryRoot: string,
+  executionDirectory: string,
+  workspaceDirectory: string,
+  environment: Readonly<Record<string, string | undefined>>,
+  caseInsensitiveEnvironmentNames: boolean,
+): Effect.Effect<UvControlInputs, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const repositoryPaths = new Set<string>([
+      joinPath(executionDirectory, "pyproject.toml"),
+      joinPath(workspaceDirectory, "pyproject.toml"),
+    ]);
+    const noConfiguration = configuredEnvironmentFlag(
+      environment,
+      "UV_NO_CONFIG",
+      caseInsensitiveEnvironmentNames,
+    );
+    const configuredPath = configuredEnvironmentValue(
+      environment,
+      "UV_CONFIG_FILE",
+      caseInsensitiveEnvironmentNames,
+    );
+    let external = false;
+    if (configuredPath !== undefined && configuredPath !== "") {
+      const path = resolveEnvironmentPath(executionDirectory, configuredPath);
+      if (isPathContained(repositoryRoot, path)) {
+        repositoryPaths.add(path);
+      } else {
+        external = true;
+      }
+    } else if (!noConfiguration) {
+      repositoryPaths.add(joinPath(workspaceDirectory, "uv.toml"));
+      const home = configuredEnvironmentValue(
+        environment,
+        "HOME",
+        caseInsensitiveEnvironmentNames,
+      );
+      const userHome = caseInsensitiveEnvironmentNames
+        ? (configuredEnvironmentValue(environment, "USERPROFILE", true) ?? home)
+        : home;
+      const configuredUserDirectory = caseInsensitiveEnvironmentNames
+        ? configuredEnvironmentValue(environment, "APPDATA", true)
+        : configuredEnvironmentValue(environment, "XDG_CONFIG_HOME", false);
+      const userDirectory =
+        configuredUserDirectory ??
+        (userHome === undefined
+          ? undefined
+          : caseInsensitiveEnvironmentNames
+            ? joinPath(userHome, "AppData", "Roaming")
+            : joinPath(userHome, ".config"));
+      if (userDirectory !== undefined && userDirectory !== "") {
+        const userConfiguration = joinPath(userDirectory, "uv", "uv.toml");
+        const exists = yield* fileSystem.exists(userConfiguration).pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({
+                path: userConfiguration,
+                message: error.message,
+              }),
+          ),
+        );
+        if (exists) {
+          if (isPathContained(repositoryRoot, userConfiguration)) {
+            repositoryPaths.add(userConfiguration);
+          } else {
+            external = true;
+          }
+        }
+      }
+    }
+    if (!noConfiguration) {
+      const pythonVersionCandidates = ancestorFileCandidates(
+        executionDirectory,
+        workspaceDirectory,
+        ".python-version",
+      );
+      for (const path of pythonVersionCandidates) repositoryPaths.add(path);
+    }
+    return {
+      repositoryPaths: [...repositoryPaths].sort(),
+      external,
+    };
+  });
 
 const stringArrayValue = (value: unknown): ReadonlyArray<string> =>
   Array.isArray(value)
@@ -1832,6 +1977,7 @@ export const discoverRepository = (
               yield* canonicalRelativeDirectory(directory),
             cachePathRestorable: yield* cachePathIsRestorable(root, directory),
             cacheInputsComplete: true,
+            workspaceDirectory: root,
             manager: "uv" as const,
             scripts: polyglotScripts("uv", []),
             cargoDependencies:

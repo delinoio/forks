@@ -1379,6 +1379,31 @@ describe("cache archive safety", () => {
     ).toThrow(/escapes repository/);
   });
 
+  it("preserves POSIX backslashes and normalizes Windows archive inputs", () => {
+    const file = {
+      path: "packages/app/dist/output\\artifact.txt",
+      contents: encoder.encode("literal backslash"),
+      mode: 0o644,
+      modifiedSeconds: 2,
+    };
+    const symlink = {
+      kind: "symlink" as const,
+      path: "packages/app/dist/current",
+      linkTarget: "output\\artifact.txt",
+      contents: new Uint8Array(),
+      mode: 0o777,
+      modifiedSeconds: 3,
+    };
+    expect(parseTarArchive(createTarArchive([file, symlink]))).toEqual([
+      symlink,
+      file,
+    ]);
+    expect(parseTarArchive(createTarArchive([file, symlink], true))).toEqual([
+      { ...symlink, linkTarget: "output/artifact.txt" },
+      { ...file, path: "packages/app/dist/output/artifact.txt" },
+    ]);
+  });
+
   it("round trips empty directory entries", () => {
     const entry = {
       kind: "directory" as const,

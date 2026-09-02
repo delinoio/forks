@@ -1,8 +1,10 @@
 import { Effect } from "effect";
 import { matchesGlob, selectByGlobs } from "../core/glob.js";
 import {
+  isAbsolutePath,
   isPathContained,
   joinPath,
+  normalizePath,
   parentPath,
   relativePath,
 } from "../core/path.js";
@@ -19,8 +21,11 @@ import type {
   RepositoryModel,
 } from "../repository/model.js";
 import {
+  configuredEnvironmentValue,
   listRepositoryFiles,
   lockfileNamesByManager,
+  uvControlInputs,
+  uvTaskControlInputCandidates,
 } from "../repository/model.js";
 import { xxhash64Hex } from "./xxhash64.js";
 
@@ -414,6 +419,8 @@ const trackedGitModes = (
 export const implicitTaskInputCandidates = (
   repository: RepositoryModel,
   node: TaskNode,
+  runtimeEnvironment: Readonly<Record<string, string | undefined>> = {},
+  caseInsensitiveEnvironmentNames = false,
 ): ReadonlyArray<string> => [
   ...new Set([
     joinPath(
@@ -433,17 +440,40 @@ export const implicitTaskInputCandidates = (
     ...owningLockfileCandidates(repository, node),
     ...cargoControlInputCandidates(repository, node),
     ...repositoryPackageManagerControlInputCandidates(repository, node),
+    ...(node.package.manager === "uv"
+      ? [
+          ...uvTaskControlInputCandidates(
+            node.package.directory,
+            node.package.workspaceDirectory ?? node.package.directory,
+          ),
+          ...(() => {
+            const configuredPath = configuredEnvironmentValue(
+              runtimeEnvironment,
+              "UV_CONFIG_FILE",
+              caseInsensitiveEnvironmentNames,
+            );
+            if (configuredPath === undefined || configuredPath === "") {
+              return [];
+            }
+            const path = isAbsolutePath(configuredPath)
+              ? normalizePath(configuredPath)
+              : joinPath(node.package.directory, configuredPath);
+            return isPathContained(repository.root, path) ? [path] : [];
+          })(),
+        ]
+      : []),
   ]),
 ];
 
 const alwaysHashedControlInputCandidates = (
   repository: RepositoryModel,
   node: TaskNode,
+  uvPaths: ReadonlyArray<string>,
 ): ReadonlyArray<string> =>
   node.package.manager === "cargo"
     ? cargoControlInputCandidates(repository, node)
     : node.package.manager === "uv"
-      ? [joinPath(node.package.directory, "pyproject.toml")]
+      ? uvPaths
       : [
           joinPath(node.package.directory, "package.json"),
           ...repositoryPackageManagerControlInputCandidates(repository, node),
@@ -454,6 +484,7 @@ const alwaysHashedControlInputFiles = (
   node: TaskNode,
   cacheDirectory: string,
   useTrackedGitModes: boolean,
+  uvPaths: ReadonlyArray<string>,
 ): Effect.Effect<
   ReadonlyArray<TaskInputFile>,
   RepositoryError,
@@ -464,6 +495,7 @@ const alwaysHashedControlInputFiles = (
     const candidates = alwaysHashedControlInputCandidates(
       repository,
       node,
+      uvPaths,
     ).filter((path) => !isIgnoredInputPath(path, cacheDirectory));
     const existing = yield* Effect.forEach(
       candidates,
@@ -646,6 +678,7 @@ export const hashTask = (
   frameworkInference: boolean,
   passThroughArguments: ReadonlyArray<string>,
   cacheDirectory: string,
+  runtimeEnvironment?: Readonly<Record<string, string | undefined>>,
 ): Effect.Effect<
   TaskHashResult,
   RepositoryError,
@@ -658,6 +691,16 @@ export const hashTask = (
     const environmentService = yield* EnvironmentService;
     const environment = yield* environmentService.entries;
     const platform = yield* environmentService.platform;
+    const uvControls =
+      node.package.manager === "uv"
+        ? yield* uvControlInputs(
+            repository.root,
+            node.package.directory,
+            node.package.workspaceDirectory ?? node.package.directory,
+            runtimeEnvironment ?? environment,
+            platform === "win32",
+          )
+        : undefined;
     const inputs = effectiveTaskInputs(repository, node);
     const packageFiles = yield* discoverFiles(
       repository,
@@ -691,6 +734,7 @@ export const hashTask = (
             node,
             cacheDirectory,
             platform === "win32",
+            uvControls?.repositoryPaths ?? [],
           )),
         ].map((input) => [input.absolutePath, input] as const),
       ).values(),
@@ -875,6 +919,13 @@ export const hashTask = (
         ...(node.package.manager === "cargo"
           ? { cargoHostTarget: node.package.cargoHostTarget ?? null }
           : {}),
+        ...(uvControls === undefined
+          ? {}
+          : {
+              uvControlPaths: uvControls.repositoryPaths.map((path) =>
+                relativePath(repository.root, path),
+              ),
+            }),
         passThroughArguments,
         definition: node.definition,
         effectiveInputs: inputs,
