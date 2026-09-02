@@ -563,16 +563,22 @@ describe("core CLI execution", () => {
         ],
       });
       const cargoCommand = `${commandDirectory}/cargo`;
+      const rustcCommand = `${commandDirectory}/rustc`;
       const uvCommand = `${commandDirectory}/uv`;
       await writeFile(
         cargoCommand,
         `#!/usr/bin/env node\nif (process.argv[2] === "metadata") process.stdout.write(${JSON.stringify(metadata)}); else console.log("cargo scope output");\n`,
       );
       await writeFile(
+        rustcCommand,
+        '#!/usr/bin/env node\nconsole.log("rustc 1.96.0-nightly");\nconsole.log("host: synthetic-target-triple");\n',
+      );
+      await writeFile(
         uvCommand,
         '#!/usr/bin/env node\nconsole.log("uv scope output");\n',
       );
       await chmod(cargoCommand, 0o755);
+      await chmod(rustcCommand, 0o755);
       await chmod(uvCommand, 0o755);
       const args = [
         candidateEntrypoint,
@@ -2700,7 +2706,7 @@ describe("core CLI execution", () => {
       configuration.futureFlags = {
         experimentalCargoWorkspaces: true,
       };
-      configuration.tasks.build = { dependsOn: ["^build"] };
+      delete configuration.tasks.build;
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
@@ -2757,11 +2763,11 @@ describe("core CLI execution", () => {
       const pathApp = pathModel.packagesByName.get("rust-app")!;
       expect(pathApp.cacheInputsComplete).toBe(true);
       expect(pathApp.internalDependencies).toEqual(["itoa"]);
-      expect(
-        buildTaskGraph(pathModel, [pathApp], ["build"], false).nodes.has(
-          "itoa#build",
-        ),
-      ).toBe(true);
+      const graph = buildTaskGraph(pathModel, [pathApp], ["build"], false);
+      expect(graph.nodes.has("itoa#build")).toBe(true);
+      expect(graph.nodes.get("rust-app#build")?.dependencies).toEqual([
+        "itoa#build",
+      ]);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2917,6 +2923,7 @@ describe("core CLI execution", () => {
         tasks: Record<string, Record<string, unknown>>;
       };
       configuration.futureFlags = { experimentalCargoWorkspaces: true };
+      configuration.tasks.build = { dependsOn: [] };
       configuration.tasks.run = { cache: true };
       await writeFile(
         configurationPath,
@@ -3516,6 +3523,25 @@ describe("core CLI execution", () => {
           ).pipe(Effect.provide(nodeFoundationLayer)),
         );
       const cargoBefore = await compute("rust-tool#test");
+      expect(cargoPackage.cargoHostTarget).toBeDefined();
+      const alternateTargetNode = {
+        ...graph.nodes.get("rust-tool#test")!,
+        package: {
+          ...cargoPackage,
+          cargoHostTarget: `${cargoPackage.cargoHostTarget}-alternate`,
+        },
+      };
+      const alternateTarget = await Effect.runPromise(
+        hashTask(
+          model,
+          alternateTargetNode,
+          [],
+          true,
+          [],
+          `${directory}/.turbo/cache`,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(alternateTarget.hash).not.toBe(cargoBefore.hash);
       const uvBefore = await compute("python-app#test");
       const cargoLockfile = `${directory}/rust/Cargo.lock`;
       await writeFile(
@@ -6120,6 +6146,16 @@ describe("core CLI execution", () => {
       const packageId = `path+file://${packageDirectory}#rust-target@0.1.0`;
       const metadataProcessLayer = Layer.succeed(ProcessService, {
         run: (request) => {
+          if (request.command === "rustc") {
+            const stdout =
+              "rustc 1.96.0-nightly\nhost: synthetic-target-triple\n";
+            return Effect.succeed({
+              exitCode: 0,
+              stdout,
+              stderr: "",
+              combinedOutput: stdout,
+            });
+          }
           metadataRequests.push(request);
           const stdout = JSON.stringify({
             workspace_root: packageDirectory,
@@ -6149,12 +6185,15 @@ describe("core CLI execution", () => {
         },
         runBytes: () => Effect.die("unexpected binary process request"),
       });
-      await Effect.runPromise(
+      const lockedModel = await Effect.runPromise(
         discover().pipe(
           Effect.provide(metadataProcessLayer),
           Effect.provide(nodeFoundationLayer),
         ),
       );
+      expect(
+        lockedModel.packagesByName.get("rust-target")?.cargoHostTarget,
+      ).toBe("synthetic-target-triple");
       expect(metadataRequests).toHaveLength(1);
       expect(metadataRequests[0]).toMatchObject({
         command: "cargo",
@@ -6262,25 +6301,54 @@ describe("core CLI execution", () => {
           },
         ],
       });
+      let hostTarget: string | undefined = "synthetic-target-triple";
       const metadataProcessLayer = Layer.succeed(ProcessService, {
-        run: () =>
-          Effect.succeed({
+        run: (request) => {
+          if (request.command === "rustc") {
+            const rustcOutput =
+              hostTarget === undefined
+                ? ""
+                : `rustc 1.96.0-nightly\nhost: ${hostTarget}\n`;
+            return Effect.succeed({
+              exitCode: hostTarget === undefined ? 1 : 0,
+              stdout: rustcOutput,
+              stderr: "",
+              combinedOutput: rustcOutput,
+            });
+          }
+          return Effect.succeed({
             exitCode: 0,
             stdout,
             stderr: "",
             combinedOutput: stdout,
-          }),
+          });
+        },
         runBytes: () => Effect.die("unexpected binary process request"),
       });
-      const model = await Effect.runPromise(
-        Effect.gen(function* () {
-          const rootConfiguration = yield* loadRootConfiguration(directory);
-          return yield* discoverRepository(directory, rootConfiguration);
-        }).pipe(
-          Effect.provide(metadataProcessLayer),
-          Effect.provide(nodeFoundationLayer),
-        ),
-      );
+      const discover = () =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const rootConfiguration = yield* loadRootConfiguration(directory);
+            return yield* discoverRepository(directory, rootConfiguration);
+          }).pipe(
+            Effect.provide(metadataProcessLayer),
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const model = await discover();
+      for (const packageName of ["rust-first", "rust-second"]) {
+        expect(model.packagesByName.get(packageName)?.cargoHostTarget).toBe(
+          "synthetic-target-triple",
+        );
+      }
+      hostTarget = undefined;
+      const missingTargetModel = await discover();
+      for (const packageName of ["rust-first", "rust-second"]) {
+        expect(
+          missingTargetModel.packagesByName.get(packageName)
+            ?.cacheInputsComplete,
+        ).toBe(false);
+      }
       const output =
         "$TURBO_ROOT$/packages/rust-workspace/target/debug/shared-tool";
       for (const packageName of ["rust-first", "rust-second"]) {

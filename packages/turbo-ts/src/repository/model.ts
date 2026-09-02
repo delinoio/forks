@@ -59,6 +59,7 @@ export interface RepositoryPackage {
   readonly canonicalRelativeDirectory: string;
   readonly cachePathRestorable: boolean;
   readonly cacheInputsComplete: boolean;
+  readonly cargoHostTarget?: string;
   readonly workspaceDirectory?: string;
   readonly manager: PackageManagerName;
   readonly scripts: Readonly<Record<string, string>>;
@@ -953,6 +954,27 @@ const cargoWorkspaceMetadata = (
     }
   });
 
+const rustHostTarget = (
+  directory: string,
+): Effect.Effect<string | undefined, never, ProcessService> =>
+  Effect.gen(function* () {
+    const processService = yield* ProcessService;
+    const result = yield* Effect.either(
+      Effect.scoped(
+        processService.run({
+          command: "rustc",
+          args: ["-vV"],
+          cwd: directory,
+        }),
+      ),
+    );
+    if (result._tag === "Left" || result.right.exitCode !== 0) {
+      return undefined;
+    }
+    const target = /^host:\s*(\S+)\s*$/m.exec(result.right.stdout)?.[1];
+    return target === undefined || target === "" ? undefined : target;
+  });
+
 interface PythonProjectMetadata {
   readonly name?: string;
   readonly dependencyNames: ReadonlyArray<string>;
@@ -1237,9 +1259,13 @@ const cargoTasks = (
   const formatDefaults: Pipeline = { cache: false };
   const buildTask = (configuredTask: Pipeline): Pipeline => {
     const merged = mergePipeline(buildDefaults, configuredTask);
+    const withInternalDependencies = {
+      ...merged,
+      dependsOn: [...new Set([...(merged.dependsOn ?? []), "^build"])],
+    };
     return configuredBuildTarget || hasCollidingBuildOutput
-      ? { ...merged, cache: false }
-      : merged;
+      ? { ...withInternalDependencies, cache: false }
+      : withInternalDependencies;
   };
   const tasks: Record<string, Pipeline> = { ...configured };
   if (!excludedTasks.has("build")) {
@@ -1603,6 +1629,7 @@ export const discoverRepository = (
         (metadata) =>
           Effect.gen(function* () {
             const directory = parentPath(metadata.manifestPath);
+            const hostTarget = yield* rustHostTarget(directory);
             const configuredBuildTarget =
               yield* cargoBuildTargetConfigured(directory);
             const packageConfiguration =
@@ -1636,7 +1663,11 @@ export const discoverRepository = (
               ),
               cacheInputsComplete:
                 metadata.workspaceDirectory !== undefined &&
-                !externalCargoConfigurationPresent,
+                !externalCargoConfigurationPresent &&
+                hostTarget !== undefined,
+              ...(hostTarget === undefined
+                ? {}
+                : { cargoHostTarget: hostTarget }),
               workspaceDirectory: metadata.workspaceDirectory,
               manager: "cargo" as const,
               scripts: polyglotScripts("cargo", metadata.entrypointNames),

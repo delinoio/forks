@@ -137,9 +137,11 @@ not valid UTF-8 fail affected selection and hashing instead of being silently
 omitted. Git-discovered and filesystem-traversed POSIX filenames preserve
 literal backslashes as filename characters. Cargo task hashes additionally
 include repository-contained ancestor manifests, Cargo configuration, and Rust
-toolchain files that can change task execution. An effective ancestor Cargo
-configuration outside the repository makes the Cargo package and downstream
-hash scopes uncacheable. Environment-name selection follows Windows
+toolchain files that can change task execution. They are partitioned by the
+effective Rust host target reported for the package execution directory. A
+missing host target or an effective ancestor Cargo configuration outside the
+repository makes the Cargo package and downstream hash scopes uncacheable.
+Environment-name selection follows Windows
 case-insensitive semantics for both hashing and strict task execution.
 Repository discovery records the resolved root lockfile path without
 structurally parsing it;
@@ -328,6 +330,9 @@ source-free metadata dependency path that resolves to the named member in the
 same workspace; registry and Git dependencies remain external. Cargo `run` and
 `dev` tasks are exposed only for crates with one unambiguous binary target, and
 default to uncached unless task configuration explicitly enables caching.
+Synthesized Cargo builds always retain an internal `^build` dependency after
+task configuration merging, so resolved workspace dependency hashes
+participate in their cache keys.
 Pass-through arguments are forwarded to Cargo without an implicit
 target-argument separator. Cargo builds
 for mixed library and binary crates default to uncached. Builds with

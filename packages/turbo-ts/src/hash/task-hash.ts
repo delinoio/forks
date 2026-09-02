@@ -872,6 +872,9 @@ export const hashTask = (
         package: node.package.relativeDirectory,
         task: node.task,
         command: node.command,
+        ...(node.package.manager === "cargo"
+          ? { cargoHostTarget: node.package.cargoHostTarget ?? null }
+          : {}),
         passThroughArguments,
         definition: node.definition,
         effectiveInputs: inputs,
