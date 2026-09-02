@@ -76,6 +76,7 @@ export interface RepositoryModel {
   readonly root: string;
   readonly manager: PackageManagerName;
   readonly managerVersion?: string;
+  readonly packageManagerExecutableInput?: string;
   readonly rootManifest: PackageManifest;
   readonly rootConfiguration: LoadedRootConfiguration;
   readonly rootPackage: RepositoryPackage;
@@ -584,17 +585,27 @@ const localPathSpecification = (
   const workspacePath = specification.startsWith("workspace:")
     ? specification.slice("workspace:".length)
     : undefined;
+  const npmPath =
+    manager === "npm" &&
+    (specification === "." ||
+      specification === ".." ||
+      specification.startsWith("./") ||
+      specification.startsWith("../"))
+      ? specification
+      : undefined;
+  const pnpmWorkspacePath =
+    manager === "pnpm" &&
+    workspacePath !== undefined &&
+    (workspacePath === "." ||
+      workspacePath === ".." ||
+      workspacePath.startsWith("./") ||
+      workspacePath.startsWith("../"))
+      ? workspacePath
+      : undefined;
   const path =
     protocol !== undefined
       ? specification.slice(protocol.length)
-      : manager === "pnpm" &&
-          workspacePath !== undefined &&
-          (workspacePath === "." ||
-            workspacePath === ".." ||
-            workspacePath.startsWith("./") ||
-            workspacePath.startsWith("../"))
-        ? workspacePath
-        : undefined;
+      : (npmPath ?? pnpmWorkspacePath);
   if (path === undefined) return undefined;
   if (path === "") return undefined;
   return isAbsolutePath(path)
@@ -1027,6 +1038,73 @@ const recordValue = (
   typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Readonly<Record<string, unknown>>)
     : undefined;
+
+const packageManagerControls = (
+  root: string,
+  canonicalRoot: string,
+  manager: PackageManagerName,
+): Effect.Effect<
+  {
+    readonly executableInput?: string;
+    readonly cacheInputsComplete: boolean;
+  },
+  RepositoryError,
+  FileSystemService
+> =>
+  Effect.gen(function* () {
+    if (manager === "cargo" || manager === "uv") {
+      return { cacheInputsComplete: true };
+    }
+    if (manager !== "yarn") return { cacheInputsComplete: true };
+
+    const configurationPath = joinPath(root, ".yarnrc.yml");
+    const fileSystem = yield* FileSystemService;
+    const exists = yield* fileSystem.exists(configurationPath).pipe(
+      Effect.mapError(
+        (error) =>
+          new RepositoryError({
+            path: configurationPath,
+            message: error.message,
+          }),
+      ),
+    );
+    if (!exists) return { cacheInputsComplete: true };
+    const source = yield* fileSystem.readText(configurationPath).pipe(
+      Effect.mapError(
+        (error) =>
+          new RepositoryError({
+            path: configurationPath,
+            message: error.message,
+          }),
+      ),
+    );
+    let document: Readonly<Record<string, unknown>> | undefined;
+    try {
+      document = recordValue(parseYaml(source));
+    } catch (cause) {
+      return yield* Effect.fail(
+        new RepositoryError({
+          path: configurationPath,
+          message: String(cause),
+        }),
+      );
+    }
+    const configuredPath = document?.yarnPath;
+    if (typeof configuredPath !== "string" || configuredPath === "") {
+      return { cacheInputsComplete: true };
+    }
+    const executablePath = isAbsolutePath(configuredPath)
+      ? normalizePath(configuredPath)
+      : joinPath(root, configuredPath);
+    const resolved = yield* Effect.either(fileSystem.realPath(executablePath));
+    const cacheInputsComplete =
+      resolved._tag === "Right" &&
+      isPathContained(canonicalRoot, normalizePath(resolved.right));
+    return {
+      ...(cacheInputsComplete ? { executableInput: executablePath } : {}),
+      cacheInputsComplete,
+    };
+  });
 
 const cargoConfigurationPath = (
   configurationDirectory: string,
@@ -1574,6 +1652,11 @@ export const discoverRepository = (
               : `@${devEngineManager.version}`
           }`;
     const managerIdentity = yield* discoverManager(root, declaredManager);
+    const managerControls = yield* packageManagerControls(
+      root,
+      canonicalRepositoryRoot,
+      managerIdentity.name,
+    );
     const patterns = yield* workspacePatterns(
       root,
       managerIdentity.name,
@@ -1632,7 +1715,7 @@ export const discoverRepository = (
             canonicalRelativeDirectory:
               yield* canonicalRelativeDirectory(directory),
             cachePathRestorable: yield* cachePathIsRestorable(root, directory),
-            cacheInputsComplete: true,
+            cacheInputsComplete: managerControls.cacheInputsComplete,
             manager: managerIdentity.name,
             scripts: manifest.scripts ?? {},
             cargoDependencies:
@@ -2275,7 +2358,8 @@ export const discoverRepository = (
       canonicalRelativeDirectory: ".",
       cachePathRestorable: true,
       cacheInputsComplete:
-        rootDependencyResolution?.cacheInputsComplete ?? true,
+        (rootDependencyResolution?.cacheInputsComplete ?? true) &&
+        managerControls.cacheInputsComplete,
       manager: managerIdentity.name,
       scripts: rootManifest.scripts ?? {},
       dependencyNames: dependencyNames(rootManifest),
@@ -2294,6 +2378,9 @@ export const discoverRepository = (
       root,
       manager: managerIdentity.name,
       managerVersion: managerIdentity.version,
+      ...(managerControls.executableInput === undefined
+        ? {}
+        : { packageManagerExecutableInput: managerControls.executableInput }),
       rootManifest,
       rootConfiguration,
       rootPackage,

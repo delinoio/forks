@@ -68,15 +68,20 @@ symlink attacks, signatures, command-injection arguments, and concurrent cache
 writers. `futureFlags.experimentalCargoSccache: true` always fails before task
 execution with a branded unsupported-compatibility diagnostic.
 
-JavaScript `file:`, `link:`, and relative pnpm `workspace:` dependencies resolve
-to discovered packages by canonical filesystem identity. A local path that
-does not resolve to a discovered JavaScript package disables caching for the
-declaring package and downstream hash scopes. JavaScript task hashes always
+JavaScript `file:`, `link:`, bare npm relative-directory, and relative pnpm
+`workspace:` dependencies resolve to discovered packages by canonical
+filesystem identity. A local path that does not resolve to a discovered
+JavaScript package disables caching for the declaring package and downstream
+hash scopes. JavaScript task hashes always
 include their owning `package.json`, independently of configured task globs.
 When that manifest is a symlink, its task hash includes both the link and the
 resolved contents consumed during discovery and execution. Repository-level
 package-manager controls and expected lockfile paths also remain task-aware
 inputs, including when the active lockfile is deleted.
+Repository-contained Yarn `yarnPath` executables are package-manager inputs;
+missing or external executables disable JavaScript caching. Effective npm and
+pnpm user `.npmrc` files likewise disable caching because they are external
+inputs.
 Enabled JavaScript, Cargo, and uv discovery passes retain co-located package
 scopes in the same workspace directory. Repository-root Cargo and uv scopes do
 not absorb ordinary root files during package-level affected selection.
@@ -101,6 +106,8 @@ Repository-root Cargo packages reuse the loaded root task configuration.
 Unfiltered Cargo workspace commands merge the effective environments of every
 grouped member and remain package-scoped when any repository member excludes
 the requested verification task.
+Explicitly cached Cargo format tasks hash ancestor `rustfmt.toml` and
+`.rustfmt.toml` files.
 
 Local and remote cache restoration is limited to 256 MiB compressed and 1 GiB
 after decompression. Artifacts beyond either limit are rejected; invalid local

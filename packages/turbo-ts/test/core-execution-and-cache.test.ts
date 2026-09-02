@@ -2303,6 +2303,26 @@ describe("core CLI execution", () => {
           "synthetic-library#build",
         ),
       ).toBe(true);
+
+      const rootManifestPath = `${directory}/package.json`;
+      const rootManifest = JSON.parse(
+        await readFile(rootManifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      rootManifest.packageManager = "npm@11.6.0";
+      rootManifest.workspaces = ["packages/*"];
+      appManifest.dependencies = { "library-alias": "../library" };
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, null, 2)}\n`,
+      );
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, null, 2)}\n`,
+      );
+      const bareNpmPath = await discover();
+      const bareNpmApp = bareNpmPath.packagesByName.get("synthetic-app")!;
+      expect(bareNpmApp.cacheInputsComplete).toBe(true);
+      expect(bareNpmApp.internalDependencies).toEqual(["synthetic-library"]);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2319,7 +2339,11 @@ describe("core CLI execution", () => {
       const appManifestPath = `${directory}/packages/app/package.json`;
       const rootManifest = JSON.parse(
         await readFile(rootManifestPath, "utf8"),
-      ) as { dependencies?: Record<string, string> };
+      ) as {
+        dependencies?: Record<string, string>;
+        packageManager?: string;
+        workspaces?: ReadonlyArray<string>;
+      };
       const appManifest = JSON.parse(
         await readFile(appManifestPath, "utf8"),
       ) as { dependencies: Record<string, string> };
@@ -2365,6 +2389,24 @@ describe("core CLI execution", () => {
         expect(isTaskScopeCacheable(appNode, [])).toBe(false);
         expect(isTaskScopeCacheable(rootNode, [])).toBe(false);
       }
+
+      rootManifest.packageManager = "npm@11.6.0";
+      rootManifest.workspaces = ["packages/*"];
+      rootManifest.dependencies = { external: "../external" };
+      appManifest.dependencies = { external: "../../../external" };
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, null, 2)}\n`,
+      );
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, null, 2)}\n`,
+      );
+      const bareNpmPath = await discover();
+      expect(bareNpmPath.rootPackage.cacheInputsComplete).toBe(false);
+      expect(
+        bareNpmPath.packagesByName.get("synthetic-app")?.cacheInputsComplete,
+      ).toBe(false);
     } finally {
       await rm(outer, { force: true, recursive: true });
     }
@@ -2910,6 +2952,80 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("hashes a repository Yarn executable and rejects external yarnPath inputs", async () => {
+    const outer = await mkdtemp(join(tmpdir(), "turbo-ts-yarn-path-"));
+    const directory = `${outer}/repository`;
+    const executablePath = `${directory}/.yarn/releases/yarn.cjs`;
+    const externalExecutablePath = `${outer}/external-yarn.cjs`;
+    try {
+      await cp(fixtureRoot, directory, { recursive: true });
+      const rootManifestPath = `${directory}/package.json`;
+      const rootManifest = JSON.parse(
+        await readFile(rootManifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      rootManifest.packageManager = "yarn@4.14.1";
+      rootManifest.workspaces = ["packages/*"];
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, null, 2)}\n`,
+      );
+      await mkdir(dirname(executablePath), { recursive: true });
+      await writeFile(executablePath, "module.exports = 'first';\n");
+      await writeFile(
+        `${directory}/.yarnrc.yml`,
+        "yarnPath: .yarn/releases/yarn.cjs\n",
+      );
+      const discover = () =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const rootConfiguration = yield* loadRootConfiguration(directory);
+            return yield* discoverRepository(directory, rootConfiguration);
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      const model = await discover();
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      const compute = () =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const before = await compute();
+      expect(before.inputFiles).toContain(
+        "$TURBO_ROOT$/.yarn/releases/yarn.cjs",
+      );
+      expect(implicitTaskInputCandidates(model, node)).toContain(
+        executablePath,
+      );
+      await writeFile(executablePath, "module.exports = 'second';\n");
+      expect((await compute()).hash).not.toBe(before.hash);
+
+      await writeFile(externalExecutablePath, "module.exports = 'external';\n");
+      await writeFile(
+        `${directory}/.yarnrc.yml`,
+        "yarnPath: ../external-yarn.cjs\n",
+      );
+      const externalModel = await discover();
+      const externalLibrary =
+        externalModel.packagesByName.get("synthetic-library")!;
+      expect(externalModel.rootPackage.cacheInputsComplete).toBe(false);
+      expect(externalLibrary.cacheInputsComplete).toBe(false);
+      expect(externalModel.packageManagerExecutableInput).toBeUndefined();
+      const externalNode = buildTaskGraph(
+        externalModel,
+        [externalLibrary],
+        ["build"],
+        false,
+      ).nodes.get("synthetic-library#build")!;
+      expect(isTaskScopeCacheable(externalNode, [])).toBe(false);
+    } finally {
+      await rm(outer, { force: true, recursive: true });
+    }
+  }, 15_000);
 
   it("hashes contents behind a symlinked owning JavaScript manifest", async () => {
     if (process.platform === "win32") return;
@@ -4236,13 +4352,14 @@ describe("core CLI execution", () => {
         await readFile(configurationPath, "utf8"),
       ) as {
         futureFlags?: Record<string, boolean>;
-        tasks: Record<string, { inputs?: Array<string> }>;
+        tasks: Record<string, { cache?: boolean; inputs?: Array<string> }>;
       };
       configuration.futureFlags = {
         experimentalCargoWorkspaces: true,
         filterUsingTasks: true,
       };
       configuration.tasks.test = { inputs: ["src/**"] };
+      configuration.tasks.format = { cache: true, inputs: ["src/**"] };
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
@@ -4252,6 +4369,7 @@ describe("core CLI execution", () => {
       const workspaceManifest = `${directory}/rust/Cargo.toml`;
       const cargoConfiguration = `${directory}/rust/.cargo/config.toml`;
       const toolchain = `${directory}/rust-toolchain`;
+      const rustfmtConfiguration = `${directory}/rustfmt.toml`;
       await writeFile(
         workspaceManifest,
         '[workspace]\nmembers = ["tool"]\nresolver = "3"\n',
@@ -4270,6 +4388,7 @@ describe("core CLI execution", () => {
         'version = 4\n\n[[package]]\nname = "rust-tool"\nversion = "0.1.0"\n',
       );
       await cp(`${repositoryRoot}/rust-toolchain`, toolchain);
+      await writeFile(rustfmtConfiguration, "tab_spaces = 2\n");
       for (const args of [
         ["init"],
         ["config", "user.email", "synthetic@example.test"],
@@ -4347,6 +4466,30 @@ describe("core CLI execution", () => {
         `${await readFile(toolchain, "utf8")}# toolchain revision\n`,
       );
       expect((await compute()).hash).not.toBe(configurationChanged.hash);
+      const formatNode = buildTaskGraph(
+        model,
+        [cargoPackage],
+        ["format"],
+        false,
+      ).nodes.get("rust-tool#format")!;
+      const computeFormat = () =>
+        Effect.runPromise(
+          hashTask(
+            model,
+            formatNode,
+            [],
+            true,
+            [],
+            `${directory}/.turbo/cache`,
+          ).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      const formatBefore = await computeFormat();
+      expect(formatBefore.inputFiles).toContain("$TURBO_ROOT$/rustfmt.toml");
+      expect(implicitTaskInputCandidates(model, formatNode)).toContain(
+        rustfmtConfiguration,
+      );
+      await writeFile(rustfmtConfiguration, "tab_spaces = 4\n");
+      expect((await computeFormat()).hash).not.toBe(formatBefore.hash);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -5335,6 +5478,15 @@ describe("core CLI execution", () => {
     );
     await cp(fixtureRoot, directory, { recursive: true });
     try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { futureFlags?: Record<string, boolean> };
+      configuration.futureFlags = { filterUsingTasks: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
       for (const args of [
         ["init"],
         ["config", "user.email", "synthetic@example.test"],
@@ -5375,12 +5527,28 @@ describe("core CLI execution", () => {
           repositoryRoot,
         );
       const characterClass = await execute("synthetic-[al]*");
-      expect(characterClass.exitCode).toBe(0);
+      expect(characterClass.exitCode, characterClass.combinedOutput).toBe(0);
       expect(characterClass.stdout).toContain("app build");
       expect(characterClass.stdout).toContain("library build");
       const sinceDevelop = await execute("[develop]");
       expect(sinceDevelop.stdout).toContain("app build");
       expect(sinceDevelop.stdout).not.toContain("library build");
+      const directoryAndGit = await execute("{./packages/app}[develop]");
+      expect(directoryAndGit.exitCode).toBe(0);
+      expect(directoryAndGit.stdout).toContain("app build");
+      expect(directoryAndGit.stdout).not.toContain("library build");
+      const disjointDirectoryAndGit = await execute(
+        "{./packages/library}[develop]",
+      );
+      expect(disjointDirectoryAndGit.exitCode).toBe(0);
+      expect(disjointDirectoryAndGit.stdout).not.toContain("app build");
+      expect(disjointDirectoryAndGit.stdout).not.toContain("library build");
+      const packageDirectoryAndGit = await execute(
+        "synthetic-*{./packages/app}[develop]",
+      );
+      expect(packageDirectoryAndGit.exitCode).toBe(0);
+      expect(packageDirectoryAndGit.stdout).toContain("app build");
+      expect(packageDirectoryAndGit.stdout).not.toContain("library build");
       const releaseToDevelop = await execute("[release...develop]");
       expect(releaseToDevelop.stdout).toContain("library build");
       expect(releaseToDevelop.stdout).not.toContain("app build");
@@ -5423,7 +5591,7 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  }, 20_000);
+  }, 40_000);
 
   it("treats global dependencies and both rename paths as affected", async () => {
     await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
@@ -7053,6 +7221,59 @@ describe("core CLI execution", () => {
       expect(second.exitCode, second.stderr).toBe(0);
       expect(second.stdout).not.toContain("cache hit");
       expect(await readFile(`${directory}/npm-user-runs.txt`, "utf8")).toBe(
+        "2",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+      await rm(homeDirectory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("bypasses pnpm caching when effective user configuration is present", async () => {
+    const directory = await makeFixture();
+    const homeDirectory = await mkdtemp(join(tmpdir(), "turbo-ts-pnpm-run-"));
+    try {
+      const libraryManifestPath = `${directory}/packages/library/package.json`;
+      const libraryManifest = JSON.parse(
+        await readFile(libraryManifestPath, "utf8"),
+      ) as { scripts: Record<string, string> };
+      libraryManifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); const path='../../pnpm-user-runs.txt'; const count=fs.existsSync(path)?Number(fs.readFileSync(path,'utf8')):0; fs.writeFileSync(path,String(count+1))\"";
+      await writeFile(
+        libraryManifestPath,
+        `${JSON.stringify(libraryManifest, null, 2)}\n`,
+      );
+      await writeFile(`${homeDirectory}/.npmrc`, "script-shell=/bin/sh\n");
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      const environment = {
+        HOME: homeDirectory,
+        NO_COLOR: "1",
+        TURBO_TELEMETRY_DISABLED: "1",
+      };
+      const first = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
+      const second = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
+      expect(first.exitCode, first.stderr).toBe(0);
+      expect(second.exitCode, second.stderr).toBe(0);
+      expect(second.stdout).not.toContain("cache hit");
+      expect(await readFile(`${directory}/pnpm-user-runs.txt`, "utf8")).toBe(
         "2",
       );
     } finally {

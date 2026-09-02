@@ -19,6 +19,7 @@ import {
   type LoadedRootConfiguration,
   loadRootConfiguration,
 } from "../config/runtime.js";
+import { parsePackageFilter } from "../core/filter.js";
 import {
   canMatchGlobDescendant,
   matchesGlob,
@@ -56,6 +57,7 @@ import {
 import type { OutputLogs } from "../generated/configuration.js";
 import {
   buildTaskGraph,
+  packageFilterComponentIdentities,
   selectPackages,
   type TaskGraph,
   type TaskNode,
@@ -562,25 +564,16 @@ const parseGitRange = (selector: string): GitRange => {
 };
 
 const gitRangeSelector = (rawFilter: string): string | undefined => {
-  let filter = rawFilter.startsWith("!") ? rawFilter.slice(1) : rawFilter;
-  if (filter.startsWith("...")) {
-    filter = filter.slice(3);
-  }
-  if (filter.endsWith("...")) {
-    filter = filter.slice(0, -3);
-  }
-  return filter.startsWith("[") && filter.endsWith("]")
-    ? filter.slice(1, -1)
-    : undefined;
+  return parsePackageFilter(rawFilter).gitRangeSelector;
 };
 
 const filterTraversal = (
   rawFilter: string,
 ): { readonly dependencies: boolean; readonly dependents: boolean } => {
-  const filter = rawFilter.startsWith("!") ? rawFilter.slice(1) : rawFilter;
+  const filter = parsePackageFilter(rawFilter);
   return {
-    dependents: filter.startsWith("..."),
-    dependencies: filter.endsWith("..."),
+    dependents: filter.includeDependents,
+    dependencies: filter.includeDependencies,
   };
 };
 
@@ -851,31 +844,35 @@ const affectedTaskEntrypoints = (
   changedFiles: ReadonlyArray<string>,
   rootChanged: boolean,
   filter: string,
+  packageIdentities: ReadonlySet<string> | undefined,
   sourceEnvironment: Readonly<Record<string, string | undefined>>,
   environmentMode: "loose" | "strict",
   frameworkInference: boolean,
   windowsPathSeparators: boolean,
 ): ReadonlySet<string> => {
-  if (rootChanged) return new Set(graph.entrypoints);
   const matchingNodes = new Set(
     [...graph.nodes]
-      .filter(([, node]) =>
-        taskMatchesChangedFiles(
-          repository,
-          node,
-          changedFiles,
-          node.package.manager === "uv"
-            ? taskEnvironment(
-                repository,
-                node,
-                sourceEnvironment,
-                environmentMode,
-                frameworkInference,
-                windowsPathSeparators,
-              )
-            : {},
-          windowsPathSeparators,
-        ),
+      .filter(
+        ([, node]) =>
+          (packageIdentities === undefined ||
+            packageIdentities.has(node.package.identity)) &&
+          (rootChanged ||
+            taskMatchesChangedFiles(
+              repository,
+              node,
+              changedFiles,
+              node.package.manager === "uv"
+                ? taskEnvironment(
+                    repository,
+                    node,
+                    sourceEnvironment,
+                    environmentMode,
+                    frameworkInference,
+                    windowsPathSeparators,
+                  )
+                : {},
+              windowsPathSeparators,
+            )),
       )
       .map(([id]) => id),
   );
@@ -1005,12 +1002,17 @@ const selectAffectedTasks = (
         ),
   );
   for (const { filter, affected } of positiveFilters) {
+    const packageIdentities = packageFilterComponentIdentities(
+      repository,
+      parsePackageFilter(filter),
+    );
     for (const id of affectedTaskEntrypoints(
       repository,
       graph,
       affected.changedFiles,
       affected.rootChanged,
       filter,
+      packageIdentities,
       sourceEnvironment,
       environmentMode,
       frameworkInference,
@@ -1022,12 +1024,17 @@ const selectAffectedTasks = (
   for (const { filter, affected } of rangeFilters.filter(({ filter }) =>
     filter.startsWith("!"),
   )) {
+    const packageIdentities = packageFilterComponentIdentities(
+      repository,
+      parsePackageFilter(filter),
+    );
     for (const id of affectedTaskEntrypoints(
       repository,
       graph,
       affected.changedFiles,
       affected.rootChanged,
       filter,
+      packageIdentities,
       sourceEnvironment,
       environmentMode,
       frameworkInference,
@@ -1686,7 +1693,10 @@ export const isTaskScopeDynamicallyCacheable = (
     caseInsensitiveEnvironmentNames,
   ) &&
   !(isCargoCompilationTask(node) && cargoHomeHasConfiguration) &&
-  !(node.package.manager === "npm" && npmUserHasConfiguration) &&
+  !(
+    (node.package.manager === "npm" || node.package.manager === "pnpm") &&
+    npmUserHasConfiguration
+  ) &&
   !(node.package.manager === "uv" && uvHasExternalControls);
 
 export const isTaskScopeCacheable = (
@@ -1880,7 +1890,7 @@ const resolveTaskScopeCacheability = (
         )
       : false;
     const npmUserHasConfiguration =
-      node.package.manager === "npm"
+      node.package.manager === "npm" || node.package.manager === "pnpm"
         ? yield* npmUserConfigurationPresent(
             executionDirectory,
             executionEnvironment,

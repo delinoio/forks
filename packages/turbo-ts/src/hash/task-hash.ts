@@ -306,10 +306,15 @@ const repositoryPackageManagerControlInputCandidates = (
   const manager = repository.manager;
   if (manager === "cargo" || manager === "uv") return [];
   return [
-    "package.json",
-    ".npmrc",
-    ...repositoryControlNamesByJavaScriptManager[manager],
-  ].map((name) => joinPath(repository.root, name));
+    ...[
+      "package.json",
+      ".npmrc",
+      ...repositoryControlNamesByJavaScriptManager[manager],
+    ].map((name) => joinPath(repository.root, name)),
+    ...(repository.packageManagerExecutableInput === undefined
+      ? []
+      : [repository.packageManagerExecutableInput]),
+  ];
 };
 
 const cargoControlInputCandidates = (
@@ -327,6 +332,12 @@ const cargoControlInputCandidates = (
               joinPath(directory, ".cargo/config.toml"),
               joinPath(directory, "rust-toolchain"),
               joinPath(directory, "rust-toolchain.toml"),
+              ...(node.task === "format"
+                ? [
+                    joinPath(directory, "rustfmt.toml"),
+                    joinPath(directory, ".rustfmt.toml"),
+                  ]
+                : []),
             ],
           ),
         ),

@@ -1,3 +1,7 @@
+import {
+  type ParsedPackageFilter,
+  parsePackageFilter,
+} from "../core/filter.js";
 import { matchesGlob } from "../core/glob.js";
 import { GraphError } from "../effect/errors.js";
 import type { Pipeline } from "../generated/configuration.js";
@@ -54,30 +58,69 @@ const expandPackageClosure = (
   return selected;
 };
 
+const intersectPackageIdentities = (
+  left: ReadonlySet<string>,
+  right: ReadonlySet<string>,
+): ReadonlySet<string> =>
+  new Set([...left].filter((identity) => right.has(identity)));
+
+export const packageFilterComponentIdentities = (
+  repository: RepositoryModel,
+  filter: ParsedPackageFilter,
+): ReadonlySet<string> | undefined => {
+  const components: Array<ReadonlySet<string>> = [];
+  if (filter.packageSelector !== undefined) {
+    const pattern = filter.packageSelector;
+    components.push(
+      new Set(
+        repository.packages
+          .filter(
+            (packageModel) =>
+              packageModel.identity === pattern ||
+              packageModel.name === pattern ||
+              matchesGlob(packageModel.name, pattern) ||
+              matchesGlob(
+                packageModel.relativeDirectory,
+                pattern.replace(/^\.\//, ""),
+              ),
+          )
+          .map((packageModel) => packageModel.identity),
+      ),
+    );
+  }
+  if (filter.directorySelector !== undefined) {
+    const pattern = filter.directorySelector.replace(/^\.\//, "");
+    components.push(
+      new Set(
+        repository.packages
+          .filter((packageModel) =>
+            matchesGlob(packageModel.relativeDirectory, pattern),
+          )
+          .map((packageModel) => packageModel.identity),
+      ),
+    );
+  }
+  return components.length === 0
+    ? undefined
+    : components.slice(1).reduce(intersectPackageIdentities, components[0]!);
+};
+
 const selectFilterBase = (
   repository: RepositoryModel,
-  selector: string,
+  filter: ParsedPackageFilter,
   gitRangePackages: ReadonlyMap<string, ReadonlySet<string>>,
 ): ReadonlySet<string> => {
-  if (selector.startsWith("[") && selector.endsWith("]")) {
-    return gitRangePackages.get(selector.slice(1, -1)) ?? new Set();
-  }
-  const directoryMatch = /^\{(.+)\}$/.exec(selector);
-  const pattern = directoryMatch?.[1] ?? selector;
-  return new Set(
-    repository.packages
-      .filter(
-        (packageModel) =>
-          packageModel.identity === pattern ||
-          packageModel.name === pattern ||
-          matchesGlob(packageModel.name, pattern) ||
-          matchesGlob(
-            packageModel.relativeDirectory,
-            pattern.replace(/^\.\//, ""),
-          ),
-      )
-      .map((packageModel) => packageModel.identity),
+  const packageIdentities = packageFilterComponentIdentities(
+    repository,
+    filter,
   );
+  const gitIdentities =
+    filter.gitRangeSelector === undefined
+      ? undefined
+      : (gitRangePackages.get(filter.gitRangeSelector) ?? new Set<string>());
+  if (packageIdentities === undefined) return gitIdentities ?? new Set();
+  if (gitIdentities === undefined) return packageIdentities;
+  return intersectPackageIdentities(packageIdentities, gitIdentities);
 };
 
 export const selectPackages = (
@@ -95,19 +138,10 @@ export const selectPackages = (
       : repository.packages.map((packageModel) => packageModel.identity),
   );
   const applyFilter = (rawFilter: string): void => {
-    const negative = rawFilter.startsWith("!");
-    let filter = negative ? rawFilter.slice(1) : rawFilter;
-    const includeDependents = filter.startsWith("...");
-    const includeDependencies = filter.endsWith("...");
-    if (includeDependents) {
-      filter = filter.slice(3);
-    }
-    if (includeDependencies) {
-      filter = filter.slice(0, -3);
-    }
+    const filter = parsePackageFilter(rawFilter);
     const baseMatches = selectFilterBase(repository, filter, gitRangePackages);
     const matches = new Set(baseMatches);
-    if (includeDependencies) {
+    if (filter.includeDependencies) {
       for (const name of expandPackageClosure(
         baseMatches,
         (name) =>
@@ -116,7 +150,7 @@ export const selectPackages = (
         matches.add(name);
       }
     }
-    if (includeDependents) {
+    if (filter.includeDependents) {
       for (const name of expandPackageClosure(
         baseMatches,
         (name) => dependents.get(name) ?? [],
@@ -125,7 +159,7 @@ export const selectPackages = (
       }
     }
     for (const name of matches) {
-      if (negative) selected.delete(name);
+      if (filter.negative) selected.delete(name);
       else selected.add(name);
     }
   };

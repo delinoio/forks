@@ -502,6 +502,23 @@ describe("core repository model", () => {
     expect(
       selectPackages(model, ["!app", "*"]).map((entry) => entry.name),
     ).toEqual(["library"]);
+    const ranges = new Map<string, ReadonlySet<string>>([
+      ["main", new Set(["app", "library"])],
+      ["app-only", new Set(["app"])],
+    ]);
+    expect(
+      selectPackages(model, ["{./packages/app}[main]"], ranges).map(
+        (entry) => entry.name,
+      ),
+    ).toEqual(["app"]);
+    expect(
+      selectPackages(model, ["library{./packages/app}[main]"], ranges),
+    ).toEqual([]);
+    expect(
+      selectPackages(model, ["app...[app-only]"], ranges).map(
+        (entry) => entry.name,
+      ),
+    ).toEqual(["app", "library"]);
     const base = packageModel("base", []);
     const target = packageModel("target", ["base"]);
     const sibling = packageModel("sibling", ["base"]);
@@ -1254,33 +1271,35 @@ describe("core repository model", () => {
     expect(isTaskScopeCacheable(node, ["--features=integration"])).toBe(true);
   });
 
-  it("disables npm caching when effective user configuration is present", () => {
-    const npmPackage = {
-      ...packageModel("app", []),
-      manager: "npm" as const,
-    };
-    const npmNode: TaskNode = {
-      id: "app#build",
-      package: npmPackage,
-      task: "build",
-      command: npmPackage.scripts.build,
-      definition: npmPackage.tasks.build!,
-      dependencies: [],
-      with: [],
-    };
-    expect(isTaskScopeCacheable(npmNode, [])).toBe(true);
-    expect(
-      isTaskScopeCacheable(
-        npmNode,
-        [],
-        { kind: "package" },
-        {},
-        false,
-        {},
-        false,
-        true,
-      ),
-    ).toBe(false);
+  it("disables npm and pnpm caching when user configuration is present", () => {
+    for (const manager of ["npm", "pnpm"] as const) {
+      const packageValue = {
+        ...packageModel("app", []),
+        manager,
+      };
+      const node: TaskNode = {
+        id: "app#build",
+        package: packageValue,
+        task: "build",
+        command: packageValue.scripts.build,
+        definition: packageValue.tasks.build!,
+        dependencies: [],
+        with: [],
+      };
+      expect(isTaskScopeCacheable(node, [])).toBe(true);
+      expect(
+        isTaskScopeCacheable(
+          node,
+          [],
+          { kind: "package" },
+          {},
+          false,
+          {},
+          false,
+          true,
+        ),
+      ).toBe(false);
+    }
   });
 
   it("propagates unrestorable workspace inputs through hash edges", () => {

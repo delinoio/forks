@@ -129,7 +129,9 @@ Package task configurations participate independently in task-aware selection.
 Owning lockfiles, repository-controlled JavaScript package-manager
 configuration, and Cargo control or toolchain files participate in both
 task-aware selection and hashing. Expected JavaScript lockfile paths remain
-task-aware inputs when the active lockfile is deleted. A changed
+task-aware inputs when the active lockfile is deleted. A repository-contained
+Yarn `yarnPath` executable is also an input; a missing or external executable
+makes JavaScript and downstream cache scopes uncacheable. A changed
 workspace gitlink path is treated as the package-relative `.` input. Task
 hashes preserve Git symlink, gitlink, and dependency semantics, exclude the
 resolved cache directory, use each task's owning ecosystem lockfile, and omit
@@ -138,9 +140,10 @@ code-unit ordering.
 When the Git index and working tree disagree on regular-file or symlink kind,
 the working-tree kind determines the hashed mode. An indexed executable bit is
 retained only while both representations remain regular files.
-An npm task bypasses caching when its effective user configuration exists,
-using `NPM_CONFIG_USERCONFIG` when set and the platform user home's `.npmrc`
-otherwise, because that external configuration is not a repository hash input.
+An npm or pnpm task bypasses caching when its effective user configuration
+exists, using `NPM_CONFIG_USERCONFIG` when set and the platform user home's
+`.npmrc` otherwise, because that external configuration is not a repository
+hash input.
 Only indexed mode `160000` directories are hashed as gitlinks; an indexed
 regular file replaced by a working-tree directory is omitted while its
 discovered descendants remain task inputs.
@@ -153,12 +156,13 @@ literal backslashes as filename characters. Cache archive paths and symlink
 targets preserve the same POSIX distinction while Windows-originated paths use
 Windows separator semantics. Cargo task hashes additionally
 include repository-contained ancestor manifests, Cargo configuration, and Rust
-toolchain files that can change task execution. They are partitioned by the
-normalized verbose compiler identity and effective Rust host target reported
-for the package execution directory. A missing compiler identity or host target,
-an effective ancestor Cargo configuration outside the repository, or an
-effective Cargo target directory outside the repository makes the Cargo package
-and downstream hash scopes uncacheable.
+toolchain files that can change task execution. Cached Cargo format tasks also
+include ancestor `rustfmt.toml` and `.rustfmt.toml` controls. They are
+partitioned by the normalized verbose compiler identity and effective Rust host
+target reported for the package execution directory. A missing compiler
+identity or host target, an effective ancestor Cargo configuration outside the
+repository, or an effective Cargo target directory outside the repository makes
+the Cargo package and downstream hash scopes uncacheable.
 Environment-name selection follows Windows
 case-insensitive semantics for both hashing and strict task execution.
 Repository discovery records the resolved root lockfile path without
@@ -334,11 +338,13 @@ registry, Git, URL, and undeclared sources remain
 external. JavaScript package-graph edges
 require declared workspace or version-range compatibility, or a `file:` or
 `link:` path whose canonical, platform-aware filesystem identity resolves to
-the local JavaScript package. Local path aliases record the resolved package's
-actual name even when the dependency key differs. Relative pnpm `workspace:`
-paths resolve by the same canonical filesystem identity. JavaScript packages
-with a local path dependency that does not resolve to a discovered JavaScript
-package make their task scopes and downstream hash scopes uncacheable. pnpm
+the local JavaScript package. Bare npm relative directory specifications use
+the same canonical resolution. Local path aliases record the resolved
+package's actual name even when the dependency key differs. Relative pnpm
+`workspace:` paths resolve by the same canonical filesystem identity.
+JavaScript packages with a local path dependency that does not resolve to a
+discovered JavaScript package make their task scopes and downstream hash scopes
+uncacheable. pnpm
 workspace aliases resolve to the package name encoded in their specification;
 same-named Cargo and uv packages are never JavaScript workspace targets. Cargo metadata
 paths are matched by canonical filesystem identity. Repository-root Cargo
@@ -398,6 +404,9 @@ to task hashing and task-aware affected selection. Task-aware Git filters
 preserve leading and trailing ellipses and traverse both task and package graphs
 in the requested dependent or dependency direction. Filters requesting both
 directions compute each closure from the original matches before unioning them.
+Package, `{directory}`, and `[Git range]` components within one filter are
+intersected before graph traversal; separate positive filters retain union
+semantics and negative filters remove their matching sets afterward.
 Ordinary root-file changes
 select only tasks whose effective inputs match them; repository-global inputs
 and Git discovery failures retain the all-task fallback.
