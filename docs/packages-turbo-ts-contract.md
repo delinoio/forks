@@ -156,8 +156,9 @@ include repository-contained ancestor manifests, Cargo configuration, and Rust
 toolchain files that can change task execution. They are partitioned by the
 normalized verbose compiler identity and effective Rust host target reported
 for the package execution directory. A missing compiler identity or host target,
-or an effective ancestor Cargo configuration outside the repository, makes the
-Cargo package and downstream hash scopes uncacheable.
+an effective ancestor Cargo configuration outside the repository, or an
+effective Cargo target directory outside the repository makes the Cargo package
+and downstream hash scopes uncacheable.
 Environment-name selection follows Windows
 case-insensitive semantics for both hashing and strict task execution.
 Repository discovery records the resolved root lockfile path without

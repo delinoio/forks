@@ -2696,45 +2696,117 @@ describe("core CLI execution", () => {
   }, 10_000);
 
   it("omits documentation-only task descriptions from hashes", async () => {
-    const directory = await makeFixture();
-    try {
-      const rootConfiguration = await Effect.runPromise(
-        loadRootConfiguration(directory).pipe(
-          Effect.provide(nodeFoundationLayer),
-        ),
-      );
-      const model = await Effect.runPromise(
-        discoverRepository(directory, rootConfiguration).pipe(
-          Effect.provide(nodeFoundationLayer),
-        ),
-      );
-      const library = model.packagesByName.get("synthetic-library")!;
-      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
-        "synthetic-library#build",
-      )!;
-      const compute = (definition: TaskNode["definition"]) =>
-        Effect.runPromise(
-          hashTask(
-            model,
-            { ...node, definition },
-            [],
-            true,
-            [],
-            `${directory}/.turbo/cache`,
-          ).pipe(Effect.provide(nodeFoundationLayer)),
-        );
-      const baseline = await compute(node.definition);
-      for (const description of [
-        null,
-        "Build the synthetic library",
-      ] as const) {
-        expect((await compute({ ...node.definition, description })).hash).toBe(
-          baseline.hash,
-        );
+    for (const extension of ["json", "jsonc"] as const) {
+      const directory = await makeFixture();
+      const configurationPath = `${directory}/packages/library/turbo.${extension}`;
+      try {
+        const writeConfiguration = (
+          description: string,
+          outputs?: ReadonlyArray<string>,
+        ) =>
+          writeFile(
+            configurationPath,
+            `${JSON.stringify(
+              {
+                extends: ["//"],
+                tasks: {
+                  build: {
+                    description,
+                    ...(outputs === undefined ? {} : { outputs }),
+                  },
+                },
+              },
+              null,
+              2,
+            )}\n`,
+          );
+        const compute = () =>
+          Effect.runPromise(
+            Effect.gen(function* () {
+              const rootConfiguration = yield* loadRootConfiguration(directory);
+              const model = yield* discoverRepository(
+                directory,
+                rootConfiguration,
+              );
+              const library = model.packagesByName.get("synthetic-library")!;
+              const node = buildTaskGraph(
+                model,
+                [library],
+                ["build"],
+                false,
+              ).nodes.get("synthetic-library#build")!;
+              return yield* hashTask(
+                model,
+                node,
+                [],
+                true,
+                [],
+                `${directory}/.turbo/cache`,
+              );
+            }).pipe(Effect.provide(nodeFoundationLayer)),
+          );
+
+        await writeConfiguration("Initial documentation");
+        const baseline = await compute();
+        expect(baseline.inputFiles).not.toContain(`turbo.${extension}`);
+        await writeConfiguration("Updated documentation");
+        expect((await compute()).hash).toBe(baseline.hash);
+        await writeConfiguration("Updated documentation", ["alternate/**"]);
+        expect((await compute()).hash).not.toBe(baseline.hash);
+      } finally {
+        await rm(directory, { force: true, recursive: true });
       }
-      expect(
-        (await compute({ ...node.definition, outputs: ["alternate/**"] })).hash,
-      ).not.toBe(baseline.hash);
+    }
+  }, 20_000);
+
+  it("hashes explicitly selected task configuration files", async () => {
+    const directory = await makeFixture();
+    const configurationPath = `${directory}/packages/library/turbo.json`;
+    try {
+      const writeConfiguration = (description: string) =>
+        writeFile(
+          configurationPath,
+          `${JSON.stringify(
+            {
+              extends: ["//"],
+              tasks: {
+                build: { description, inputs: ["turbo.json"] },
+              },
+            },
+            null,
+            2,
+          )}\n`,
+        );
+      const compute = () =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const rootConfiguration = yield* loadRootConfiguration(directory);
+            const model = yield* discoverRepository(
+              directory,
+              rootConfiguration,
+            );
+            const library = model.packagesByName.get("synthetic-library")!;
+            const node = buildTaskGraph(
+              model,
+              [library],
+              ["build"],
+              false,
+            ).nodes.get("synthetic-library#build")!;
+            return yield* hashTask(
+              model,
+              node,
+              [],
+              true,
+              [],
+              `${directory}/.turbo/cache`,
+            );
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      await writeConfiguration("Initial documentation");
+      const baseline = await compute();
+      expect(baseline.inputFiles).toContain("turbo.json");
+      await writeConfiguration("Updated documentation");
+      expect((await compute()).hash).not.toBe(baseline.hash);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -7172,6 +7244,7 @@ describe("core CLI execution", () => {
         readonly args: ReadonlyArray<string>;
       }> = [];
       const packageId = `path+file://${packageDirectory}#rust-target@0.1.0`;
+      let targetDirectory = `${packageDirectory}/target`;
       const compilerIdentity = [
         "rustc 1.96.0-nightly (012345678 2026-08-31)",
         "binary: rustc",
@@ -7196,7 +7269,7 @@ describe("core CLI execution", () => {
           const stdout = JSON.stringify({
             workspace_root: packageDirectory,
             workspace_members: [packageId],
-            target_directory: `${packageDirectory}/target`,
+            target_directory: targetDirectory,
             packages: [
               {
                 id: packageId,
@@ -7247,6 +7320,32 @@ describe("core CLI execution", () => {
       });
       await expect(lstat(lockfilePath)).rejects.toThrow();
 
+      const cargoConfigurationPath = `${packageDirectory}/.cargo/config.toml`;
+      await mkdir(`${packageDirectory}/.cargo`, { recursive: true });
+      targetDirectory = `${directory}-external-target`;
+      await writeFile(
+        cargoConfigurationPath,
+        `[build]\ntarget-dir = ${JSON.stringify(targetDirectory)}\n`,
+      );
+      const externalTargetModel = await Effect.runPromise(
+        discover().pipe(
+          Effect.provide(metadataProcessLayer),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const externalTargetPackage =
+        externalTargetModel.packagesByName.get("rust-target")!;
+      expect(externalTargetPackage.tasks.build).toMatchObject({ cache: true });
+      expect(externalTargetPackage.cacheInputsComplete).toBe(false);
+      const externalTargetNode = buildTaskGraph(
+        externalTargetModel,
+        [externalTargetPackage],
+        ["build"],
+        false,
+      ).nodes.get("rust-target#build")!;
+      expect(isTaskScopeCacheable(externalTargetNode, [])).toBe(false);
+      await writeFile(cargoConfigurationPath, "");
+
       const generated = await run(
         "cargo",
         [
@@ -7261,9 +7360,8 @@ describe("core CLI execution", () => {
       expect(rustc.exitCode, rustc.stderr).toBe(0);
       const host = /^host: (.+)$/m.exec(rustc.stdout)?.[1];
       expect(host).toBeDefined();
-      await mkdir(`${packageDirectory}/.cargo`, { recursive: true });
       await writeFile(
-        `${packageDirectory}/.cargo/config.toml`,
+        cargoConfigurationPath,
         `[build]\ntarget = ${JSON.stringify(host)}\n`,
       );
       const configuredTarget = await Effect.runPromise(

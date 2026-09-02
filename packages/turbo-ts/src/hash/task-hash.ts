@@ -186,7 +186,7 @@ const taskInputFiles = (
   cacheDirectory: string,
   windowsPathSeparators: boolean,
 ): ReadonlyArray<TaskInputFile> => {
-  const defaults = packageFiles
+  const packageInputFiles = packageFiles
     .filter((file) => !isIgnoredInputPath(file.absolutePath, cacheDirectory))
     .map((file) => {
       const packagePrefix =
@@ -200,6 +200,20 @@ const taskInputFiles = (
         matchPath: relative,
       };
     });
+  const comparablePath = (path: string): string => {
+    const normalized = normalizePath(path, windowsPathSeparators);
+    return windowsPathSeparators ? normalized.toLowerCase() : normalized;
+  };
+  const configurationPaths = new Set(
+    [
+      repository.rootConfiguration.path,
+      joinPath(node.package.directory, "turbo.json"),
+      joinPath(node.package.directory, "turbo.jsonc"),
+    ].map(comparablePath),
+  );
+  const defaults = packageInputFiles.filter(
+    (file) => !configurationPaths.has(comparablePath(file.absolutePath)),
+  );
   const rootFiles = repositoryFiles
     .filter((file) => !isIgnoredInputPath(file.absolutePath, cacheDirectory))
     .map((file) => {
@@ -216,7 +230,7 @@ const taskInputFiles = (
     const matcher = rootRelative
       ? pattern.slice(turboRootInputPrefix.length)
       : pattern;
-    return (rootRelative ? rootFiles : defaults).filter((file) =>
+    return (rootRelative ? rootFiles : packageInputFiles).filter((file) =>
       matchesGlob(file.matchPath, matcher, windowsPathSeparators),
     );
   };

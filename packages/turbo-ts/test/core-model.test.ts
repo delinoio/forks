@@ -1491,7 +1491,7 @@ describe("cache archive safety", () => {
     ]);
   });
 
-  it("rejects tar numeric fields with non-octal suffixes", () => {
+  it("rejects non-octal bytes around tar numeric terminators", () => {
     const archive = createTarArchive([
       {
         path: "packages/app/dist/output.txt",
@@ -1509,6 +1509,18 @@ describe("cache archive safety", () => {
       invalid.set(encoder.encode(`${"0".repeat(length - 2)}8`), offset);
       updateTarChecksum(invalid);
       expect(() => parseTarArchive(invalid)).toThrow(
+        /invalid tar numeric field/,
+      );
+
+      const invalidAfterTerminator = archive.slice();
+      invalidAfterTerminator.fill(0, offset, offset + length);
+      invalidAfterTerminator.set(
+        encoder.encode("0".repeat(length - 2)),
+        offset,
+      );
+      invalidAfterTerminator[offset + length - 1] = 0x38;
+      updateTarChecksum(invalidAfterTerminator);
+      expect(() => parseTarArchive(invalidAfterTerminator)).toThrow(
         /invalid tar numeric field/,
       );
     }

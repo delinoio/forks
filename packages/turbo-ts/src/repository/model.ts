@@ -1892,6 +1892,8 @@ export const discoverRepository = (
               ),
               cacheInputsComplete:
                 metadata.workspaceDirectory !== undefined &&
+                (metadata.targetDirectory === undefined ||
+                  isPathContained(root, metadata.targetDirectory)) &&
                 !externalCargoConfigurationPresent &&
                 compilerIdentity !== undefined,
               ...(compilerIdentity === undefined
