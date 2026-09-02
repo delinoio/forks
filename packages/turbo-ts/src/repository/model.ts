@@ -60,6 +60,7 @@ export interface RepositoryPackage {
   readonly canonicalRelativeDirectory: string;
   readonly cachePathRestorable: boolean;
   readonly cacheInputsComplete: boolean;
+  readonly cargoCompilerIdentity?: string;
   readonly cargoHostTarget?: string;
   readonly workspaceDirectory?: string;
   readonly manager: PackageManagerName;
@@ -970,9 +971,14 @@ const cargoWorkspaceMetadata = (
     }
   });
 
-const rustHostTarget = (
+interface RustCompilerIdentity {
+  readonly hostTarget: string;
+  readonly verboseVersion: string;
+}
+
+const rustCompilerIdentity = (
   directory: string,
-): Effect.Effect<string | undefined, never, ProcessService> =>
+): Effect.Effect<RustCompilerIdentity | undefined, never, ProcessService> =>
   Effect.gen(function* () {
     const processService = yield* ProcessService;
     const result = yield* Effect.either(
@@ -987,8 +993,13 @@ const rustHostTarget = (
     if (result._tag === "Left" || result.right.exitCode !== 0) {
       return undefined;
     }
-    const target = /^host:\s*(\S+)\s*$/m.exec(result.right.stdout)?.[1];
-    return target === undefined || target === "" ? undefined : target;
+    const verboseVersion = result.right.stdout.replace(/\r\n?/g, "\n").trim();
+    const hostTarget = /^host:\s*(\S+)\s*$/m.exec(verboseVersion)?.[1];
+    return hostTarget === undefined ||
+      hostTarget === "" ||
+      verboseVersion === ""
+      ? undefined
+      : { hostTarget, verboseVersion };
   });
 
 interface PythonProjectMetadata {
@@ -1847,7 +1858,7 @@ export const discoverRepository = (
         (metadata) =>
           Effect.gen(function* () {
             const directory = parentPath(metadata.manifestPath);
-            const hostTarget = yield* rustHostTarget(directory);
+            const compilerIdentity = yield* rustCompilerIdentity(directory);
             const configuredBuildTarget =
               yield* cargoBuildTargetConfigured(directory);
             const packageConfiguration =
@@ -1882,10 +1893,13 @@ export const discoverRepository = (
               cacheInputsComplete:
                 metadata.workspaceDirectory !== undefined &&
                 !externalCargoConfigurationPresent &&
-                hostTarget !== undefined,
-              ...(hostTarget === undefined
+                compilerIdentity !== undefined,
+              ...(compilerIdentity === undefined
                 ? {}
-                : { cargoHostTarget: hostTarget }),
+                : {
+                    cargoCompilerIdentity: compilerIdentity.verboseVersion,
+                    cargoHostTarget: compilerIdentity.hostTarget,
+                  }),
               workspaceDirectory: metadata.workspaceDirectory,
               manager: "cargo" as const,
               scripts: polyglotScripts("cargo", metadata.entrypointNames),

@@ -3855,7 +3855,26 @@ describe("core CLI execution", () => {
           ).pipe(Effect.provide(nodeFoundationLayer)),
         );
       const cargoBefore = await compute("rust-tool#test");
+      expect(cargoPackage.cargoCompilerIdentity).toBeDefined();
       expect(cargoPackage.cargoHostTarget).toBeDefined();
+      const alternateCompilerNode = {
+        ...graph.nodes.get("rust-tool#test")!,
+        package: {
+          ...cargoPackage,
+          cargoCompilerIdentity: `${cargoPackage.cargoCompilerIdentity}\nrelease: alternate`,
+        },
+      };
+      const alternateCompiler = await Effect.runPromise(
+        hashTask(
+          model,
+          alternateCompilerNode,
+          [],
+          true,
+          [],
+          `${directory}/.turbo/cache`,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(alternateCompiler.hash).not.toBe(cargoBefore.hash);
       const alternateTargetNode = {
         ...graph.nodes.get("rust-tool#test")!,
         package: {
@@ -4574,6 +4593,75 @@ describe("core CLI execution", () => {
       ).toBe(0);
       expect((await lstat(inputPath)).mode & 0o111).toBe(0);
       expect((await compute()).hash).not.toBe(regular.hash);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("uses the working-tree kind when the tracked Git kind is stale", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(packageRoot, "test-index-kind-"));
+    const packageDirectory = `${directory}/packages/library`;
+    const inputPath = `${packageDirectory}/input.txt`;
+    try {
+      await cp(fixtureRoot, directory, { recursive: true });
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["input.txt"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await symlink("payload", inputPath);
+      expect((await run("git", ["init"], directory)).exitCode).toBe(0);
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      const compute = () =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provideService(EnvironmentService, {
+              argv: Effect.succeed([]),
+              cwd: Effect.succeed(directory),
+              platform: Effect.succeed("win32" as const),
+              get: () => Effect.succeed(undefined),
+              entries: Effect.succeed({}),
+            }),
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const trackedSymlink = await compute();
+      await rm(inputPath);
+      await writeFile(inputPath, "payload");
+      const regularWithSymlinkIndex = await compute();
+      expect(regularWithSymlinkIndex.hash).not.toBe(trackedSymlink.hash);
+
+      expect(
+        (
+          await run(
+            "git",
+            ["add", "--", "packages/library/input.txt"],
+            directory,
+          )
+        ).exitCode,
+      ).toBe(0);
+      const trackedRegular = await compute();
+      expect(trackedRegular.hash).toBe(regularWithSymlinkIndex.hash);
+      await rm(inputPath);
+      await symlink("payload", inputPath);
+      const symlinkWithRegularIndex = await compute();
+      expect(symlinkWithRegularIndex.hash).not.toBe(trackedRegular.hash);
+      expect(symlinkWithRegularIndex.hash).toBe(trackedSymlink.hash);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -6873,11 +6961,19 @@ describe("core CLI execution", () => {
         readonly args: ReadonlyArray<string>;
       }> = [];
       const packageId = `path+file://${packageDirectory}#rust-target@0.1.0`;
+      const compilerIdentity = [
+        "rustc 1.96.0-nightly (012345678 2026-08-31)",
+        "binary: rustc",
+        "commit-hash: 0123456789abcdef0123456789abcdef01234567",
+        "commit-date: 2026-08-31",
+        "host: synthetic-target-triple",
+        "release: 1.96.0-nightly",
+        "LLVM version: 22.0.0",
+      ].join("\n");
       const metadataProcessLayer = Layer.succeed(ProcessService, {
         run: (request) => {
           if (request.command === "rustc") {
-            const stdout =
-              "rustc 1.96.0-nightly\nhost: synthetic-target-triple\n";
+            const stdout = `${compilerIdentity.replace(/\n/g, "\r\n")}\r\n`;
             return Effect.succeed({
               exitCode: 0,
               stdout,
@@ -6923,6 +7019,9 @@ describe("core CLI execution", () => {
       expect(
         lockedModel.packagesByName.get("rust-target")?.cargoHostTarget,
       ).toBe("synthetic-target-triple");
+      expect(
+        lockedModel.packagesByName.get("rust-target")?.cargoCompilerIdentity,
+      ).toBe(compilerIdentity);
       expect(metadataRequests).toHaveLength(1);
       expect(metadataRequests[0]).toMatchObject({
         command: "cargo",
@@ -9458,6 +9557,60 @@ describe("cache interoperability and safety", () => {
       }
       await eviction;
       await expect(lstat(archivePath)).rejects.toThrow();
+      await expect(lstat(lockPath)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("revalidates republished eviction candidates under their entry lock", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-race-"));
+    const cacheDirectory = `${directory}/cache`;
+    const firstHash = "0123456789abcdef";
+    const secondHash = "fedcba9876543210";
+    const firstArchive = `${cacheDirectory}/${firstHash}.tar.zst`;
+    const secondArchive = `${cacheDirectory}/${secondHash}.tar.zst`;
+    const lockPath = `${cacheDirectory}/${firstHash}.turbo-ts.lock`;
+    try {
+      await mkdir(cacheDirectory, { recursive: true });
+      await writeFile(firstArchive, "cached-a");
+      await writeFile(secondArchive, "cached-b");
+      const initialNow = Date.now();
+      await utimes(
+        firstArchive,
+        new Date(initialNow - 10_000),
+        new Date(initialNow - 10_000),
+      );
+      await utimes(
+        secondArchive,
+        new Date(initialNow - 5_000),
+        new Date(initialNow - 5_000),
+      );
+      await writeFile(
+        lockPath,
+        JSON.stringify({
+          owner: "00000000-0000-7000-8000-000000000005",
+          createdAt: initialNow,
+        }),
+      );
+      const eviction = Effect.runPromise(
+        evictLocalCache({
+          directory: cacheDirectory,
+          maxAgeMilliseconds: 7_500,
+          maxSizeBytes: (await lstat(firstArchive)).size,
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 75));
+      try {
+        await writeFile(firstArchive, "fresh--a");
+        const refreshed = new Date();
+        await utimes(firstArchive, refreshed, refreshed);
+      } finally {
+        await rm(lockPath, { force: true });
+      }
+      await eviction;
+      expect(await readFile(firstArchive, "utf8")).toBe("fresh--a");
+      await expect(lstat(secondArchive)).rejects.toThrow();
       await expect(lstat(lockPath)).rejects.toThrow();
     } finally {
       await rm(directory, { force: true, recursive: true });

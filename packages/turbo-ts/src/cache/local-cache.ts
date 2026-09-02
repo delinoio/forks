@@ -49,6 +49,97 @@ const cacheFileHash = (name: string): string | undefined => {
   return suffix === undefined ? undefined : name.slice(0, -suffix.length);
 };
 
+interface CacheEntryFileSnapshot {
+  readonly name: string;
+  readonly modified: number;
+  readonly size: number;
+}
+
+interface CacheEntrySnapshot {
+  readonly hash: string;
+  readonly files: ReadonlyArray<CacheEntryFileSnapshot>;
+  readonly modified: number;
+  readonly size: number;
+}
+
+const summarizeCacheEntry = (
+  hash: string,
+  files: ReadonlyArray<CacheEntryFileSnapshot>,
+): CacheEntrySnapshot => {
+  const sortedFiles = [...files].sort((left, right) =>
+    left.name.localeCompare(right.name),
+  );
+  const archiveModified = sortedFiles.find((file) =>
+    file.name.endsWith(".tar.zst"),
+  )?.modified;
+  return {
+    hash,
+    files: sortedFiles,
+    modified:
+      archiveModified ??
+      sortedFiles.reduce(
+        (modified, file) => Math.max(modified, file.modified),
+        0,
+      ),
+    size: sortedFiles.reduce((size, file) => size + file.size, 0),
+  };
+};
+
+const cacheEntrySnapshotMatches = (
+  left: CacheEntrySnapshot,
+  right: CacheEntrySnapshot,
+): boolean =>
+  left.files.length === right.files.length &&
+  left.files.every((file, index) => {
+    const candidate = right.files[index];
+    return (
+      candidate !== undefined &&
+      file.name === candidate.name &&
+      file.modified === candidate.modified &&
+      file.size === candidate.size
+    );
+  });
+
+const readCacheEntrySnapshot = (
+  directory: string,
+  hash: string,
+): Effect.Effect<
+  CacheEntrySnapshot | undefined,
+  CacheError,
+  FileSystemService
+> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const files = (yield* Effect.forEach(
+      cacheFileSuffixes,
+      (suffix) => {
+        const name = `${hash}${suffix}`;
+        const path = joinPath(directory, name);
+        return fileSystem.exists(path).pipe(
+          Effect.mapError((error) => cacheError(path, error.message)),
+          Effect.flatMap((exists) =>
+            exists
+              ? fileSystem.metadata(path).pipe(
+                  Effect.map((metadata) =>
+                    metadata.kind === "file"
+                      ? {
+                          name,
+                          modified: metadata.modifiedMilliseconds,
+                          size: metadata.size,
+                        }
+                      : undefined,
+                  ),
+                  Effect.mapError((error) => cacheError(path, error.message)),
+                )
+              : Effect.succeed(undefined),
+          ),
+        );
+      },
+      { concurrency: 3 },
+    )).filter((file): file is CacheEntryFileSnapshot => file !== undefined);
+    return files.length === 0 ? undefined : summarizeCacheEntry(hash, files);
+  });
+
 const atomicTemporaryFile = (
   name: string,
 ): { readonly hash: string; readonly name: string } | undefined => {
@@ -684,7 +775,7 @@ export const evictLocalCache = (
         return fileSystem.metadata(path).pipe(
           Effect.map((metadata) => ({
             hash: entry.hash,
-            archive: entry.name.endsWith(".tar.zst"),
+            name: entry.name,
             modified: metadata.modifiedMilliseconds,
             size: metadata.size,
           })),
@@ -692,31 +783,19 @@ export const evictLocalCache = (
         );
       },
     );
-    const grouped = new Map<
-      string,
-      {
-        readonly hash: string;
-        readonly size: number;
-        readonly modified: number;
-        readonly archiveModified?: number;
-      }
-    >();
+    const grouped = new Map<string, Array<CacheEntryFileSnapshot>>();
     for (const file of cacheFiles) {
-      const current = grouped.get(file.hash);
-      grouped.set(file.hash, {
-        hash: file.hash,
-        size: (current?.size ?? 0) + file.size,
-        modified: Math.max(current?.modified ?? 0, file.modified),
-        archiveModified: file.archive
-          ? file.modified
-          : current?.archiveModified,
+      const current = grouped.get(file.hash) ?? [];
+      current.push({
+        name: file.name,
+        modified: file.modified,
+        size: file.size,
       });
+      grouped.set(file.hash, current);
     }
-    const cacheEntries = [...grouped.values()].map((entry) => ({
-      hash: entry.hash,
-      size: entry.size,
-      modified: entry.archiveModified ?? entry.modified,
-    }));
+    const cacheEntries = [...grouped].map(([hash, files]) =>
+      summarizeCacheEntry(hash, files),
+    );
     let total = cacheEntries.reduce((size, entry) => size + entry.size, 0);
     for (const entry of cacheEntries.sort(
       (left, right) => left.modified - right.modified,
@@ -729,11 +808,35 @@ export const evictLocalCache = (
       if (!expired && !oversized) {
         continue;
       }
-      yield* withEntryLock(
+      const revalidated = yield* withEntryLock(
         options,
         entry.hash,
-        removeEntry(options.directory, entry.hash),
+        Effect.gen(function* () {
+          const current = yield* readCacheEntrySnapshot(
+            options.directory,
+            entry.hash,
+          );
+          const currentTotal = total - entry.size + (current?.size ?? 0);
+          if (current === undefined) {
+            return currentTotal;
+          }
+          const lockedNow = yield* clock.now;
+          const stillExpired =
+            options.maxAgeMilliseconds !== undefined &&
+            lockedNow - current.modified > options.maxAgeMilliseconds;
+          const stillOversized =
+            options.maxSizeBytes !== undefined &&
+            currentTotal > options.maxSizeBytes;
+          if (
+            !cacheEntrySnapshotMatches(entry, current) ||
+            (!stillExpired && !stillOversized)
+          ) {
+            return currentTotal;
+          }
+          yield* removeEntry(options.directory, entry.hash);
+          return currentTotal - current.size;
+        }),
       );
-      total -= entry.size;
+      total = revalidated;
     }
   });

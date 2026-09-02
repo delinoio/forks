@@ -133,6 +133,9 @@ task-aware inputs when the active lockfile is deleted. A changed
 workspace gitlink path is treated as the package-relative `.` input. Task
 hashes preserve Git symlink, gitlink, and dependency semantics, exclude the
 resolved cache directory, and use each task's owning ecosystem lockfile.
+When the Git index and working tree disagree on regular-file or symlink kind,
+the working-tree kind determines the hashed mode. An indexed executable bit is
+retained only while both representations remain regular files.
 An npm task bypasses caching when its effective user configuration exists,
 using `NPM_CONFIG_USERCONFIG` when set and the platform user home's `.npmrc`
 otherwise, because that external configuration is not a repository hash input.
@@ -149,9 +152,10 @@ targets preserve the same POSIX distinction while Windows-originated paths use
 Windows separator semantics. Cargo task hashes additionally
 include repository-contained ancestor manifests, Cargo configuration, and Rust
 toolchain files that can change task execution. They are partitioned by the
-effective Rust host target reported for the package execution directory. A
-missing host target or an effective ancestor Cargo configuration outside the
-repository makes the Cargo package and downstream hash scopes uncacheable.
+normalized verbose compiler identity and effective Rust host target reported
+for the package execution directory. A missing compiler identity or host target,
+or an effective ancestor Cargo configuration outside the repository, makes the
+Cargo package and downstream hash scopes uncacheable.
 Environment-name selection follows Windows
 case-insensitive semantics for both hashing and strict task execution.
 Repository discovery records the resolved root lockfile path without
@@ -266,9 +270,11 @@ accepts week-based ages, runs before cache restoration only when local cache
 reads or writes are enabled, and counts archive and sidecar bytes, including
 orphaned sidecars. Startup eviction failures warn and continue without making
 cache maintenance a prerequisite for task execution. Eviction acquires the
-per-entry writer lock before removal so it cannot expose a partially published
-entry; selected-entry removal failures are aggregated after all of its archive
-and sidecar paths are tried. Eviction also reclaims stale atomic-write
+per-entry writer lock before removal, then rereads and revalidates the selected
+entry's file fingerprint and current limits so it cannot remove a concurrent
+publication or expose a partially published entry. Selected-entry removal
+failures are aggregated after all of its archive and sidecar paths are tried.
+Eviction also reclaims stale atomic-write
 temporaries under the corresponding entry lock. Restoration of an existing
 entry holds the same lock through validation and rejected-entry cleanup so it
 cannot remove a concurrent publication. Active entry locks renew their lease

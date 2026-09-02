@@ -800,12 +800,14 @@ export const hashTask = (
             : ([relative, "160000", objectId] as const);
         }
         const mode =
-          gitMode ??
-          (metadata.kind === "symlink"
+          metadata.kind === "symlink"
             ? ("120000" as const)
-            : (metadata.mode & 0o111) !== 0
-              ? ("100755" as const)
-              : ("100644" as const));
+            : metadata.kind === "file" &&
+                (gitMode === "100644" || gitMode === "100755")
+              ? gitMode
+              : (metadata.mode & 0o111) !== 0
+                ? ("100755" as const)
+                : ("100644" as const);
         const hash = yield* (
           metadata.kind === "symlink"
             ? fileSystem.readLink(path).pipe(
@@ -917,7 +919,10 @@ export const hashTask = (
         task: node.task,
         command: node.command,
         ...(node.package.manager === "cargo"
-          ? { cargoHostTarget: node.package.cargoHostTarget ?? null }
+          ? {
+              cargoCompilerIdentity: node.package.cargoCompilerIdentity ?? null,
+              cargoHostTarget: node.package.cargoHostTarget ?? null,
+            }
           : {}),
         ...(uvControls === undefined
           ? {}
