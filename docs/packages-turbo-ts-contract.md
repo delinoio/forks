@@ -130,7 +130,8 @@ Owning lockfiles, repository-controlled JavaScript package-manager
 configuration, workspace-local Bun `bunfig.toml` files, and Cargo control or
 toolchain files participate in both task-aware selection and hashing. Expected
 JavaScript lockfile paths remain task-aware inputs when the active lockfile is
-deleted. A repository-contained
+deleted. Yarn PnP tasks always hash the repository-root `.pnp.cjs` loader in
+addition to the preferred resolution lockfile. A repository-contained
 Yarn `yarnPath` executable is also an input; a missing or external executable
 makes JavaScript and downstream cache scopes uncacheable. Yarn 2+ tasks also
 hash effective workspace-relative `injectEnvironmentFiles`, including the
@@ -167,13 +168,17 @@ toolchain files that can change task execution. Repository-contained compiler
 wrappers selected by effective `build.rustc-wrapper` and
 `build.rustc-workspace-wrapper` configuration are also inputs; missing,
 external, and PATH-resolved wrappers make the Cargo package and downstream
-scopes uncacheable. Cached Cargo format tasks also include ancestor
-`rustfmt.toml` and `.rustfmt.toml` controls. They are
+scopes uncacheable. Cached Cargo format tasks require at least one positive
+output declaration and also include ancestor `rustfmt.toml` and `.rustfmt.toml`
+controls. They are
 partitioned by the normalized verbose compiler identity and effective Rust host
 target reported for the package execution directory. A missing compiler
 identity or host target, an effective ancestor Cargo configuration outside the
 repository, or an effective Cargo target directory outside the repository makes
 the Cargo package and downstream hash scopes uncacheable.
+Cargo compilation tasks with an effective `RUSTC` environment override and
+their downstream scopes are likewise uncacheable because the task-specific
+compiler identity is not modeled.
 Environment-name selection follows Windows case-insensitive semantics for run
 options, affected-range controls, hashing, and strict task execution.
 Repository discovery records the resolved root lockfile path without
@@ -433,9 +438,9 @@ select only tasks whose effective inputs match them; repository-global inputs
 and Git discovery failures retain the all-task fallback.
 Changes to the loaded root task configuration select all requested task
 entrypoints under task-aware affected and Git-range filtering.
-Changes to the repository-root `.gitignore` retain the same all-task fallback
-because they can change Git-discovered task inputs without exposing newly
-included files in the revision diff.
+Changes to any repository-contained `.gitignore` retain the same all-task
+fallback because they can change Git-discovered task inputs without exposing
+newly included files in the revision diff.
 
 Gate 2 is not closed: the composed task-hash serializer does not yet reproduce
 the official 2.10.12 task hashes. Individual source-file hashes match Git and

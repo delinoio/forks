@@ -78,7 +78,8 @@ When that manifest is a symlink, its task hash includes both the link and the
 resolved contents consumed during discovery and execution. Repository-level
 package-manager controls, workspace-local Bun `bunfig.toml` files, and expected
 lockfile paths also remain task-aware inputs, including when the active
-lockfile is deleted.
+lockfile is deleted. Yarn PnP tasks hash the root `.pnp.cjs` loader separately
+from the preferred resolution lockfile.
 Repository-contained Yarn `yarnPath` executables are package-manager inputs;
 missing or external executables disable JavaScript caching. Yarn 2+ tasks also
 hash their effective workspace-relative `injectEnvironmentFiles`, including
@@ -99,8 +100,10 @@ explicitly. Pass-through
 external configuration paths are not task-hash inputs. Mismatched metadata/task
 `CARGO_TARGET_DIR` values also disable Cargo compilation-task caching. Any
 effective Cargo-home configuration or `CARGO_BUILD_TARGET` likewise disables
-every cacheable Cargo compilation task. Cargo configuration above the
-repository disables the affected Cargo and downstream cache scopes.
+every cacheable Cargo compilation task. An effective `RUSTC` override also
+disables the affected Cargo compilation and downstream cache scopes. Cargo
+configuration above the repository disables the affected Cargo and downstream
+cache scopes.
 Repository-contained compiler wrappers selected by effective
 `build.rustc-wrapper` and `build.rustc-workspace-wrapper` configuration are
 hashed; missing, external, or PATH-resolved wrappers disable caching.
@@ -118,7 +121,8 @@ Unfiltered Cargo workspace commands merge the effective environments of every
 grouped member and remain package-scoped when any repository member excludes
 the requested verification task.
 Explicitly cached Cargo format tasks hash ancestor `rustfmt.toml` and
-`.rustfmt.toml` files.
+`.rustfmt.toml` files and require at least one positive output declaration so
+formatted sources can be restored on a cache hit.
 
 Local and remote cache restoration is limited to 256 MiB compressed and 1 GiB
 after decompression. Artifacts beyond either limit are rejected; invalid local

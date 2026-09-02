@@ -1858,6 +1858,14 @@ const cargoTasks = (
     : { outputs };
   const executionDefaults: Pipeline = { cache: false };
   const formatDefaults: Pipeline = { cache: false };
+  const formatTask = (configuredTask: Pipeline): Pipeline => {
+    const merged = mergePipeline(formatDefaults, configuredTask);
+    const hasPositiveOutputs =
+      merged.outputs?.some((output) => !output.startsWith("!")) === true;
+    return merged.cache === true && !hasPositiveOutputs
+      ? { ...merged, cache: false }
+      : merged;
+  };
   const compilationTaskNames = [
     "build",
     "check",
@@ -1912,17 +1920,14 @@ const cargoTasks = (
     }
   }
   if (!excludedTasks.has("format")) {
-    tasks.format = mergePipeline(formatDefaults, configured.format ?? {});
+    tasks.format = formatTask(configured.format ?? {});
   }
   const qualifiedFormat = `${packageName}#format`;
   if (
     !excludedTasks.has("format") &&
     configured[qualifiedFormat] !== undefined
   ) {
-    tasks[qualifiedFormat] = mergePipeline(
-      formatDefaults,
-      configured[qualifiedFormat],
-    );
+    tasks[qualifiedFormat] = formatTask(configured[qualifiedFormat]);
   }
   return tasks;
 };

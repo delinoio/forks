@@ -716,11 +716,13 @@ const findAffectedPackages = (
     const rootConfigurationChanged = changedFiles.includes(
       relativePath(repository.root, repository.rootConfiguration.path),
     );
-    const rootGitIgnoreChanged = changedFiles.includes(".gitignore");
+    const gitIgnoreChanged = changedFiles.some(
+      (path) => path === ".gitignore" || path.endsWith("/.gitignore"),
+    );
     const rootChanged =
       globalDependencyChanged ||
       rootConfigurationChanged ||
-      rootGitIgnoreChanged ||
+      gitIgnoreChanged ||
       (!globalInputsAreTaskAware && ordinaryRootChanged);
     return {
       packages: rootChanged
@@ -1584,6 +1586,18 @@ const usesEnvironmentCargoBuildTarget = (
         : name === "CARGO_BUILD_TARGET"),
   );
 
+const usesEnvironmentRustCompiler = (
+  environment: Readonly<Record<string, string | undefined>>,
+  caseInsensitiveEnvironmentNames: boolean,
+): boolean =>
+  Object.entries(environment).some(
+    ([name, value]) =>
+      value !== undefined &&
+      (caseInsensitiveEnvironmentNames
+        ? name.toLowerCase() === "rustc"
+        : name === "RUSTC"),
+  );
+
 const environmentValue = (
   environment: Readonly<Record<string, string | undefined>>,
   name: string,
@@ -1661,19 +1675,34 @@ const taskExecutionDirectory = (
   scope?.kind === "cargo-workspace" ? scope.directory : node.package.directory;
 
 const taskLogIdentifiers = (
+  repository: RepositoryModel,
   graph: TaskGraph,
   scopes: ReadonlyMap<string, TaskCommandScope> = new Map(),
   caseInsensitivePaths = false,
 ): ReadonlyMap<string, string> => {
-  const nodesByLogPath = new Map<string, Array<TaskNode>>();
-  for (const node of graph.nodes.values()) {
-    const directory = normalizePath(
+  const repositoryPackages = [repository.rootPackage, ...repository.packages];
+  const comparableDirectory = (directory: string): string => {
+    const normalized = normalizePath(directory);
+    return caseInsensitivePaths ? normalized.toLowerCase() : normalized;
+  };
+  const hasRepositoryCollision = (node: TaskNode): boolean => {
+    const directory = comparableDirectory(
       taskExecutionDirectory(node, scopes.get(node.id)),
     );
-    const comparableDirectory = caseInsensitivePaths
-      ? directory.toLowerCase()
-      : directory;
-    const key = `${comparableDirectory}\0${encodeTaskLogIdentifier(node.task)}`;
+    return repositoryPackages.some(
+      (packageModel) =>
+        packageModel.identity !== node.package.identity &&
+        comparableDirectory(packageModel.directory) === directory &&
+        !packageModel.excludedTasks.has(node.task) &&
+        packageModel.scripts[node.task] !== undefined,
+    );
+  };
+  const nodesByLogPath = new Map<string, Array<TaskNode>>();
+  for (const node of graph.nodes.values()) {
+    const directory = comparableDirectory(
+      taskExecutionDirectory(node, scopes.get(node.id)),
+    );
+    const key = `${directory}\0${encodeTaskLogIdentifier(node.task)}`;
     const nodes = nodesByLogPath.get(key) ?? [];
     nodes.push(node);
     nodesByLogPath.set(key, nodes);
@@ -1681,7 +1710,13 @@ const taskLogIdentifiers = (
   return new Map(
     [...nodesByLogPath.values()].flatMap((nodes) =>
       nodes.map(
-        (node) => [node.id, nodes.length > 1 ? node.id : node.task] as const,
+        (node) =>
+          [
+            node.id,
+            nodes.length > 1 || hasRepositoryCollision(node)
+              ? node.id
+              : node.task,
+          ] as const,
       ),
     ),
   );
@@ -1743,6 +1778,10 @@ export const isTaskScopeDynamicallyCacheable = (
       environment,
       caseInsensitiveEnvironmentNames,
     )
+  ) &&
+  !(
+    isCargoCompilationTask(node) &&
+    usesEnvironmentRustCompiler(environment, caseInsensitiveEnvironmentNames)
   ) &&
   !usesMismatchedCargoTargetDirectory(
     node,
@@ -3101,6 +3140,7 @@ export const executeRun = (
       ),
     );
     const logIdentifiers = taskLogIdentifiers(
+      repository,
       graph,
       cargoWorkspacePlan.scopes,
       platform === "win32",

@@ -289,7 +289,7 @@ type JavaScriptPackageManagerName = Exclude<PackageManagerName, "cargo" | "uv">;
 const repositoryControlNamesByJavaScriptManager = {
   npm: [],
   pnpm: ["pnpm-workspace.yaml", ".pnpmfile.cjs"],
-  yarn: [".yarnrc", ".yarnrc.yml"],
+  yarn: [".yarnrc", ".yarnrc.yml", ".pnp.cjs"],
   bun: ["bunfig.toml"],
   aube: ["aube-workspace.yaml", ".config/aube/config.toml"],
   nub: ["nub.jsonc"],
