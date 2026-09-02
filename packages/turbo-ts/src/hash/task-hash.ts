@@ -18,6 +18,7 @@ import {
 import type { TaskNode } from "../graph/task-graph.js";
 import type {
   PackageManagerName,
+  PackageManagerRuntimeIdentity,
   RepositoryModel,
   UvRuntimeIdentity,
 } from "../repository/model.js";
@@ -733,6 +734,7 @@ export const hashTask = (
   cacheDirectory: string,
   runtimeEnvironment?: Readonly<Record<string, string | undefined>>,
   uvRuntimeIdentity?: UvRuntimeIdentity,
+  packageManagerRuntimeIdentity?: PackageManagerRuntimeIdentity,
 ): Effect.Effect<
   TaskHashResult,
   RepositoryError,
@@ -964,6 +966,12 @@ export const hashTask = (
     const hash = xxhash64Hex(
       canonicalStringify({
         packageManager: `${repository.manager}@${repository.managerVersion ?? ""}`,
+        ...(node.package.manager === "cargo" || node.package.manager === "uv"
+          ? {}
+          : {
+              packageManagerRuntimeIdentity:
+                packageManagerRuntimeIdentity ?? null,
+            }),
         lockfilePath:
           lockfilePath === undefined
             ? null

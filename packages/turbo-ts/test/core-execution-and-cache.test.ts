@@ -56,6 +56,7 @@ import {
   CompressionService,
   DigestService,
   EnvironmentService,
+  type ExecutionRequest,
   FileSystemService,
   HttpService,
   ProcessService,
@@ -73,6 +74,8 @@ import {
   cargoHomeConfigurationPresent,
   discoverRepository,
   npmUserConfigurationPresent,
+  type PackageManagerRuntimeIdentity,
+  resolvePackageManagerRuntimeIdentity,
   resolveUvRuntimeIdentity,
   type UvRuntimeIdentity,
   uvControlInputs,
@@ -2998,7 +3001,7 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
-  it("hashes repository package-manager controls independently of task globs", async () => {
+  it("hashes package-manager controls and runtime identity", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;
     const npmConfigurationPath = `${directory}/.npmrc`;
@@ -3027,13 +3030,35 @@ describe("core CLI execution", () => {
       const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
         "synthetic-library#build",
       )!;
-      const compute = () =>
+      const runtimeIdentity: PackageManagerRuntimeIdentity = {
+        name: "pnpm",
+        version: "10.34.5",
+      };
+      const compute = (
+        identity: PackageManagerRuntimeIdentity = runtimeIdentity,
+      ) =>
         Effect.runPromise(
-          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
-            Effect.provide(nodeFoundationLayer),
-          ),
+          hashTask(
+            model,
+            node,
+            [],
+            true,
+            [],
+            `${directory}/.turbo/cache`,
+            undefined,
+            undefined,
+            identity,
+          ).pipe(Effect.provide(nodeFoundationLayer)),
         );
       const before = await compute();
+      expect(
+        (
+          await compute({
+            name: "pnpm",
+            version: "11.0.0",
+          })
+        ).hash,
+      ).not.toBe(before.hash);
       expect(before.inputFiles).toEqual(
         expect.arrayContaining([
           ".npmrc",
@@ -5625,7 +5650,7 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  }, 10_000);
+  }, 15_000);
 
   it("hashes tracked Git submodules as gitlinks", async () => {
     const directory = await mkdtemp(join(packageRoot, "test-gitlink-"));
@@ -7657,6 +7682,72 @@ describe("core CLI execution", () => {
     } finally {
       await rm(homeDirectory, { force: true, recursive: true });
     }
+  });
+
+  it("resolves normalized JavaScript package-manager identities", async () => {
+    const requests: Array<ExecutionRequest> = [];
+    let exitCode = 0;
+    let stdout = "";
+    const processLayer = Layer.succeed(ProcessService, {
+      run: (request) => {
+        requests.push(request);
+        return Effect.succeed({
+          exitCode,
+          stdout,
+          stderr: "",
+          combinedOutput: stdout,
+        });
+      },
+      runBytes: () => Effect.die("unexpected binary process request"),
+    });
+    const environment = { PATH: "/synthetic/bin" };
+    for (const manager of [
+      "npm",
+      "pnpm",
+      "yarn",
+      "bun",
+      "aube",
+      "nub",
+    ] as const) {
+      stdout = `${manager} 1.2.3\r\n`;
+      expect(
+        await Effect.runPromise(
+          resolvePackageManagerRuntimeIdentity(
+            manager,
+            "/repository/packages/app",
+            environment,
+          ).pipe(Effect.provide(processLayer)),
+        ),
+      ).toEqual({ name: manager, version: `${manager} 1.2.3` });
+      expect(requests.at(-1)).toEqual({
+        command: manager,
+        args: ["--version"],
+        cwd: "/repository/packages/app",
+        env: environment,
+        inheritEnvironment: false,
+      });
+    }
+    stdout = "\r\n";
+    expect(
+      await Effect.runPromise(
+        resolvePackageManagerRuntimeIdentity(
+          "pnpm",
+          "/repository",
+          environment,
+        ).pipe(Effect.provide(processLayer)),
+      ),
+    ).toBeUndefined();
+    exitCode = 1;
+    stdout = "pnpm 1.2.3\n";
+    expect(
+      await Effect.runPromise(
+        resolvePackageManagerRuntimeIdentity(
+          "pnpm",
+          "/repository",
+          environment,
+        ).pipe(Effect.provide(processLayer)),
+      ),
+    ).toBeUndefined();
   });
 
   it("resolves repository and external uv controls", async () => {

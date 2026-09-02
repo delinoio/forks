@@ -153,6 +153,12 @@ task bypasses caching when its effective user configuration exists, using
 otherwise, because that external configuration is not a repository hash input.
 Yarn tasks likewise bypass caching when the platform user home contains an
 effective `.yarnrc` or `.yarnrc.yml` configuration.
+Cache-eligible JavaScript task hashes include the normalized runtime identity
+reported by the bare npm, pnpm, Yarn, Bun, Aube, or Nub command from the task
+execution directory and effective task environment. A failed or empty identity
+probe makes the task and its downstream hash scopes uncacheable; a
+manifest-declared version is configuration metadata and does not substitute
+for this runtime identity.
 Only indexed mode `160000` directories are hashed as gitlinks; an indexed
 regular file replaced by a working-tree directory is omitted while its
 discovered descendants remain task inputs.
@@ -180,7 +186,9 @@ repository, or an effective Cargo target directory outside the repository makes
 the Cargo package and downstream hash scopes uncacheable.
 Cargo compilation tasks with an effective `RUSTC` environment override and
 their downstream scopes are likewise uncacheable because the task-specific
-compiler identity is not modeled.
+compiler identity is not modeled. Effective `RUSTC_WRAPPER` and
+`RUSTC_WORKSPACE_WRAPPER` environment overrides apply the same bypass because
+the wrapper executables are not repository hash inputs.
 Environment-name selection follows Windows case-insensitive semantics for run
 options, affected-range controls, hashing, and strict task execution.
 Repository discovery records the resolved root lockfile path without
@@ -412,7 +420,9 @@ compilation task bypasses caching when pass-through arguments add a package
 selector, including `-p`, `--package`, `--workspace`, and `--all`. Every
 cacheable Cargo compilation task with an alternate output layout or manifest,
 or an unmodeled library, binary, example, test, or benchmark target, bypasses
-caching until those outputs are modeled explicitly. Cargo pass-through
+caching until those outputs are modeled explicitly. `--timings` also bypasses
+caching until its generated timing report is included in cache artifacts.
+Cargo pass-through
 `--config` arguments also bypass caching for every cacheable Cargo
 compilation task (`build`, `check`, `test`, `lint`, `run`, and `dev`) because
 they can load or set external compilation controls that are not hashed. The

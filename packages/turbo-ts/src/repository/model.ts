@@ -31,6 +31,16 @@ export const packageManagerNames = [
 
 export type PackageManagerName = (typeof packageManagerNames)[number];
 
+export type JavaScriptPackageManagerName = Exclude<
+  PackageManagerName,
+  "cargo" | "uv"
+>;
+
+export interface PackageManagerRuntimeIdentity {
+  readonly name: JavaScriptPackageManagerName;
+  readonly version: string;
+}
+
 export interface PackageManifest {
   readonly name?: string;
   readonly version?: string;
@@ -1663,6 +1673,35 @@ export interface UvRuntimeIdentity {
   readonly uvVersion: string;
   readonly pythonVersion: string;
 }
+
+export const resolvePackageManagerRuntimeIdentity = (
+  manager: JavaScriptPackageManagerName,
+  executionDirectory: string,
+  environment: Readonly<Record<string, string | undefined>>,
+): Effect.Effect<
+  PackageManagerRuntimeIdentity | undefined,
+  never,
+  ProcessService
+> =>
+  Effect.gen(function* () {
+    const processService = yield* ProcessService;
+    const result = yield* Effect.either(
+      Effect.scoped(
+        processService.run({
+          command: manager,
+          args: ["--version"],
+          cwd: executionDirectory,
+          env: environment,
+          inheritEnvironment: false,
+        }),
+      ),
+    );
+    if (result._tag === "Left" || result.right.exitCode !== 0) {
+      return undefined;
+    }
+    const version = result.right.stdout.replace(/\r\n?/g, "\n").trim();
+    return version === "" ? undefined : { name: manager, version };
+  });
 
 export const resolveUvRuntimeIdentity = (
   executionDirectory: string,

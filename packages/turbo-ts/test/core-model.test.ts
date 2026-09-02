@@ -1330,6 +1330,8 @@ describe("core repository model", () => {
         ["--profile", "release"],
         ["--target=synthetic-target"],
         ["--target-dir", "../alternate-target"],
+        ["--timings"],
+        ["--timings=html"],
       ]) {
         expect(isTaskScopeCacheable(compilationNode, arguments_)).toBe(false);
       }
@@ -1371,6 +1373,20 @@ describe("core repository model", () => {
           { CARGO_TARGET_DIR: "/repo/custom-target" },
         ),
       ).toBe(false);
+      for (const name of [
+        "RUSTC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+      ]) {
+        expect(
+          isTaskScopeCacheable(
+            compilationNode,
+            [],
+            { kind: "package" },
+            { [name]: "/toolchains/custom-tool" },
+          ),
+        ).toBe(false);
+      }
     }
     expect(
       isTaskScopeCacheable(node, [], { kind: "package" }, {}, false, {
@@ -1391,6 +1407,15 @@ describe("core repository model", () => {
       isTaskScopeCacheable(node, [], { kind: "package" }, {}, false, {}, true),
     ).toBe(false);
     expect(isTaskScopeCacheable(node, ["--features=integration"])).toBe(true);
+    expect(
+      isTaskScopeCacheable(
+        node,
+        [],
+        { kind: "package" },
+        { rustc_workspace_wrapper: "C:/toolchains/custom-wrapper.exe" },
+        true,
+      ),
+    ).toBe(false);
   });
 
   it("disables npm and pnpm caching when user configuration is present", () => {
@@ -1419,6 +1444,46 @@ describe("core repository model", () => {
           {},
           false,
           true,
+        ),
+      ).toBe(false);
+    }
+  });
+
+  it("requires verified JavaScript package-manager runtime identities", () => {
+    for (const manager of [
+      "npm",
+      "pnpm",
+      "yarn",
+      "bun",
+      "aube",
+      "nub",
+    ] as const) {
+      const packageValue = {
+        ...packageModel("app", []),
+        manager,
+      };
+      const node: TaskNode = {
+        id: "app#build",
+        package: packageValue,
+        task: "build",
+        command: packageValue.scripts.build,
+        definition: packageValue.tasks.build!,
+        dependencies: [],
+        with: [],
+      };
+      expect(
+        isTaskScopeCacheable(
+          node,
+          [],
+          { kind: "package" },
+          {},
+          false,
+          {},
+          false,
+          false,
+          false,
+          true,
+          false,
         ),
       ).toBe(false);
     }

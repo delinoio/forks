@@ -88,21 +88,27 @@ effective workspace-relative `injectEnvironmentFiles`, including the default
 npm and pnpm user `.npmrc` files likewise disable caching because they are
 external inputs, while repository-contained ancestor `.npmrc` files are always
 hashed. Yarn home `.yarnrc` and `.yarnrc.yml` files also disable caching.
+Cache-eligible JavaScript task hashes include the normalized identity reported
+by the actual npm, pnpm, Yarn, Bun, Aube, or Nub command invoked from the task
+directory. If that identity cannot be verified, the task and downstream scopes
+execute without cache reads or writes.
 Enabled JavaScript, Cargo, and uv discovery passes retain co-located package
 scopes in the same workspace directory. Repository-root Cargo and uv scopes do
 not absorb ordinary root files during package-level affected selection.
 
 Cargo compilation tasks that receive pass-through arguments selecting another
 package, release, profile, target, another manifest or alternate artifact
-layout, or an unmodeled library, binary, example, test, or benchmark target
+layout, a timing report, or an unmodeled library, binary, example, test, or
+benchmark target
 execute without cache reads or writes until those outputs are modeled
 explicitly. Pass-through
 `--config` arguments disable every cacheable Cargo compilation task because
 external configuration paths are not task-hash inputs. Mismatched metadata/task
 `CARGO_TARGET_DIR` values also disable Cargo compilation-task caching. Any
 effective Cargo-home configuration or `CARGO_BUILD_TARGET` likewise disables
-every cacheable Cargo compilation task. An effective `RUSTC` override also
-disables the affected Cargo compilation and downstream cache scopes. Cargo
+every cacheable Cargo compilation task. Effective `RUSTC`, `RUSTC_WRAPPER`, or
+`RUSTC_WORKSPACE_WRAPPER` overrides also disable the affected Cargo compilation
+and downstream cache scopes. Cargo
 configuration above the repository disables the affected Cargo and downstream
 cache scopes.
 Repository-contained compiler wrappers selected by effective
