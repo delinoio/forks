@@ -86,7 +86,10 @@ traversal prunes subtrees that cannot match a positive workspace pattern before
 listing them; ordered exclusions are applied to the resulting candidates.
 Enabled JavaScript, Cargo, and uv discovery passes operate independently, so a
 declared JavaScript workspace may also contain co-located Cargo and uv package
-scopes.
+scopes. Package names are unique within an ecosystem but may be shared across
+ecosystems. Cross-ecosystem collisions use `javascript:`, `cargo:`, or `uv:`
+qualified internal identities; plain name selectors retain all matching
+scopes, while a qualified identity selects one scope.
 Matching directory symlinks are traversed by their declared logical path only
 when their canonical target is a directory inside the repository; canonical
 ancestor tracking prevents symlink cycles.
@@ -127,6 +130,9 @@ task-aware inputs when the active lockfile is deleted. A changed
 workspace gitlink path is treated as the package-relative `.` input. Task
 hashes preserve Git symlink, gitlink, and dependency semantics, exclude the
 resolved cache directory, and use each task's owning ecosystem lockfile.
+An npm task bypasses caching when its effective user configuration exists,
+using `NPM_CONFIG_USERCONFIG` when set and the platform user home's `.npmrc`
+otherwise, because that external configuration is not a repository hash input.
 Only indexed mode `160000` directories are hashed as gitlinks; an indexed
 regular file replaced by a working-tree directory is omitted while its
 discovered descendants remain task inputs.
@@ -347,9 +353,11 @@ same compilation-task set bypasses caching when any effective Cargo-home
 configuration is present or when the effective task environment sets a build
 target. Ancestor configuration setting a build target, or different
 `CARGO_TARGET_DIR` values for Cargo metadata and strict task execution,
-likewise bypass caching. Cargo metadata discovery uses
-`--locked`, uses each response's workspace-member list, and does not probe
-excluded or unrelated nested manifests. Combined workspace task
+likewise bypass caching. Runtime-only cache bypasses seed the dependency and
+`with` closure, so downstream task scopes cannot restore cache entries whose
+prerequisite output depends on unmodeled external controls. Cargo metadata
+discovery uses `--locked`, uses each response's workspace-member list, and does
+not probe excluded or unrelated nested manifests. Combined workspace task
 hashes are propagated into every downstream task hash.
 Cargo builds with colliding synthesized binary destinations bypass caching,
 including when task configuration explicitly enables it.

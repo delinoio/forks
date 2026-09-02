@@ -53,6 +53,7 @@ export interface PackageManifest {
 }
 
 export interface RepositoryPackage {
+  readonly identity: string;
   readonly name: string;
   readonly directory: string;
   readonly relativeDirectory: string;
@@ -79,8 +80,14 @@ export interface RepositoryModel {
   readonly rootPackage: RepositoryPackage;
   readonly lockfile?: string;
   readonly packages: ReadonlyArray<RepositoryPackage>;
+  readonly packagesByIdentity: ReadonlyMap<string, RepositoryPackage>;
   readonly packagesByName: ReadonlyMap<string, RepositoryPackage>;
 }
+
+type PackageEcosystem = "javascript" | "cargo" | "uv";
+
+const packageEcosystem = (manager: PackageManagerName): PackageEcosystem =>
+  manager === "cargo" || manager === "uv" ? manager : "javascript";
 
 const workspaceTraversalIgnoredDirectories = new Set([
   ".git",
@@ -622,7 +629,11 @@ const javascriptInternalDependencies = (
   manager: PackageManagerName,
   packagesByName: ReadonlyMap<
     string,
-    { readonly directory: string; readonly manifest: PackageManifest }
+    {
+      readonly identity: string;
+      readonly directory: string;
+      readonly manifest: PackageManifest;
+    }
   >,
 ): Effect.Effect<
   {
@@ -636,10 +647,12 @@ const javascriptInternalDependencies = (
     const packagesByFilesystemIdentity = new Map(
       (yield* Effect.forEach(
         [...packagesByName],
-        ([name, target]) =>
+        ([, target]) =>
           canonicalFilesystemIdentity(target.directory).pipe(
             Effect.map((identity) =>
-              identity === undefined ? undefined : ([identity, name] as const),
+              identity === undefined
+                ? undefined
+                : ([identity, target.identity] as const),
             ),
           ),
         { concurrency: 8 },
@@ -649,7 +662,7 @@ const javascriptInternalDependencies = (
     );
     const declaringFilesystemIdentity =
       yield* canonicalFilesystemIdentity(declaringDirectory);
-    const declaringPackageName =
+    const declaringPackageIdentity =
       declaringFilesystemIdentity === undefined
         ? undefined
         : packagesByFilesystemIdentity.get(declaringFilesystemIdentity);
@@ -691,7 +704,7 @@ const javascriptInternalDependencies = (
               target,
             ).pipe(
               Effect.map((matches) => ({
-                internalDependency: matches ? reference.name : undefined,
+                internalDependency: matches ? target.identity : undefined,
                 cacheInputsComplete: true,
               })),
             );
@@ -705,7 +718,7 @@ const javascriptInternalDependencies = (
             .map(({ internalDependency }) => internalDependency)
             .filter(
               (name): name is string =>
-                name !== undefined && name !== declaringPackageName,
+                name !== undefined && name !== declaringPackageIdentity,
             ),
         ),
       ].sort(),
@@ -760,13 +773,16 @@ interface CargoDependencyMetadata {
 }
 
 interface RepositoryPackageDraft
-  extends Omit<RepositoryPackage, "internalDependencies"> {
+  extends Omit<RepositoryPackage, "identity" | "internalDependencies"> {
   readonly cargoDependencies: ReadonlyArray<CargoDependencyMetadata>;
   readonly uvDependencySources?: ReadonlyMap<
     string,
     ReadonlyArray<PythonDependencySource>
   >;
 }
+
+type IdentifiedRepositoryPackageDraft = RepositoryPackageDraft &
+  Pick<RepositoryPackage, "identity">;
 
 export const parseCargoMetadata = (
   source: string,
@@ -1115,6 +1131,48 @@ const configuredEnvironmentValue = (
   }
   return selected;
 };
+
+export const npmUserConfigurationPresent = (
+  executionDirectory: string,
+  environment: Readonly<Record<string, string | undefined>>,
+  caseInsensitiveEnvironmentNames: boolean,
+): Effect.Effect<boolean, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const configuredUserConfiguration = configuredEnvironmentValue(
+      environment,
+      "NPM_CONFIG_USERCONFIG",
+      true,
+    );
+    const home = configuredEnvironmentValue(
+      environment,
+      "HOME",
+      caseInsensitiveEnvironmentNames,
+    );
+    const userHome = caseInsensitiveEnvironmentNames
+      ? (configuredEnvironmentValue(environment, "USERPROFILE", true) ?? home)
+      : home;
+    const userConfiguration =
+      configuredUserConfiguration === undefined ||
+      configuredUserConfiguration === ""
+        ? userHome === undefined
+          ? undefined
+          : joinPath(userHome, ".npmrc")
+        : configuredUserConfiguration;
+    if (userConfiguration === undefined || userConfiguration === "") {
+      return false;
+    }
+    const path = isAbsolutePath(userConfiguration)
+      ? normalizePath(userConfiguration)
+      : joinPath(executionDirectory, userConfiguration);
+    const fileSystem = yield* FileSystemService;
+    return yield* fileSystem
+      .exists(path)
+      .pipe(
+        Effect.mapError(
+          (error) => new RepositoryError({ path, message: error.message }),
+        ),
+      );
+  });
 
 export const cargoHomeConfigurationPresent = (
   executionDirectory: string,
@@ -1786,18 +1844,24 @@ export const discoverRepository = (
         (entry): entry is NonNullable<typeof entry> => entry !== undefined,
       ),
     ];
-    const names = new Set<string>();
+    const ecosystemNames = new Set<string>();
+    const ecosystemsByName = new Map<string, Set<PackageEcosystem>>();
     const uvNames = new Map<string, string>();
     for (const packageDraft of drafts) {
-      if (names.has(packageDraft.name)) {
+      const ecosystem = packageEcosystem(packageDraft.manager);
+      const ecosystemName = `${ecosystem}\0${packageDraft.name}`;
+      if (ecosystemNames.has(ecosystemName)) {
         return yield* Effect.fail(
           new RepositoryError({
             path: packageDraft.directory,
-            message: `duplicate package name: ${packageDraft.name}`,
+            message: `duplicate ${ecosystem} package name: ${packageDraft.name}`,
           }),
         );
       }
-      names.add(packageDraft.name);
+      ecosystemNames.add(ecosystemName);
+      const ecosystems = ecosystemsByName.get(packageDraft.name) ?? new Set();
+      ecosystems.add(ecosystem);
+      ecosystemsByName.set(packageDraft.name, ecosystems);
       if (packageDraft.manager === "uv") {
         const identity = normalizePythonPackageName(packageDraft.name);
         const existing = uvNames.get(identity);
@@ -1812,18 +1876,27 @@ export const discoverRepository = (
         uvNames.set(identity, packageDraft.name);
       }
     }
-    const draftsByName = new Map(
-      drafts.map((packageDraft) => [packageDraft.name, packageDraft] as const),
+    const identifiedDrafts: ReadonlyArray<IdentifiedRepositoryPackageDraft> =
+      drafts.map((packageDraft) => ({
+        ...packageDraft,
+        identity:
+          (ecosystemsByName.get(packageDraft.name)?.size ?? 0) > 1
+            ? `${packageEcosystem(packageDraft.manager)}:${packageDraft.name}`
+            : packageDraft.name,
+      }));
+    const javascriptPackageDrafts = identifiedDrafts.filter(
+      (packageDraft) =>
+        packageDraft.manager !== "cargo" && packageDraft.manager !== "uv",
     );
     const javascriptDraftsByName = new Map(
-      javascriptDrafts.map(
+      javascriptPackageDrafts.map(
         (packageDraft) => [packageDraft.name, packageDraft] as const,
       ),
     );
     const javascriptDependencyResolutionByDirectory = new Map(
       yield* Effect.forEach(
         [
-          ...javascriptDrafts.map(({ directory, manifest }) => ({
+          ...javascriptPackageDrafts.map(({ directory, manifest }) => ({
             directory,
             manifest,
           })),
@@ -1844,7 +1917,7 @@ export const discoverRepository = (
       ),
     );
     const cargoDraftsByDirectory = new Map(
-      drafts
+      identifiedDrafts
         .filter((packageDraft) => packageDraft.manager === "cargo")
         .map(
           (packageDraft) =>
@@ -1852,9 +1925,12 @@ export const discoverRepository = (
         ),
     );
     const cargoDependencyTarget = (
-      packageDraft: Pick<RepositoryPackageDraft, "workspaceDirectory">,
+      packageDraft: Pick<
+        IdentifiedRepositoryPackageDraft,
+        "workspaceDirectory"
+      >,
       dependency: CargoDependencyMetadata,
-    ): RepositoryPackageDraft | undefined => {
+    ): IdentifiedRepositoryPackageDraft | undefined => {
       if (
         dependency.source !== undefined ||
         dependency.path === undefined ||
@@ -1869,9 +1945,16 @@ export const discoverRepository = (
         ? target
         : undefined;
     };
+    const uvDraftsByName = new Map(
+      identifiedDrafts
+        .filter((packageDraft) => packageDraft.manager === "uv")
+        .map((packageDraft) => [packageDraft.name, packageDraft] as const),
+    );
     const uvFilesystemIdentitiesByName = new Map(
       yield* Effect.forEach(
-        drafts.filter((packageDraft) => packageDraft.manager === "uv"),
+        identifiedDrafts.filter(
+          (packageDraft) => packageDraft.manager === "uv",
+        ),
         (packageDraft) =>
           canonicalFilesystemIdentity(packageDraft.directory).pipe(
             Effect.map((identity) => [packageDraft.name, identity] as const),
@@ -1881,7 +1964,9 @@ export const discoverRepository = (
     );
     const uvDependencyResolutionByName = new Map(
       yield* Effect.forEach(
-        drafts.filter((packageDraft) => packageDraft.manager === "uv"),
+        identifiedDrafts.filter(
+          (packageDraft) => packageDraft.manager === "uv",
+        ),
         (packageDraft) =>
           Effect.forEach(
             packageDraft.dependencyNames,
@@ -1891,7 +1976,7 @@ export const discoverRepository = (
                 const target =
                   resolved === undefined
                     ? undefined
-                    : draftsByName.get(resolved);
+                    : uvDraftsByName.get(resolved);
                 const sources =
                   packageDraft.uvDependencySources?.get(
                     normalizePythonPackageName(name),
@@ -1916,7 +2001,7 @@ export const discoverRepository = (
                   (sources.some((source) => source.workspace) ||
                     (targetIdentity !== undefined &&
                       sourceIdentities.includes(targetIdentity)))
-                    ? uvTarget.name
+                    ? uvTarget.identity
                     : undefined;
                 const cacheInputsComplete = sources.every(
                   (source, index) =>
@@ -1931,7 +2016,7 @@ export const discoverRepository = (
             Effect.map(
               (dependencies) =>
                 [
-                  packageDraft.name,
+                  packageDraft.identity,
                   {
                     internalDependencies: dependencies.flatMap(
                       ({ internalDependency }) =>
@@ -1949,7 +2034,7 @@ export const discoverRepository = (
         { concurrency: 8 },
       ),
     );
-    const packages: ReadonlyArray<RepositoryPackage> = drafts
+    const packages: ReadonlyArray<RepositoryPackage> = identifiedDrafts
       .map(({ cargoDependencies, ...packageDraft }) => {
         if (packageDraft.manager === "cargo") {
           const resolvedDependencies = cargoDependencies.map((dependency) => ({
@@ -1967,13 +2052,13 @@ export const discoverRepository = (
                   target !== undefined,
               ),
             internalDependencies: resolvedDependencies.flatMap(({ target }) =>
-              target === undefined ? [] : [target.name],
+              target === undefined ? [] : [target.identity],
             ),
           };
         }
         if (packageDraft.manager === "uv") {
           const resolution = uvDependencyResolutionByName.get(
-            packageDraft.name,
+            packageDraft.identity,
           );
           return {
             ...packageDraft,
@@ -1994,7 +2079,7 @@ export const discoverRepository = (
           internalDependencies: resolution?.internalDependencies ?? [],
         };
       })
-      .sort((left, right) => left.name.localeCompare(right.name));
+      .sort((left, right) => left.identity.localeCompare(right.identity));
     const rootTasks = Object.fromEntries(
       Object.entries(rootConfiguration.value.tasks ?? {}).flatMap(
         ([name, definition]) =>
@@ -2006,6 +2091,7 @@ export const discoverRepository = (
     const rootDependencyResolution =
       javascriptDependencyResolutionByDirectory.get(normalizePath(root));
     const rootPackage: RepositoryPackage = {
+      identity: "//",
       name: "//",
       directory: root,
       relativeDirectory: ".",
@@ -2023,6 +2109,10 @@ export const discoverRepository = (
       manifest: rootManifest,
     };
     const lockfile = yield* findLockfile(root, managerIdentity.name);
+    const packagesByIdentity = new Map<string, RepositoryPackage>([
+      [rootPackage.identity, rootPackage],
+      ...packages.map((entry) => [entry.identity, entry] as const),
+    ]);
     return {
       root,
       manager: managerIdentity.name,
@@ -2032,10 +2122,8 @@ export const discoverRepository = (
       rootPackage,
       lockfile,
       packages,
-      packagesByName: new Map<string, RepositoryPackage>([
-        [rootPackage.name, rootPackage],
-        ...packages.map((entry) => [entry.name, entry] as const),
-      ]),
+      packagesByIdentity,
+      packagesByName: packagesByIdentity,
     };
   });
 

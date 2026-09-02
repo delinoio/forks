@@ -28,7 +28,7 @@ const packageDependents = (
   for (const packageModel of repository.packages) {
     for (const dependency of packageModel.internalDependencies) {
       const entries = dependents.get(dependency) ?? [];
-      entries.push(packageModel.name);
+      entries.push(packageModel.identity);
       dependents.set(dependency, entries);
     }
   }
@@ -68,6 +68,7 @@ const selectFilterBase = (
     repository.packages
       .filter(
         (packageModel) =>
+          packageModel.identity === pattern ||
           packageModel.name === pattern ||
           matchesGlob(packageModel.name, pattern) ||
           matchesGlob(
@@ -75,7 +76,7 @@ const selectFilterBase = (
             pattern.replace(/^\.\//, ""),
           ),
       )
-      .map((packageModel) => packageModel.name),
+      .map((packageModel) => packageModel.identity),
   );
 };
 
@@ -91,7 +92,7 @@ export const selectPackages = (
   const selected = new Set<string>(
     filters.some((filter) => !filter.startsWith("!"))
       ? []
-      : repository.packages.map((packageModel) => packageModel.name),
+      : repository.packages.map((packageModel) => packageModel.identity),
   );
   const applyFilter = (rawFilter: string): void => {
     const negative = rawFilter.startsWith("!");
@@ -110,7 +111,7 @@ export const selectPackages = (
       for (const name of expandPackageClosure(
         baseMatches,
         (name) =>
-          repository.packagesByName.get(name)?.internalDependencies ?? [],
+          repository.packagesByIdentity.get(name)?.internalDependencies ?? [],
       )) {
         matches.add(name);
       }
@@ -135,19 +136,29 @@ export const selectPackages = (
     applyFilter(filter);
   }
   return repository.packages.filter((packageModel) =>
-    selected.has(packageModel.name),
+    selected.has(packageModel.identity),
   );
 };
 
-const taskId = (packageName: string, task: string): string =>
-  `${packageName}#${task}`;
+const taskId = (packageModel: RepositoryPackage, task: string): string =>
+  `${packageModel.identity}#${task}`;
 
 const taskDefinition = (
   packageModel: RepositoryPackage,
   task: string,
 ): Pipeline | undefined =>
+  packageModel.tasks[`${packageModel.identity}#${task}`] ??
   packageModel.tasks[`${packageModel.name}#${task}`] ??
   packageModel.tasks[task];
+
+const packagesMatchingIdentityOrName = (
+  repository: RepositoryModel,
+  value: string,
+): ReadonlyArray<RepositoryPackage> =>
+  [repository.rootPackage, ...repository.packages].filter(
+    (packageModel) =>
+      packageModel.identity === value || packageModel.name === value,
+  );
 
 const resolveTaskReference = (
   repository: RepositoryModel,
@@ -157,7 +168,7 @@ const resolveTaskReference = (
   if (reference.startsWith("^")) {
     const task = reference.slice(1);
     return packageModel.internalDependencies.flatMap((name) => {
-      const dependency = repository.packagesByName.get(name);
+      const dependency = repository.packagesByIdentity.get(name);
       return dependency === undefined ? [] : [[dependency, task] as const];
     });
   }
@@ -165,8 +176,9 @@ const resolveTaskReference = (
   if (separator !== -1) {
     const packageName = reference.slice(0, separator);
     const task = reference.slice(separator + 1);
-    const dependency = repository.packagesByName.get(packageName);
-    return dependency === undefined ? [] : [[dependency, task]];
+    return packagesMatchingIdentityOrName(repository, packageName).map(
+      (dependency) => [dependency, task] as const,
+    );
   }
   return [[packageModel, reference]];
 };
@@ -189,7 +201,7 @@ export const buildTaskGraph = (
     if (packageModel.excludedTasks.has(task)) {
       return undefined;
     }
-    const id = taskId(packageModel.name, task);
+    const id = taskId(packageModel, task);
     const configuredDefinition = taskDefinition(packageModel, task);
     const definition = configuredDefinition ?? {};
     const command = packageModel.scripts[task];
@@ -265,8 +277,8 @@ export const buildTaskGraph = (
     return id;
   };
 
-  const selectedPackageNames = new Set(
-    packages.map((packageModel) => packageModel.name),
+  const selectedPackageIdentities = new Set(
+    packages.map((packageModel) => packageModel.identity),
   );
   const entrypoints = tasks.flatMap((task) => {
     if (task.startsWith("//#")) {
@@ -275,17 +287,16 @@ export const buildTaskGraph = (
     }
     const explicitSeparator = task.indexOf("#");
     if (explicitSeparator !== -1) {
-      const explicitPackage = repository.packagesByName.get(
+      return packagesMatchingIdentityOrName(
+        repository,
         task.slice(0, explicitSeparator),
-      );
-      if (
-        explicitPackage === undefined ||
-        !selectedPackageNames.has(explicitPackage.name)
-      ) {
-        return [];
-      }
-      const id = addNode(explicitPackage, task.slice(explicitSeparator + 1));
-      return id === undefined ? [] : [id];
+      ).flatMap((explicitPackage) => {
+        if (!selectedPackageIdentities.has(explicitPackage.identity)) {
+          return [];
+        }
+        const id = addNode(explicitPackage, task.slice(explicitSeparator + 1));
+        return id === undefined ? [] : [id];
+      });
     }
     return packages.flatMap((packageModel) => {
       const id = addNode(packageModel, task);

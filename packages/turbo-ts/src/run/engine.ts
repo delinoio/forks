@@ -76,6 +76,7 @@ import {
   cargoHomeConfigurationPresent,
   discoverRepository,
   listRepositoryFiles,
+  npmUserConfigurationPresent,
   type RepositoryModel,
   type RepositoryPackage,
 } from "../repository/model.js";
@@ -632,7 +633,7 @@ const findAffectedPackages = (
       }
       return {
         packages: new Set(
-          repository.packages.map((packageModel) => packageModel.name),
+          repository.packages.map((packageModel) => packageModel.identity),
         ),
         changedFiles: [],
         rootChanged: true,
@@ -678,7 +679,9 @@ const findAffectedPackages = (
       (!globalInputsAreTaskAware && ordinaryRootChanged);
     return {
       packages: rootChanged
-        ? new Set(repository.packages.map((packageModel) => packageModel.name))
+        ? new Set(
+            repository.packages.map((packageModel) => packageModel.identity),
+          )
         : new Set(
             repository.packages
               .filter((packageModel) =>
@@ -688,7 +691,7 @@ const findAffectedPackages = (
                     undefined,
                 ),
               )
-              .map((packageModel) => packageModel.name),
+              .map((packageModel) => packageModel.identity),
           ),
       changedFiles,
       rootChanged,
@@ -885,30 +888,32 @@ const affectedTaskEntrypoints = (
     graph.entrypoints.filter((id) => selectedNodes.has(id)),
   );
   if (traversal.dependencies || traversal.dependents) {
-    const matchingPackageNames = new Set(
+    const matchingPackageIdentities = new Set(
       [...matchingNodes].flatMap((id) => {
-        const name = graph.nodes.get(id)?.package.name;
-        return name === undefined || name === "//" ? [] : [name];
+        const identity = graph.nodes.get(id)?.package.identity;
+        return identity === undefined || identity === "//" ? [] : [identity];
       }),
     );
     const prefix = traversal.dependents ? "..." : "";
     const suffix = traversal.dependencies ? "..." : "";
-    const expandedPackageNames = new Set(
-      matchingPackageNames.size === 0
+    const expandedPackageIdentities = new Set(
+      matchingPackageIdentities.size === 0
         ? []
         : selectPackages(
             repository,
-            [...matchingPackageNames].map(
-              (name) => `${prefix}${name}${suffix}`,
+            [...matchingPackageIdentities].map(
+              (identity) => `${prefix}${identity}${suffix}`,
             ),
-          ).map((packageModel) => packageModel.name),
+          ).map((packageModel) => packageModel.identity),
     );
-    for (const name of matchingPackageNames) expandedPackageNames.delete(name);
+    for (const identity of matchingPackageIdentities) {
+      expandedPackageIdentities.delete(identity);
+    }
     for (const id of graph.entrypoints) {
       const node = graph.nodes.get(id)!;
       if (
         node.command !== undefined &&
-        expandedPackageNames.has(node.package.name)
+        expandedPackageIdentities.has(node.package.identity)
       ) {
         selectedEntrypoints.add(id);
       }
@@ -946,7 +951,7 @@ const selectAffectedTasks = (
   graph: TaskGraph,
   filters: ReadonlyArray<string>,
   affectedBySelector: ReadonlyMap<string, AffectedPackages>,
-  retainedPackageNames: ReadonlySet<string> = new Set(),
+  retainedPackageIdentities: ReadonlySet<string> = new Set(),
   windowsPathSeparators = false,
 ): TaskGraph => {
   const rangeFilters = filters.flatMap((filter) => {
@@ -964,7 +969,7 @@ const selectAffectedTasks = (
     positiveFilters.length === 0
       ? graph.entrypoints
       : graph.entrypoints.filter((id) =>
-          retainedPackageNames.has(graph.nodes.get(id)!.package.name),
+          retainedPackageIdentities.has(graph.nodes.get(id)!.package.identity),
         ),
   );
   for (const { filter, affected } of positiveFilters) {
@@ -1556,14 +1561,9 @@ const usesCargoConfigurationOverride = (
     (argument) => argument === "--config" || argument.startsWith("--config="),
   );
 
-export const isTaskScopeCacheable = (
+const isTaskScopeStaticallyCacheable = (
   node: TaskNode,
-  passThroughArguments: ReadonlyArray<string>,
-  scope: TaskCommandScope = packageTaskCommandScope,
-  environment: Readonly<Record<string, string | undefined>> = {},
-  caseInsensitiveEnvironmentNames = false,
-  sourceEnvironment: Readonly<Record<string, string | undefined>> = environment,
-  cargoHomeHasConfiguration = false,
+  scope: TaskCommandScope,
 ): boolean =>
   (scope.kind === "cargo-workspace" ? scope.members : [node]).every(
     (member) =>
@@ -1571,7 +1571,17 @@ export const isTaskScopeCacheable = (
       member.package.cacheInputsComplete &&
       member.definition.cache !== false &&
       member.definition.persistent !== true,
-  ) &&
+  );
+
+export const isTaskScopeDynamicallyCacheable = (
+  node: TaskNode,
+  passThroughArguments: ReadonlyArray<string>,
+  environment: Readonly<Record<string, string | undefined>> = {},
+  caseInsensitiveEnvironmentNames = false,
+  sourceEnvironment: Readonly<Record<string, string | undefined>> = environment,
+  cargoHomeHasConfiguration = false,
+  npmUserHasConfiguration = false,
+): boolean =>
   !usesAlternateCargoBuildOutputs(node, passThroughArguments) &&
   !usesCargoConfigurationOverride(node, passThroughArguments) &&
   !usesAlternateUvBuildOutputs(node, passThroughArguments) &&
@@ -1588,7 +1598,29 @@ export const isTaskScopeCacheable = (
     environment,
     caseInsensitiveEnvironmentNames,
   ) &&
-  !(isCargoCompilationTask(node) && cargoHomeHasConfiguration);
+  !(isCargoCompilationTask(node) && cargoHomeHasConfiguration) &&
+  !(node.package.manager === "npm" && npmUserHasConfiguration);
+
+export const isTaskScopeCacheable = (
+  node: TaskNode,
+  passThroughArguments: ReadonlyArray<string>,
+  scope: TaskCommandScope = packageTaskCommandScope,
+  environment: Readonly<Record<string, string | undefined>> = {},
+  caseInsensitiveEnvironmentNames = false,
+  sourceEnvironment: Readonly<Record<string, string | undefined>> = environment,
+  cargoHomeHasConfiguration = false,
+  npmUserHasConfiguration = false,
+): boolean =>
+  isTaskScopeStaticallyCacheable(node, scope) &&
+  isTaskScopeDynamicallyCacheable(
+    node,
+    passThroughArguments,
+    environment,
+    caseInsensitiveEnvironmentNames,
+    sourceEnvironment,
+    cargoHomeHasConfiguration,
+    npmUserHasConfiguration,
+  );
 
 const hashDependencyGraph = (graph: TaskGraph): TaskGraph => ({
   ...graph,
@@ -1606,6 +1638,7 @@ const hashDependencyGraph = (graph: TaskGraph): TaskGraph => ({
 export const taskIdsWithUnrestorableCacheInputs = (
   graph: TaskGraph,
   scopes: ReadonlyMap<string, TaskCommandScope> = new Map(),
+  runtimeUnrestorableTaskIds: ReadonlySet<string> = new Set(),
 ): ReadonlySet<string> => {
   const uncacheable = new Set<string>();
   for (const id of topologicalOrder(hashDependencyGraph(graph))) {
@@ -1614,6 +1647,7 @@ export const taskIdsWithUnrestorableCacheInputs = (
     const scopeNodes =
       scope?.kind === "cargo-workspace" ? scope.members : [node];
     if (
+      runtimeUnrestorableTaskIds.has(id) ||
       scopeNodes.some(
         (member) =>
           !member.package.cachePathRestorable ||
@@ -1724,6 +1758,61 @@ const prepareTaskLogPath = (
       );
   });
 
+interface TaskScopeCacheability {
+  readonly cacheable: boolean;
+  readonly runtimeInputsRestorable: boolean;
+}
+
+const resolveTaskScopeCacheability = (
+  repository: RepositoryModel,
+  node: TaskNode,
+  options: ResolvedRunOptions,
+  sourceEnvironment: Readonly<Record<string, string | undefined>>,
+  scope: TaskCommandScope = packageTaskCommandScope,
+  caseInsensitiveEnvironmentNames = false,
+): Effect.Effect<TaskScopeCacheability, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const executionEnvironment = taskScopeEnvironment(
+      repository,
+      node,
+      sourceEnvironment,
+      options.environmentMode,
+      options.frameworkInference,
+      scope,
+      caseInsensitiveEnvironmentNames,
+    );
+    const executionDirectory = taskExecutionDirectory(node, scope);
+    const cargoHomeHasConfiguration = isCargoCompilationTask(node)
+      ? yield* cargoHomeConfigurationPresent(
+          executionDirectory,
+          executionEnvironment,
+          caseInsensitiveEnvironmentNames,
+        )
+      : false;
+    const npmUserHasConfiguration =
+      node.package.manager === "npm"
+        ? yield* npmUserConfigurationPresent(
+            executionDirectory,
+            executionEnvironment,
+            caseInsensitiveEnvironmentNames,
+          )
+        : false;
+    const runtimeInputsRestorable = isTaskScopeDynamicallyCacheable(
+      node,
+      options.passThroughArguments,
+      executionEnvironment,
+      caseInsensitiveEnvironmentNames,
+      sourceEnvironment,
+      cargoHomeHasConfiguration,
+      npmUserHasConfiguration,
+    );
+    return {
+      cacheable:
+        isTaskScopeStaticallyCacheable(node, scope) && runtimeInputsRestorable,
+      runtimeInputsRestorable,
+    };
+  });
+
 const executeTask = (
   repository: RepositoryModel,
   node: TaskNode,
@@ -1731,7 +1820,7 @@ const executeTask = (
   hash: TaskHashResult,
   sourceEnvironment: Readonly<Record<string, string | undefined>>,
   scope: TaskCommandScope = packageTaskCommandScope,
-  cacheInputsRestorable = true,
+  cacheable = true,
   withCachePublicationPermit: CachePublicationPermit = (publication) =>
     publication,
   logIdentifier = node.task,
@@ -1770,28 +1859,7 @@ const executeTask = (
     );
     const cacheNodes =
       scope.kind === "cargo-workspace" ? scope.members : [node];
-    const executionDirectory =
-      scope.kind === "cargo-workspace"
-        ? scope.directory
-        : node.package.directory;
-    const cargoHomeHasConfiguration = isCargoCompilationTask(node)
-      ? yield* cargoHomeConfigurationPresent(
-          executionDirectory,
-          executionEnvironment,
-          platform === "win32",
-        )
-      : false;
-    const cacheable =
-      cacheInputsRestorable &&
-      isTaskScopeCacheable(
-        node,
-        options.passThroughArguments,
-        scope,
-        executionEnvironment,
-        platform === "win32",
-        sourceEnvironment,
-        cargoHomeHasConfiguration,
-      );
+    const executionDirectory = taskExecutionDirectory(node, scope);
     const localOptions = {
       directory: options.cacheDirectory,
       maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
@@ -2256,15 +2324,15 @@ export const planCargoWorkspaceTasks = (
         packageModel.workspaceDirectory ===
           representative.package.workspaceDirectory,
     );
-    const groupedPackageNames = new Set(
-      members.map((member) => member.package.name),
+    const groupedPackageIdentities = new Set(
+      members.map((member) => member.package.identity),
     );
     if (
       !hasCompatibleCargoWorkspaceRuntime(members) ||
       workspaceMembers.some(
         (packageModel) =>
           packageModel.tasks[representative.task] === undefined ||
-          !groupedPackageNames.has(packageModel.name),
+          !groupedPackageIdentities.has(packageModel.identity),
       )
     ) {
       continue;
@@ -2675,14 +2743,14 @@ export const executeRun = (
       (filter) =>
         !filter.startsWith("!") && gitRangeSelector(filter) !== undefined,
     );
-    const retainedPackageNames = new Set(
+    const retainedPackageIdentities = new Set(
       !useTaskInputs || positivePackageFilters.length === 0
         ? []
         : selectPackages(
             repository,
             [...positivePackageFilters, ...negativePackageFilters],
             affected.ranges,
-          ).map((packageModel) => packageModel.name),
+          ).map((packageModel) => packageModel.identity),
     );
     const packageFilters = !useTaskInputs
       ? affected.filters
@@ -2697,18 +2765,26 @@ export const executeRun = (
       flags?.strictTaskEntrypointSelection === true,
     );
     const entrypointIds = new Set(validationGraph.entrypoints);
-    const entrypointTasks = new Set(
-      validationGraph.entrypoints.map(
-        (entrypoint) => validationGraph.nodes.get(entrypoint)!.task,
-      ),
+    const entrypointNodes = validationGraph.entrypoints.map(
+      (entrypoint) => validationGraph.nodes.get(entrypoint)!,
     );
     const unresolvedTasks = [
       ...new Set(
-        options.tasks.filter((task) =>
-          task.startsWith("//#") || task.includes("#")
-            ? !entrypointIds.has(task)
-            : !entrypointTasks.has(task),
-        ),
+        options.tasks.filter((task) => {
+          if (task.startsWith("//#")) return !entrypointIds.has(task);
+          const separator = task.indexOf("#");
+          if (separator === -1) {
+            return !entrypointNodes.some((node) => node.task === task);
+          }
+          const packageSelector = task.slice(0, separator);
+          const taskName = task.slice(separator + 1);
+          return !entrypointNodes.some(
+            (node) =>
+              node.task === taskName &&
+              (node.package.identity === packageSelector ||
+                node.package.name === packageSelector),
+          );
+        }),
       ),
     ];
     if (unresolvedTasks.length > 0) {
@@ -2737,7 +2813,7 @@ export const executeRun = (
           unfilteredGraph,
           affected.filters,
           affected.affectedBySelector,
-          retainedPackageNames,
+          retainedPackageIdentities,
           platform === "win32",
         )
       : unfilteredGraph;
@@ -2748,6 +2824,21 @@ export const executeRun = (
       affected.filters.length === 0,
     );
     const graph = cargoWorkspacePlan.graph;
+    const cacheabilityByTask = new Map(
+      yield* Effect.forEach(
+        [...graph.nodes],
+        ([id, node]) =>
+          resolveTaskScopeCacheability(
+            repository,
+            node,
+            options,
+            environment,
+            cargoWorkspacePlan.scopes.get(id),
+            platform === "win32",
+          ).pipe(Effect.map((cacheability) => [id, cacheability] as const)),
+        { concurrency: 8 },
+      ),
+    );
     const hashes = yield* applyCargoWorkspaceHashes(
       repository,
       graph,
@@ -2758,6 +2849,11 @@ export const executeRun = (
     const unrestorableCacheInputs = taskIdsWithUnrestorableCacheInputs(
       graph,
       cargoWorkspacePlan.scopes,
+      new Set(
+        [...cacheabilityByTask].flatMap(([id, cacheability]) =>
+          cacheability.runtimeInputsRestorable ? [] : [id],
+        ),
+      ),
     );
     const logIdentifiers = taskLogIdentifiers(
       graph,
@@ -2810,7 +2906,8 @@ export const executeRun = (
           hashes.get(id)!,
           environment,
           cargoWorkspacePlan.scopes.get(id),
-          !unrestorableCacheInputs.has(id),
+          cacheabilityByTask.get(id)!.cacheable &&
+            !unrestorableCacheInputs.has(id),
           withCachePublicationPermit,
           logIdentifiers.get(id),
         ).pipe(

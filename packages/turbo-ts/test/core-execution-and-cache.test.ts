@@ -67,6 +67,7 @@ import { xxhash64Hex } from "../src/hash/xxhash64.js";
 import {
   cargoHomeConfigurationPresent,
   discoverRepository,
+  npmUserConfigurationPresent,
 } from "../src/repository/model.js";
 import {
   executeRun,
@@ -492,9 +493,22 @@ describe("core CLI execution", () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/polyglot`;
     const commandDirectory = `${directory}/commands`;
-    const cargoPackageId = `path+file://${packageDirectory}#rust-scope@0.1.0`;
-    const cargoLog = `${packageDirectory}/.turbo/turbo-rust-scope%0023build.log`;
-    const uvLog = `${packageDirectory}/.turbo/turbo-python-scope%0023build.log`;
+    const packageName = "polyglot-scope";
+    const cargoPackageId = `path+file://${packageDirectory}#${packageName}@0.1.0`;
+    const logs = new Map([
+      [
+        "javascript scope output",
+        `${packageDirectory}/.turbo/turbo-javascript%003A${packageName}%0023build.log`,
+      ],
+      [
+        "cargo scope output",
+        `${packageDirectory}/.turbo/turbo-cargo%003A${packageName}%0023build.log`,
+      ],
+      [
+        "uv scope output",
+        `${packageDirectory}/.turbo/turbo-uv%003A${packageName}%0023build.log`,
+      ],
+    ]);
     try {
       const configurationPath = `${directory}/turbo.json`;
       const configuration = JSON.parse(
@@ -521,22 +535,33 @@ describe("core CLI execution", () => {
         `${packageDirectory}/package.json`,
         `${JSON.stringify(
           {
-            name: "javascript-scope",
+            name: packageName,
             version: "0.1.0",
-            scripts: { build: "node -e \"console.log('javascript scope')\"" },
+            scripts: {
+              build: "node -e \"console.log('javascript scope output')\"",
+            },
           },
           null,
           2,
         )}\n`,
       );
+      const appManifestPath = `${directory}/packages/app/package.json`;
+      const appManifest = JSON.parse(
+        await readFile(appManifestPath, "utf8"),
+      ) as { dependencies: Record<string, string> };
+      appManifest.dependencies[packageName] = "workspace:*";
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, null, 2)}\n`,
+      );
       await writeFile(
         `${packageDirectory}/Cargo.toml`,
-        '[package]\nname = "rust-scope"\nversion = "0.1.0"\nedition = "2024"\n',
+        `[package]\nname = "${packageName}"\nversion = "0.1.0"\nedition = "2024"\n`,
       );
       await writeFile(`${packageDirectory}/src/lib.rs`, "pub fn value() {}\n");
       await writeFile(
         `${packageDirectory}/Cargo.lock`,
-        'version = 4\n\n[[package]]\nname = "rust-scope"\nversion = "0.1.0"\n',
+        `version = 4\n\n[[package]]\nname = "${packageName}"\nversion = "0.1.0"\n`,
       );
       await writeFile(
         `${directory}/pyproject.toml`,
@@ -544,7 +569,7 @@ describe("core CLI execution", () => {
       );
       await writeFile(
         `${packageDirectory}/pyproject.toml`,
-        '[project]\nname = "python-scope"\nversion = "0.1.0"\ndependencies = []\n',
+        `[project]\nname = "${packageName}"\nversion = "0.1.0"\ndependencies = []\n`,
       );
       await writeFile(`${directory}/uv.lock`, "version = 1\nrevision = 1\n");
       await mkdir(commandDirectory, { recursive: true });
@@ -555,7 +580,7 @@ describe("core CLI execution", () => {
         packages: [
           {
             id: cargoPackageId,
-            name: "rust-scope",
+            name: packageName,
             manifest_path: `${packageDirectory}/Cargo.toml`,
             dependencies: [],
             targets: [{ kind: ["lib"], name: "rust_scope" }],
@@ -586,8 +611,7 @@ describe("core CLI execution", () => {
         "build",
         "--cwd",
         directory,
-        "--filter=rust-scope",
-        "--filter=python-scope",
+        "--filter={packages/polyglot}",
         "--concurrency=2",
       ];
       const env = {
@@ -597,21 +621,48 @@ describe("core CLI execution", () => {
       };
       const first = await run(process.execPath, args, repositoryRoot, env);
       expect(first.exitCode, first.stderr).toBe(0);
-      expect(await readFile(cargoLog, "utf8")).toContain("cargo scope output");
-      expect(await readFile(cargoLog, "utf8")).not.toContain("uv scope output");
-      expect(await readFile(uvLog, "utf8")).toContain("uv scope output");
-      expect(await readFile(uvLog, "utf8")).not.toContain("cargo scope output");
-
-      await rm(cargoLog);
-      await rm(uvLog);
+      for (const [expectedOutput, log] of logs) {
+        const contents = await readFile(log, "utf8");
+        expect(contents).toContain(expectedOutput);
+        for (const otherOutput of logs.keys()) {
+          if (otherOutput !== expectedOutput) {
+            expect(contents).not.toContain(otherOutput);
+          }
+        }
+        await rm(log);
+      }
       const second = await run(process.execPath, args, repositoryRoot, env);
       expect(second.exitCode, second.stderr).toBe(0);
-      expect(second.stdout).toContain("rust-scope:build: cache hit");
-      expect(second.stdout).toContain("python-scope:build: cache hit");
-      expect(await readFile(cargoLog, "utf8")).toContain("cargo scope output");
-      expect(await readFile(cargoLog, "utf8")).not.toContain("uv scope output");
-      expect(await readFile(uvLog, "utf8")).toContain("uv scope output");
-      expect(await readFile(uvLog, "utf8")).not.toContain("cargo scope output");
+      expect(
+        second.stdout.match(/polyglot-scope:build: cache hit/g),
+      ).toHaveLength(3);
+      for (const [expectedOutput, log] of logs) {
+        const contents = await readFile(log, "utf8");
+        expect(contents).toContain(expectedOutput);
+        for (const otherOutput of logs.keys()) {
+          if (otherOutput !== expectedOutput) {
+            expect(contents).not.toContain(otherOutput);
+          }
+        }
+      }
+      const dependent = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--filter=synthetic-app",
+          "--no-cache",
+        ],
+        repositoryRoot,
+        env,
+      );
+      expect(dependent.exitCode, dependent.stderr).toBe(0);
+      expect(dependent.stdout).toContain("javascript scope output");
+      expect(dependent.stdout).not.toContain("cargo scope output");
+      expect(dependent.stdout).not.toContain("uv scope output");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -6042,6 +6093,7 @@ describe("core CLI execution", () => {
       expect(await detect({})).toBe(false);
 
       const cargoPackage = {
+        identity: "synthetic-cargo",
         name: "synthetic-cargo",
         directory,
         relativeDirectory: ".",
@@ -6093,6 +6145,242 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   });
+
+  it("detects effective npm user configuration", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-npm-home-"));
+    const homeDirectory = `${directory}/home`;
+    const customConfiguration = `${directory}/custom.npmrc`;
+    const detect = (
+      environment: Readonly<Record<string, string | undefined>>,
+      caseInsensitiveEnvironmentNames = false,
+    ) =>
+      Effect.runPromise(
+        npmUserConfigurationPresent(
+          directory,
+          environment,
+          caseInsensitiveEnvironmentNames,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+    try {
+      await mkdir(homeDirectory, { recursive: true });
+      await writeFile(`${homeDirectory}/.npmrc`, "script-shell=/bin/sh\n");
+      expect(await detect({ HOME: homeDirectory })).toBe(true);
+      expect(await detect({ home: homeDirectory }, true)).toBe(true);
+
+      await writeFile(customConfiguration, "script-shell=/bin/bash\n");
+      expect(
+        await detect({
+          HOME: homeDirectory,
+          npm_config_userconfig: "custom.npmrc",
+        }),
+      ).toBe(true);
+      expect(
+        await detect({
+          HOME: homeDirectory,
+          NPM_CONFIG_USERCONFIG: "missing.npmrc",
+        }),
+      ).toBe(false);
+      expect(await detect({})).toBe(false);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("bypasses npm caching when effective user configuration is present", async () => {
+    const directory = await makeFixture();
+    const homeDirectory = await mkdtemp(join(tmpdir(), "turbo-ts-npm-run-"));
+    try {
+      const rootManifestPath = `${directory}/package.json`;
+      const rootManifest = JSON.parse(
+        await readFile(rootManifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      rootManifest.packageManager = "npm@11.6.0";
+      rootManifest.workspaces = ["packages/*"];
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, null, 2)}\n`,
+      );
+      const libraryManifestPath = `${directory}/packages/library/package.json`;
+      const libraryManifest = JSON.parse(
+        await readFile(libraryManifestPath, "utf8"),
+      ) as { scripts: Record<string, string> };
+      libraryManifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); const path='../../npm-user-runs.txt'; const count=fs.existsSync(path)?Number(fs.readFileSync(path,'utf8')):0; fs.writeFileSync(path,String(count+1))\"";
+      await writeFile(
+        libraryManifestPath,
+        `${JSON.stringify(libraryManifest, null, 2)}\n`,
+      );
+      await writeFile(`${homeDirectory}/.npmrc`, "script-shell=/bin/sh\n");
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      const environment = {
+        HOME: homeDirectory,
+        NO_COLOR: "1",
+        TURBO_TELEMETRY_DISABLED: "1",
+      };
+      const first = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
+      const second = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
+      expect(first.exitCode, first.stderr).toBe(0);
+      expect(second.exitCode, second.stderr).toBe(0);
+      expect(second.stdout).not.toContain("cache hit");
+      expect(await readFile(`${directory}/npm-user-runs.txt`, "utf8")).toBe(
+        "2",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+      await rm(homeDirectory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("propagates Cargo-home cache bypasses to dependent tasks", async () => {
+    if (process.platform === "win32") return;
+    const directory = await makeFixture();
+    const homeDirectory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-cargo-dependent-"),
+    );
+    const cargoDirectory = `${directory}/packages/rust-scope`;
+    const commandDirectory = `${directory}/commands`;
+    const cargoPackageId = `path+file://${cargoDirectory}#rust-scope@0.1.0`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, Record<string, unknown>>;
+      };
+      configuration.futureFlags = {
+        ...configuration.futureFlags,
+        experimentalCargoWorkspaces: true,
+      };
+      configuration.tasks.build = {
+        ...configuration.tasks.build,
+        cache: true,
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const libraryConfigurationPath = `${directory}/packages/library/turbo.json`;
+      const libraryConfiguration = {
+        extends: ["//"],
+        tasks: {
+          build: {
+            dependsOn: ["rust-scope#build"],
+            outputs: ["dist/**"],
+          },
+        },
+      };
+      await writeFile(
+        libraryConfigurationPath,
+        `${JSON.stringify(libraryConfiguration, null, 2)}\n`,
+      );
+      const libraryManifestPath = `${directory}/packages/library/package.json`;
+      const libraryManifest = JSON.parse(
+        await readFile(libraryManifestPath, "utf8"),
+      ) as { scripts: Record<string, string> };
+      libraryManifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); const path='../../cargo-dependent-runs.txt'; const count=fs.existsSync(path)?Number(fs.readFileSync(path,'utf8')):0; fs.writeFileSync(path,String(count+1))\"";
+      await writeFile(
+        libraryManifestPath,
+        `${JSON.stringify(libraryManifest, null, 2)}\n`,
+      );
+      await mkdir(`${cargoDirectory}/src`, { recursive: true });
+      await writeFile(
+        `${cargoDirectory}/Cargo.toml`,
+        '[package]\nname = "rust-scope"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(`${cargoDirectory}/src/lib.rs`, "pub fn value() {}\n");
+      await writeFile(
+        `${cargoDirectory}/Cargo.lock`,
+        'version = 4\n\n[[package]]\nname = "rust-scope"\nversion = "0.1.0"\n',
+      );
+      await mkdir(`${homeDirectory}/.cargo`, { recursive: true });
+      await writeFile(
+        `${homeDirectory}/.cargo/config.toml`,
+        '[build]\nrustflags = ["--cfg", "external_home"]\n',
+      );
+      await mkdir(commandDirectory, { recursive: true });
+      const metadata = JSON.stringify({
+        workspace_root: cargoDirectory,
+        workspace_members: [cargoPackageId],
+        target_directory: `${cargoDirectory}/target`,
+        packages: [
+          {
+            id: cargoPackageId,
+            name: "rust-scope",
+            manifest_path: `${cargoDirectory}/Cargo.toml`,
+            dependencies: [],
+            targets: [{ kind: ["lib"], name: "rust_scope" }],
+          },
+        ],
+      });
+      const cargoCommand = `${commandDirectory}/cargo`;
+      await writeFile(
+        cargoCommand,
+        `#!/usr/bin/env node\nif (process.argv[2] === "metadata") process.stdout.write(${JSON.stringify(metadata)}); else console.log("cargo dependency output");\n`,
+      );
+      await writeFile(
+        `${commandDirectory}/rustc`,
+        '#!/usr/bin/env node\nconsole.log("rustc 1.96.0-nightly");\nconsole.log("host: synthetic-target-triple");\n',
+      );
+      await chmod(cargoCommand, 0o755);
+      await chmod(`${commandDirectory}/rustc`, 0o755);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      const environment = {
+        HOME: homeDirectory,
+        PATH: `${commandDirectory}${delimiter}${process.env.PATH ?? ""}`,
+        NO_COLOR: "1",
+        TURBO_TELEMETRY_DISABLED: "1",
+      };
+      const first = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
+      const second = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
+      expect(first.exitCode, first.stderr).toBe(0);
+      expect(second.exitCode, second.stderr).toBe(0);
+      expect(second.stdout).not.toContain("synthetic-library:build: cache hit");
+      expect(
+        await readFile(`${directory}/cargo-dependent-runs.txt`, "utf8"),
+      ).toBe("2");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+      await rm(homeDirectory, { force: true, recursive: true });
+    }
+  }, 20_000);
 
   it("keeps Cargo discovery locked and disables configured target caching", async () => {
     const directory = await makeFixture();

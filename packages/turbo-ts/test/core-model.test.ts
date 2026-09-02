@@ -66,6 +66,7 @@ const packageModel = (
   dependencies: ReadonlyArray<string>,
   task: Record<string, unknown> = {},
 ): RepositoryPackage => ({
+  identity: name,
   name,
   directory: `/repo/packages/${name}`,
   relativeDirectory: `packages/${name}`,
@@ -93,6 +94,10 @@ const repository = (
     relativeDirectory: ".",
     canonicalRelativeDirectory: ".",
   } satisfies RepositoryPackage;
+  const packagesByIdentity = new Map([
+    [rootPackage.identity, rootPackage],
+    ...packages.map((entry) => [entry.identity, entry] as const),
+  ]);
   return {
     root: "/repo",
     manager: "pnpm",
@@ -105,10 +110,8 @@ const repository = (
     },
     rootPackage,
     packages,
-    packagesByName: new Map([
-      [rootPackage.name, rootPackage],
-      ...packages.map((entry) => [entry.name, entry] as const),
-    ]),
+    packagesByIdentity,
+    packagesByName: packagesByIdentity,
   };
 };
 
@@ -800,6 +803,7 @@ describe("core repository model", () => {
     expect(parseConcurrency("50%", 8)).toBe(4);
     expect(parseConcurrency("100%", 1)).toBe(1);
     const packageModel = {
+      identity: "app",
       name: "app",
       directory: "/repo/crates/app",
       relativeDirectory: "crates/app",
@@ -1211,6 +1215,35 @@ describe("core repository model", () => {
     expect(isTaskScopeCacheable(node, ["--features=integration"])).toBe(true);
   });
 
+  it("disables npm caching when effective user configuration is present", () => {
+    const npmPackage = {
+      ...packageModel("app", []),
+      manager: "npm" as const,
+    };
+    const npmNode: TaskNode = {
+      id: "app#build",
+      package: npmPackage,
+      task: "build",
+      command: npmPackage.scripts.build,
+      definition: npmPackage.tasks.build!,
+      dependencies: [],
+      with: [],
+    };
+    expect(isTaskScopeCacheable(npmNode, [])).toBe(true);
+    expect(
+      isTaskScopeCacheable(
+        npmNode,
+        [],
+        { kind: "package" },
+        {},
+        false,
+        {},
+        false,
+        true,
+      ),
+    ).toBe(false);
+  });
+
   it("propagates unrestorable workspace inputs through hash edges", () => {
     const unrestorablePackage: RepositoryPackage = {
       ...packageModel("linked", []),
@@ -1240,6 +1273,11 @@ describe("core repository model", () => {
       [incomplete.id],
     );
     const companionOwner = node(packageModel("owner", []), [], [linked.id]);
+    const runtimeBypassed = node(packageModel("runtime-bypassed", []));
+    const runtimeDependent = node(
+      packageModel("runtime-dependent", ["runtime-bypassed"]),
+      [runtimeBypassed.id],
+    );
     const unrelated = node(packageModel("unrelated", []));
     const graph: TaskGraph = {
       nodes: new Map(
@@ -1249,6 +1287,8 @@ describe("core repository model", () => {
           dependent,
           incompleteDependent,
           companionOwner,
+          runtimeBypassed,
+          runtimeDependent,
           unrelated,
         ].map((task) => [task.id, task]),
       ),
@@ -1256,16 +1296,27 @@ describe("core repository model", () => {
         dependent.id,
         incompleteDependent.id,
         companionOwner.id,
+        runtimeDependent.id,
         unrelated.id,
       ],
     };
-    expect([...taskIdsWithUnrestorableCacheInputs(graph)].sort()).toEqual(
+    expect(
+      [
+        ...taskIdsWithUnrestorableCacheInputs(
+          graph,
+          new Map(),
+          new Set([runtimeBypassed.id]),
+        ),
+      ].sort(),
+    ).toEqual(
       [
         companionOwner.id,
         dependent.id,
         incomplete.id,
         incompleteDependent.id,
         linked.id,
+        runtimeBypassed.id,
+        runtimeDependent.id,
       ].sort(),
     );
   });
