@@ -7744,6 +7744,52 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
+  it("restores declared outputs beneath .turbo", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const generatedOutput = `${packageDirectory}/.turbo/generated/value.txt`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: { build: { outputs: Array<string> } } };
+      configuration.tasks.build.outputs = [".turbo/generated/**"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); fs.mkdirSync('.turbo/generated',{recursive:true}); fs.writeFileSync('.turbo/generated/value.txt','generated'); console.log('built hidden output')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      const cold = await run(process.execPath, args, repositoryRoot);
+      expect(cold.exitCode).toBe(0);
+      expect(cold.stdout).toContain("cache miss");
+      await rm(`${packageDirectory}/.turbo`, {
+        force: true,
+        recursive: true,
+      });
+      const warm = await run(process.execPath, args, repositoryRoot);
+      expect(warm.exitCode).toBe(0);
+      expect(warm.stdout).toContain("cache hit");
+      expect(await readFile(generatedOutput, "utf8")).toBe("generated");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("prunes unrelated node_modules during output collection", async () => {
     if (process.platform === "win32") return;
     const directory = await makeFixture();

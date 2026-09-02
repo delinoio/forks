@@ -1173,17 +1173,25 @@ const collectOutputPaths = (
           (pattern) => !pattern.startsWith("!"),
         );
         const files = yield* listRepositoryFiles(directory, {
-          ignoredDirectories: new Set([".git", ".turbo"]),
+          ignoredDirectories: new Set([".git"]),
           includeDirectories: true,
           includeOtherEntries: true,
-          shouldTraverseDirectory: (relativeDirectory) =>
-            positivePatterns.some((pattern) =>
-              canMatchGlobDescendant(
-                relativeDirectory,
-                pattern,
-                windowsPathSeparators,
-              ),
-            ),
+          shouldTraverseDirectory: (relativeDirectory) => {
+            const path = normalizePath(
+              `${directory}/${relativeDirectory}`,
+              windowsPathSeparators,
+            );
+            return (
+              !isPathContained(cacheDirectory, path, windowsPathSeparators) &&
+              positivePatterns.some((pattern) =>
+                canMatchGlobDescendant(
+                  relativeDirectory,
+                  pattern,
+                  windowsPathSeparators,
+                ),
+              )
+            );
+          },
           windowsPathSeparators,
         });
         for (const path of files) {
@@ -1464,9 +1472,20 @@ const usesAlternateUvBuildOutputs = (
   node.task === "build" &&
   passThroughArguments.some(
     (argument) =>
-      argument === "-o" ||
+      argument.startsWith("-o") ||
       argument === "--out-dir" ||
       argument.startsWith("--out-dir="),
+  );
+
+const usesUvConfigurationOverride = (
+  node: TaskNode,
+  passThroughArguments: ReadonlyArray<string>,
+): boolean =>
+  node.package.manager === "uv" &&
+  node.task === "build" &&
+  passThroughArguments.some(
+    (argument) =>
+      argument === "--config-file" || argument.startsWith("--config-file="),
   );
 
 const usesEnvironmentCargoBuildTarget = (
@@ -1652,6 +1671,7 @@ export const isTaskScopeDynamicallyCacheable = (
   !usesAdditionalCargoPackageSelection(node, passThroughArguments) &&
   !usesCargoConfigurationOverride(node, passThroughArguments) &&
   !usesAlternateUvBuildOutputs(node, passThroughArguments) &&
+  !usesUvConfigurationOverride(node, passThroughArguments) &&
   !(
     isCargoCompilationTask(node) &&
     usesEnvironmentCargoBuildTarget(

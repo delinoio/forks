@@ -249,7 +249,7 @@ const taskInputFiles = (
     }
   }
   return [...selected.values()].sort((left, right) =>
-    left.hashPath.localeCompare(right.hashPath),
+    compareCodeUnits(left.hashPath, right.hashPath),
   );
 };
 
@@ -536,7 +536,7 @@ const alwaysHashedControlInputFiles = (
           hashResolvedSymlinkContents: true,
         };
       })
-      .sort((left, right) => left.hashPath.localeCompare(right.hashPath));
+      .sort((left, right) => compareCodeUnits(left.hashPath, right.hashPath));
   });
 
 export interface TaskHashResult {
@@ -596,7 +596,7 @@ const discoverFiles = (
           };
         })
         .sort((left, right) =>
-          left.absolutePath.localeCompare(right.absolutePath),
+          compareCodeUnits(left.absolutePath, right.absolutePath),
         );
       const existing = yield* Effect.forEach(
         discovered,

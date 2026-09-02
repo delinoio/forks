@@ -133,7 +133,8 @@ task-aware inputs when the active lockfile is deleted. A changed
 workspace gitlink path is treated as the package-relative `.` input. Task
 hashes preserve Git symlink, gitlink, and dependency semantics, exclude the
 resolved cache directory, use each task's owning ecosystem lockfile, and omit
-documentation-only task descriptions.
+documentation-only task descriptions. Hash input paths use locale-independent
+code-unit ordering.
 When the Git index and working tree disagree on regular-file or symlink kind,
 the working-tree kind determines the hashed mode. An indexed executable bit is
 retained only while both representations remain regular files.
@@ -300,6 +301,8 @@ Regular archive destinations are unlinked before their contents are restored,
 so an existing hard link cannot redirect truncation outside the repository.
 Resolved cache-directory subtrees are excluded from both task inputs and task
 outputs, including custom cache directory names selected by broad output globs.
+Declared output patterns may select `.turbo` descendants outside the resolved
+cache-directory subtree.
 Cache output collection prunes directory subtrees that cannot match a positive
 output pattern, while matching patterns may explicitly retain `node_modules`
 or other normally ignored directories. A matching FIFO, socket, device, or
@@ -311,7 +314,9 @@ exclusions; unrelated Python projects and `.venv` trees are ignored.
 Synthesized uv packages
 expose `build` and `test`, and implicit builds default to uncached unless task
 configuration explicitly enables caching. Explicitly cached uv builds bypass
-caching when `-o` or `--out-dir` selects an unmodeled output directory. uv
+caching when `-o`, an attached `-o` value, or `--out-dir` selects an unmodeled
+output directory, and when pass-through `--config-file` selects an unmodeled
+configuration file. uv
 tasks execute from their project directory, forward test arguments directly to
 `pytest`, and parse `uv.lock` as TOML. Each task hash includes the owning
 `pyproject.toml`, the workspace-root `pyproject.toml`, and effective

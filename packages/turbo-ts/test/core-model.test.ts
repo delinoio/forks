@@ -1130,8 +1130,33 @@ describe("core repository model", () => {
     ).nodes.get("python-app#build")!;
     expect(isTaskScopeCacheable(node, [])).toBe(true);
     expect(isTaskScopeCacheable(node, ["-o", "wheelhouse"])).toBe(false);
+    expect(isTaskScopeCacheable(node, ["-owheelhouse"])).toBe(false);
     expect(isTaskScopeCacheable(node, ["--out-dir", "wheelhouse"])).toBe(false);
     expect(isTaskScopeCacheable(node, ["--out-dir=wheelhouse"])).toBe(false);
+  });
+
+  it("disables uv build caching for explicit configuration files", () => {
+    const uvPackage = {
+      ...packageModel("python-app", []),
+      directory: "/repo/python/app",
+      relativeDirectory: "python/app",
+      manager: "uv" as const,
+      scripts: { build: "uv build" },
+      tasks: { build: { cache: true, outputs: ["dist/**"] } },
+    } satisfies RepositoryPackage;
+    const node = buildTaskGraph(
+      repository([uvPackage]),
+      [uvPackage],
+      ["build"],
+      false,
+    ).nodes.get("python-app#build")!;
+    expect(isTaskScopeCacheable(node, [])).toBe(true);
+    expect(
+      isTaskScopeCacheable(node, ["--config-file", "alternate-uv.toml"]),
+    ).toBe(false);
+    expect(
+      isTaskScopeCacheable(node, ["--config-file=alternate-uv.toml"]),
+    ).toBe(false);
   });
 
   it("disables Cargo build caching for unmodeled target selectors", () => {
