@@ -3251,6 +3251,10 @@ describe("core CLI execution", () => {
     const packageDirectory = `${directory}/packages/library`;
     const defaultEnvironmentPath = `${packageDirectory}/.env.yarn`;
     const customEnvironmentPath = `${packageDirectory}/.env.custom`;
+    const packageEnvironmentPath = `${packageDirectory}/.env.package`;
+    const rootEnvironmentPath = `${directory}/.env.root`;
+    const packageConfigurationPath = `${packageDirectory}/.yarnrc.yml`;
+    const packageExecutablePath = `${packageDirectory}/.yarn/releases/yarn.cjs`;
     const externalEnvironmentPath = `${outer}/external.env`;
     try {
       await cp(fixtureRoot, directory, { recursive: true });
@@ -3310,6 +3314,45 @@ describe("core CLI execution", () => {
       expect((await compute(defaultModel, defaultNode)).hash).not.toBe(
         defaultHash.hash,
       );
+
+      await writeFile(rootEnvironmentPath, "ROOT=true\n");
+      await writeFile(
+        `${directory}/.yarnrc.yml`,
+        'injectEnvironmentFiles: [".env.root?"]\n',
+      );
+      await writeFile(packageEnvironmentPath, "PACKAGE=first\n");
+      await mkdir(dirname(packageExecutablePath), { recursive: true });
+      await writeFile(packageExecutablePath, "module.exports = 'first';\n");
+      await writeFile(
+        packageConfigurationPath,
+        'injectEnvironmentFiles: [".env.package?"]\nyarnPath: .yarn/releases/yarn.cjs\n',
+      );
+      const packageModel = await discover();
+      const packageNode = taskFor(packageModel);
+      const packageHash = await compute(packageModel, packageNode);
+      expect(packageHash.inputFiles).toEqual(
+        expect.arrayContaining([
+          ".env.package",
+          ".yarn/releases/yarn.cjs",
+          ".yarnrc.yml",
+          "$TURBO_ROOT$/.yarnrc.yml",
+        ]),
+      );
+      expect(packageHash.inputFiles).not.toContain("$TURBO_ROOT$/.env.root");
+      expect(implicitTaskInputCandidates(packageModel, packageNode)).toEqual(
+        expect.arrayContaining([
+          packageConfigurationPath,
+          `${directory}/.yarnrc.yml`,
+        ]),
+      );
+      await writeFile(packageEnvironmentPath, "PACKAGE=second\n");
+      const changedEnvironmentHash = await compute(packageModel, packageNode);
+      expect(changedEnvironmentHash.hash).not.toBe(packageHash.hash);
+      await writeFile(packageExecutablePath, "module.exports = 'second';\n");
+      expect((await compute(packageModel, packageNode)).hash).not.toBe(
+        changedEnvironmentHash.hash,
+      );
+      await rm(packageConfigurationPath);
 
       await writeFile(customEnvironmentPath, "CUSTOM=first\n");
       await writeFile(
@@ -4704,6 +4747,27 @@ describe("core CLI execution", () => {
           { UV_CONFIG_FILE: configuredUvPath },
         ),
       ).toContain(configuredUvPath);
+      const uvEnvironmentPath = `${directory}/python/app/.env.task`;
+      await writeFile(uvEnvironmentPath, "VALUE=first\n");
+      const uvWithEnvironment = await compute("python-app#test", {
+        UV_ENV_FILE: ".env.task",
+      });
+      expect(uvWithEnvironment.inputFiles).toContain(".env.task");
+      expect(
+        implicitTaskInputCandidates(
+          model,
+          graph.nodes.get("python-app#test")!,
+          { UV_ENV_FILE: ".env.task" },
+        ),
+      ).toContain(uvEnvironmentPath);
+      await writeFile(uvEnvironmentPath, "VALUE=second\n");
+      expect(
+        (
+          await compute("python-app#test", {
+            UV_ENV_FILE: ".env.task",
+          })
+        ).hash,
+      ).not.toBe(uvWithEnvironment.hash);
       const cargoLockfile = `${directory}/rust/Cargo.lock`;
       await writeFile(
         cargoLockfile,
@@ -7600,6 +7664,7 @@ describe("core CLI execution", () => {
     const packageDirectory = `${directory}/python/app`;
     const externalHome = await mkdtemp(join(tmpdir(), "turbo-ts-uv-home-"));
     const externalConfiguration = `${externalHome}/.config/uv/uv.toml`;
+    const externalEnvironment = `${externalHome}/external.env`;
     try {
       await mkdir(packageDirectory, { recursive: true });
       await mkdir(dirname(externalConfiguration), { recursive: true });
@@ -7611,6 +7676,9 @@ describe("core CLI execution", () => {
         '[project]\nname = "app"\n',
       );
       await writeFile(externalConfiguration, "offline = false\n");
+      await writeFile(`${packageDirectory}/.env.local`, "LOCAL=true\n");
+      await writeFile(`${directory}/.env.root`, "ROOT=true\n");
+      await writeFile(externalEnvironment, "EXTERNAL=true\n");
       const resolve = (
         environment: Readonly<Record<string, string | undefined>>,
       ) =>
@@ -7649,6 +7717,34 @@ describe("core CLI execution", () => {
           })
         ).external,
       ).toBe(true);
+      const environmentFiles = await resolve({
+        UV_NO_CONFIG: "1",
+        UV_ENV_FILE: ".env.local ../../.env.root",
+      });
+      expect(environmentFiles.external).toBe(false);
+      expect(environmentFiles.repositoryPaths).toEqual(
+        expect.arrayContaining([
+          `${packageDirectory}/.env.local`,
+          `${directory}/.env.root`,
+        ]),
+      );
+      expect(
+        (
+          await resolve({
+            UV_NO_CONFIG: "1",
+            UV_ENV_FILE: externalEnvironment,
+          })
+        ).external,
+      ).toBe(true);
+      expect(
+        (
+          await resolve({
+            UV_ENV_FILE: externalEnvironment,
+            UV_NO_CONFIG: "1",
+            UV_NO_ENV_FILE: "1",
+          })
+        ).external,
+      ).toBe(false);
 
       const uvPackage = {
         identity: "uv:app",
@@ -8897,6 +8993,68 @@ describe("core CLI execution", () => {
         "new",
       );
       await expect(lstat(`${packageDirectory}/dist/old.js`)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("preserves excluded output descendants while restoring a cache hit", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const outputDirectory = `${packageDirectory}/dist`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        tasks: Record<
+          string,
+          { inputs?: Array<string>; outputs?: Array<string> }
+        >;
+      };
+      configuration.tasks.build = {
+        inputs: ["input.txt"],
+        outputs: ["dist/**", "!dist/keep/**"],
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',fs.readFileSync('input.txt'))\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      await writeFile(`${packageDirectory}/input.txt`, "cached\n");
+      await mkdir(`${outputDirectory}/keep`, { recursive: true });
+      await writeFile(`${outputDirectory}/keep/preserved.txt`, "first\n");
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      await writeFile(`${outputDirectory}/value.txt`, "stale\n");
+      await writeFile(`${outputDirectory}/stale.txt`, "remove me\n");
+      await writeFile(`${outputDirectory}/keep/preserved.txt`, "current\n");
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache hit");
+      expect(await readFile(`${outputDirectory}/value.txt`, "utf8")).toBe(
+        "cached\n",
+      );
+      expect(
+        await readFile(`${outputDirectory}/keep/preserved.txt`, "utf8"),
+      ).toBe("current\n");
+      await expect(lstat(`${outputDirectory}/stale.txt`)).rejects.toThrow();
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

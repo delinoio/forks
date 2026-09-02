@@ -26,6 +26,7 @@ import {
   listRepositoryFiles,
   lockfileNamesByManager,
   uvControlInputs,
+  uvEnvironmentFilePaths,
   uvTaskControlInputCandidates,
 } from "../repository/model.js";
 import { xxhash64Hex } from "./xxhash64.js";
@@ -312,10 +313,17 @@ const repositoryPackageManagerControlInputCandidates = (
           (directory) => joinPath(directory, ".npmrc"),
         )
       : [joinPath(repository.root, ".npmrc")];
+  const yarnConfigurationPaths =
+    manager === "yarn"
+      ? ancestorDirectories(repository, node.package.directory).map(
+          (directory) => joinPath(directory, ".yarnrc.yml"),
+        )
+      : [];
   return [
     ...new Set([
       joinPath(repository.root, "package.json"),
       ...npmConfigurationPaths,
+      ...yarnConfigurationPaths,
       ...repositoryControlNamesByJavaScriptManager[manager].map((name) =>
         joinPath(repository.root, name),
       ),
@@ -498,6 +506,11 @@ export const implicitTaskInputCandidates = (
               : joinPath(node.package.directory, configuredPath);
             return isPathContained(repository.root, path) ? [path] : [];
           })(),
+          ...uvEnvironmentFilePaths(
+            node.package.directory,
+            runtimeEnvironment,
+            caseInsensitiveEnvironmentNames,
+          ).filter((path) => isPathContained(repository.root, path)),
         ]
       : []),
   ]),

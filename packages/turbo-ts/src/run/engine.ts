@@ -1208,6 +1208,7 @@ const collectOutputPaths = (
   nodes: ReadonlyArray<TaskNode>,
   cacheDirectory: string,
   windowsPathSeparators: boolean,
+  preserveExcludedDescendants = false,
 ): Effect.Effect<ReadonlyArray<string>, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
     const selected = new Set<string>();
@@ -1220,6 +1221,9 @@ const collectOutputPaths = (
         const fileSystem = yield* FileSystemService;
         const positivePatterns = patterns.filter(
           (pattern) => !pattern.startsWith("!"),
+        );
+        const negativePatterns = patterns.flatMap((pattern) =>
+          pattern.startsWith("!") ? [pattern.slice(1)] : [],
         );
         const files = yield* listRepositoryFiles(directory, {
           ignoredDirectories: new Set([".git"]),
@@ -1280,7 +1284,15 @@ const collectOutputPaths = (
               }),
             );
           }
-          if (matchesOutput) {
+          const canContainExcludedDescendant =
+            metadata.kind === "directory" &&
+            negativePatterns.some((pattern) =>
+              canMatchGlobDescendant(relative, pattern, windowsPathSeparators),
+            );
+          if (
+            matchesOutput &&
+            !(preserveExcludedDescendants && canContainExcludedDescendant)
+          ) {
             selected.add(path);
           }
         }
@@ -2117,6 +2129,7 @@ const executeTask = (
           cacheNodes,
           options.cacheExclusionDirectory,
           platform === "win32",
+          true,
         ).pipe(
           Effect.map((paths) =>
             paths.map((path) =>

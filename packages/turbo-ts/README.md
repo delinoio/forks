@@ -79,11 +79,12 @@ resolved contents consumed during discovery and execution. Repository-level
 package-manager controls, workspace-local Bun `bunfig.toml` files, and expected
 lockfile paths also remain task-aware inputs, including when the active
 lockfile is deleted. Yarn PnP tasks hash the root `.pnp.cjs` loader separately
-from the preferred resolution lockfile.
-Repository-contained Yarn `yarnPath` executables are package-manager inputs;
-missing or external executables disable JavaScript caching. Yarn 2+ tasks also
-hash their effective workspace-relative `injectEnvironmentFiles`, including
-the default `.env.yarn`; external or unmodeled paths disable caching. Effective
+from the preferred resolution lockfile. Yarn tasks hash ancestor `.yarnrc.yml`
+files through the repository root. Repository-contained effective `yarnPath`
+executables are package-manager inputs; missing or external executables disable
+caching for the package and downstream tasks. Yarn 2+ tasks also hash their
+effective workspace-relative `injectEnvironmentFiles`, including the default
+`.env.yarn`; external or unmodeled paths disable caching. Effective
 npm and pnpm user `.npmrc` files likewise disable caching because they are
 external inputs, while repository-contained ancestor `.npmrc` files are always
 hashed. Yarn home `.yarnrc` and `.yarnrc.yml` files also disable caching.
@@ -148,7 +149,9 @@ finalization can terminate detached task processes.
 
 Cache publication is skipped when a declared output glob would require
 traversing an output-directory symlink, preventing a log-only cache artifact
-from standing in for omitted declared outputs.
+from standing in for omitted declared outputs. Cache restoration preserves
+excluded descendants when a broader positive output pattern matches one of
+their ancestor directories.
 
 Configured cache directories may be inside or outside the repository, but the
 repository root, its ancestors, and directories containing discovered packages
@@ -158,13 +161,15 @@ when Git metadata is unavailable.
 
 uv task hashes always include the owning and workspace-root `pyproject.toml`
 plus effective repository-contained `uv.toml`, `.python-version`, and
-`UV_CONFIG_FILE` controls. These controls remain task-aware inputs. Effective
-user configuration or an external `UV_CONFIG_FILE`, explicitly cached uv builds
-using `-o`, `--out-dir`, `--project`, or `--directory`, and uv packages with
-unresolved external local path dependencies bypass cache reads and writes until
-those inputs and outputs are modeled, regardless of editable mode. Raw direct
-path or URL requirements without a corresponding `tool.uv.sources` declaration
-also bypass caching. uv task hashes include normalized uv and effective Python
+`UV_CONFIG_FILE` controls. Repository-contained files selected through
+`UV_ENV_FILE` are also hashed unless `UV_NO_ENV_FILE` disables them. These
+controls remain task-aware inputs. Effective user configuration, an external
+`UV_CONFIG_FILE`, an external `UV_ENV_FILE`, explicitly cached uv builds using
+`-o`, `--out-dir`, `--project`, or `--directory`, and uv packages with unresolved
+external local path dependencies bypass cache reads and writes until those
+inputs and outputs are modeled, regardless of editable mode. Raw direct path or
+URL requirements without a corresponding `tool.uv.sources` declaration also
+bypass caching. uv task hashes include normalized uv and effective Python
 identities; caching is bypassed when either identity cannot be determined
 without downloading an interpreter.
 

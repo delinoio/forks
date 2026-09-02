@@ -131,12 +131,14 @@ configuration, workspace-local Bun `bunfig.toml` files, and Cargo control or
 toolchain files participate in both task-aware selection and hashing. Expected
 JavaScript lockfile paths remain task-aware inputs when the active lockfile is
 deleted. Yarn PnP tasks always hash the repository-root `.pnp.cjs` loader in
-addition to the preferred resolution lockfile. A repository-contained
-Yarn `yarnPath` executable is also an input; a missing or external executable
-makes JavaScript and downstream cache scopes uncacheable. Yarn 2+ tasks also
-hash effective workspace-relative `injectEnvironmentFiles`, including the
-default `.env.yarn`; external or unmodeled injected-file paths make the package
-and downstream scopes uncacheable. A changed workspace gitlink path is treated
+addition to the preferred resolution lockfile. Yarn tasks hash every
+repository-contained ancestor `.yarnrc.yml` from their execution directory to
+the repository root. A repository-contained effective `yarnPath` executable is
+also an input; a missing or external executable makes the package and downstream
+cache scopes uncacheable. Yarn 2+ tasks also hash effective workspace-relative
+`injectEnvironmentFiles`, including the default `.env.yarn`; external or
+unmodeled injected-file paths make the package and downstream scopes
+uncacheable. A changed workspace gitlink path is treated
 as the package-relative `.` input. Task hashes preserve Git symlink, gitlink,
 and dependency semantics, exclude the resolved cache directory, use each
 task's owning ecosystem lockfile, and omit documentation-only task
@@ -259,8 +261,10 @@ declared output globs or exact literal log path before clearing or writing
 files. It rejects destinations beneath the active cache directory, duplicate
 destinations, and any non-directory archive entry that is an ancestor of
 another destination. Output negations are deny rules during both collection
-and restoration, regardless of their order relative to positive patterns. Task
-identifiers are
+and restoration, regardless of their order relative to positive patterns.
+Pre-restoration clearing preserves matched ancestor directories whose
+descendants can match an output negation while still clearing matched leaves
+and safe subtrees. Task identifiers are
 encoded into portable single-component log filenames; lowercase portable task
 names retain their existing filenames, and
 uppercase code points are encoded to prevent case-insensitive collisions.
@@ -346,11 +350,14 @@ tasks execute from their project directory, forward test arguments directly to
 `pyproject.toml`, the workspace-root `pyproject.toml`, and effective
 repository-contained `uv.toml`, `.python-version`, or `UV_CONFIG_FILE` controls
 independently of configured input globs; these controls also participate in
-task-aware affected selection. uv task hashes are partitioned by normalized uv
-and effective Python identities. If either identity cannot be determined
-without downloading an interpreter, the task and downstream hash scopes bypass
-caching. Effective uv user configuration or an external `UV_CONFIG_FILE` makes
-the package and downstream hash scopes uncacheable. uv
+task-aware affected selection. Repository-contained files selected through
+`UV_ENV_FILE` are handled the same way unless `UV_NO_ENV_FILE` disables them;
+external environment-file paths make the package and downstream hash scopes
+uncacheable. uv task hashes are partitioned by normalized uv and effective
+Python identities. If either identity cannot be determined without downloading
+an interpreter, the task and downstream hash scopes bypass caching. Effective
+uv user configuration or an external `UV_CONFIG_FILE` makes the package and
+downstream hash scopes uncacheable. uv
 path dependencies that do not resolve to the named discovered workspace member
 make the package and hash scopes that depend on them uncacheable, regardless of
 editable mode. Raw direct path and URL requirements without a corresponding
