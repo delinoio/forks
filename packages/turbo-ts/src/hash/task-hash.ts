@@ -313,14 +313,19 @@ const repositoryPackageManagerControlInputCandidates = (
         )
       : [joinPath(repository.root, ".npmrc")];
   return [
-    joinPath(repository.root, "package.json"),
-    ...npmConfigurationPaths,
-    ...repositoryControlNamesByJavaScriptManager[manager].map((name) =>
-      joinPath(repository.root, name),
-    ),
-    ...(repository.packageManagerExecutableInput === undefined
-      ? []
-      : [repository.packageManagerExecutableInput]),
+    ...new Set([
+      joinPath(repository.root, "package.json"),
+      ...npmConfigurationPaths,
+      ...repositoryControlNamesByJavaScriptManager[manager].map((name) =>
+        joinPath(repository.root, name),
+      ),
+      ...(manager === "bun"
+        ? [joinPath(node.package.directory, "bunfig.toml")]
+        : []),
+      ...(repository.packageManagerExecutableInput === undefined
+        ? []
+        : [repository.packageManagerExecutableInput]),
+    ]),
   ];
 };
 

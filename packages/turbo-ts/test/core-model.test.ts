@@ -55,6 +55,7 @@ import {
   packageManagerCommand,
   parseCacheSpecification,
   planCargoWorkspaceTasks,
+  resolveOptions,
   taskIdsWithUnrestorableCacheInputs,
   taskScopeEnvironment,
 } from "../src/run/engine.js";
@@ -447,6 +448,7 @@ describe("core repository model", () => {
           "package.json",
           ".npmrc",
           "bunfig.toml",
+          "packages/app/bunfig.toml",
           "bun.lock",
           "bun.lockb",
         ],
@@ -496,6 +498,72 @@ describe("core repository model", () => {
       );
       expect(candidates).toEqual(expect.arrayContaining(names));
     }
+  });
+
+  it("resolves run option environment names case-insensitively on Windows", () => {
+    const model = repository([]);
+    const parsed = parseRunArguments(["run", "build"]);
+    const environment = {
+      turbo_cache: "local:rw,remote:rw",
+      turbo_remote_only: "1",
+      turbo_remote_cache_read_only: "1",
+      turbo_concurrency: "2",
+      turbo_env_mode: "loose",
+      turbo_cache_dir: ".cache",
+      turbo_api: "https://cache.example.test/api",
+      turbo_token: "token",
+      turbo_remote_cache_signature_key: "signature",
+      turbo_remote_cache_timeout: "4",
+      turbo_remote_cache_upload_timeout: "5",
+      turbo_teamid: "team-id",
+      turbo_team: "team-slug",
+      turbo_force: "true",
+      no_color: "1",
+    };
+    const options = resolveOptions(
+      parsed,
+      model.root,
+      environment,
+      model.rootConfiguration,
+      8,
+      true,
+    );
+    expect(options).toMatchObject({
+      concurrency: 2,
+      environmentMode: "loose",
+      cacheDirectory: "/repo/.cache",
+      cachePolicy: {
+        localRead: false,
+        localWrite: false,
+        remoteRead: true,
+        remoteWrite: false,
+      },
+      force: true,
+      colorEnabled: false,
+      remote: {
+        apiUrl: "https://cache.example.test/api",
+        token: "token",
+        teamId: "team-id",
+        teamSlug: "team-slug",
+        timeoutMilliseconds: 4_000,
+        uploadTimeoutMilliseconds: 5_000,
+        signatureKey: "signature",
+      },
+    });
+    expect(
+      resolveOptions(
+        parsed,
+        model.root,
+        environment,
+        model.rootConfiguration,
+        8,
+      ),
+    ).toMatchObject({
+      cacheDirectory: "/repo/.turbo/cache",
+      force: false,
+      colorEnabled: true,
+      remote: undefined,
+    });
   });
 
   it("builds dependency graphs, filters closures, and rejects cycles", () => {

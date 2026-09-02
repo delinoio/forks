@@ -80,6 +80,7 @@ import {
 } from "../logging/events.js";
 import {
   cargoHomeConfigurationPresent,
+  configuredEnvironmentValue,
   discoverRepository,
   listRepositoryFiles,
   npmUserConfigurationPresent,
@@ -199,7 +200,7 @@ const parseQuantity = (
 
 const parseCachePolicy = (
   parsed: ParsedRunOptions,
-  environment: Readonly<Record<string, string | undefined>>,
+  environmentValue: (name: string) => string | undefined,
 ): CachePolicy => {
   let policy: CachePolicy = {
     localRead: true,
@@ -207,7 +208,8 @@ const parseCachePolicy = (
     remoteRead: true,
     remoteWrite: true,
   };
-  const specification = parsed.cacheSpecification ?? environment.TURBO_CACHE;
+  const specification =
+    parsed.cacheSpecification ?? environmentValue("TURBO_CACHE");
   if (specification !== undefined) {
     policy = parseCacheSpecification(
       specification,
@@ -216,13 +218,14 @@ const parseCachePolicy = (
   }
   if (
     parsed.remoteOnly ||
-    environmentBoolean(environment.TURBO_REMOTE_ONLY) === true
+    environmentBoolean(environmentValue("TURBO_REMOTE_ONLY")) === true
   ) {
     policy = { ...policy, localRead: false, localWrite: false };
   }
   if (
     parsed.remoteCacheReadOnly ||
-    environmentBoolean(environment.TURBO_REMOTE_CACHE_READ_ONLY) === true
+    environmentBoolean(environmentValue("TURBO_REMOTE_CACHE_READ_ONLY")) ===
+      true
   ) {
     policy = { ...policy, remoteWrite: false };
   }
@@ -315,26 +318,41 @@ export const discoverRepositoryRoot = (
     }
   });
 
-const resolveOptions = (
+export const resolveOptions = (
   parsed: ParsedRunOptions,
   root: string,
   environment: Readonly<Record<string, string | undefined>>,
   configuration: LoadedRootConfiguration,
   availableParallelism: number,
+  caseInsensitiveEnvironmentNames = false,
 ): ResolvedRunOptions => {
   const value = configuration.value;
   const global = value.global;
+  const environmentValue = (name: string): string | undefined =>
+    configuredEnvironmentValue(
+      environment,
+      name,
+      caseInsensitiveEnvironmentNames,
+    );
+  const configuredEnvironmentMode = environmentValue("TURBO_ENV_MODE");
+  const configuredApiUrl = environmentValue("TURBO_API");
+  const configuredRemoteTimeout = environmentValue(
+    "TURBO_REMOTE_CACHE_TIMEOUT",
+  );
+  const configuredRemoteUploadTimeout = environmentValue(
+    "TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT",
+  );
   const concurrency =
     parsed.concurrency ??
-    environment.TURBO_CONCURRENCY ??
+    environmentValue("TURBO_CONCURRENCY") ??
     value.concurrency ??
     global?.concurrency ??
     undefined;
   const environmentModeValue =
     parsed.environmentMode ??
-    (environment.TURBO_ENV_MODE === "loose"
+    (configuredEnvironmentMode === "loose"
       ? "loose"
-      : environment.TURBO_ENV_MODE === "strict"
+      : configuredEnvironmentMode === "strict"
         ? "strict"
         : undefined) ??
     value.envMode ??
@@ -342,7 +360,7 @@ const resolveOptions = (
     "strict";
   const cacheDirectoryValue =
     parsed.cacheDirectory ??
-    environment.TURBO_CACHE_DIR ??
+    environmentValue("TURBO_CACHE_DIR") ??
     value.cacheDir ??
     global?.cacheDir ??
     ".turbo/cache";
@@ -352,32 +370,32 @@ const resolveOptions = (
   const remoteConfiguration = value.remoteCache ?? global?.remoteCache;
   const apiUrl =
     parsed.apiUrl ??
-    environment.TURBO_API ??
+    configuredApiUrl ??
     remoteConfiguration?.apiUrl ??
     undefined;
-  const token = parsed.token ?? environment.TURBO_TOKEN;
-  const signatureKey = environment.TURBO_REMOTE_CACHE_SIGNATURE_KEY;
+  const token = parsed.token ?? environmentValue("TURBO_TOKEN");
+  const signatureKey = environmentValue("TURBO_REMOTE_CACHE_SIGNATURE_KEY");
   const remoteTimeoutValue =
     parsed.remoteCacheTimeoutSeconds ??
-    environment.TURBO_REMOTE_CACHE_TIMEOUT ??
+    configuredRemoteTimeout ??
     remoteConfiguration?.timeout ??
     30;
   const remoteTimeoutPath =
     parsed.remoteCacheTimeoutSeconds !== undefined
       ? "<arguments>"
-      : environment.TURBO_REMOTE_CACHE_TIMEOUT !== undefined
+      : configuredRemoteTimeout !== undefined
         ? "TURBO_REMOTE_CACHE_TIMEOUT"
         : configuration.path;
   const remoteUploadTimeoutValue =
     parsed.remoteCacheTimeoutSeconds ??
-    environment.TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT ??
+    configuredRemoteUploadTimeout ??
     remoteConfiguration?.uploadTimeout ??
     remoteConfiguration?.timeout ??
     30;
   const remoteUploadTimeoutPath =
     parsed.remoteCacheTimeoutSeconds !== undefined
       ? "<arguments>"
-      : environment.TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT !== undefined
+      : configuredRemoteUploadTimeout !== undefined
         ? "TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT"
         : configuration.path;
   const remote = (() => {
@@ -406,7 +424,7 @@ const resolveOptions = (
     const apiUrlPath =
       parsed.apiUrl !== undefined
         ? "<arguments>"
-        : environment.TURBO_API !== undefined
+        : configuredApiUrl !== undefined
           ? "TURBO_API"
           : configuration.path;
     try {
@@ -458,10 +476,12 @@ const resolveOptions = (
       apiUrl,
       token,
       teamId:
-        environment.TURBO_TEAMID ?? remoteConfiguration?.teamId ?? undefined,
+        environmentValue("TURBO_TEAMID") ??
+        remoteConfiguration?.teamId ??
+        undefined,
       teamSlug:
         parsed.team ??
-        environment.TURBO_TEAM ??
+        environmentValue("TURBO_TEAM") ??
         remoteConfiguration?.teamSlug ??
         undefined,
       timeoutMilliseconds: 1_000 * remoteTimeoutSeconds,
@@ -510,14 +530,16 @@ const resolveOptions = (
         gib: 1_073_741_824,
       },
     ),
-    cachePolicy: parseCachePolicy(parsed, environment),
-    force: parsed.force || environmentBoolean(environment.TURBO_FORCE) === true,
+    cachePolicy: parseCachePolicy(parsed, environmentValue),
+    force:
+      parsed.force ||
+      environmentBoolean(environmentValue("TURBO_FORCE")) === true,
     frameworkInference: parsed.frameworkInference ?? true,
     outputLogs: parsed.outputLogs,
     only: parsed.only,
     parallel: parsed.parallel,
     remote,
-    colorEnabled: !parsed.noColor && environment.NO_COLOR === undefined,
+    colorEnabled: !parsed.noColor && environmentValue("NO_COLOR") === undefined,
   };
 };
 
@@ -589,10 +611,25 @@ const findAffectedPackages = (
 ): Effect.Effect<AffectedPackages, ConfigurationError, ProcessService> =>
   Effect.gen(function* () {
     const processService = yield* ProcessService;
-    const explicitBase = environment.TURBO_SCM_BASE;
-    const githubBase = environment.GITHUB_BASE_REF;
+    const explicitBase = configuredEnvironmentValue(
+      environment,
+      "TURBO_SCM_BASE",
+      windowsPathSeparators,
+    );
+    const githubBase = configuredEnvironmentValue(
+      environment,
+      "GITHUB_BASE_REF",
+      windowsPathSeparators,
+    );
     const base = range?.base ?? explicitBase ?? githubBase ?? "main";
-    const head = range?.head ?? environment.TURBO_SCM_HEAD ?? "HEAD";
+    const head =
+      range?.head ??
+      configuredEnvironmentValue(
+        environment,
+        "TURBO_SCM_HEAD",
+        windowsPathSeparators,
+      ) ??
+      "HEAD";
     const diff = (baseReference: string) =>
       Effect.either(
         Effect.scoped(
@@ -2821,6 +2858,7 @@ export const executeRun = (
       environment,
       configuration,
       availableParallelism,
+      platform === "win32",
     );
     const [canonicalRoot, canonicalCacheDirectory] = yield* Effect.all([
       canonicalContainmentPath(unresolvedOptions.root),
@@ -2892,7 +2930,11 @@ export const executeRun = (
     const packageManagerCheckDisabled =
       parsed.dangerouslyDisablePackageManagerCheck ||
       environmentBoolean(
-        environment.TURBO_DANGEROUSLY_DISABLE_PACKAGE_MANAGER_CHECK,
+        configuredEnvironmentValue(
+          environment,
+          "TURBO_DANGEROUSLY_DISABLE_PACKAGE_MANAGER_CHECK",
+          platform === "win32",
+        ),
       ) === true ||
       configuration.value.dangerouslyDisablePackageManagerCheck === true ||
       configuration.value.global?.dangerouslyDisablePackageManagerCheck ===

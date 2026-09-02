@@ -127,9 +127,10 @@ input globs. Symlinked owning control manifests retain their link identity and
 also hash the resolved file contents consumed by discovery and execution.
 Package task configurations participate independently in task-aware selection.
 Owning lockfiles, repository-controlled JavaScript package-manager
-configuration, and Cargo control or toolchain files participate in both
-task-aware selection and hashing. Expected JavaScript lockfile paths remain
-task-aware inputs when the active lockfile is deleted. A repository-contained
+configuration, workspace-local Bun `bunfig.toml` files, and Cargo control or
+toolchain files participate in both task-aware selection and hashing. Expected
+JavaScript lockfile paths remain task-aware inputs when the active lockfile is
+deleted. A repository-contained
 Yarn `yarnPath` executable is also an input; a missing or external executable
 makes JavaScript and downstream cache scopes uncacheable. A changed
 workspace gitlink path is treated as the package-relative `.` input. Task
@@ -167,8 +168,8 @@ target reported for the package execution directory. A missing compiler
 identity or host target, an effective ancestor Cargo configuration outside the
 repository, or an effective Cargo target directory outside the repository makes
 the Cargo package and downstream hash scopes uncacheable.
-Environment-name selection follows Windows
-case-insensitive semantics for both hashing and strict task execution.
+Environment-name selection follows Windows case-insensitive semantics for run
+options, affected-range controls, hashing, and strict task execution.
 Repository discovery records the resolved root lockfile path without
 structurally parsing it;
 lockfile parsing and pruning remain Gate 3 work. Without Git, explicit task
@@ -383,8 +384,10 @@ task configuration merging. Other cached Cargo compilation tasks (`check`,
 `test`, `lint`, `run`, and `dev`) retain the same dependency, so resolved
 workspace dependency hashes participate in their cache keys.
 Pass-through arguments are forwarded to Cargo without an implicit
-target-argument separator. Cargo builds
-for mixed library and binary crates default to uncached. Every cacheable Cargo
+target-argument separator. Cargo builds for pure-library and mixed
+library/binary crates remain uncached when configuration enables caching
+without declaring positive output patterns; explicitly configured outputs may
+opt those builds into caching. Every cacheable Cargo
 compilation task bypasses caching when pass-through arguments add a package
 selector, including `-p`, `--package`, `--workspace`, and `--all`. Every
 cacheable Cargo compilation task with an alternate output layout or manifest,

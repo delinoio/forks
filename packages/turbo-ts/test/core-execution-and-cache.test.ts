@@ -2986,6 +2986,68 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
+  it("hashes workspace Bun configuration independently of task globs", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const workspaceConfigurationPath = `${packageDirectory}/bunfig.toml`;
+    try {
+      const rootManifestPath = `${directory}/package.json`;
+      const rootManifest = JSON.parse(
+        await readFile(rootManifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      rootManifest.packageManager = "bun@1.2.14";
+      rootManifest.workspaces = ["packages/*"];
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, null, 2)}\n`,
+      );
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["src/**"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${packageDirectory}/src`, { recursive: true });
+      await writeFile(`${packageDirectory}/src/input.js`, "export {};\n");
+      await writeFile(`${directory}/bunfig.toml`, "telemetry = false\n");
+      await writeFile(workspaceConfigurationPath, '[run]\nshell = "bun"\n');
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      const compute = () =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+      const before = await compute();
+      expect(before.inputFiles).toEqual(
+        expect.arrayContaining([
+          "bunfig.toml",
+          "$TURBO_ROOT$/bunfig.toml",
+          "src/input.js",
+        ]),
+      );
+      expect(implicitTaskInputCandidates(model, node)).toContain(
+        workspaceConfigurationPath,
+      );
+      await writeFile(workspaceConfigurationPath, '[run]\nshell = "system"\n');
+      expect((await compute()).hash).not.toBe(before.hash);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("hashes a repository Yarn executable and rejects external yarnPath inputs", async () => {
     const outer = await mkdtemp(join(tmpdir(), "turbo-ts-yarn-path-"));
     const directory = `${outer}/repository`;
@@ -7968,6 +8030,11 @@ describe("core CLI execution", () => {
       };
       configuration.futureFlags = { experimentalCargoWorkspaces: true };
       delete configuration.tasks.build?.outputs;
+      configuration.tasks.build!.cache = true;
+      configuration.tasks["synthetic-rust-library#build"] = {
+        cache: true,
+        outputs: ["$TURBO_ROOT$/packages/rust-library/target/**"],
+      };
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
@@ -8037,6 +8104,14 @@ describe("core CLI execution", () => {
       expect(
         model.packagesByName.get("synthetic-rust-mixed")?.tasks.build,
       ).toMatchObject({ cache: false });
+      expect(
+        model.packagesByName.get("synthetic-rust-library")?.tasks[
+          "synthetic-rust-library#build"
+        ],
+      ).toMatchObject({
+        cache: true,
+        outputs: ["$TURBO_ROOT$/packages/rust-library/target/**"],
+      });
       expect(
         model.packagesByName.get("synthetic-rust-tool")?.tasks.format,
       ).toMatchObject({ cache: false });

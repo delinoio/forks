@@ -76,8 +76,9 @@ hash scopes. JavaScript task hashes always
 include their owning `package.json`, independently of configured task globs.
 When that manifest is a symlink, its task hash includes both the link and the
 resolved contents consumed during discovery and execution. Repository-level
-package-manager controls and expected lockfile paths also remain task-aware
-inputs, including when the active lockfile is deleted.
+package-manager controls, workspace-local Bun `bunfig.toml` files, and expected
+lockfile paths also remain task-aware inputs, including when the active
+lockfile is deleted.
 Repository-contained Yarn `yarnPath` executables are package-manager inputs;
 missing or external executables disable JavaScript caching. Effective npm and
 pnpm user `.npmrc` files likewise disable caching because they are external
@@ -97,9 +98,11 @@ external configuration paths are not task-hash inputs. Mismatched metadata/task
 `CARGO_TARGET_DIR` values also disable Cargo compilation-task caching. Any
 effective Cargo-home configuration or `CARGO_BUILD_TARGET` likewise disables
 every cacheable Cargo compilation task. Cargo configuration above the
-repository disables the affected Cargo and downstream cache scopes. Mixed
-library and binary crates default to uncached because binary-only output
-declarations cannot restore all of Cargo's default artifacts. Source-free local
+repository disables the affected Cargo and downstream cache scopes.
+Pure-library and mixed library/binary crates remain uncached when caching is
+enabled without positive output declarations because binary-only or log-only
+artifacts cannot restore all of Cargo's default outputs. Explicit output
+declarations may opt those builds into caching. Source-free local
 path dependencies that do not resolve to a same-workspace repository package
 also disable caching. Synthesized binary outputs cover the extensionless
 executable plus `.exe` and `.pdb` variants. Single-binary Cargo `run` and `dev`
@@ -126,7 +129,8 @@ snapshot cannot exceed the collection bound. Cache publication is serialized
 within a run to bound writer memory independently of task concurrency. Remote
 downloads, signature verification, and decompression use scoped files so
 concurrent cache hits do not retain or duplicate complete compressed response
-bodies in memory. Blank remote-cache timeout values are invalid. Local
+bodies in memory. Blank remote-cache timeout values are invalid. Run-option
+environment names follow Windows case-insensitive semantics. Local
 execution rejects symlinked task-log directories and exact log destinations
 before starting the task, and replaces existing regular log files before
 writing so hard links cannot redirect truncation. On Windows, scoped process

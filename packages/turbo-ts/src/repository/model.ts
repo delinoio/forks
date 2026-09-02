@@ -1617,10 +1617,11 @@ const cargoTasks = (
           `${outputPrefix}/${name}.exe`,
           `${outputPrefix}/${name}.pdb`,
         ]);
-  const buildDefaults: Pipeline =
-    metadata?.hasLibraryTarget === true || outputs.length === 0
-      ? { cache: false }
-      : { outputs };
+  const buildRequiresExplicitOutputs =
+    metadata?.hasLibraryTarget === true || outputs.length === 0;
+  const buildDefaults: Pipeline = buildRequiresExplicitOutputs
+    ? { cache: false }
+    : { outputs };
   const executionDefaults: Pipeline = { cache: false };
   const formatDefaults: Pipeline = { cache: false };
   const compilationTaskNames = [
@@ -1650,8 +1651,14 @@ const cargoTasks = (
             dependsOn: [...new Set([...(merged.dependsOn ?? []), "^build"])],
           }
         : merged;
+    const hasExplicitBuildOutputs =
+      task === "build" &&
+      configuredTask.outputs?.some((output) => !output.startsWith("!")) ===
+        true;
     return task === "build" &&
-      (configuredBuildTarget || hasCollidingBuildOutput)
+      (configuredBuildTarget ||
+        hasCollidingBuildOutput ||
+        (buildRequiresExplicitOutputs && !hasExplicitBuildOutputs))
       ? { ...withInternalDependencies, cache: false }
       : withInternalDependencies;
   };
