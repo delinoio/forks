@@ -18,7 +18,7 @@ import {
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it } from "@rstest/core";
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect";
@@ -2335,6 +2335,46 @@ describe("core CLI execution", () => {
       const rootManifest = JSON.parse(
         await readFile(rootManifestPath, "utf8"),
       ) as Record<string, unknown>;
+      rootManifest.packageManager = "yarn@4.14.1";
+      rootManifest.workspaces = ["packages/*"];
+      appManifest.dependencies = {
+        "synthetic-library": "portal:../library",
+      };
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, null, 2)}\n`,
+      );
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, null, 2)}\n`,
+      );
+      const portal = await discover();
+      const portalApp = portal.packagesByName.get("synthetic-app")!;
+      expect(portalApp.cacheInputsComplete).toBe(true);
+      expect(portalApp.internalDependencies).toEqual(["synthetic-library"]);
+
+      appManifest.dependencies = { "library-alias": "portal:../library" };
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, null, 2)}\n`,
+      );
+      expect(
+        (await discover()).packagesByName.get("synthetic-app")
+          ?.internalDependencies,
+      ).toEqual(["synthetic-library"]);
+
+      appManifest.dependencies = {
+        external: "portal:../../../missing-external-package",
+      };
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, null, 2)}\n`,
+      );
+      expect(
+        (await discover()).packagesByName.get("synthetic-app")
+          ?.cacheInputsComplete,
+      ).toBe(false);
+
       rootManifest.packageManager = "npm@11.6.0";
       rootManifest.workspaces = ["packages/*"];
       appManifest.dependencies = { "library-alias": "../library" };
@@ -3117,6 +3157,127 @@ describe("core CLI execution", () => {
         false,
       ).nodes.get("synthetic-library#build")!;
       expect(isTaskScopeCacheable(externalNode, [])).toBe(false);
+    } finally {
+      await rm(outer, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("hashes Yarn-injected environment files outside explicit task inputs", async () => {
+    const outer = await mkdtemp(join(tmpdir(), "turbo-ts-yarn-environment-"));
+    const directory = `${outer}/repository`;
+    const packageDirectory = `${directory}/packages/library`;
+    const defaultEnvironmentPath = `${packageDirectory}/.env.yarn`;
+    const customEnvironmentPath = `${packageDirectory}/.env.custom`;
+    const externalEnvironmentPath = `${outer}/external.env`;
+    try {
+      await cp(fixtureRoot, directory, { recursive: true });
+      const rootManifestPath = `${directory}/package.json`;
+      const rootManifest = JSON.parse(
+        await readFile(rootManifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      rootManifest.packageManager = "yarn@4.14.1";
+      rootManifest.workspaces = ["packages/*"];
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, null, 2)}\n`,
+      );
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["src/**"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${packageDirectory}/src`, { recursive: true });
+      await writeFile(`${packageDirectory}/src/input.js`, "export {};\n");
+      await writeFile(defaultEnvironmentPath, "VALUE=first\n");
+      const discover = () =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const rootConfiguration = yield* loadRootConfiguration(directory);
+            return yield* discoverRepository(directory, rootConfiguration);
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      const taskFor = (model: Awaited<ReturnType<typeof discover>>) => {
+        const library = model.packagesByName.get("synthetic-library")!;
+        return buildTaskGraph(model, [library], ["build"], false).nodes.get(
+          "synthetic-library#build",
+        )!;
+      };
+      const compute = (
+        model: Awaited<ReturnType<typeof discover>>,
+        node: TaskNode,
+      ) =>
+        Effect.runPromise(
+          hashTask(model, node, [], true, [], `${directory}/.turbo/cache`).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+
+      const defaultModel = await discover();
+      const defaultNode = taskFor(defaultModel);
+      const defaultHash = await compute(defaultModel, defaultNode);
+      expect(defaultHash.inputFiles).toContain(".env.yarn");
+      expect(implicitTaskInputCandidates(defaultModel, defaultNode)).toContain(
+        defaultEnvironmentPath,
+      );
+      await writeFile(defaultEnvironmentPath, "VALUE=second\n");
+      expect((await compute(defaultModel, defaultNode)).hash).not.toBe(
+        defaultHash.hash,
+      );
+
+      await writeFile(customEnvironmentPath, "CUSTOM=first\n");
+      await writeFile(
+        `${directory}/.yarnrc.yml`,
+        'injectEnvironmentFiles: [".env.custom?"]\n',
+      );
+      const customModel = await discover();
+      const customNode = taskFor(customModel);
+      const customHash = await compute(customModel, customNode);
+      expect(customHash.inputFiles).toContain(".env.custom");
+      expect(customHash.inputFiles).not.toContain(".env.yarn");
+      await writeFile(customEnvironmentPath, "CUSTOM=second\n");
+      expect((await compute(customModel, customNode)).hash).not.toBe(
+        customHash.hash,
+      );
+
+      await writeFile(
+        `${directory}/.yarnrc.yml`,
+        "injectEnvironmentFiles: []\n",
+      );
+      const disabledModel = await discover();
+      const disabledNode = taskFor(disabledModel);
+      expect(
+        (await compute(disabledModel, disabledNode)).inputFiles,
+      ).not.toEqual(expect.arrayContaining([".env.yarn", ".env.custom"]));
+
+      await writeFile(externalEnvironmentPath, "EXTERNAL=true\n");
+      await writeFile(
+        `${directory}/.yarnrc.yml`,
+        `injectEnvironmentFiles: [${JSON.stringify(externalEnvironmentPath)}]\n`,
+      );
+      const externalModel = await discover();
+      const externalLibrary =
+        externalModel.packagesByName.get("synthetic-library")!;
+      expect(externalLibrary.cacheInputsComplete).toBe(false);
+      expect(isTaskScopeCacheable(taskFor(externalModel), [])).toBe(false);
+
+      rootManifest.packageManager = "yarn@1.22.22";
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, null, 2)}\n`,
+      );
+      const classicModel = await discover();
+      expect(
+        classicModel.packagesByName.get("synthetic-library")
+          ?.cacheInputsComplete,
+      ).toBe(true);
+      expect(
+        classicModel.packagesByName.get("synthetic-library")
+          ?.cacheControlInputPaths,
+      ).toBeUndefined();
     } finally {
       await rm(outer, { force: true, recursive: true });
     }
@@ -4141,6 +4302,30 @@ describe("core CLI execution", () => {
         false,
       );
 
+      await writeFile(
+        appManifestPath,
+        appManifestSource.replace(
+          `dependencies = ["local-helper>=1", "my-util>=1", "requests>=2"]`,
+          `dependencies = ["local-helper>=1", "my-util>=1", "raw-helper @ ${pathToFileURL(externalDependency).href}", "requests>=2"]`,
+        ),
+      );
+      const rawDirectPath = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const rawDirectApp = rawDirectPath.packagesByName.get("app")!;
+      expect(rawDirectApp.dependencyNames).toContain("raw-helper");
+      expect(rawDirectApp.cacheInputsComplete).toBe(false);
+      const rawDirectNode = buildTaskGraph(
+        rawDirectPath,
+        [rawDirectApp],
+        ["test"],
+        false,
+      ).nodes.get("app#test")!;
+      expect(isTaskScopeCacheable(rawDirectNode, [])).toBe(false);
+
       configuration.tasks.build = {
         cache: true,
         dependsOn: ["^build"],
@@ -4486,13 +4671,29 @@ describe("core CLI execution", () => {
       await mkdir(`${directory}/rust/tool/src`, { recursive: true });
       const workspaceManifest = `${directory}/rust/Cargo.toml`;
       const cargoConfiguration = `${directory}/rust/.cargo/config.toml`;
+      const rustcWrapper = `${directory}/rust/tools/rustc-wrapper`;
+      const rustcWorkspaceWrapper = `${directory}/rust/tools/rustc-workspace-wrapper`;
+      const externalWrapper = `${directory}-external-wrapper`;
       const toolchain = `${directory}/rust-toolchain`;
       const rustfmtConfiguration = `${directory}/rustfmt.toml`;
+      const wrapperSource = (revision: string) =>
+        `#!/usr/bin/env node\nconst { spawnSync } = require("node:child_process");\nconst child = spawnSync(process.argv[2], process.argv.slice(3), { stdio: "inherit" });\nprocess.exit(child.status ?? 1);\n// ${revision}\n`;
       await writeFile(
         workspaceManifest,
         '[workspace]\nmembers = ["tool"]\nresolver = "3"\n',
       );
-      await writeFile(cargoConfiguration, "[build]\nincremental = false\n");
+      await mkdir(`${directory}/rust/tools`, { recursive: true });
+      await writeFile(
+        cargoConfiguration,
+        `[build]\nincremental = false\nrustc-wrapper = "tools/rustc-wrapper"\nrustc-workspace-wrapper = "tools/rustc-workspace-wrapper"\n`,
+      );
+      await writeFile(rustcWrapper, wrapperSource("rustc wrapper v1"));
+      await writeFile(
+        rustcWorkspaceWrapper,
+        wrapperSource("workspace wrapper v1"),
+      );
+      await chmod(rustcWrapper, 0o755);
+      await chmod(rustcWorkspaceWrapper, 0o755);
       await writeFile(
         `${directory}/rust/tool/Cargo.toml`,
         '[package]\nname = "rust-tool"\nversion = "0.1.0"\nedition = "2024"\n',
@@ -4506,6 +4707,7 @@ describe("core CLI execution", () => {
         'version = 4\n\n[[package]]\nname = "rust-tool"\nversion = "0.1.0"\n',
       );
       await cp(`${repositoryRoot}/rust-toolchain`, toolchain);
+      const originalToolchain = await readFile(toolchain, "utf8");
       await writeFile(rustfmtConfiguration, "tab_spaces = 2\n");
       for (const args of [
         ["init"],
@@ -4517,12 +4719,14 @@ describe("core CLI execution", () => {
         const git = await run("git", args, directory);
         expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
       }
-      const model = await Effect.runPromise(
-        Effect.gen(function* () {
-          const rootConfiguration = yield* loadRootConfiguration(directory);
-          return yield* discoverRepository(directory, rootConfiguration);
-        }).pipe(Effect.provide(nodeFoundationLayer)),
-      );
+      const discover = () =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const rootConfiguration = yield* loadRootConfiguration(directory);
+            return yield* discoverRepository(directory, rootConfiguration);
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      const model = await discover();
       const cargoPackage = model.packagesByName.get("rust-tool")!;
       const node = buildTaskGraph(
         model,
@@ -4542,16 +4746,21 @@ describe("core CLI execution", () => {
           "$TURBO_ROOT$/rust-toolchain",
           "$TURBO_ROOT$/rust/.cargo/config.toml",
           "$TURBO_ROOT$/rust/Cargo.toml",
+          "$TURBO_ROOT$/rust/tools/rustc-wrapper",
+          "$TURBO_ROOT$/rust/tools/rustc-workspace-wrapper",
           "Cargo.toml",
           "src/lib.rs",
         ]),
       );
+      await writeFile(rustcWrapper, wrapperSource("rustc wrapper v2"));
+      const wrapperChanged = await compute();
+      expect(wrapperChanged.hash).not.toBe(initial.hash);
       await writeFile(
         workspaceManifest,
         `${await readFile(workspaceManifest, "utf8")}# workspace revision\n`,
       );
       const workspaceChanged = await compute();
-      expect(workspaceChanged.hash).not.toBe(initial.hash);
+      expect(workspaceChanged.hash).not.toBe(wrapperChanged.hash);
       expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
       expect(
         (await run("git", ["commit", "-m", "workspace control"], directory))
@@ -4608,8 +4817,39 @@ describe("core CLI execution", () => {
       );
       await writeFile(rustfmtConfiguration, "tab_spaces = 4\n");
       expect((await computeFormat()).hash).not.toBe(formatBefore.hash);
+
+      await writeFile(toolchain, originalToolchain);
+      await writeFile(externalWrapper, "external wrapper\n");
+      await writeFile(
+        cargoConfiguration,
+        `[build]\nrustc-wrapper = ${JSON.stringify(externalWrapper)}\nrustc-workspace-wrapper = "tools/rustc-workspace-wrapper"\n`,
+      );
+      const externalModel = await discover();
+      expect(
+        externalModel.packagesByName.get("rust-tool")?.cacheInputsComplete,
+      ).toBe(false);
+
+      await writeFile(
+        cargoConfiguration,
+        `[build]\nrustc-wrapper = "tools/missing-wrapper"\nrustc-workspace-wrapper = "tools/rustc-workspace-wrapper"\n`,
+      );
+      const missingModel = await discover();
+      const missingPackage = missingModel.packagesByName.get("rust-tool")!;
+      expect(missingPackage.cacheInputsComplete).toBe(false);
+      expect(
+        isTaskScopeCacheable(
+          buildTaskGraph(
+            missingModel,
+            [missingPackage],
+            ["test"],
+            false,
+          ).nodes.get("rust-tool#test")!,
+          [],
+        ),
+      ).toBe(false);
     } finally {
       await rm(directory, { force: true, recursive: true });
+      await rm(`${directory}-external-wrapper`, { force: true });
     }
   }, 30_000);
 

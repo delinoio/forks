@@ -132,12 +132,14 @@ toolchain files participate in both task-aware selection and hashing. Expected
 JavaScript lockfile paths remain task-aware inputs when the active lockfile is
 deleted. A repository-contained
 Yarn `yarnPath` executable is also an input; a missing or external executable
-makes JavaScript and downstream cache scopes uncacheable. A changed
-workspace gitlink path is treated as the package-relative `.` input. Task
-hashes preserve Git symlink, gitlink, and dependency semantics, exclude the
-resolved cache directory, use each task's owning ecosystem lockfile, and omit
-documentation-only task descriptions. Hash input paths use locale-independent
-code-unit ordering.
+makes JavaScript and downstream cache scopes uncacheable. Yarn 2+ tasks also
+hash effective workspace-relative `injectEnvironmentFiles`, including the
+default `.env.yarn`; external or unmodeled injected-file paths make the package
+and downstream scopes uncacheable. A changed workspace gitlink path is treated
+as the package-relative `.` input. Task hashes preserve Git symlink, gitlink,
+and dependency semantics, exclude the resolved cache directory, use each
+task's owning ecosystem lockfile, and omit documentation-only task
+descriptions. Hash input paths use locale-independent code-unit ordering.
 When the Git index and working tree disagree on regular-file or symlink kind,
 the working-tree kind determines the hashed mode. An indexed executable bit is
 retained only while both representations remain regular files.
@@ -161,8 +163,12 @@ path joining, cache archive paths, and symlink targets preserve the same POSIX
 distinction while Windows-originated paths use Windows separator semantics.
 Cargo task hashes additionally
 include repository-contained ancestor manifests, Cargo configuration, and Rust
-toolchain files that can change task execution. Cached Cargo format tasks also
-include ancestor `rustfmt.toml` and `.rustfmt.toml` controls. They are
+toolchain files that can change task execution. Repository-contained compiler
+wrappers selected by effective `build.rustc-wrapper` and
+`build.rustc-workspace-wrapper` configuration are also inputs; missing,
+external, and PATH-resolved wrappers make the Cargo package and downstream
+scopes uncacheable. Cached Cargo format tasks also include ancestor
+`rustfmt.toml` and `.rustfmt.toml` controls. They are
 partitioned by the normalized verbose compiler identity and effective Rust host
 target reported for the package execution directory. A missing compiler
 identity or host target, an effective ancestor Cargo configuration outside the
@@ -342,17 +348,19 @@ caching. Effective uv user configuration or an external `UV_CONFIG_FILE` makes
 the package and downstream hash scopes uncacheable. uv
 path dependencies that do not resolve to the named discovered workspace member
 make the package and hash scopes that depend on them uncacheable, regardless of
-editable mode. uv package-graph edges require a
+editable mode. Raw direct path and URL requirements without a corresponding
+`tool.uv.sources` declaration likewise make those scopes uncacheable. uv
+package-graph edges require a
 matching `tool.uv.sources` workspace declaration or local path resolving to the
 named workspace member by canonical, platform-aware filesystem identity;
 registry, Git, URL, and undeclared sources remain
-external. JavaScript package-graph edges
-require declared workspace or version-range compatibility, or a `file:` or
-`link:` path whose canonical, platform-aware filesystem identity resolves to
-the local JavaScript package. Bare npm relative directory specifications use
-the same canonical resolution. Local path aliases record the resolved
-package's actual name even when the dependency key differs. Relative pnpm
-`workspace:` paths resolve by the same canonical filesystem identity.
+external. JavaScript package-graph edges require declared workspace or
+version-range compatibility, or a `file:`, `link:`, or Yarn `portal:` path whose
+canonical, platform-aware filesystem identity resolves to the local JavaScript
+package. Bare npm relative directory specifications use the same canonical
+resolution. Local path aliases record the resolved package's actual name even
+when the dependency key differs. Relative pnpm `workspace:` paths resolve by
+the same canonical filesystem identity.
 JavaScript packages with a local path dependency that does not resolve to a
 discovered JavaScript package make their task scopes and downstream hash scopes
 uncacheable. pnpm

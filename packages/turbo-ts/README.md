@@ -68,11 +68,11 @@ symlink attacks, signatures, command-injection arguments, and concurrent cache
 writers. `futureFlags.experimentalCargoSccache: true` always fails before task
 execution with a branded unsupported-compatibility diagnostic.
 
-JavaScript `file:`, `link:`, bare npm relative-directory, and relative pnpm
-`workspace:` dependencies resolve to discovered packages by canonical
-filesystem identity. A local path that does not resolve to a discovered
-JavaScript package disables caching for the declaring package and downstream
-hash scopes. JavaScript task hashes always
+JavaScript `file:`, `link:`, Yarn `portal:`, bare npm relative-directory, and
+relative pnpm `workspace:` dependencies resolve to discovered packages by
+canonical filesystem identity. A local path that does not resolve to a
+discovered JavaScript package disables caching for the declaring package and
+downstream hash scopes. JavaScript task hashes always
 include their owning `package.json`, independently of configured task globs.
 When that manifest is a symlink, its task hash includes both the link and the
 resolved contents consumed during discovery and execution. Repository-level
@@ -80,10 +80,12 @@ package-manager controls, workspace-local Bun `bunfig.toml` files, and expected
 lockfile paths also remain task-aware inputs, including when the active
 lockfile is deleted.
 Repository-contained Yarn `yarnPath` executables are package-manager inputs;
-missing or external executables disable JavaScript caching. Effective npm and
-pnpm user `.npmrc` files likewise disable caching because they are external
-inputs, while repository-contained ancestor `.npmrc` files are always hashed.
-Yarn home `.yarnrc` and `.yarnrc.yml` files also disable caching.
+missing or external executables disable JavaScript caching. Yarn 2+ tasks also
+hash their effective workspace-relative `injectEnvironmentFiles`, including
+the default `.env.yarn`; external or unmodeled paths disable caching. Effective
+npm and pnpm user `.npmrc` files likewise disable caching because they are
+external inputs, while repository-contained ancestor `.npmrc` files are always
+hashed. Yarn home `.yarnrc` and `.yarnrc.yml` files also disable caching.
 Enabled JavaScript, Cargo, and uv discovery passes retain co-located package
 scopes in the same workspace directory. Repository-root Cargo and uv scopes do
 not absorb ordinary root files during package-level affected selection.
@@ -99,6 +101,9 @@ external configuration paths are not task-hash inputs. Mismatched metadata/task
 effective Cargo-home configuration or `CARGO_BUILD_TARGET` likewise disables
 every cacheable Cargo compilation task. Cargo configuration above the
 repository disables the affected Cargo and downstream cache scopes.
+Repository-contained compiler wrappers selected by effective
+`build.rustc-wrapper` and `build.rustc-workspace-wrapper` configuration are
+hashed; missing, external, or PATH-resolved wrappers disable caching.
 Pure-library and mixed library/binary crates remain uncached when caching is
 enabled without positive output declarations because binary-only or log-only
 artifacts cannot restore all of Cargo's default outputs. Explicit output
@@ -153,10 +158,11 @@ plus effective repository-contained `uv.toml`, `.python-version`, and
 user configuration or an external `UV_CONFIG_FILE`, explicitly cached uv builds
 using `-o`, `--out-dir`, `--project`, or `--directory`, and uv packages with
 unresolved external local path dependencies bypass cache reads and writes until
-those inputs and outputs are modeled, regardless of editable mode. uv task
-hashes include normalized uv and effective Python identities; caching is
-bypassed when either identity cannot be determined without downloading an
-interpreter.
+those inputs and outputs are modeled, regardless of editable mode. Raw direct
+path or URL requirements without a corresponding `tool.uv.sources` declaration
+also bypass caching. uv task hashes include normalized uv and effective Python
+identities; caching is bypassed when either identity cannot be determined
+without downloading an interpreter.
 
 ## License and Attribution
 

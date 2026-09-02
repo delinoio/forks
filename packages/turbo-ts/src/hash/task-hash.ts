@@ -477,6 +477,7 @@ export const implicitTaskInputCandidates = (
     ...owningLockfileCandidates(repository, node),
     ...cargoControlInputCandidates(repository, node),
     ...repositoryPackageManagerControlInputCandidates(repository, node),
+    ...(node.package.cacheControlInputPaths ?? []),
     ...(node.package.manager === "uv"
       ? [
           ...uvTaskControlInputCandidates(
@@ -506,15 +507,17 @@ const alwaysHashedControlInputCandidates = (
   repository: RepositoryModel,
   node: TaskNode,
   uvPaths: ReadonlyArray<string>,
-): ReadonlyArray<string> =>
-  node.package.manager === "cargo"
+): ReadonlyArray<string> => [
+  ...(node.package.manager === "cargo"
     ? cargoControlInputCandidates(repository, node)
     : node.package.manager === "uv"
       ? uvPaths
       : [
           joinPath(node.package.directory, "package.json"),
           ...repositoryPackageManagerControlInputCandidates(repository, node),
-        ];
+        ]),
+  ...(node.package.cacheControlInputPaths ?? []),
+];
 
 const alwaysHashedControlInputFiles = (
   repository: RepositoryModel,

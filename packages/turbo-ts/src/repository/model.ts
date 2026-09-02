@@ -60,6 +60,7 @@ export interface RepositoryPackage {
   readonly canonicalRelativeDirectory: string;
   readonly cachePathRestorable: boolean;
   readonly cacheInputsComplete: boolean;
+  readonly cacheControlInputPaths?: ReadonlyArray<string>;
   readonly cargoCompilerIdentity?: string;
   readonly cargoHostTarget?: string;
   readonly workspaceDirectory?: string;
@@ -579,9 +580,13 @@ const localPathSpecification = (
   specification: string,
   manager: PackageManagerName,
 ): string | undefined => {
-  const protocol = (["file:", "link:"] as const).find((candidate) =>
-    specification.startsWith(candidate),
-  );
+  const protocol = (
+    [
+      "file:",
+      "link:",
+      ...(manager === "yarn" ? (["portal:"] as const) : []),
+    ] as const
+  ).find((candidate) => specification.startsWith(candidate));
   const workspacePath = specification.startsWith("workspace:")
     ? specification.slice("workspace:".length)
     : undefined;
@@ -1015,6 +1020,7 @@ const rustCompilerIdentity = (
 
 interface PythonProjectMetadata {
   readonly name?: string;
+  readonly cacheInputsComplete: boolean;
   readonly dependencyNames: ReadonlyArray<string>;
   readonly dependencySources: ReadonlyMap<
     string,
@@ -1043,9 +1049,11 @@ const packageManagerControls = (
   root: string,
   canonicalRoot: string,
   manager: PackageManagerName,
+  managerVersion: string | undefined,
 ): Effect.Effect<
   {
     readonly executableInput?: string;
+    readonly yarnEnvironmentFiles?: ReadonlyArray<string>;
     readonly cacheInputsComplete: boolean;
   },
   RepositoryError,
@@ -1056,6 +1064,12 @@ const packageManagerControls = (
       return { cacheInputsComplete: true };
     }
     if (manager !== "yarn") return { cacheInputsComplete: true };
+
+    const supportsInjectedEnvironmentFiles =
+      managerVersion === undefined || !satisfies(managerVersion, "<2.0.0");
+    const yarnEnvironmentFiles = supportsInjectedEnvironmentFiles
+      ? [".env.yarn?"]
+      : undefined;
 
     const configurationPath = joinPath(root, ".yarnrc.yml");
     const fileSystem = yield* FileSystemService;
@@ -1068,7 +1082,12 @@ const packageManagerControls = (
           }),
       ),
     );
-    if (!exists) return { cacheInputsComplete: true };
+    if (!exists) {
+      return {
+        ...(yarnEnvironmentFiles === undefined ? {} : { yarnEnvironmentFiles }),
+        cacheInputsComplete: true,
+      };
+    }
     const source = yield* fileSystem.readText(configurationPath).pipe(
       Effect.mapError(
         (error) =>
@@ -1089,20 +1108,117 @@ const packageManagerControls = (
         }),
       );
     }
+    const configuredEnvironmentFiles = supportsInjectedEnvironmentFiles
+      ? document?.injectEnvironmentFiles
+      : undefined;
+    const validEnvironmentFiles =
+      configuredEnvironmentFiles === undefined ||
+      (Array.isArray(configuredEnvironmentFiles) &&
+        configuredEnvironmentFiles.every((entry) => typeof entry === "string"));
+    const effectiveEnvironmentFiles =
+      configuredEnvironmentFiles === undefined
+        ? yarnEnvironmentFiles
+        : validEnvironmentFiles
+          ? (configuredEnvironmentFiles as ReadonlyArray<string>)
+          : undefined;
     const configuredPath = document?.yarnPath;
     if (typeof configuredPath !== "string" || configuredPath === "") {
-      return { cacheInputsComplete: true };
+      return {
+        ...(effectiveEnvironmentFiles === undefined
+          ? {}
+          : { yarnEnvironmentFiles: effectiveEnvironmentFiles }),
+        cacheInputsComplete: validEnvironmentFiles,
+      };
     }
     const executablePath = isAbsolutePath(configuredPath)
       ? normalizePath(configuredPath)
       : joinPath(root, configuredPath);
     const resolved = yield* Effect.either(fileSystem.realPath(executablePath));
     const cacheInputsComplete =
+      validEnvironmentFiles &&
       resolved._tag === "Right" &&
       isPathContained(canonicalRoot, normalizePath(resolved.right));
     return {
       ...(cacheInputsComplete ? { executableInput: executablePath } : {}),
+      ...(effectiveEnvironmentFiles === undefined
+        ? {}
+        : { yarnEnvironmentFiles: effectiveEnvironmentFiles }),
       cacheInputsComplete,
+    };
+  });
+
+const yarnEnvironmentControls = (
+  root: string,
+  canonicalRoot: string,
+  executionDirectory: string,
+  configuredPaths: ReadonlyArray<string> | undefined,
+): Effect.Effect<
+  {
+    readonly paths: ReadonlyArray<string>;
+    readonly cacheInputsComplete: boolean;
+  },
+  RepositoryError,
+  FileSystemService
+> =>
+  Effect.gen(function* () {
+    if (configuredPaths === undefined) {
+      return { paths: [], cacheInputsComplete: true };
+    }
+    const fileSystem = yield* FileSystemService;
+    const controls = yield* Effect.forEach(
+      configuredPaths,
+      (configuredPath) =>
+        Effect.gen(function* () {
+          const value = configuredPath.endsWith("?")
+            ? configuredPath.slice(0, -1)
+            : configuredPath;
+          if (value === "" || value.includes("${")) {
+            return { path: undefined, cacheInputsComplete: false };
+          }
+          const candidate = isAbsolutePath(value)
+            ? normalizePath(value)
+            : joinPath(executionDirectory, value);
+          const repositoryPath = isPathContained(root, candidate)
+            ? candidate
+            : repositoryPathFromCanonical(
+                root,
+                canonicalRoot,
+                normalizePath(candidate),
+              );
+          if (repositoryPath === undefined) {
+            return { path: undefined, cacheInputsComplete: false };
+          }
+          const exists = yield* fileSystem.exists(repositoryPath).pipe(
+            Effect.mapError(
+              (error) =>
+                new RepositoryError({
+                  path: repositoryPath,
+                  message: error.message,
+                }),
+            ),
+          );
+          if (!exists) {
+            return { path: repositoryPath, cacheInputsComplete: true };
+          }
+          const resolved = yield* Effect.either(
+            fileSystem.realPath(repositoryPath),
+          );
+          return resolved._tag === "Right" &&
+            isPathContained(canonicalRoot, normalizePath(resolved.right))
+            ? { path: repositoryPath, cacheInputsComplete: true }
+            : { path: undefined, cacheInputsComplete: false };
+        }),
+      { concurrency: 8 },
+    );
+    return {
+      paths: [
+        ...new Set(
+          controls.flatMap(({ path }) => (path === undefined ? [] : [path])),
+        ),
+      ],
+      cacheInputsComplete: controls.every(
+        (control) => control.cacheInputsComplete,
+      ),
     };
   });
 
@@ -1201,6 +1317,112 @@ const cargoBuildTargetConfigured = (
       if (parent === current) return false;
       current = parent;
     }
+  });
+
+const cargoCompilerWrapperControls = (
+  root: string,
+  canonicalRoot: string,
+  executionDirectory: string,
+): Effect.Effect<
+  {
+    readonly paths: ReadonlyArray<string>;
+    readonly cacheInputsComplete: boolean;
+  },
+  RepositoryError,
+  FileSystemService
+> =>
+  Effect.gen(function* () {
+    const wrapperNames = ["rustc-wrapper", "rustc-workspace-wrapper"] as const;
+    const configured = new Map<
+      (typeof wrapperNames)[number],
+      { readonly configurationPath: string; readonly value: unknown }
+    >();
+    const fileSystem = yield* FileSystemService;
+    let current = normalizePath(executionDirectory);
+    while (isPathContained(root, current)) {
+      const configurationPath = yield* cargoConfigurationPath(
+        joinPath(current, ".cargo"),
+      );
+      if (configurationPath !== undefined) {
+        const source = yield* fileSystem.readText(configurationPath).pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({
+                path: configurationPath,
+                message: error.message,
+              }),
+          ),
+        );
+        let document: Readonly<Record<string, unknown>> | undefined;
+        try {
+          document = recordValue(parseToml(source));
+        } catch (cause) {
+          return yield* Effect.fail(
+            new RepositoryError({
+              path: configurationPath,
+              message: String(cause),
+            }),
+          );
+        }
+        const build = recordValue(document?.build);
+        for (const name of wrapperNames) {
+          if (!configured.has(name) && build !== undefined && name in build) {
+            configured.set(name, {
+              configurationPath,
+              value: build[name],
+            });
+          }
+        }
+      }
+      if (current === root || configured.size === wrapperNames.length) break;
+      const parent = parentPath(current);
+      if (parent === current) break;
+      current = parent;
+    }
+    const controls = yield* Effect.forEach(
+      [...configured.values()],
+      ({ configurationPath, value }) =>
+        Effect.gen(function* () {
+          if (
+            typeof value !== "string" ||
+            value === "" ||
+            (!isAbsolutePath(value) && !/[\\/]/.test(value))
+          ) {
+            return { path: undefined, cacheInputsComplete: false };
+          }
+          const candidate = isAbsolutePath(value)
+            ? normalizePath(value)
+            : joinPath(parentPath(parentPath(configurationPath)), value);
+          const resolved = yield* Effect.either(fileSystem.realPath(candidate));
+          if (
+            resolved._tag === "Left" ||
+            !isPathContained(canonicalRoot, normalizePath(resolved.right))
+          ) {
+            return { path: undefined, cacheInputsComplete: false };
+          }
+          const repositoryPath = isPathContained(root, candidate)
+            ? candidate
+            : repositoryPathFromCanonical(
+                root,
+                canonicalRoot,
+                normalizePath(candidate),
+              );
+          return repositoryPath === undefined
+            ? { path: undefined, cacheInputsComplete: false }
+            : { path: repositoryPath, cacheInputsComplete: true };
+        }),
+      { concurrency: 2 },
+    );
+    return {
+      paths: [
+        ...new Set(
+          controls.flatMap(({ path }) => (path === undefined ? [] : [path])),
+        ),
+      ],
+      cacheInputsComplete: controls.every(
+        (control) => control.cacheInputsComplete,
+      ),
+    };
   });
 
 export const configuredEnvironmentValue = (
@@ -1538,9 +1760,18 @@ const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
     ...stringArrayValue(uv?.["dev-dependencies"]),
   ];
   const names = new Set<string>();
+  const directRequirementNames = new Set<string>();
   for (const requirement of requirements) {
-    const name = /^([A-Za-z0-9][A-Za-z0-9_.-]*)/.exec(requirement.trim())?.[1];
+    const trimmed = requirement.trim();
+    const name = /^([A-Za-z0-9][A-Za-z0-9_.-]*)/.exec(trimmed)?.[1];
     if (name !== undefined) names.add(normalizePythonPackageName(name));
+    const directName =
+      /^([A-Za-z0-9][A-Za-z0-9_.-]*)(?:\s*\[[^\]]*\])?\s*@\s*\S+/.exec(
+        trimmed,
+      )?.[1];
+    if (directName !== undefined) {
+      directRequirementNames.add(normalizePythonPackageName(directName));
+    }
   }
   const dependencySources = new Map<
     string,
@@ -1562,6 +1793,9 @@ const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
   }
   return {
     name: typeof project?.name === "string" ? project.name : undefined,
+    cacheInputsComplete: [...directRequirementNames].every((name) =>
+      dependencySources.has(name),
+    ),
     dependencyNames: [...names].sort(),
     dependencySources,
     ...(workspace === undefined
@@ -1737,6 +1971,7 @@ export const discoverRepository = (
       root,
       canonicalRepositoryRoot,
       managerIdentity.name,
+      managerIdentity.version,
     );
     const patterns = yield* workspacePatterns(
       root,
@@ -1789,6 +2024,12 @@ export const discoverRepository = (
                 }),
             ),
           );
+          const environmentControls = yield* yarnEnvironmentControls(
+            root,
+            canonicalRepositoryRoot,
+            directory,
+            managerControls.yarnEnvironmentFiles,
+          );
           return {
             name,
             directory,
@@ -1796,7 +2037,12 @@ export const discoverRepository = (
             canonicalRelativeDirectory:
               yield* canonicalRelativeDirectory(directory),
             cachePathRestorable: yield* cachePathIsRestorable(root, directory),
-            cacheInputsComplete: managerControls.cacheInputsComplete,
+            cacheInputsComplete:
+              managerControls.cacheInputsComplete &&
+              environmentControls.cacheInputsComplete,
+            ...(environmentControls.paths.length === 0
+              ? {}
+              : { cacheControlInputPaths: environmentControls.paths }),
             manager: managerIdentity.name,
             scripts: manifest.scripts ?? {},
             cargoDependencies:
@@ -2023,6 +2269,34 @@ export const discoverRepository = (
           Effect.gen(function* () {
             const directory = parentPath(metadata.manifestPath);
             const compilerIdentity = yield* rustCompilerIdentity(directory);
+            const compilerWrapperControls = yield* Effect.forEach(
+              [
+                ...new Set([
+                  directory,
+                  ...(metadata.workspaceDirectory === undefined ||
+                  !isPathContained(root, metadata.workspaceDirectory)
+                    ? []
+                    : [metadata.workspaceDirectory]),
+                ]),
+              ],
+              (executionDirectory) =>
+                cargoCompilerWrapperControls(
+                  root,
+                  canonicalRepositoryRoot,
+                  executionDirectory,
+                ),
+              { concurrency: 2 },
+            );
+            const compilerWrappers = {
+              paths: [
+                ...new Set(
+                  compilerWrapperControls.flatMap((control) => control.paths),
+                ),
+              ],
+              cacheInputsComplete: compilerWrapperControls.every(
+                (control) => control.cacheInputsComplete,
+              ),
+            };
             const configuredBuildTarget =
               yield* cargoBuildTargetConfigured(directory);
             const packageConfiguration =
@@ -2059,7 +2333,11 @@ export const discoverRepository = (
                 (metadata.targetDirectory === undefined ||
                   isPathContained(root, metadata.targetDirectory)) &&
                 !externalCargoConfigurationPresent &&
-                compilerIdentity !== undefined,
+                compilerIdentity !== undefined &&
+                compilerWrappers.cacheInputsComplete,
+              ...(compilerWrappers.paths.length === 0
+                ? {}
+                : { cacheControlInputPaths: compilerWrappers.paths }),
               ...(compilerIdentity === undefined
                 ? {}
                 : {
@@ -2156,7 +2434,7 @@ export const discoverRepository = (
             canonicalRelativeDirectory:
               yield* canonicalRelativeDirectory(directory),
             cachePathRestorable: yield* cachePathIsRestorable(root, directory),
-            cacheInputsComplete: true,
+            cacheInputsComplete: metadata.cacheInputsComplete,
             workspaceDirectory: root,
             manager: "uv" as const,
             scripts: polyglotScripts("uv", []),
@@ -2431,6 +2709,12 @@ export const discoverRepository = (
     );
     const rootDependencyResolution =
       javascriptDependencyResolutionByDirectory.get(normalizePath(root));
+    const rootEnvironmentControls = yield* yarnEnvironmentControls(
+      root,
+      canonicalRepositoryRoot,
+      root,
+      managerControls.yarnEnvironmentFiles,
+    );
     const rootPackage: RepositoryPackage = {
       identity: "//",
       name: "//",
@@ -2440,7 +2724,11 @@ export const discoverRepository = (
       cachePathRestorable: true,
       cacheInputsComplete:
         (rootDependencyResolution?.cacheInputsComplete ?? true) &&
-        managerControls.cacheInputsComplete,
+        managerControls.cacheInputsComplete &&
+        rootEnvironmentControls.cacheInputsComplete,
+      ...(rootEnvironmentControls.paths.length === 0
+        ? {}
+        : { cacheControlInputPaths: rootEnvironmentControls.paths }),
       manager: managerIdentity.name,
       scripts: rootManifest.scripts ?? {},
       dependencyNames: dependencyNames(rootManifest),
