@@ -2695,6 +2695,51 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
+  it("omits documentation-only task descriptions from hashes", async () => {
+    const directory = await makeFixture();
+    try {
+      const rootConfiguration = await Effect.runPromise(
+        loadRootConfiguration(directory).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const model = await Effect.runPromise(
+        discoverRepository(directory, rootConfiguration).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      const compute = (definition: TaskNode["definition"]) =>
+        Effect.runPromise(
+          hashTask(
+            model,
+            { ...node, definition },
+            [],
+            true,
+            [],
+            `${directory}/.turbo/cache`,
+          ).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      const baseline = await compute(node.definition);
+      for (const description of [
+        null,
+        "Build the synthetic library",
+      ] as const) {
+        expect((await compute({ ...node.definition, description })).hash).toBe(
+          baseline.hash,
+        );
+      }
+      expect(
+        (await compute({ ...node.definition, outputs: ["alternate/**"] })).hash,
+      ).not.toBe(baseline.hash);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("hashes the owning JavaScript manifest independently of task globs", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;
@@ -3517,6 +3562,158 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 60_000);
+
+  it("preserves strict uv controls when propagating Cargo workspace hashes", async () => {
+    const directory = await makeFixture();
+    const commandDirectory = `${directory}/commands`;
+    const cargoWorkspaceDirectory = `${directory}/rust`;
+    const pythonPackageDirectory = `${directory}/python/app`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        tasks: Record<string, unknown>;
+      };
+      configuration.futureFlags = {
+        experimentalCargoWorkspaces: true,
+        experimentalPythonWorkspaces: true,
+      };
+      configuration.tasks.test = { cache: true };
+      configuration.tasks["python-app#test"] = {
+        cache: true,
+        dependsOn: ["rust-a#test"],
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+
+      const cargoPackages = ["a", "b"].map((name) => {
+        const packageDirectory = `${cargoWorkspaceDirectory}/${name}`;
+        const packageName = `rust-${name}`;
+        return {
+          id: `path+file://${packageDirectory}#${packageName}@0.1.0`,
+          name: packageName,
+          packageDirectory,
+        };
+      });
+      for (const cargoPackage of cargoPackages) {
+        await mkdir(`${cargoPackage.packageDirectory}/src`, {
+          recursive: true,
+        });
+        await writeFile(
+          `${cargoPackage.packageDirectory}/Cargo.toml`,
+          `[package]\nname = "${cargoPackage.name}"\nversion = "0.1.0"\nedition = "2024"\n`,
+        );
+        await writeFile(
+          `${cargoPackage.packageDirectory}/src/lib.rs`,
+          `pub fn value() -> &'static str { "${cargoPackage.name}" }\n`,
+        );
+      }
+      await writeFile(
+        `${cargoWorkspaceDirectory}/Cargo.toml`,
+        '[workspace]\nmembers = ["a", "b"]\nresolver = "3"\n',
+      );
+      await writeFile(
+        `${cargoWorkspaceDirectory}/Cargo.lock`,
+        `version = 4\n\n${cargoPackages
+          .map(
+            ({ name }) => `[[package]]\nname = "${name}"\nversion = "0.1.0"\n`,
+          )
+          .join("\n")}`,
+      );
+
+      await mkdir(pythonPackageDirectory, { recursive: true });
+      await writeFile(
+        `${directory}/pyproject.toml`,
+        '[tool.uv.workspace]\nmembers = ["python/*"]\n',
+      );
+      await writeFile(
+        `${pythonPackageDirectory}/pyproject.toml`,
+        '[project]\nname = "python-app"\nversion = "0.1.0"\ndependencies = []\n',
+      );
+      await writeFile(`${directory}/uv.lock`, "version = 1\nrevision = 1\n");
+      const uvConfigurationPath = `${directory}/uv.toml`;
+      await writeFile(uvConfigurationPath, "offline = true\n");
+
+      await mkdir(commandDirectory, { recursive: true });
+      const cargoMetadata = JSON.stringify({
+        workspace_root: cargoWorkspaceDirectory,
+        workspace_members: cargoPackages.map(({ id }) => id),
+        target_directory: `${cargoWorkspaceDirectory}/target`,
+        packages: cargoPackages.map(({ id, name, packageDirectory }) => ({
+          id,
+          name,
+          manifest_path: `${packageDirectory}/Cargo.toml`,
+          dependencies: [],
+          targets: [{ kind: ["lib"], name: name.replaceAll("-", "_") }],
+        })),
+      });
+      const cargoCommand = `${commandDirectory}/cargo`;
+      const rustcCommand = `${commandDirectory}/rustc`;
+      const uvCommand = `${commandDirectory}/uv`;
+      await writeFile(
+        cargoCommand,
+        `#!/usr/bin/env node\nif (process.argv[2] === "metadata") process.stdout.write(${JSON.stringify(cargoMetadata)}); else console.log("cargo test output");\n`,
+      );
+      await writeFile(
+        rustcCommand,
+        '#!/usr/bin/env node\nconsole.log("rustc 1.96.0-nightly");\nconsole.log("host: synthetic-target-triple");\n',
+      );
+      await writeFile(
+        uvCommand,
+        '#!/usr/bin/env node\nif (process.env.UV_NO_CONFIG) process.exit(9);\nconsole.log("uv test output");\n',
+      );
+      await chmod(cargoCommand, 0o755);
+      await chmod(rustcCommand, 0o755);
+      await chmod(uvCommand, 0o755);
+
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "test",
+        "--cwd",
+        directory,
+        "--output-logs=hash-only",
+      ];
+      const environment = {
+        PATH: `${commandDirectory}${delimiter}${process.env.PATH ?? ""}`,
+        NO_COLOR: "1",
+        TURBO_TELEMETRY_DISABLED: "1",
+        UV_NO_CONFIG: "1",
+      };
+      const first = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
+      expect(first.exitCode, first.stderr).toBe(0);
+      expect(first.stdout).toContain("python-app:test: cache miss");
+      const warm = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
+      expect(warm.exitCode, warm.stderr).toBe(0);
+      expect(warm.stdout).toContain("python-app:test: cache hit");
+
+      await writeFile(uvConfigurationPath, "offline = false\n");
+      const changed = await run(
+        process.execPath,
+        args,
+        repositoryRoot,
+        environment,
+      );
+      expect(changed.exitCode, changed.stderr).toBe(0);
+      expect(changed.stdout).toContain("python-app:test: cache miss");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
 
   it("reads uv project names and dependencies from their TOML sections", async () => {
     const directory = await makeFixture();
@@ -6559,6 +6756,20 @@ describe("core CLI execution", () => {
           ),
         ).toBe(false);
       }
+      const additionalPackageSelectors = [
+        ["-p", "other"],
+        ["-pother"],
+        ["--package", "other"],
+        ["--package=other"],
+        ["--workspace"],
+        ["--all"],
+      ];
+      for (const task of ["build", "check", "dev", "lint", "run", "test"]) {
+        for (const selector of additionalPackageSelectors) {
+          expect(isTaskScopeCacheable(cargoNode(task), selector)).toBe(false);
+        }
+      }
+      expect(isTaskScopeCacheable(cargoNode("test"), ["--verbose"])).toBe(true);
       expect(
         isTaskScopeCacheable(
           cargoNode("format"),
@@ -8076,6 +8287,88 @@ describe("core CLI execution", () => {
       expect(filtered.exitCode).toBe(0);
       expect(filtered.stdout).toContain("library build");
       expect(filtered.stdout).toContain("app build");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("treats root Git ignore changes as task-aware inputs", async () => {
+    const directory = await makeGitFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as {
+        futureFlags?: Record<string, boolean>;
+      };
+      configuration.futureFlags = {
+        affectedUsingTaskInputs: true,
+        filterUsingTasks: true,
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await mkdir(`${directory}/packages/library/src`, { recursive: true });
+      await writeFile(
+        `${directory}/packages/library/src/generated.ts`,
+        "export const generated = true;\n",
+      );
+      await writeFile(
+        `${directory}/.gitignore`,
+        "packages/library/src/generated.ts\n",
+      );
+      for (const args of [
+        ["init"],
+        ["config", "user.email", "synthetic@example.test"],
+        ["config", "user.name", "Synthetic Fixture"],
+        ["add", "."],
+        ["commit", "-m", "fixture base"],
+      ]) {
+        const git = await run("git", args, directory);
+        expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
+      }
+      await writeFile(
+        `${directory}/.gitignore`,
+        "# generated source is now included\n",
+      );
+      for (const args of [
+        ["add", ".gitignore"],
+        ["commit", "-m", "include generated source"],
+      ]) {
+        const git = await run("git", args, directory);
+        expect(git.exitCode, `${args.join(" ")}: ${git.stderr}`).toBe(0);
+      }
+      expect(
+        (
+          await run("git", ["diff", "--name-only", "HEAD~1...HEAD"], directory)
+        ).stdout.trim(),
+      ).toBe(".gitignore");
+      const common = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--no-cache",
+      ];
+      for (const [arguments_, environment] of [
+        [
+          [...common, "--affected"],
+          { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+        ],
+        [[...common, "--filter=[HEAD~1]"], {}],
+      ] as const) {
+        const result = await run(
+          process.execPath,
+          arguments_,
+          repositoryRoot,
+          environment,
+        );
+        expect(result.exitCode, result.stderr).toBe(0);
+        expect(result.stdout).toContain("library build");
+        expect(result.stdout).toContain("app build");
+      }
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -11868,6 +12161,7 @@ describe("cache interoperability and safety", () => {
       expect(result.exitCode).not.toBe(0);
       expect(result.stderr).toContain(message);
       expect(result.stdout).not.toContain("library build");
+      return result;
     };
     try {
       await expectConfigurationFailure(
@@ -11890,6 +12184,28 @@ describe("cache interoperability and safety", () => {
           {},
           "invalid remote cache URL",
         );
+      }
+      for (const [args, environment, secret] of [
+        [
+          [
+            ...baseArguments,
+            "--api=https://alice:argument-secret@cache.example.test",
+          ],
+          {},
+          "argument-secret",
+        ],
+        [
+          baseArguments,
+          { TURBO_API: "https://alice:environment-secret@cache.example.test" },
+          "environment-secret",
+        ],
+      ] as const) {
+        const result = await expectConfigurationFailure(
+          args,
+          environment,
+          "invalid remote cache URL",
+        );
+        expect(result.stderr).not.toContain(secret);
       }
       for (const value of ["", "   ", "nonnumeric", "-1", "Infinity"]) {
         await expectConfigurationFailure(
@@ -11924,6 +12240,21 @@ describe("cache interoperability and safety", () => {
         baseArguments,
         {},
         "invalid remote cache URL",
+      );
+      configuration.remoteCache = {
+        apiUrl: "https://alice:configuration-secret@cache.example.test",
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const configuredCredentialFailure = await expectConfigurationFailure(
+        baseArguments,
+        {},
+        "invalid remote cache URL",
+      );
+      expect(configuredCredentialFailure.stderr).not.toContain(
+        "configuration-secret",
       );
     } finally {
       await rm(directory, { force: true, recursive: true });

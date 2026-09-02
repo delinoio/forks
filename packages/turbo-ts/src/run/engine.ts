@@ -412,6 +412,9 @@ const resolveOptions = (
       ) {
         throw new TypeError("unsupported remote cache URL protocol");
       }
+      if (parsedApiUrl.username !== "" || parsedApiUrl.password !== "") {
+        throw new TypeError("remote cache URL credentials are not supported");
+      }
     } catch {
       throw new ConfigurationError({
         path: apiUrlPath,
@@ -680,9 +683,11 @@ const findAffectedPackages = (
     const rootConfigurationChanged = changedFiles.includes(
       relativePath(repository.root, repository.rootConfiguration.path),
     );
+    const rootGitIgnoreChanged = changedFiles.includes(".gitignore");
     const rootChanged =
       globalDependencyChanged ||
       rootConfigurationChanged ||
+      rootGitIgnoreChanged ||
       (!globalInputsAreTaskAware && ordinaryRootChanged);
     return {
       packages: rootChanged
@@ -1415,8 +1420,13 @@ const cargoAlternateOutputFlags = [
   "--target-dir",
 ] as const;
 
-const cargoUnmodeledTargetFlags = [
+const cargoAdditionalPackageFlags = [
   "--all",
+  "--package",
+  "--workspace",
+] as const;
+
+const cargoUnmodeledTargetFlags = [
   "--all-targets",
   "--bench",
   "--benches",
@@ -1425,10 +1435,9 @@ const cargoUnmodeledTargetFlags = [
   "--example",
   "--examples",
   "--lib",
-  "--package",
   "--test",
   "--tests",
-  "--workspace",
+  ...cargoAdditionalPackageFlags,
 ] as const;
 
 const usesAlternateCargoBuildOutputs = (
@@ -1595,6 +1604,19 @@ const isCargoCompilationTask = (node: TaskNode): boolean =>
   node.package.manager === "cargo" &&
   cargoCompilationTasks.has(node.task as CargoCompilationTaskName);
 
+const usesAdditionalCargoPackageSelection = (
+  node: TaskNode,
+  passThroughArguments: ReadonlyArray<string>,
+): boolean =>
+  isCargoCompilationTask(node) &&
+  passThroughArguments.some(
+    (argument) =>
+      argument.startsWith("-p") ||
+      cargoAdditionalPackageFlags.some(
+        (flag) => argument === flag || argument.startsWith(`${flag}=`),
+      ),
+  );
+
 const usesCargoConfigurationOverride = (
   node: TaskNode,
   passThroughArguments: ReadonlyArray<string>,
@@ -1627,6 +1649,7 @@ export const isTaskScopeDynamicallyCacheable = (
   uvHasExternalControls = false,
 ): boolean =>
   !usesAlternateCargoBuildOutputs(node, passThroughArguments) &&
+  !usesAdditionalCargoPackageSelection(node, passThroughArguments) &&
   !usesCargoConfigurationOverride(node, passThroughArguments) &&
   !usesAlternateUvBuildOutputs(node, passThroughArguments) &&
   !(
@@ -2291,15 +2314,14 @@ const computeTaskHashes = (
   repository: RepositoryModel,
   graph: TaskGraph,
   options: ResolvedRunOptions,
+  sourceEnvironment: Readonly<Record<string, string | undefined>>,
+  caseInsensitiveEnvironmentNames: boolean,
 ): Effect.Effect<
   ReadonlyMap<string, TaskHashResult>,
   RepositoryError,
   FileSystemService | EnvironmentService | DigestService | ProcessService
 > =>
   Effect.gen(function* () {
-    const environmentService = yield* EnvironmentService;
-    const sourceEnvironment = yield* environmentService.entries;
-    const platform = yield* environmentService.platform;
     const hashes = new Map<string, TaskHashResult>();
     for (const id of topologicalOrder(hashDependencyGraph(graph))) {
       const node = graph.nodes.get(id)!;
@@ -2320,7 +2342,7 @@ const computeTaskHashes = (
           options.environmentMode,
           options.frameworkInference,
           packageTaskCommandScope,
-          platform === "win32",
+          caseInsensitiveEnvironmentNames,
         ),
       );
       hashes.set(id, result);
@@ -2463,6 +2485,8 @@ const applyCargoWorkspaceHashes = (
   hashes: ReadonlyMap<string, TaskHashResult>,
   scopes: ReadonlyMap<string, TaskCommandScope>,
   options: ResolvedRunOptions,
+  sourceEnvironment: Readonly<Record<string, string | undefined>>,
+  caseInsensitiveEnvironmentNames: boolean,
 ): Effect.Effect<
   ReadonlyMap<string, TaskHashResult>,
   RepositoryError,
@@ -2507,6 +2531,15 @@ const applyCargoWorkspaceHashes = (
           options.frameworkInference,
           options.passThroughArguments,
           options.cacheExclusionDirectory,
+          taskScopeEnvironment(
+            repository,
+            node,
+            sourceEnvironment,
+            options.environmentMode,
+            options.frameworkInference,
+            packageTaskCommandScope,
+            caseInsensitiveEnvironmentNames,
+          ),
         ),
       );
       changed.add(id);
@@ -2919,9 +2952,17 @@ export const executeRun = (
     const hashes = yield* applyCargoWorkspaceHashes(
       repository,
       graph,
-      yield* computeTaskHashes(repository, selectedGraph, options),
+      yield* computeTaskHashes(
+        repository,
+        selectedGraph,
+        options,
+        environment,
+        platform === "win32",
+      ),
       cargoWorkspacePlan.scopes,
       options,
+      environment,
+      platform === "win32",
     );
     const unrestorableCacheInputs = taskIdsWithUnrestorableCacheInputs(
       graph,

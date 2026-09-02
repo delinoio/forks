@@ -932,7 +932,11 @@ export const hashTask = (
               ),
             }),
         passThroughArguments,
-        definition: node.definition,
+        definition: Object.fromEntries(
+          Object.entries(node.definition).filter(
+            ([name]) => name !== "description",
+          ),
+        ),
         effectiveInputs: inputs,
         files: fileHashes,
         environment: hashedEnvironment,

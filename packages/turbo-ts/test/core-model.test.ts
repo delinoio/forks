@@ -61,6 +61,20 @@ import { parseConcurrency, parseRunArguments } from "../src/run/options.js";
 
 const encoder = new TextEncoder();
 
+const updateTarChecksum = (archive: Uint8Array): void => {
+  const checksum = archive
+    .subarray(0, tarBlockSize)
+    .reduce(
+      (total, byte, index) =>
+        total + (index >= 148 && index < 156 ? 0x20 : byte),
+      0,
+    );
+  archive.fill(0, 148, 156);
+  archive.set(encoder.encode(checksum.toString(8).padStart(6, "0")), 148);
+  archive[154] = 0;
+  archive[155] = 0x20;
+};
+
 const packageModel = (
   name: string,
   dependencies: ReadonlyArray<string>,
@@ -1452,6 +1466,29 @@ describe("cache archive safety", () => {
     ]);
   });
 
+  it("rejects tar numeric fields with non-octal suffixes", () => {
+    const archive = createTarArchive([
+      {
+        path: "packages/app/dist/output.txt",
+        contents: encoder.encode("output"),
+        mode: 0o644,
+        modifiedSeconds: 1,
+      },
+    ]);
+    for (const [offset, length] of [
+      [100, 8],
+      [124, 12],
+    ] as const) {
+      const invalid = archive.slice();
+      invalid.fill(0, offset, offset + length);
+      invalid.set(encoder.encode(`${"0".repeat(length - 2)}8`), offset);
+      updateTarChecksum(invalid);
+      expect(() => parseTarArchive(invalid)).toThrow(
+        /invalid tar numeric field/,
+      );
+    }
+  });
+
   it("rejects tar header text that is not valid UTF-8", () => {
     const withInvalidHeaderText = (
       archive: Uint8Array,
@@ -1459,16 +1496,7 @@ describe("cache archive safety", () => {
     ): Uint8Array => {
       const invalid = archive.slice();
       invalid[offset] = 0xff;
-      const checksum = invalid
-        .subarray(0, tarBlockSize)
-        .reduce(
-          (total, byte, index) =>
-            total + (index >= 148 && index < 156 ? 0x20 : byte),
-          0,
-        );
-      invalid.set(encoder.encode(checksum.toString(8).padStart(6, "0")), 148);
-      invalid[154] = 0;
-      invalid[155] = 0x20;
+      updateTarChecksum(invalid);
       return invalid;
     };
     const file = {

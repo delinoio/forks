@@ -355,6 +355,9 @@ const readOctal = (
   length: number,
 ): number => {
   const text = readText(source, offset, length).trim();
+  if (text !== "" && !/^[0-7]+$/.test(text)) {
+    throw new TypeError("invalid tar numeric field");
+  }
   const value = text === "" ? 0 : Number.parseInt(text, 8);
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new TypeError("invalid tar numeric field");

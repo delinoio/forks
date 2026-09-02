@@ -132,7 +132,8 @@ task-aware selection and hashing. Expected JavaScript lockfile paths remain
 task-aware inputs when the active lockfile is deleted. A changed
 workspace gitlink path is treated as the package-relative `.` input. Task
 hashes preserve Git symlink, gitlink, and dependency semantics, exclude the
-resolved cache directory, and use each task's owning ecosystem lockfile.
+resolved cache directory, use each task's owning ecosystem lockfile, and omit
+documentation-only task descriptions.
 When the Git index and working tree disagree on regular-file or symlink kind,
 the working-tree kind determines the hashed mode. An indexed executable bit is
 retained only while both representations remain regular files.
@@ -201,9 +202,10 @@ Workspace configuration inheritance accepts only the exact `["//"]` parent
 list.
 Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
 reject malformed entries. Remote artifact routes preserve configured API path
-prefixes. Active remote URLs must use HTTP or HTTPS, and URLs and timeout values
-are validated before cache or task work begins; blank download and upload
-timeout strings are invalid. Signature-key requirements
+prefixes. Active remote URLs must use HTTP or HTTPS, must not contain username
+or password credentials, and URLs and timeout values are validated before cache
+or task work begins; blank download and upload timeout strings are invalid.
+Signature-key requirements
 apply only when a remote transport is active; disabled remotes and
 configurations without an API URL do not require a signing key. Every active
 signed remote requires a non-empty key, while the 32-character minimum applies
@@ -282,10 +284,11 @@ before the stale-lock threshold, and renewal or ownership loss interrupts the
 protected operation. Locks left by terminated writers remain reclaimable.
 Cache archives use PAX
 extensions for paths beyond ustar limits. Tar header paths, link targets, and
-PAX metadata must be valid UTF-8; unsupported raw-byte names reject the
-artifact. Interrupted or failed atomic writes attempt to remove their temporary
-files. An atomic-write cleanup failure is surfaced as a local cache
-write failure, including when the write or rename also failed. A cache
+PAX metadata must be valid UTF-8, and numeric fields must contain complete octal
+values; malformed fields reject the artifact. Interrupted or failed atomic
+writes attempt to remove their temporary files. An atomic-write cleanup failure
+is surfaced as a local cache write failure, including when the write or rename
+also failed. A cache
 writer-lock release failure is likewise surfaced and preserves any preceding
 write or eviction failure.
 Archives preserve empty declared output directories. Failed restoration removes
@@ -359,11 +362,12 @@ task configuration merging. Other cached Cargo compilation tasks (`check`,
 workspace dependency hashes participate in their cache keys.
 Pass-through arguments are forwarded to Cargo without an implicit
 target-argument separator. Cargo builds
-for mixed library and binary crates default to uncached. Builds with
-pass-through arguments that select an additional package, an alternate output
-layout or manifest, or an unmodeled library, binary, example, test, or benchmark
-target bypass caching until those outputs are modeled explicitly. The
-additional-package selectors include `--workspace` and `--all`. Cargo build
+for mixed library and binary crates default to uncached. Every cacheable Cargo
+compilation task bypasses caching when pass-through arguments add a package
+selector, including `-p`, `--package`, `--workspace`, and `--all`. Cargo builds
+with an alternate output layout or manifest, or an unmodeled library, binary,
+example, test, or benchmark target also bypass caching until those outputs are
+modeled explicitly. Cargo build
 pass-through `--config` arguments also bypass caching for every cacheable Cargo
 compilation task (`build`, `check`, `test`, `lint`, `run`, and `dev`) because
 they can load or set external compilation controls that are not hashed. The
@@ -376,7 +380,8 @@ likewise bypass caching. Runtime-only cache bypasses seed the dependency and
 prerequisite output depends on unmodeled external controls. Cargo metadata
 discovery uses `--locked`, uses each response's workspace-member list, and does
 not probe excluded or unrelated nested manifests. Combined workspace task
-hashes are propagated into every downstream task hash.
+hashes are propagated into every downstream task hash using the same effective
+task environment as the initial hash computation.
 Cargo builds with colliding synthesized binary destinations bypass caching,
 including when task configuration explicitly enables it.
 Synthesized Cargo binary outputs cover the extensionless executable plus
@@ -392,6 +397,9 @@ select only tasks whose effective inputs match them; repository-global inputs
 and Git discovery failures retain the all-task fallback.
 Changes to the loaded root task configuration select all requested task
 entrypoints under task-aware affected and Git-range filtering.
+Changes to the repository-root `.gitignore` retain the same all-task fallback
+because they can change Git-discovered task inputs without exposing newly
+included files in the revision diff.
 
 Gate 2 is not closed: the composed task-hash serializer does not yet reproduce
 the official 2.10.12 task hashes. Individual source-file hashes match Git and
