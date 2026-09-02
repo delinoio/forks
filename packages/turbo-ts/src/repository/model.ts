@@ -1315,40 +1315,55 @@ const cargoTasks = (
       : { outputs };
   const executionDefaults: Pipeline = { cache: false };
   const formatDefaults: Pipeline = { cache: false };
-  const buildTask = (configuredTask: Pipeline): Pipeline => {
-    const merged = mergePipeline(buildDefaults, configuredTask);
-    const withInternalDependencies = {
-      ...merged,
-      dependsOn: [...new Set([...(merged.dependsOn ?? []), "^build"])],
-    };
-    return configuredBuildTarget || hasCollidingBuildOutput
+  const compilationTaskNames = [
+    "build",
+    "check",
+    "dev",
+    "lint",
+    "run",
+    "test",
+  ] as const;
+  type CompilationTaskName = (typeof compilationTaskNames)[number];
+  const compilationTask = (
+    task: CompilationTaskName,
+    configuredTask: Pipeline,
+  ): Pipeline => {
+    const defaults =
+      task === "build"
+        ? buildDefaults
+        : task === "dev" || task === "run"
+          ? executionDefaults
+          : {};
+    const merged = mergePipeline(defaults, configuredTask);
+    const withInternalDependencies =
+      task === "build" || merged.cache !== false
+        ? {
+            ...merged,
+            dependsOn: [...new Set([...(merged.dependsOn ?? []), "^build"])],
+          }
+        : merged;
+    return task === "build" &&
+      (configuredBuildTarget || hasCollidingBuildOutput)
       ? { ...withInternalDependencies, cache: false }
       : withInternalDependencies;
   };
   const tasks: Record<string, Pipeline> = { ...configured };
-  if (!excludedTasks.has("build")) {
-    tasks.build = buildTask(configured.build ?? {});
+  for (const task of compilationTaskNames) {
+    if (
+      excludedTasks.has(task) ||
+      ((task === "dev" || task === "run") &&
+        metadata?.entrypointNames.length !== 1)
+    ) {
+      continue;
+    }
+    tasks[task] = compilationTask(task, configured[task] ?? {});
+    const qualifiedTask = `${packageName}#${task}`;
+    if (configured[qualifiedTask] !== undefined) {
+      tasks[qualifiedTask] = compilationTask(task, configured[qualifiedTask]);
+    }
   }
   if (!excludedTasks.has("format")) {
     tasks.format = mergePipeline(formatDefaults, configured.format ?? {});
-  }
-  if (metadata?.entrypointNames.length === 1) {
-    for (const task of ["dev", "run"] as const) {
-      if (!excludedTasks.has(task)) {
-        tasks[task] = mergePipeline(executionDefaults, configured[task] ?? {});
-      }
-      const qualifiedTask = `${packageName}#${task}`;
-      if (!excludedTasks.has(task) && configured[qualifiedTask] !== undefined) {
-        tasks[qualifiedTask] = mergePipeline(
-          executionDefaults,
-          configured[qualifiedTask],
-        );
-      }
-    }
-  }
-  const qualifiedBuild = `${packageName}#build`;
-  if (!excludedTasks.has("build") && configured[qualifiedBuild] !== undefined) {
-    tasks[qualifiedBuild] = buildTask(configured[qualifiedBuild]);
   }
   const qualifiedFormat = `${packageName}#format`;
   if (
@@ -2132,6 +2147,7 @@ export const listRepositoryFiles = (
   options: {
     readonly ignoredDirectories?: ReadonlySet<string>;
     readonly includeDirectories?: boolean;
+    readonly includeOtherEntries?: boolean;
     readonly shouldTraverseDirectory?: (relativeDirectory: string) => boolean;
     readonly windowsPathSeparators?: boolean;
   } = {},
@@ -2171,7 +2187,11 @@ export const listRepositoryFiles = (
             files.push(path);
           }
           pending.push(path);
-        } else if (entry.kind === "file" || entry.kind === "symlink") {
+        } else if (
+          entry.kind === "file" ||
+          entry.kind === "symlink" ||
+          (entry.kind === "other" && options.includeOtherEntries === true)
+        ) {
           files.push(
             normalizePath(
               `${current.endsWith("/") ? current : `${current}/`}${entry.name}`,

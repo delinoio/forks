@@ -288,7 +288,9 @@ Resolved cache-directory subtrees are excluded from both task inputs and task
 outputs, including custom cache directory names selected by broad output globs.
 Cache output collection prunes directory subtrees that cannot match a positive
 output pattern, while matching patterns may explicitly retain `node_modules`
-or other normally ignored directories.
+or other normally ignored directories. A matching FIFO, socket, device, or
+other unsupported filesystem entry skips cache publication without changing a
+successful task result.
 uv packages are discovered from the root
 `pyproject.toml` workspace root and member globs after applying workspace
 exclusions; unrelated Python projects and `.venv` trees are ignored.
@@ -337,8 +339,9 @@ same workspace; registry and Git dependencies remain external. Cargo `run` and
 `dev` tasks are exposed only for crates with one unambiguous binary target, and
 default to uncached unless task configuration explicitly enables caching.
 Synthesized Cargo builds always retain an internal `^build` dependency after
-task configuration merging, so resolved workspace dependency hashes
-participate in their cache keys.
+task configuration merging. Other cached Cargo compilation tasks (`check`,
+`test`, `lint`, `run`, and `dev`) retain the same dependency, so resolved
+workspace dependency hashes participate in their cache keys.
 Pass-through arguments are forwarded to Cargo without an implicit
 target-argument separator. Cargo builds
 for mixed library and binary crates default to uncached. Builds with

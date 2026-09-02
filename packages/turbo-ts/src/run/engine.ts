@@ -34,7 +34,11 @@ import {
   parentPath,
   relativePath,
 } from "../core/path.js";
-import { ConfigurationError, RepositoryError } from "../effect/errors.js";
+import {
+  CacheRollbackError,
+  ConfigurationError,
+  RepositoryError,
+} from "../effect/errors.js";
 import {
   ClockService,
   CompressionService,
@@ -1137,6 +1141,7 @@ const collectOutputPaths = (
         const files = yield* listRepositoryFiles(directory, {
           ignoredDirectories: new Set([".git", ".turbo"]),
           includeDirectories: true,
+          includeOtherEntries: true,
           shouldTraverseDirectory: (relativeDirectory) =>
             positivePatterns.some((pattern) =>
               canMatchGlobDescendant(
@@ -1251,6 +1256,14 @@ const collectCacheEntries = (
     const entries: Array<CacheWriteEntry> = [];
     let inputBytes = 0;
     for (const { path, metadata } of selectedMetadata) {
+      if (metadata.kind === "other") {
+        return yield* Effect.fail(
+          new RepositoryError({
+            path,
+            message: "declared task output has an unsupported filesystem type",
+          }),
+        );
+      }
       const common = {
         path: relativePath(repository.root, path, windowsPathSeparators),
         mode: metadata.mode,
@@ -2872,14 +2885,14 @@ export const executeRun = (
       ReadonlyArray<string>,
     ]): Effect.Effect<
       ReadonlyArray<TaskOutcome>,
-      RepositoryError,
+      CacheRollbackError | RepositoryError,
       RunRequirements
     > => {
       const memberSet = new Set(members);
       const groupOutcomes = new Map<string, TaskOutcome>();
       const runNode = (
         id: string,
-      ): Effect.Effect<TaskOutcome, never, RunRequirements> => {
+      ): Effect.Effect<TaskOutcome, CacheRollbackError, RunRequirements> => {
         const node = graph.nodes.get(id)!;
         const dependencyFailed = node.dependencies.some((dependency) => {
           const outcome =
@@ -2912,17 +2925,19 @@ export const executeRun = (
           logIdentifiers.get(id),
         ).pipe(
           Effect.catchAll((cause) =>
-            Effect.gen(function* () {
-              const terminal = yield* TerminalService;
-              yield* terminal
-                .writeStderr(`turbo-ts: ${String(cause)}\n`)
-                .pipe(Effect.ignore);
-              return {
-                id,
-                exitCode: 1,
-                skipped: false,
-              } satisfies TaskOutcome;
-            }),
+            cause instanceof CacheRollbackError
+              ? Effect.fail(cause)
+              : Effect.gen(function* () {
+                  const terminal = yield* TerminalService;
+                  yield* terminal
+                    .writeStderr(`turbo-ts: ${String(cause)}\n`)
+                    .pipe(Effect.ignore);
+                  return {
+                    id,
+                    exitCode: 1,
+                    skipped: false,
+                  } satisfies TaskOutcome;
+                }),
           ),
         );
       };
@@ -2940,7 +2955,7 @@ export const executeRun = (
         Effect.gen(function* () {
           const backgroundFibers: Array<{
             readonly id: string;
-            readonly fiber: Fiber.RuntimeFiber<TaskOutcome, never>;
+            readonly fiber: Fiber.RuntimeFiber<TaskOutcome, CacheRollbackError>;
           }> = [];
           const startedBackground = new Set<string>();
           const remaining = new Set(foreground);
@@ -3108,7 +3123,10 @@ export const executeRun = (
         const completions = yield* Queue.unbounded<string>();
         const running = new Map<
           string,
-          Fiber.RuntimeFiber<ReadonlyArray<TaskOutcome>, RepositoryError>
+          Fiber.RuntimeFiber<
+            ReadonlyArray<TaskOutcome>,
+            CacheRollbackError | RepositoryError
+          >
         >();
         let stopScheduling = false;
         while (pending.size > 0 || running.size > 0) {

@@ -45,7 +45,11 @@ import {
 } from "../src/cache/restore.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { loadRootConfiguration } from "../src/config/runtime.js";
-import { BoundaryError, CacheError } from "../src/effect/errors.js";
+import {
+  BoundaryError,
+  CacheError,
+  CacheRollbackError,
+} from "../src/effect/errors.js";
 import { nodeFoundationLayer } from "../src/effect/node-layer.js";
 import {
   ClockService,
@@ -798,6 +802,97 @@ describe("core CLI execution", () => {
     }
   });
 
+  it("skips cache publication for unsupported declared output types", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const outputDirectory = `${packageDirectory}/dist`;
+    const specialOutput = `${outputDirectory}/special-output`;
+    try {
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt','value'); console.log('special output build')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const stderr: Array<string> = [];
+      let specialOutputRead = false;
+      const exitCode = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const overrides = Layer.merge(
+            Layer.succeed(FileSystemService, {
+              ...fileSystem,
+              list: (path) =>
+                fileSystem
+                  .list(path)
+                  .pipe(
+                    Effect.map((entries) =>
+                      path === outputDirectory
+                        ? [
+                            ...entries,
+                            { name: "special-output", kind: "other" as const },
+                          ]
+                        : entries,
+                    ),
+                  ),
+              metadata: (path) =>
+                path === specialOutput
+                  ? Effect.succeed({
+                      kind: "other" as const,
+                      mode: 0,
+                      modifiedMilliseconds: 0,
+                      size: 0,
+                    })
+                  : fileSystem.metadata(path),
+              readBytesRange: (path, offset, length) => {
+                if (path !== specialOutput) {
+                  return fileSystem.readBytesRange(path, offset, length);
+                }
+                specialOutputRead = true;
+                return Effect.fail(
+                  new BoundaryError({
+                    boundary: "filesystem",
+                    message: "special output must not be read",
+                    retryable: false,
+                  }),
+                );
+              },
+            }),
+            Layer.succeed(TerminalService, {
+              writeStdout: () => Effect.void,
+              writeStderr: (text) =>
+                Effect.sync(() => {
+                  stderr.push(text);
+                }),
+              stdoutColorEnabled: Effect.succeed(false),
+              stderrColorEnabled: Effect.succeed(false),
+            }),
+          );
+          return yield* executeRun(
+            parseRunArguments([
+              "run",
+              "build",
+              "--cwd",
+              directory,
+              "--filter=synthetic-library",
+              "--cache=local:w",
+              "--no-color",
+            ]),
+          ).pipe(Effect.provide(overrides));
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(exitCode).toBe(0);
+      expect(specialOutputRead).toBe(false);
+      expect(stderr.join("")).toContain(
+        "declared task output has an unsupported filesystem type",
+      );
+      await expect(readdir(`${directory}/.turbo/cache`)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("skips oversized cache inputs before retaining file contents", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;
@@ -1304,6 +1399,123 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("aborts scheduling when cache restoration rollback fails", async () => {
+    const directory = await makeFixture();
+    const libraryDirectory = `${directory}/packages/library`;
+    const applicationDirectory = `${directory}/packages/app`;
+    const firstOutput = `${libraryDirectory}/dist/first.txt`;
+    const secondOutput = `${libraryDirectory}/dist/second.txt`;
+    const continuedMarker = `${applicationDirectory}/continued.txt`;
+    try {
+      const libraryManifestPath = `${libraryDirectory}/package.json`;
+      const libraryManifest = JSON.parse(
+        await readFile(libraryManifestPath, "utf8"),
+      ) as { scripts: Record<string, string> };
+      libraryManifest.scripts.build =
+        "node -e \"const fs=require('node:fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/first.txt','first'); fs.writeFileSync('dist/second.txt','second'); console.log('library build')\"";
+      await writeFile(
+        libraryManifestPath,
+        `${JSON.stringify(libraryManifest, null, 2)}\n`,
+      );
+      const applicationManifestPath = `${applicationDirectory}/package.json`;
+      const applicationManifest = JSON.parse(
+        await readFile(applicationManifestPath, "utf8"),
+      ) as { scripts: Record<string, string> };
+      applicationManifest.scripts.build =
+        "node -e \"require('node:fs').writeFileSync('continued.txt','continued')\"";
+      await writeFile(
+        applicationManifestPath,
+        `${JSON.stringify(applicationManifest, null, 2)}\n`,
+      );
+      const applicationConfigurationPath = `${applicationDirectory}/turbo.json`;
+      const applicationConfiguration = JSON.parse(
+        await readFile(applicationConfigurationPath, "utf8"),
+      ) as { tasks: Record<string, Record<string, unknown>> };
+      applicationConfiguration.tasks.build = {
+        ...applicationConfiguration.tasks.build,
+        cache: false,
+      };
+      await writeFile(
+        applicationConfigurationPath,
+        `${JSON.stringify(applicationConfiguration, null, 2)}\n`,
+      );
+      const arguments_ = [
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-app",
+        "--continue=always",
+        "--cache=local:rw",
+        "--no-color",
+      ];
+      const cold = await run(
+        process.execPath,
+        [candidateEntrypoint, ...arguments_],
+        repositoryRoot,
+      );
+      expect(cold.exitCode, cold.stderr).toBe(0);
+      await rm(`${libraryDirectory}/dist`, { force: true, recursive: true });
+      await rm(continuedMarker, { force: true });
+
+      let restoreFailureInjected = false;
+      const outcome = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const failingLayer = Layer.succeed(FileSystemService, {
+            ...fileSystem,
+            copyBytesRange: (source, offset, length, destination) => {
+              if (destination !== secondOutput || restoreFailureInjected) {
+                return fileSystem.copyBytesRange(
+                  source,
+                  offset,
+                  length,
+                  destination,
+                );
+              }
+              restoreFailureInjected = true;
+              return fileSystem
+                .copyBytesRange(source, offset, length, destination)
+                .pipe(
+                  Effect.zipRight(
+                    Effect.fail(
+                      new BoundaryError({
+                        boundary: "filesystem",
+                        message: "synthetic restore failure",
+                        retryable: false,
+                      }),
+                    ),
+                  ),
+                );
+            },
+            remove: (path) =>
+              path === firstOutput
+                ? Effect.fail(
+                    new BoundaryError({
+                      boundary: "filesystem",
+                      message: "synthetic rollback failure",
+                      retryable: false,
+                    }),
+                  )
+                : fileSystem.remove(path),
+          });
+          return yield* executeRun(parseRunArguments(arguments_)).pipe(
+            Effect.either,
+            Effect.provide(failingLayer),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(restoreFailureInjected).toBe(true);
+      expect(outcome._tag).toBe("Left");
+      if (outcome._tag === "Left") {
+        expect(outcome.left).toBeInstanceOf(CacheRollbackError);
+      }
+      await expect(lstat(continuedMarker)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
 
   it("streams large task logs when replaying cache hits", async () => {
     const directory = await makeFixture();
@@ -2758,6 +2970,8 @@ describe("core CLI execution", () => {
         experimentalCargoWorkspaces: true,
       };
       delete configuration.tasks.build;
+      configuration.tasks.dev = { cache: true };
+      configuration.tasks.run = { cache: true };
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
@@ -2814,11 +3028,13 @@ describe("core CLI execution", () => {
       const pathApp = pathModel.packagesByName.get("rust-app")!;
       expect(pathApp.cacheInputsComplete).toBe(true);
       expect(pathApp.internalDependencies).toEqual(["itoa"]);
-      const graph = buildTaskGraph(pathModel, [pathApp], ["build"], false);
-      expect(graph.nodes.has("itoa#build")).toBe(true);
-      expect(graph.nodes.get("rust-app#build")?.dependencies).toEqual([
-        "itoa#build",
-      ]);
+      for (const task of ["build", "check", "dev", "lint", "run", "test"]) {
+        const graph = buildTaskGraph(pathModel, [pathApp], [task], false);
+        expect(graph.nodes.has("itoa#build")).toBe(true);
+        expect(graph.nodes.get(`rust-app#${task}`)?.dependencies).toEqual([
+          "itoa#build",
+        ]);
+      }
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
