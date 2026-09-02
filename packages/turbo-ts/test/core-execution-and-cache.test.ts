@@ -313,7 +313,9 @@ describe("core CLI execution", () => {
       );
       expect(result.exitCode, result.combinedOutput).toBe(0);
       const prefix = "synthetic-library:long-line: ";
-      expect(result.stdout).toContain(`${prefix}${output}\n`);
+      expect(stripVTControlCharacters(result.stdout)).toContain(
+        `${prefix}${output}\n`,
+      );
       expect(
         await readFile(
           `${packageDirectory}/.turbo/turbo-long-line.log`,
