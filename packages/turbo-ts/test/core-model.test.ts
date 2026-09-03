@@ -293,12 +293,16 @@ describe("core repository model", () => {
       parseLockfile(
         "/repo/package-lock.json",
         encoder.encode(
-          '{"lockfileVersion":3,"packages":{"node_modules/a":{"name":"a","version":"1.0.0"}}}',
+          '{"lockfileVersion":3,"packages":{"node_modules/a":{"version":"1.0.0"},"node_modules/@scope/b":{"version":"2.0.0"},"node_modules/parent/node_modules/nested":{"version":"3.0.0"}}}',
         ),
       ),
     ).toMatchObject({
       format: "npm",
-      packages: [{ name: "a", version: "1.0.0" }],
+      packages: [
+        { name: "@scope/b", version: "2.0.0" },
+        { name: "a", version: "1.0.0" },
+        { name: "nested", version: "3.0.0" },
+      ],
     });
     expect(
       parseLockfile(

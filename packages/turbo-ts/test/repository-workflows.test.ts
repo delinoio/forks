@@ -16,7 +16,7 @@ import {
 } from "node:http2";
 import { createConnection as createNetConnection } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "@rstest/core";
@@ -34,6 +34,7 @@ import { parseDaemonArguments } from "../src/workflow/daemon.js";
 import { isWindowsSubsystemForLinux } from "../src/workflow/misc.js";
 import { parsePruneArguments } from "../src/workflow/prune.js";
 import { repositoryQuerySchema } from "../src/workflow/query.js";
+import { repositoryPackageManagerLabel } from "../src/workflow/repository.js";
 import { parseWatchArguments } from "../src/workflow/watch.js";
 
 const execFilePromise = promisify(execFile);
@@ -194,6 +195,7 @@ describe("repository workflow gate", () => {
       "--log-order=grouped",
       "--log-prefix=task",
       "--global-deps=tooling/*.json",
+      "--single-package",
       "--json",
     ]);
     expect(run).toMatchObject({
@@ -205,8 +207,21 @@ describe("repository workflow gate", () => {
       logOrder: "grouped",
       logPrefix: "task",
       globalDependencies: ["tooling/*.json"],
+      singlePackage: true,
       json: true,
     });
+    for (const [manager, label] of [
+      ["npm", "npm"],
+      ["pnpm", "pnpm9"],
+      ["yarn", "yarn"],
+      ["bun", "bun"],
+      ["aube", "aube"],
+      ["nub", "nub"],
+      ["cargo", "cargo"],
+      ["uv", "uv"],
+    ] as const) {
+      expect(repositoryPackageManagerLabel({ manager })).toBe(label);
+    }
     expect(
       parseWatchArguments(["build", "--", "--experimental-write-cache"]),
     ).toMatchObject({
@@ -347,6 +362,18 @@ describe("repository workflow gate", () => {
         "synthetic-app#build",
         "synthetic-library#build",
       ]);
+      const singlePackage = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--single-package",
+        "--no-cache",
+        "--cwd",
+        directory,
+      ]);
+      expect(singlePackage.stdout).toContain("root build");
+      expect(singlePackage.stdout).not.toContain("app build");
+      expect(singlePackage.stdout).not.toContain("library build");
 
       await execFilePromise(process.execPath, [
         candidate,
@@ -432,6 +459,7 @@ describe("repository workflow gate", () => {
         ),
       ).toBe(true);
       const runSummary = structuredRecords.at(-1) as {
+        readonly id: string;
         readonly type: string;
         readonly tasks: ReadonlyArray<{
           readonly taskId: string;
@@ -442,12 +470,16 @@ describe("repository workflow gate", () => {
         }>;
       };
       expect(runSummary.type).toBe("run_summary");
+      expect(runSummary.id).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
       const logRecords = (await readFile(join(directory, "run.ndjson"), "utf8"))
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line) as Record<string, unknown>);
       expect(logRecords.map((record) => record.type)).toContain("task_event");
       expect(logRecords.at(-1)?.type).toBe("run_summary");
+      expect(logRecords.at(-1)?.id).toBe(runSummary.id);
       const libraryTiming = runSummary.tasks.find(
         (task) => task.taskId === "synthetic-library#build",
       )!.execution;
@@ -524,7 +556,13 @@ describe("repository workflow gate", () => {
           (await readFile(join(directory, artifact))).byteLength,
         ).toBeGreaterThan(0);
       }
-      expect(await readdir(join(directory, ".turbo/runs"))).toHaveLength(1);
+      const runFiles = await readdir(join(directory, ".turbo/runs"));
+      expect(runFiles).toEqual([`${runSummary.id}.json`]);
+      expect(
+        JSON.parse(
+          await readFile(join(directory, ".turbo/runs", runFiles[0]!), "utf8"),
+        ).id,
+      ).toBe(runSummary.id);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -776,6 +814,16 @@ describe("repository workflow gate", () => {
       if (sentinel.pid === undefined) throw new Error("sentinel did not start");
       await writeFile(running.pid_file, `${sentinel.pid}\n`);
       await writeFile(running.sock_file, "stale socket\n");
+      await expect(runCandidate("daemon", "status", "--json")).rejects.toThrow(
+        /daemon is not running/,
+      );
+      expect(
+        await readFile(running.pid_file, "utf8").catch(() => undefined),
+      ).toBeUndefined();
+      expect(
+        await readFile(running.sock_file, "utf8").catch(() => undefined),
+      ).toBeUndefined();
+      expect(sentinel.exitCode).toBeNull();
       await runCandidate("daemon", "stop");
       expect(sentinel.exitCode).toBeNull();
       sentinel.kill();
@@ -1256,8 +1304,45 @@ snapshots:
 
   it("rejects unsafe prune output aliases and escaping package symlinks", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-safety-"));
+    const outside = await mkdtemp(join(tmpdir(), "turbo-ts-prune-control-"));
     try {
       await prepareFixture(directory);
+      await writeFile(join(directory, ".yarnrc"), "safe-control\n");
+      await symlink(".yarnrc", join(directory, ".npmrc"));
+      await execFilePromise(process.execPath, [
+        candidate,
+        "prune",
+        "synthetic-app",
+        "--out-dir=safe-control-result",
+        "--cwd",
+        directory,
+      ]);
+      expect(
+        await readlink(join(directory, "safe-control-result/.npmrc")),
+      ).toBe(".yarnrc");
+      expect(
+        await readFile(join(directory, "safe-control-result/.npmrc"), "utf8"),
+      ).toBe("safe-control\n");
+      await rm(join(directory, ".npmrc"));
+      const outsideControl = join(outside, ".npmrc");
+      await writeFile(outsideControl, "registry-token=secret\n");
+      await symlink(
+        relative(directory, outsideControl),
+        join(directory, ".npmrc"),
+      );
+      await expect(
+        execFilePromise(process.execPath, [
+          candidate,
+          "prune",
+          "synthetic-app",
+          "--out-dir=unsafe-control-result",
+          "--cwd",
+          directory,
+        ]),
+      ).rejects.toThrow(
+        /prune root control symlink must use a relative target/,
+      );
+      await rm(join(directory, ".npmrc"));
       await symlink(".", join(directory, "output-alias"));
       await expect(
         execFilePromise(process.execPath, [
@@ -1309,6 +1394,7 @@ snapshots:
       ).rejects.toThrow(/prune symlink must use a relative target/);
     } finally {
       await rm(directory, { force: true, recursive: true });
+      await rm(outside, { force: true, recursive: true });
     }
   }, 15_000);
 
@@ -1454,6 +1540,23 @@ snapshots:
             affectedTasks: {
               items: [{ fullName: "synthetic-linked#build" }],
             },
+          },
+        });
+        const canonicalList = await execFilePromise(
+          process.execPath,
+          [candidate, "ls", "--affected", "--output=json", "--cwd", directory],
+          {
+            env: {
+              ...differentialEnvironment,
+              TURBO_SCM_BASE: "HEAD~1",
+              TURBO_SCM_HEAD: "HEAD",
+            },
+          },
+        );
+        expect(JSON.parse(canonicalList.stdout)).toMatchObject({
+          packages: {
+            count: 1,
+            items: [{ name: "synthetic-linked", path: "packages/linked" }],
           },
         });
       }

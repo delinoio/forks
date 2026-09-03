@@ -97,6 +97,10 @@ export interface RepositoryModel {
   readonly packagesByName: ReadonlyMap<string, RepositoryPackage>;
 }
 
+export interface RepositoryDiscoveryOptions {
+  readonly singlePackage?: boolean;
+}
+
 type PackageEcosystem = "javascript" | "cargo" | "uv";
 
 const packageEcosystem = (manager: PackageManagerName): PackageEcosystem =>
@@ -2038,6 +2042,7 @@ const cargoTasks = (
 export const discoverRepository = (
   root: string,
   rootConfiguration: LoadedRootConfiguration,
+  options: RepositoryDiscoveryOptions = {},
 ): Effect.Effect<
   RepositoryModel,
   RepositoryError,
@@ -2082,12 +2087,12 @@ export const discoverRepository = (
       managerIdentity.name,
       managerIdentity.version,
     );
-    const patterns = yield* workspacePatterns(
-      root,
-      managerIdentity.name,
-      rootManifest,
-    );
-    const workspaceDirectories = yield* walkDirectories(root, patterns);
+    const patterns = options.singlePackage
+      ? []
+      : yield* workspacePatterns(root, managerIdentity.name, rootManifest);
+    const workspaceDirectories = options.singlePackage
+      ? []
+      : yield* walkDirectories(root, patterns);
     const candidateDirectoryPaths = new Set(
       selectByGlobs(
         workspaceDirectories
@@ -2183,10 +2188,12 @@ export const discoverRepository = (
       (entry): entry is NonNullable<typeof entry> => entry !== undefined,
     );
     const cargoEnabled =
+      !options.singlePackage &&
       rootConfiguration.value.futureFlags?.experimentalCargoWorkspaces === true;
     const pythonEnabled =
+      !options.singlePackage &&
       rootConfiguration.value.futureFlags?.experimentalPythonWorkspaces ===
-      true;
+        true;
     const directories =
       cargoEnabled || pythonEnabled
         ? yield* walkDirectories(root, ["**"])
@@ -2823,14 +2830,16 @@ export const discoverRepository = (
         };
       })
       .sort((left, right) => left.identity.localeCompare(right.identity));
-    const rootTasks = Object.fromEntries(
-      Object.entries(rootConfiguration.value.tasks ?? {}).flatMap(
-        ([name, definition]) =>
-          name.startsWith("//#") && name.length > 3
-            ? [[name.slice(3), definition] as const]
-            : [],
-      ),
-    );
+    const rootTasks = options.singlePackage
+      ? (rootConfiguration.value.tasks ?? {})
+      : Object.fromEntries(
+          Object.entries(rootConfiguration.value.tasks ?? {}).flatMap(
+            ([name, definition]) =>
+              name.startsWith("//#") && name.length > 3
+                ? [[name.slice(3), definition] as const]
+                : [],
+          ),
+        );
     const rootDependencyResolution =
       javascriptDependencyResolutionByDirectory.get(normalizePath(root));
     const rootEnvironmentControls = yield* yarnEnvironmentControls(
@@ -2863,9 +2872,10 @@ export const discoverRepository = (
       manifest: rootManifest,
     };
     const lockfile = yield* findLockfile(root, managerIdentity.name);
+    const repositoryPackages = options.singlePackage ? [rootPackage] : packages;
     const packagesByIdentity = new Map<string, RepositoryPackage>([
       [rootPackage.identity, rootPackage],
-      ...packages.map((entry) => [entry.identity, entry] as const),
+      ...repositoryPackages.map((entry) => [entry.identity, entry] as const),
     ]);
     return {
       root,
@@ -2878,7 +2888,7 @@ export const discoverRepository = (
       rootConfiguration,
       rootPackage,
       lockfile,
-      packages,
+      packages: repositoryPackages,
       packagesByIdentity,
       packagesByName: packagesByIdentity,
     };

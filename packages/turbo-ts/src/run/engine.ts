@@ -3136,7 +3136,9 @@ export const executeRun = (
           )
         : unresolvedOptions.cacheDirectory,
     };
-    const repository = yield* discoverRepository(options.root, configuration);
+    const repository = yield* discoverRepository(options.root, configuration, {
+      singlePackage: parsed.singlePackage,
+    });
     const containedPackage = repository.packages.find((packageModel) =>
       isPathContained(
         canonicalCacheDirectory,
@@ -4065,8 +4067,13 @@ export const executeRun = (
         },
       };
     });
+    const summaryIsEmitted =
+      parsed.summarize || parsed.json || parsed.logFile !== undefined;
+    const runId = summaryIsEmitted
+      ? yield* (yield* RandomnessService).uuidV7
+      : "";
     const summary = {
-      id: "",
+      id: runId,
       version: "1",
       turboVersion: "2.10.12",
       monorepo: repository.packages.length > 1,
@@ -4104,11 +4111,9 @@ export const executeRun = (
       scm: { type: "git", sha: null, branch: null },
     };
     if (parsed.summarize) {
-      const randomness = yield* RandomnessService;
-      const runId = yield* randomness.uuidV7;
       yield* fileSystem.writeTextAtomic(
         joinPath(options.root, ".turbo", "runs", `${runId}.json`),
-        `${JSON.stringify({ ...summary, id: runId }, undefined, 2)}\n`,
+        `${JSON.stringify(summary, undefined, 2)}\n`,
       );
     }
     const traceEvents = orderedNodes.map((node) => {

@@ -97,7 +97,9 @@ Matching directory symlinks are traversed by their declared logical path only
 when their canonical target is a directory inside the repository; canonical
 ancestor tracking prevents symlink cycles.
 Git changes beneath a contained workspace symlink's canonical target map back
-to that workspace for package and task-aware affected selection.
+to that workspace for package and task-aware affected selection, including
+`ls --affected`. `--single-package` skips child workspace discovery and treats
+the repository root as the only runnable package.
 Tasks owned by a logical workspace path containing a symlink component execute
 without local or remote caching because restoration intentionally rejects
 symlink parents. Task scopes whose hashes depend on those tasks, including
@@ -501,6 +503,8 @@ protocol data rather than empty acknowledgments. Start-lock ownership is
 preserved across overlapping starts, stale locks are validated before removal,
 and a Hello response carrying an error is not healthy. Start, stop, restart,
 status, logs, and clean are race-safe; `info` reports the live daemon state.
+Status failures clean stale PID and socket state even when the recorded PID has
+been reused by an unrelated live process.
 Log clients follow the exact dated log reported by the running daemon until
 interrupted. Stop escalates only after a successful RPC identifies the process
 as the expected daemon; reused live PIDs without a healthy daemon RPC are
@@ -521,8 +525,11 @@ ls`, and `ls` share repository discovery and stable ordering. The server limits
 request bodies and closes HTTP handles in Scope; oversized requests receive
 HTTP 413 without resetting the connection. Top-level package predicates are
 applied, external dependencies come from manifest references resolved against
-the parsed lockfile, and Yarn Berry entries report their installed `version`
-rather than descriptor ranges. File queries enforce repository containment
+the parsed lockfile, including npm v2/v3 package locations whose entries omit
+the package name, and Yarn Berry entries report their installed `version`
+rather than descriptor ranges. Package-manager fields use protocol identifiers;
+only pnpm's compatibility family uses the versioned `pnpm9` label. File queries
+enforce repository containment
 after resolving symlinks. The startup message describes the static page as a
 GraphQL endpoint rather than an IDE.
 
@@ -533,7 +540,8 @@ rejects output roots that could contain the source repository. It never
 follows workspace symlinks into a prune output. Output safety and traversal
 exclusions use canonical locations. Contained relative file symlinks are
 recreated without dereferencing; absolute, escaping, or output-targeting links
-are rejected. The root pnpm hook `.pnpmfile.cjs` is retained in every
+are rejected, including symlinked root installation controls. The root pnpm
+hook `.pnpmfile.cjs` is retained in every
 installation root. Root Yarn installation controls, including `.yarnrc.yml`,
 `.pnp.cjs`, releases, and patches, are retained in applicable ordinary and
 Docker layouts. Copying honors repository and
@@ -555,7 +563,9 @@ merged into task hash inputs. Dry runs do not perform local cache eviction, and
 `info` derives WSL status from the Linux kernel release. Log-prefix selection
 applies to live and cached output. Summaries record
 the actual local or remote cache source and saved duration, and summaries and
-profiles use each task's scheduling timestamps. Mermaid graphs assign stable,
+profiles use each task's scheduling timestamps. Persisted, stdout, and
+newline-delimited summaries from one run share one canonical UUID v7 identifier.
+Mermaid graphs assign stable,
 unique node identifiers without truncated-hash collisions.
 
 Only behavior with automated ledger evidence is a compatibility claim. Hosted

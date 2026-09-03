@@ -88,9 +88,5 @@ export const loadWorkflowRepository = (
   });
 
 export const repositoryPackageManagerLabel = (
-  repository: RepositoryModel,
-): string => {
-  if (repository.manager === "pnpm") return "pnpm9";
-  const major = repository.managerVersion?.match(/^\d+/)?.[0];
-  return `${repository.manager}${major ?? ""}`;
-};
+  repository: Pick<RepositoryModel, "manager">,
+): string => (repository.manager === "pnpm" ? "pnpm9" : repository.manager);

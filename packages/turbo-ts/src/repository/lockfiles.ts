@@ -88,6 +88,32 @@ const collectPackages = (value: unknown): ReadonlyArray<LockfilePackage> => {
   );
 };
 
+const collectNpmPackages = (value: unknown): ReadonlyArray<LockfilePackage> => {
+  const packages = new Map(
+    collectPackages(value).map((entry) => [
+      `${entry.name}@${entry.version}`,
+      entry,
+    ]),
+  );
+  const locations = objectValue(objectValue(value)?.packages);
+  for (const [location, value] of Object.entries(locations ?? {})) {
+    const entry = objectValue(value);
+    const match = /(?:^|\/)node_modules\/((?:@[^/]+\/)?[^/]+)$/.exec(location);
+    if (match?.[1] === undefined || typeof entry?.version !== "string") {
+      continue;
+    }
+    packages.set(`${match[1]}@${entry.version}`, {
+      name: match[1],
+      version: entry.version,
+    });
+  }
+  return [...packages.values()].sort((left, right) =>
+    `${left.name}@${left.version}`.localeCompare(
+      `${right.name}@${right.version}`,
+    ),
+  );
+};
+
 const parseJson = (source: string): unknown => {
   const value = JSON.parse(source) as unknown;
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -209,7 +235,7 @@ export const parseLockfile = (
   }
   const source = validateSource(contents);
   if (name === "package-lock.json" || name === "npm-shrinkwrap.json") {
-    return { format: "npm", packages: collectPackages(parseJson(source)) };
+    return { format: "npm", packages: collectNpmPackages(parseJson(source)) };
   }
   if (name === "pnpm-lock.yaml") {
     return {

@@ -253,12 +253,59 @@ const canonicalOutputPath = (
 const copyIfPresent = (
   source: string,
   destination: string,
+  repositoryRoot: string,
+  excludedRoot: string,
 ): Effect.Effect<void, unknown, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
-    if (yield* fileSystem.exists(source)) {
+    if (!(yield* fileSystem.exists(source))) return;
+    const metadata = yield* fileSystem.metadata(source);
+    if (metadata.kind === "file") {
       yield* fileSystem.copyFile(source, destination);
+      return;
     }
+    if (metadata.kind === "symlink") {
+      const target = yield* fileSystem.readLink(source);
+      const resolved = yield* fileSystem.realPath(source).pipe(
+        Effect.mapError(
+          (error) =>
+            new ConfigurationError({
+              path: source,
+              message: `cannot resolve prune root control symlink: ${error.message}`,
+            }),
+        ),
+      );
+      if (
+        isAbsolutePath(target) ||
+        isPathContained(excludedRoot, resolved) ||
+        !isPathContained(repositoryRoot, resolved)
+      ) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: source,
+            message:
+              "prune root control symlink must use a relative target inside the repository",
+          }),
+        );
+      }
+      const targetMetadata = yield* fileSystem.metadata(resolved);
+      if (targetMetadata.kind !== "file") {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: source,
+            message: "prune root control symlink must target a regular file",
+          }),
+        );
+      }
+      yield* fileSystem.createSymlink(target, destination);
+      return;
+    }
+    return yield* Effect.fail(
+      new ConfigurationError({
+        path: source,
+        message: "prune root control must be a regular file or symlink",
+      }),
+    );
   });
 
 const writeManifest = (
@@ -422,7 +469,12 @@ export const executePrune = (
           yield* writeWorkspaceConfiguration(source, joinPath(jsonRoot, name));
         }
       } else {
-        yield* copyIfPresent(source, joinPath(fullRoot, name));
+        yield* copyIfPresent(
+          source,
+          joinPath(fullRoot, name),
+          repository.root,
+          canonicalOutputRoot,
+        );
         if (
           options.docker &&
           [
@@ -433,7 +485,12 @@ export const executePrune = (
             ".yarnrc.yml",
           ].includes(name)
         ) {
-          yield* copyIfPresent(source, joinPath(jsonRoot, name));
+          yield* copyIfPresent(
+            source,
+            joinPath(jsonRoot, name),
+            repository.root,
+            canonicalOutputRoot,
+          );
         }
       }
     }

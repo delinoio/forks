@@ -115,9 +115,19 @@ export const executeList = (
       const selected = new Set<string>();
       let rootChanged = false;
       for (const path of paths) {
-        const owners = repository.packages.filter((packageModel) =>
-          path.startsWith(`${packageModel.relativeDirectory}/`),
-        );
+        const owners = repository.packages.filter((packageModel) => {
+          const directories = new Set(
+            [
+              packageModel.relativeDirectory,
+              packageModel.canonicalRelativeDirectory,
+            ].map((directory) => directory.replace(/^\.\/?/, "")),
+          );
+          return [...directories].some(
+            (directory) =>
+              directory !== "" &&
+              (path === directory || path.startsWith(`${directory}/`)),
+          );
+        });
         if (owners.length === 0) rootChanged = true;
         for (const owner of owners) selected.add(owner.identity);
       }

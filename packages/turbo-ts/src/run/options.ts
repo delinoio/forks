@@ -26,6 +26,7 @@ export interface ParsedRunOptions {
   readonly outputLogs?: OutputLogs;
   readonly only: boolean;
   readonly parallel: boolean;
+  readonly singlePackage: boolean;
   readonly apiUrl?: string;
   readonly token?: string;
   readonly team?: string;
@@ -113,6 +114,7 @@ export const parseRunArguments = (
   let outputLogs: OutputLogs | undefined;
   let only = false;
   let parallel = false;
+  let singlePackage = false;
   let apiUrl: string | undefined;
   let token: string | undefined;
   let team: string | undefined;
@@ -225,6 +227,9 @@ export const parseRunArguments = (
         break;
       case "--parallel":
         parallel = true;
+        break;
+      case "--single-package":
+        singlePackage = true;
         break;
       case "--api":
         [apiUrl, index] = optionValue(arguments_, index, name);
@@ -399,7 +404,6 @@ export const parseRunArguments = (
       case "--daemon":
       case "--no-update-notifier":
       case "--skip-infer":
-      case "--single-package":
       case "--experimental-otel-enabled":
       case "--experimental-otel-metrics-run-summary":
       case "--experimental-otel-metrics-task-details":
@@ -459,6 +463,7 @@ export const parseRunArguments = (
     outputLogs,
     only,
     parallel,
+    singlePackage,
     apiUrl,
     token,
     team,

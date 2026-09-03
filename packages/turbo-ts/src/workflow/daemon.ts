@@ -789,28 +789,24 @@ export const executeDaemon = (
         }),
       );
     }
-    const pid = yield* readPid(paths.pid);
-    if (!(yield* isAlive(pid))) {
+    if (!(yield* daemonHealthy(paths))) {
       yield* cleanStaleState(paths);
       yield* terminal.writeStderr(
         "x daemon is not running, run `turbo daemon start` to start it\n",
       );
       return 1;
     }
-    const hello = yield* daemonRequest(paths, DaemonMethod.hello, {
-      version: "2.0.0",
-    });
-    if (hello.error !== undefined) {
-      return yield* Effect.fail(
-        new BoundaryError({
-          boundary: "daemon",
-          message: hello.error,
-          retryable: false,
-        }),
+    const status = yield* daemonRequest(paths, DaemonMethod.status).pipe(
+      Effect.either,
+    );
+    if (status._tag === "Left" || status.right.error !== undefined) {
+      yield* cleanStaleState(paths);
+      yield* terminal.writeStderr(
+        "x daemon is not running, run `turbo daemon start` to start it\n",
       );
+      return 1;
     }
-    const status = yield* daemonRequest(paths, DaemonMethod.status);
-    const result = status.result as {
+    const result = status.right.result as {
       readonly logFile?: unknown;
       readonly uptimeMilliseconds?: unknown;
     };
