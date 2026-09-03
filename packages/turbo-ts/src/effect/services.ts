@@ -3,8 +3,8 @@ import { Context, Effect, Layer, Schedule } from "effect";
 import type { BoundaryError, ProcessExecutionError } from "./errors.js";
 
 export type OutputChunkHandler =
-  | ((chunk: string) => void)
-  | ((chunk: string) => PromiseLike<void>);
+  | ((chunk: string, level: "stdout" | "stderr") => void)
+  | ((chunk: string, level: "stdout" | "stderr") => PromiseLike<void>);
 
 export interface ExecutionRequest {
   readonly command: string;
@@ -338,9 +338,20 @@ export class DigestService extends Context.Tag("turbo-ts/DigestService")<
   DigestService,
   DigestOperations
 >() {}
+export const DaemonMethod = {
+  discoverPackages: "DiscoverPackages",
+  getChangedOutputs: "GetChangedOutputs",
+  hello: "Hello",
+  notifyOutputsWritten: "NotifyOutputsWritten",
+  shutdown: "Shutdown",
+  status: "Status",
+} as const;
+
+export type DaemonMethod = (typeof DaemonMethod)[keyof typeof DaemonMethod];
+
 export interface DaemonRequest {
   readonly id: string;
-  readonly method: string;
+  readonly method: DaemonMethod;
   readonly params?: unknown;
 }
 

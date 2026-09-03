@@ -1,6 +1,15 @@
-import { Effect, Stream } from "effect";
-import { normalizePath } from "../core/path.js";
+import { Effect, Ref, Stream } from "effect";
+import {
+  canMatchGlobDescendant,
+  matchesGlobsWithExclusions,
+} from "../core/glob.js";
+import { isPathContained, normalizePath, relativePath } from "../core/path.js";
 import { FileWatcherService, TerminalService } from "../effect/services.js";
+import {
+  type GitIgnoreMatcher,
+  loadGitIgnoreMatcher,
+} from "../repository/git-ignore.js";
+import type { RepositoryModel } from "../repository/model.js";
 import { executeRun, type RunRequirements } from "../run/engine.js";
 import { type ParsedRunOptions, parseRunArguments } from "../run/options.js";
 import { loadWorkflowRepository } from "./repository.js";
@@ -36,6 +45,28 @@ const ignoredWatchPath = (path: string): boolean => {
   );
 };
 
+const configuredOutputPath = (
+  repository: RepositoryModel,
+  path: string,
+): boolean =>
+  [repository.rootPackage, ...repository.packages].some((packageModel) => {
+    if (!isPathContained(packageModel.directory, path)) return false;
+    const relative = relativePath(packageModel.directory, path);
+    return Object.values(packageModel.tasks).some((task) => {
+      const outputs = task.outputs ?? [];
+      return (
+        matchesGlobsWithExclusions([relative], outputs) ||
+        outputs.some(
+          (output) =>
+            !output.startsWith("!") && canMatchGlobDescendant(relative, output),
+        )
+      );
+    });
+  });
+
+const isGitIgnorePath = (path: string): boolean =>
+  normalizePath(path).split("/").at(-1) === ".gitignore";
+
 export const executeWatch = (
   options: WatchOptions,
 ): Effect.Effect<number, unknown, FileWatcherService | RunRequirements> =>
@@ -46,8 +77,27 @@ export const executeWatch = (
       cwd: options.run.cwd,
       rootTurboJson: options.run.rootTurboJson,
     });
+    const ignoreMatcher = yield* Ref.make<GitIgnoreMatcher>(
+      yield* loadGitIgnoreMatcher(repository.root),
+    );
     const changes = watcher.watch(repository.root).pipe(
-      Stream.filter((change) => !ignoredWatchPath(change.path)),
+      Stream.filterEffect((change) =>
+        Effect.gen(function* () {
+          if (ignoredWatchPath(change.path)) return false;
+          if (isGitIgnorePath(change.path)) {
+            yield* Ref.set(
+              ignoreMatcher,
+              yield* loadGitIgnoreMatcher(repository.root),
+            );
+            return true;
+          }
+          const ignored = (yield* Ref.get(ignoreMatcher)).ignores(
+            change.path,
+            change.kind !== "modify",
+          );
+          return !ignored && !configuredOutputPath(repository, change.path);
+        }),
+      ),
       Stream.debounce("100 millis"),
       Stream.map((change) => change.path),
     );

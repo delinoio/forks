@@ -1,8 +1,16 @@
-import { Deferred, Effect, Stream } from "effect";
-import { joinPath, parentPath } from "../core/path.js";
+import { Deferred, Effect, Queue, Stream } from "effect";
+import { matchesGlobsWithExclusions } from "../core/glob.js";
+import {
+  joinPath,
+  normalizePath,
+  parentPath,
+  relativePath,
+} from "../core/path.js";
 import { BoundaryError, ConfigurationError } from "../effect/errors.js";
 import {
   ClockService,
+  DaemonMethod,
+  type DaemonMethod as DaemonMethodType,
   DaemonService,
   DigestService,
   EnvironmentService,
@@ -13,7 +21,10 @@ import {
   SystemService,
   TerminalService,
 } from "../effect/services.js";
-import { loadWorkflowRepository } from "./repository.js";
+import {
+  loadWorkflowRepository,
+  repositoryPackageManagerLabel,
+} from "./repository.js";
 
 type DaemonCommand =
   | "clean"
@@ -203,11 +214,14 @@ const cleanStaleState = (
     yield* Effect.all([
       fileSystem.remove(paths.pid).pipe(Effect.ignore),
       fileSystem.remove(paths.socket).pipe(Effect.ignore),
-      fileSystem.remove(paths.lock).pipe(Effect.ignore),
     ]);
   });
 
-const daemonRequest = (paths: DaemonPaths, method: string, params?: unknown) =>
+const daemonRequest = (
+  paths: DaemonPaths,
+  method: DaemonMethodType,
+  params?: unknown,
+) =>
   Effect.gen(function* () {
     const daemon = yield* DaemonService;
     return yield* daemon.request(paths.socket, {
@@ -215,6 +229,93 @@ const daemonRequest = (paths: DaemonPaths, method: string, params?: unknown) =>
       method,
       params,
     });
+  });
+
+const daemonHealthy = (
+  paths: DaemonPaths,
+): Effect.Effect<
+  boolean,
+  never,
+  DaemonService | FileSystemService | ProcessService
+> =>
+  Effect.gen(function* () {
+    const pid = yield* readPid(paths.pid);
+    if (!(yield* isAlive(pid))) return false;
+    const hello = yield* daemonRequest(paths, DaemonMethod.hello, {
+      version: "2.0.0",
+    }).pipe(Effect.either);
+    return hello._tag === "Right" && hello.right.error === undefined;
+  });
+
+export const daemonIsRunning = (
+  root: string,
+): Effect.Effect<
+  boolean,
+  never,
+  | DaemonService
+  | DigestService
+  | FileSystemService
+  | ProcessService
+  | SystemService
+> =>
+  daemonPaths(root).pipe(
+    Effect.flatMap(daemonHealthy),
+    Effect.orElseSucceed(() => false),
+  );
+
+const staleStartLockMilliseconds = 30_000;
+
+const acquireStartLock = (
+  paths: DaemonPaths,
+): Effect.Effect<string, BoundaryError, ClockService | FileSystemService> =>
+  Effect.gen(function* () {
+    const clock = yield* ClockService;
+    const fileSystem = yield* FileSystemService;
+    const now = yield* clock.now;
+    const contents = `${now}\n`;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (yield* fileSystem.createExclusiveFile(paths.lock, contents)) {
+        return contents;
+      }
+      const observed = yield* fileSystem
+        .readText(paths.lock)
+        .pipe(Effect.either);
+      if (observed._tag === "Left") continue;
+      const timestamp = Number(observed.right.trim());
+      if (
+        Number.isFinite(timestamp) &&
+        now - timestamp < staleStartLockMilliseconds
+      ) {
+        break;
+      }
+      yield* Effect.yieldNow();
+      const confirmed = yield* fileSystem
+        .readText(paths.lock)
+        .pipe(Effect.either);
+      if (confirmed._tag === "Left" || confirmed.right !== observed.right) {
+        continue;
+      }
+      yield* fileSystem.remove(paths.lock).pipe(Effect.ignore);
+    }
+    return yield* Effect.fail(
+      new BoundaryError({
+        boundary: "daemon",
+        message: "another daemon start is in progress",
+        retryable: true,
+      }),
+    );
+  });
+
+const releaseStartLock = (
+  paths: DaemonPaths,
+  contents: string,
+): Effect.Effect<void, never, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const current = yield* fileSystem.readText(paths.lock).pipe(Effect.either);
+    if (current._tag === "Right" && current.right === contents) {
+      yield* fileSystem.remove(paths.lock).pipe(Effect.ignore);
+    }
   });
 
 const startDaemon = (
@@ -236,97 +337,83 @@ const startDaemon = (
     const processService = yield* ProcessService;
     const environment = yield* EnvironmentService;
     const terminal = yield* TerminalService;
-    const pid = yield* readPid(paths.pid);
-    if (yield* isAlive(pid)) {
-      const hello = yield* daemonRequest(paths, "Hello", {
-        version: "2.0.0",
-      }).pipe(Effect.either);
-      if (hello._tag === "Right") {
-        yield* terminal.writeStdout("✓ daemon is running\n");
-        return;
-      }
+    if (yield* daemonHealthy(paths)) {
+      yield* terminal.writeStdout("✓ daemon is running\n");
+      return;
     }
-    yield* cleanStaleState(paths);
     yield* fileSystem.makeDirectory(paths.stateDirectory);
     const clock = yield* ClockService;
     const startedAt = yield* clock.now;
     yield* fileSystem
       .setFileMetadata(paths.stateDirectory, 0o700, startedAt)
       .pipe(Effect.ignore);
-    const ownsLock = yield* fileSystem.createExclusiveFile(
-      paths.lock,
-      `${startedAt}\n`,
+    yield* Effect.acquireUseRelease(
+      acquireStartLock(paths),
+      () =>
+        Effect.gen(function* () {
+          if (yield* daemonHealthy(paths)) {
+            yield* terminal.writeStdout("✓ daemon is running\n");
+            return;
+          }
+          yield* cleanStaleState(paths);
+          const argv = yield* environment.argv;
+          const executable =
+            environment.executablePath === undefined
+              ? undefined
+              : yield* environment.executablePath;
+          if (
+            executable === undefined ||
+            argv[1] === undefined ||
+            processService.spawnDetached === undefined
+          ) {
+            return yield* Effect.fail(
+              new BoundaryError({
+                boundary: "daemon",
+                message: "detached process execution is unavailable",
+                retryable: false,
+              }),
+            );
+          }
+          const childPid = yield* processService.spawnDetached({
+            command: executable,
+            args: [
+              argv[1],
+              "daemon",
+              "serve",
+              "--cwd",
+              root,
+              `--idle-time=${options.idleMilliseconds}ms`,
+            ],
+            cwd: root,
+            inheritEnvironment: true,
+          });
+          let ready = false;
+          for (let attempt = 0; attempt < 100; attempt += 1) {
+            yield* Effect.sleep("50 millis");
+            if (yield* daemonHealthy(paths)) {
+              ready = true;
+              break;
+            }
+          }
+          if (!ready) {
+            if (processService.terminateProcess !== undefined) {
+              yield* processService
+                .terminateProcess(childPid, true)
+                .pipe(Effect.ignore);
+            }
+            yield* cleanStaleState(paths);
+            return yield* Effect.fail(
+              new BoundaryError({
+                boundary: "daemon",
+                message: "daemon did not become ready",
+                retryable: true,
+              }),
+            );
+          }
+          yield* terminal.writeStdout("✓ daemon is running\n");
+        }),
+      (contents) => releaseStartLock(paths, contents),
     );
-    if (!ownsLock) {
-      return yield* Effect.fail(
-        new BoundaryError({
-          boundary: "daemon",
-          message: "another daemon start is in progress",
-          retryable: true,
-        }),
-      );
-    }
-    const argv = yield* environment.argv;
-    const executable =
-      environment.executablePath === undefined
-        ? undefined
-        : yield* environment.executablePath;
-    if (
-      executable === undefined ||
-      argv[1] === undefined ||
-      processService.spawnDetached === undefined
-    ) {
-      yield* fileSystem.remove(paths.lock).pipe(Effect.ignore);
-      return yield* Effect.fail(
-        new BoundaryError({
-          boundary: "daemon",
-          message: "detached process execution is unavailable",
-          retryable: false,
-        }),
-      );
-    }
-    yield* processService
-      .spawnDetached({
-        command: executable,
-        args: [
-          argv[1],
-          "daemon",
-          "serve",
-          "--cwd",
-          root,
-          `--idle-time=${options.idleMilliseconds}ms`,
-        ],
-        cwd: root,
-        inheritEnvironment: true,
-      })
-      .pipe(
-        Effect.tapError(() =>
-          fileSystem.remove(paths.lock).pipe(Effect.ignore),
-        ),
-      );
-    let ready = false;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      yield* Effect.sleep("50 millis");
-      const hello = yield* daemonRequest(paths, "Hello", {
-        version: "2.0.0",
-      }).pipe(Effect.either);
-      if (hello._tag === "Right") {
-        ready = true;
-        break;
-      }
-    }
-    yield* fileSystem.remove(paths.lock).pipe(Effect.ignore);
-    if (!ready) {
-      yield* cleanStaleState(paths);
-      return yield* Effect.fail(
-        new BoundaryError({
-          boundary: "daemon",
-          message: "daemon did not become ready",
-          retryable: true,
-        }),
-      );
-    }
-    yield* terminal.writeStdout("✓ daemon is running\n");
   });
 
 const stopDaemon = (
@@ -349,7 +436,7 @@ const stopDaemon = (
       yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);
       return;
     }
-    yield* daemonRequest(paths, "Shutdown").pipe(Effect.ignore);
+    yield* daemonRequest(paths, DaemonMethod.shutdown).pipe(Effect.ignore);
     for (let attempt = 0; attempt < 40; attempt += 1) {
       if (!(yield* isAlive(pid))) break;
       yield* Effect.sleep("25 millis");
@@ -369,19 +456,34 @@ const stopDaemon = (
 const serveDaemon = (
   options: DaemonOptions,
   paths: DaemonPaths,
+  repository: import("../repository/model.js").RepositoryModel,
 ): Effect.Effect<
   number,
   unknown,
-  ClockService | DaemonService | FileSystemService | SystemService
+  | ClockService
+  | DaemonService
+  | FileSystemService
+  | FileWatcherService
+  | SystemService
 > =>
   Effect.scoped(
     Effect.gen(function* () {
       const clock = yield* ClockService;
       const daemon = yield* DaemonService;
       const fileSystem = yield* FileSystemService;
+      const fileWatcher = yield* FileWatcherService;
       const system = yield* SystemService;
       const information = yield* system.information;
       const shutdown = yield* Deferred.make<void>();
+      const activity = yield* Queue.sliding<void>(1);
+      const outputRegistrations = new Map<
+        string,
+        {
+          readonly outputGlobs: ReadonlyArray<string>;
+          readonly outputExclusionGlobs: ReadonlyArray<string>;
+          readonly changedOutputGlobs: Set<string>;
+        }
+      >();
       const startedAt = yield* clock.now;
       yield* fileSystem.makeDirectory(paths.stateDirectory);
       yield* fileSystem.makeDirectory(parentPath(paths.log));
@@ -399,7 +501,6 @@ const serveDaemon = (
       yield* Effect.addFinalizer(() =>
         Effect.gen(function* () {
           yield* fileSystem.remove(paths.pid).pipe(Effect.ignore);
-          yield* fileSystem.remove(paths.lock).pipe(Effect.ignore);
           const stoppedAt = yield* clock.now;
           yield* fileSystem
             .appendText(
@@ -409,40 +510,160 @@ const serveDaemon = (
             .pipe(Effect.ignore);
         }),
       );
+      const repositoryChanges = fileWatcher.watch(repository.root).pipe(
+        Stream.filter((change) => {
+          const normalized = `/${normalizePath(change.path)}/`;
+          return !["/.git/", "/.turbo/", "/node_modules/"].some((component) =>
+            normalized.includes(component),
+          );
+        }),
+        Stream.runForEach((change) =>
+          Effect.gen(function* () {
+            const relative = relativePath(repository.root, change.path);
+            for (const registration of outputRegistrations.values()) {
+              const patterns = [
+                ...registration.outputGlobs,
+                ...registration.outputExclusionGlobs.map((glob) => `!${glob}`),
+              ];
+              if (!matchesGlobsWithExclusions([relative], patterns)) {
+                continue;
+              }
+              for (const glob of registration.outputGlobs) {
+                if (matchesGlobsWithExclusions([relative], [glob])) {
+                  registration.changedOutputGlobs.add(glob);
+                }
+              }
+            }
+            yield* Queue.offer(activity, undefined);
+          }),
+        ),
+      );
+      yield* Effect.forkScoped(repositoryChanges);
       const serve = Stream.runForEach(
         daemon.serve(paths.socket),
         (connection) =>
           Stream.runForEach(connection.requests, (request) =>
             Effect.gen(function* () {
+              yield* Queue.offer(activity, undefined);
               yield* fileSystem
                 .appendText(
                   paths.log,
                   `${new Date(yield* clock.now).toISOString()} rpc=${request.method}\n`,
                 )
                 .pipe(Effect.ignore);
-              const result =
-                request.method === "Status"
-                  ? {
+              const result = yield* (() => {
+                if (request.method === DaemonMethod.status) {
+                  return Effect.gen(function* () {
+                    return {
                       logFile: paths.log.replace(/\.\d{4}-\d{2}-\d{2}$/, ""),
                       uptimeMilliseconds: Math.max(
                         0,
                         (yield* clock.now) - startedAt,
                       ),
-                    }
-                  : {};
-              yield* connection.respond({ id: request.id, result });
-              if (request.method === "Shutdown") {
+                    };
+                  });
+                }
+                if (request.method === DaemonMethod.discoverPackages) {
+                  return Effect.succeed({
+                    packages: repository.packages
+                      .map((packageModel) => ({
+                        name: packageModel.name,
+                        path: packageModel.relativeDirectory,
+                      }))
+                      .sort((left, right) =>
+                        left.name.localeCompare(right.name),
+                      ),
+                    packageManager: repositoryPackageManagerLabel(repository),
+                  });
+                }
+                if (request.method === DaemonMethod.notifyOutputsWritten) {
+                  const params = request.params as {
+                    readonly hash?: unknown;
+                    readonly outputGlobs?: unknown;
+                    readonly outputExclusionGlobs?: unknown;
+                  };
+                  if (typeof params.hash !== "string" || params.hash === "") {
+                    return Effect.fail(
+                      new BoundaryError({
+                        boundary: "daemon",
+                        message: "NotifyOutputsWritten requires a hash",
+                        retryable: false,
+                      }),
+                    );
+                  }
+                  outputRegistrations.set(params.hash, {
+                    outputGlobs: Array.isArray(params.outputGlobs)
+                      ? params.outputGlobs.filter(
+                          (value): value is string => typeof value === "string",
+                        )
+                      : [],
+                    outputExclusionGlobs: Array.isArray(
+                      params.outputExclusionGlobs,
+                    )
+                      ? params.outputExclusionGlobs.filter(
+                          (value): value is string => typeof value === "string",
+                        )
+                      : [],
+                    changedOutputGlobs: new Set(),
+                  });
+                  return Effect.succeed({});
+                }
+                if (request.method === DaemonMethod.getChangedOutputs) {
+                  const params = request.params as {
+                    readonly hashes?: unknown;
+                  };
+                  const hashes = Array.isArray(params.hashes)
+                    ? params.hashes.filter(
+                        (value): value is string => typeof value === "string",
+                      )
+                    : [];
+                  const changedOutputs = hashes.flatMap((hash) => {
+                    const registration = outputRegistrations.get(hash);
+                    if (registration === undefined) return [];
+                    const changedOutputGlobs = [
+                      ...registration.changedOutputGlobs,
+                    ].sort();
+                    registration.changedOutputGlobs.clear();
+                    return [{ hash, changedOutputGlobs }];
+                  });
+                  return Effect.succeed({ changedOutputs });
+                }
+                return Effect.succeed({});
+              })().pipe(Effect.either);
+              if (result._tag === "Left") {
+                yield* connection.respond({
+                  id: request.id,
+                  error:
+                    result.left instanceof Error
+                      ? result.left.message
+                      : String(result.left),
+                });
+              } else {
+                yield* connection.respond({
+                  id: request.id,
+                  result: result.right,
+                });
+              }
+              if (request.method === DaemonMethod.shutdown) {
                 yield* Deferred.succeed(shutdown, undefined);
               }
             }),
           ),
       );
+      const waitForIdle = Effect.gen(function* () {
+        while (true) {
+          const outcome = yield* Effect.race(
+            Queue.take(activity).pipe(Effect.as("activity" as const)),
+            clock
+              .sleep(options.idleMilliseconds)
+              .pipe(Effect.as("idle" as const)),
+          );
+          if (outcome === "idle") return;
+        }
+      });
       yield* Effect.race(
         serve,
-        Effect.race(
-          Deferred.await(shutdown),
-          clock.sleep(options.idleMilliseconds),
-        ),
+        Effect.race(Deferred.await(shutdown), waitForIdle),
       );
       return 0;
     }),
@@ -469,7 +690,9 @@ export const executeDaemon = (
     const fileSystem = yield* FileSystemService;
     const repository = yield* loadWorkflowRepository(options);
     const paths = yield* daemonPaths(repository.root);
-    if (options.command === "serve") return yield* serveDaemon(options, paths);
+    if (options.command === "serve") {
+      return yield* serveDaemon(options, paths, repository);
+    }
     if (options.command === "stop") {
       yield* stopDaemon(paths);
       return 0;
@@ -527,7 +750,9 @@ export const executeDaemon = (
       );
       return 1;
     }
-    const hello = yield* daemonRequest(paths, "Hello", { version: "2.0.0" });
+    const hello = yield* daemonRequest(paths, DaemonMethod.hello, {
+      version: "2.0.0",
+    });
     if (hello.error !== undefined) {
       return yield* Effect.fail(
         new BoundaryError({
@@ -537,7 +762,7 @@ export const executeDaemon = (
         }),
       );
     }
-    const status = yield* daemonRequest(paths, "Status");
+    const status = yield* daemonRequest(paths, DaemonMethod.status);
     const result = status.result as {
       readonly logFile?: unknown;
       readonly uptimeMilliseconds?: unknown;

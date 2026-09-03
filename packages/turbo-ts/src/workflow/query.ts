@@ -20,6 +20,8 @@ import {
   SignalService,
   TerminalService,
 } from "../effect/services.js";
+import { buildTaskGraph } from "../graph/task-graph.js";
+import { decodeNullDelimitedGitOutput } from "../hash/task-hash.js";
 import type {
   RepositoryModel,
   RepositoryPackage,
@@ -274,9 +276,180 @@ interface TaskView {
 
 const list = <A>(items: ReadonlyArray<A>) => ({ items, length: items.length });
 
+interface AffectedRepository {
+  readonly affected: ReadonlyMap<string, RepositoryPackage>;
+  readonly directlyAffected: ReadonlySet<string>;
+}
+
+const calculateAffectedRepository = (
+  repository: RepositoryModel,
+  base: string,
+  head: string,
+): Effect.Effect<AffectedRepository, ConfigurationError, ProcessService> =>
+  Effect.gen(function* () {
+    const processService = yield* ProcessService;
+    const git = yield* Effect.scoped(
+      processService.runBytes({
+        command: "git",
+        args: [
+          "diff",
+          "--no-renames",
+          "--name-only",
+          "-z",
+          "--end-of-options",
+          `${base}...${head}`,
+          "--",
+        ],
+        cwd: repository.root,
+        inheritEnvironment: true,
+      }),
+    ).pipe(Effect.either);
+    if (git._tag === "Left" || git.right.exitCode !== 0) {
+      const message =
+        git._tag === "Left"
+          ? git.left.message
+          : new TextDecoder().decode(git.right.stderr).trim();
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: "<query>",
+          message: `Failed to calculate affected packages: ${message}`,
+        }),
+      );
+    }
+    const changedPaths = yield* Effect.try({
+      try: () =>
+        decodeNullDelimitedGitOutput(git.right.stdout, repository.root).map(
+          (path) => normalizePath(path),
+        ),
+      catch: (cause) =>
+        new ConfigurationError({
+          path: "<query>",
+          message: String(cause),
+        }),
+    });
+    const directlyAffected = new Map<string, RepositoryPackage>();
+    let globalChange = false;
+    for (const path of changedPaths) {
+      const owners = repository.packages.filter((packageModel) => {
+        const directory = packageModel.relativeDirectory.replace(/^\.\/?/, "");
+        return (
+          directory !== "" &&
+          (path === directory || path.startsWith(`${directory}/`))
+        );
+      });
+      if (owners.length === 0) globalChange = true;
+      for (const owner of owners) directlyAffected.set(owner.identity, owner);
+    }
+    if (globalChange) {
+      for (const packageModel of repository.packages) {
+        directlyAffected.set(packageModel.identity, packageModel);
+      }
+    }
+    const affected = new Map(directlyAffected);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const packageModel of repository.packages) {
+        if (
+          !affected.has(packageModel.identity) &&
+          packageModel.internalDependencies.some((dependency) =>
+            affected.has(dependency),
+          )
+        ) {
+          affected.set(packageModel.identity, packageModel);
+          changed = true;
+        }
+      }
+    }
+    return {
+      affected,
+      directlyAffected: new Set(directlyAffected.keys()),
+    };
+  });
+
+interface PackagePredicate {
+  readonly and?: ReadonlyArray<PackagePredicate>;
+  readonly or?: ReadonlyArray<PackagePredicate>;
+  readonly not?: PackagePredicate;
+  readonly equal?: { readonly field: string; readonly value: unknown };
+  readonly notEqual?: { readonly field: string; readonly value: unknown };
+  readonly greaterThan?: { readonly field: string; readonly value: unknown };
+  readonly lessThan?: { readonly field: string; readonly value: unknown };
+  readonly has?: { readonly field: string; readonly value: unknown };
+}
+
+const packageField = (view: PackageView, field: string): unknown => {
+  const normalizedField = field
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replaceAll("-", "_")
+    .toUpperCase();
+  switch (normalizedField) {
+    case "NAME":
+    case "PACKAGE_NAME":
+      return view.name;
+    case "PATH":
+    case "PACKAGE_PATH":
+      return view.path;
+    case "TASK_NAME":
+    case "TASKS":
+      return view.tasks.items.map((task) => task.name);
+    case "DIRECT_DEPENDENT_COUNT":
+      return view.directDependents.length;
+    case "DIRECT_DEPENDENCY_COUNT":
+      return view.directDependencies.length;
+    default:
+      return undefined;
+  }
+};
+
+const packageMatchesPredicate = (
+  view: PackageView,
+  predicate: PackagePredicate | undefined,
+): boolean => {
+  if (predicate === undefined) return true;
+  if (predicate.and !== undefined) {
+    return predicate.and.every((entry) => packageMatchesPredicate(view, entry));
+  }
+  if (predicate.or !== undefined) {
+    return predicate.or.some((entry) => packageMatchesPredicate(view, entry));
+  }
+  if (predicate.not !== undefined) {
+    return !packageMatchesPredicate(view, predicate.not);
+  }
+  const comparison =
+    predicate.equal ??
+    predicate.notEqual ??
+    predicate.greaterThan ??
+    predicate.lessThan ??
+    predicate.has;
+  if (comparison === undefined) return true;
+  const value = packageField(view, comparison.field);
+  if (predicate.has !== undefined) {
+    return Array.isArray(value) && value.includes(comparison.value);
+  }
+  if (predicate.equal !== undefined) return value === comparison.value;
+  if (predicate.notEqual !== undefined) return value !== comparison.value;
+  if (predicate.greaterThan !== undefined) {
+    return (
+      typeof value === "number" &&
+      typeof comparison.value === "number" &&
+      value > comparison.value
+    );
+  }
+  return (
+    typeof value === "number" &&
+    typeof comparison.value === "number" &&
+    value < comparison.value
+  );
+};
+
 const repositoryQueryRoot = (
   repository: RepositoryModel,
   readFile: (path: string) => Promise<string>,
+  affectedRepository: (
+    base: string,
+    head: string,
+  ) => Promise<AffectedRepository>,
 ) => {
   const models = [repository.rootPackage, ...repository.packages];
   const byIdentity = new Map(models.map((model) => [model.identity, model]));
@@ -304,15 +477,19 @@ const repositoryQueryRoot = (
       left.name.localeCompare(right.name),
     );
   };
-  const views = new Map<string, PackageView>();
-  const packageView = (model: RepositoryPackage): PackageView => {
-    const existing = views.get(model.identity);
-    if (existing !== undefined) return existing;
-    const mutable = {
-      name: model.name,
-      path: model === repository.rootPackage ? "" : model.relativeDirectory,
-    } as PackageView;
-    views.set(model.identity, mutable);
+  const views = new Map(
+    models.map((model) => [
+      model.identity,
+      {
+        name: model.name,
+        path: model === repository.rootPackage ? "" : model.relativeDirectory,
+      } as PackageView,
+    ]),
+  );
+  const packageView = (model: RepositoryPackage): PackageView =>
+    views.get(model.identity)!;
+  for (const model of models) {
+    const mutable = packageView(model);
     const dependencies = model.internalDependencies.flatMap((identity) => {
       const dependency = byIdentity.get(identity);
       return dependency === undefined ? [] : [dependency];
@@ -328,23 +505,6 @@ const repositoryQueryRoot = (
       model,
       (entry) => dependents.get(entry.identity) ?? [],
     );
-    const tasks = Object.keys(model.scripts)
-      .sort()
-      .map((name): TaskView => {
-        const emptyTasks = list<TaskView>([]);
-        return {
-          name,
-          package: mutable,
-          fullName: `${model.name}#${name}`,
-          script: model.scripts[name],
-          directDependents: emptyTasks,
-          directDependencies: emptyTasks,
-          indirectDependents: emptyTasks,
-          indirectDependencies: emptyTasks,
-          allDependents: emptyTasks,
-          allDependencies: emptyTasks,
-        };
-      });
     Object.assign(mutable, {
       directDependencies: list(dependencies.map(packageView)),
       directDependents: list(directDependents.map(packageView)),
@@ -360,10 +520,94 @@ const repositoryQueryRoot = (
           .filter((entry) => !directDependents.includes(entry))
           .map(packageView),
       ),
-      tasks: list(tasks),
+      tasks: list<TaskView>([]),
     });
-    return mutable;
+  }
+  const taskNames = [
+    ...new Set(
+      models.flatMap((model) => [
+        ...Object.keys(model.scripts),
+        ...Object.keys(model.tasks).map((name) =>
+          name.slice(name.lastIndexOf("#") + 1),
+        ),
+      ]),
+    ),
+  ].sort();
+  const taskGraph = buildTaskGraph(repository, models, taskNames, false);
+  const taskDependents = new Map<string, Array<string>>();
+  for (const node of taskGraph.nodes.values()) {
+    for (const dependency of node.dependencies) {
+      const entries = taskDependents.get(dependency) ?? [];
+      entries.push(node.id);
+      taskDependents.set(dependency, entries);
+    }
+  }
+  const taskClosure = (
+    start: string,
+    next: (id: string) => ReadonlyArray<string>,
+  ): ReadonlyArray<string> => {
+    const result = new Set<string>();
+    const pending = [...next(start)];
+    while (pending.length > 0) {
+      const id = pending.shift()!;
+      if (result.has(id)) continue;
+      result.add(id);
+      pending.push(...next(id));
+    }
+    return [...result].sort();
   };
+  const taskViews = new Map(
+    [...taskGraph.nodes.values()].map((node) => [
+      node.id,
+      {
+        name: node.task,
+        package: packageView(node.package),
+        fullName: `${node.package.name}#${node.task}`,
+        script: node.command,
+      } as TaskView,
+    ]),
+  );
+  for (const node of taskGraph.nodes.values()) {
+    const mutable = taskViews.get(node.id)!;
+    const directDependencies = node.dependencies;
+    const directDependents = taskDependents.get(node.id) ?? [];
+    const allDependencies = taskClosure(
+      node.id,
+      (id) => taskGraph.nodes.get(id)?.dependencies ?? [],
+    );
+    const allDependents = taskClosure(
+      node.id,
+      (id) => taskDependents.get(id) ?? [],
+    );
+    Object.assign(mutable, {
+      directDependencies: list(
+        directDependencies.map((id) => taskViews.get(id)!),
+      ),
+      directDependents: list(directDependents.map((id) => taskViews.get(id)!)),
+      allDependencies: list(allDependencies.map((id) => taskViews.get(id)!)),
+      allDependents: list(allDependents.map((id) => taskViews.get(id)!)),
+      indirectDependencies: list(
+        allDependencies
+          .filter((id) => !directDependencies.includes(id))
+          .map((id) => taskViews.get(id)!),
+      ),
+      indirectDependents: list(
+        allDependents
+          .filter((id) => !directDependents.includes(id))
+          .map((id) => taskViews.get(id)!),
+      ),
+    });
+  }
+  for (const model of models) {
+    Object.assign(packageView(model), {
+      tasks: list(
+        [...taskGraph.nodes.values()]
+          .filter((node) => node.package.identity === model.identity)
+          .sort((left, right) => left.task.localeCompare(right.task))
+          .map((node) => taskViews.get(node.id)!),
+      ),
+    });
+  }
   const packageViews = models.map(packageView);
   const graphEdges = models.flatMap((model) =>
     model.internalDependencies.map((target) => ({
@@ -386,19 +630,67 @@ const repositoryQueryRoot = (
       nodes: list(packageViews),
       edges: list(graphEdges),
     }),
-    affectedPackages: () =>
-      list(
-        packageViews.map((view) => ({ ...view, reason: { type: "unknown" } })),
-      ),
-    affectedTasks: ({ tasks }: { readonly tasks?: ReadonlyArray<string> }) => {
+    affectedPackages: async ({
+      base = "main",
+      head = "HEAD",
+      filter,
+    }: {
+      readonly base?: string;
+      readonly head?: string;
+      readonly filter?: PackagePredicate;
+    }) => {
+      const result = await affectedRepository(base, head);
+      return list(
+        [...result.affected.values()]
+          .map(packageView)
+          .filter((view) => packageMatchesPredicate(view, filter))
+          .map((view) => ({
+            ...view,
+            reason: {
+              __typename: result.directlyAffected.has(
+                models.find((model) => packageView(model) === view)!.identity,
+              )
+                ? "FileChanged"
+                : "DependencyChanged",
+            },
+          })),
+      );
+    },
+    affectedTasks: async ({
+      base = "main",
+      head = "HEAD",
+      tasks,
+      filter,
+    }: {
+      readonly base?: string;
+      readonly head?: string;
+      readonly tasks?: ReadonlyArray<string>;
+      readonly filter?: PackagePredicate;
+    }) => {
+      const result = await affectedRepository(base, head);
       const requested = new Set(tasks ?? []);
-      const allTasks = packageViews.flatMap((view) => view.tasks.items);
+      const allTasks = [...result.affected.values()]
+        .map(packageView)
+        .filter((view) => packageMatchesPredicate(view, filter))
+        .flatMap((view) => view.tasks.items);
       const selected =
         requested.size === 0
           ? allTasks
           : allTasks.filter((task) => requested.has(task.name));
       return list(
-        selected.map((task) => ({ ...task, reason: { type: "unknown" } })),
+        selected.map((task) => {
+          const packageModel = models.find(
+            (model) => packageView(model) === task.package,
+          )!;
+          return {
+            ...task,
+            reason: {
+              __typename: result.directlyAffected.has(packageModel.identity)
+                ? "TaskFileChanged"
+                : "TaskDependencyTaskChanged",
+            },
+          };
+        }),
       );
     },
     boundaries: () => ({ errors: [], warnings: [] }),
@@ -427,17 +719,25 @@ const executeGraphql = (
 ): Effect.Effect<
   Awaited<ReturnType<typeof graphql>>,
   ConfigurationError,
-  FileSystemService
+  FileSystemService | ProcessService
 > =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
+    const processService = yield* ProcessService;
     return yield* Effect.tryPromise({
       try: () =>
         graphql({
           schema: repositoryQuerySchema,
           source,
-          rootValue: repositoryQueryRoot(repository, (path) =>
-            Effect.runPromise(fileSystem.readText(path)),
+          rootValue: repositoryQueryRoot(
+            repository,
+            (path) => Effect.runPromise(fileSystem.readText(path)),
+            (base, head) =>
+              Effect.runPromise(
+                calculateAffectedRepository(repository, base, head).pipe(
+                  Effect.provideService(ProcessService, processService),
+                ),
+              ),
           ),
           variableValues: variables,
         }),
@@ -461,6 +761,7 @@ export const executeQuery = (
   Effect.gen(function* () {
     const terminal = yield* TerminalService;
     const fileSystem = yield* FileSystemService;
+    const processService = yield* ProcessService;
     const repository = yield* loadWorkflowRepository(options);
     if (options.schema) {
       yield* terminal.writeStdout(
@@ -524,7 +825,10 @@ export const executeQuery = (
                 !Array.isArray(input.variables)
                 ? (input.variables as Record<string, unknown>)
                 : undefined,
-            ).pipe(Effect.provideService(FileSystemService, fileSystem));
+            ).pipe(
+              Effect.provideService(FileSystemService, fileSystem),
+              Effect.provideService(ProcessService, processService),
+            );
             return {
               status: result.errors === undefined ? 200 : 400,
               headers: { "content-type": "application/json" },
@@ -628,33 +932,20 @@ export const executeQueryAffected = (
   Effect.gen(function* () {
     const options = parseAffectedArguments(arguments_);
     const terminal = yield* TerminalService;
-    const processService = yield* ProcessService;
     const repository = yield* loadWorkflowRepository(options);
-    const git = yield* Effect.scoped(
-      processService.runBytes({
-        command: "git",
-        args: [
-          "diff",
-          "--name-only",
-          "-z",
-          `${options.base}...${options.head}`,
-        ],
-        cwd: repository.root,
-        inheritEnvironment: true,
-      }),
+    const calculation = yield* calculateAffectedRepository(
+      repository,
+      options.base,
+      options.head,
     ).pipe(Effect.either);
-    if (git._tag === "Left" || git.right.exitCode !== 0) {
-      const message =
-        git._tag === "Left"
-          ? git.left.message
-          : new TextDecoder().decode(git.right.stderr).trim();
+    if (calculation._tag === "Left") {
       yield* terminal.writeStdout(
         `${JSON.stringify(
           {
             data: null,
             errors: [
               {
-                message: `Failed to calculate affected packages: ${message}`,
+                message: calculation.left.message,
                 path: [options.packages ? "affectedPackages" : "affectedTasks"],
               },
             ],
@@ -665,46 +956,13 @@ export const executeQueryAffected = (
       );
       return 2;
     }
-    const changedPaths = new TextDecoder("utf-8", { fatal: true })
-      .decode(git.right.stdout)
-      .split("\0")
-      .filter(Boolean)
-      .map((path) => normalizePath(path));
-    const directlyAffected = new Map<string, RepositoryPackage>();
-    let globalChange = false;
-    for (const path of changedPaths) {
-      const owners = repository.packages.filter((packageModel) => {
-        const directory = packageModel.relativeDirectory.replace(/^\.\/?/, "");
-        return (
-          directory !== "" &&
-          (path === directory || path.startsWith(`${directory}/`))
-        );
-      });
-      if (owners.length === 0) globalChange = true;
-      for (const owner of owners) directlyAffected.set(owner.identity, owner);
-    }
-    if (globalChange) {
-      for (const packageModel of repository.packages) {
-        directlyAffected.set(packageModel.identity, packageModel);
-      }
-    }
-    const affected = new Map(directlyAffected);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const packageModel of repository.packages) {
-        if (
-          !affected.has(packageModel.identity) &&
-          packageModel.internalDependencies.some((dependency) =>
-            affected.has(dependency),
-          )
-        ) {
-          affected.set(packageModel.identity, packageModel);
-          changed = true;
-        }
-      }
-    }
+    const { affected, directlyAffected } = calculation.right;
+    const requested = new Set(options.fields);
     const packageItems = [...affected.values()]
+      .filter(
+        (packageModel) =>
+          requested.size === 0 || requested.has(packageModel.name),
+      )
       .sort((left, right) => left.name.localeCompare(right.name))
       .map((packageModel) => ({
         name: packageModel.name,
@@ -732,12 +990,14 @@ export const executeQueryAffected = (
     };
     const taskItems = [...affected.values()]
       .flatMap((packageModel) =>
-        Object.keys(packageModel.scripts).map((name) => ({
-          name,
-          fullName: `${packageModel.name}#${name}`,
-          package: { name: packageModel.name },
-          reason: taskReason(packageModel, name),
-        })),
+        Object.keys(packageModel.scripts)
+          .filter((name) => requested.size === 0 || requested.has(name))
+          .map((name) => ({
+            name,
+            fullName: `${packageModel.name}#${name}`,
+            package: { name: packageModel.name },
+            reason: taskReason(packageModel, name),
+          })),
       )
       .sort((left, right) => left.fullName.localeCompare(right.fullName));
     const items = options.packages ? packageItems : taskItems;

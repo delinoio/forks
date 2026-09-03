@@ -153,13 +153,22 @@ interface ResolvedRunOptions {
   readonly parallel: boolean;
   readonly remote?: RemoteCacheOptions;
   readonly colorEnabled: boolean;
+  readonly json: boolean;
+  readonly logPrefix: "auto" | "none" | "task";
 }
 
-interface TaskOutcome {
+interface TaskExecutionResult {
   readonly id: string;
   readonly exitCode: number;
   readonly hash?: string;
   readonly skipped: boolean;
+  readonly cacheSource?: "local" | "remote";
+  readonly cacheTimeSaved?: number;
+}
+
+interface TaskOutcome extends TaskExecutionResult {
+  readonly startTime: number;
+  readonly endTime: number;
 }
 
 export type RunRequirements =
@@ -543,6 +552,8 @@ export const resolveOptions = (
     parallel: parsed.parallel,
     remote,
     colorEnabled: !parsed.noColor && environmentValue("NO_COLOR") === undefined,
+    json: parsed.json,
+    logPrefix: parsed.logPrefix ?? "auto",
   };
 };
 
@@ -1491,7 +1502,11 @@ const shouldReplayOutput = (
   mode === undefined || mode === "full" || (mode === "new-only" && !cacheHit);
 
 type TaskOutputQueueEvent =
-  | { readonly kind: "chunk"; readonly output: string }
+  | {
+      readonly kind: "chunk";
+      readonly output: string;
+      readonly level: "stdout" | "stderr";
+    }
   | { readonly kind: "end" };
 
 const persistentOutputCaptureCharacters = 64 * 1024;
@@ -2124,7 +2139,7 @@ const executeTask = (
   withCachePublicationPermit: CachePublicationPermit = (publication) =>
     publication,
   logIdentifier = node.task,
-): Effect.Effect<TaskOutcome, unknown, RunRequirements> =>
+): Effect.Effect<TaskExecutionResult, unknown, RunRequirements> =>
   Effect.gen(function* () {
     const terminal = yield* TerminalService;
     const fileSystem = yield* FileSystemService;
@@ -2138,10 +2153,24 @@ const executeTask = (
     const warningColor = options.colorEnabled
       ? yield* terminal.stderrColorEnabled
       : false;
+    const taskLabel = `${node.package.name}:${node.task}`;
+    const prefixTask = options.logPrefix !== "none";
+    const writeTaskEvent = (
+      level: "info" | "stdout" | "stderr",
+      text: string,
+    ) =>
+      options.json
+        ? clock.now.pipe(
+            Effect.flatMap((timestamp) =>
+              terminal.writeStdout(
+                `${JSON.stringify({ timestamp, source: taskLabel, level, text })}\n`,
+              ),
+            ),
+          )
+        : terminal.writeStdout(text);
     if (node.command === undefined) {
       return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
     }
-    const taskLabel = `${node.package.name}:${node.task}`;
     const outputMode =
       options.outputLogs ?? node.definition.outputLogs ?? undefined;
     const showHashEvent =
@@ -2214,6 +2243,8 @@ const executeTask = (
       options.cacheExclusionDirectory,
     );
     let cacheHit = false;
+    let cacheSource: TaskExecutionResult["cacheSource"];
+    let cacheTimeSaved = 0;
     if (cacheRestoreEnabled && options.cachePolicy.localRead) {
       cacheHit = yield* restoreLocalCache(
         repository.root,
@@ -2221,6 +2252,10 @@ const executeTask = (
         hash.hash,
         restoreScope,
         platform === "win32",
+        (duration) => {
+          cacheSource = "local";
+          cacheTimeSaved = duration;
+        },
       ).pipe(
         Effect.catchTag("CacheError", (error) =>
           terminal
@@ -2249,6 +2284,10 @@ const executeTask = (
         hash.hash,
         restoreScope,
         platform === "win32",
+        (duration) => {
+          cacheSource = "remote";
+          cacheTimeSaved = duration;
+        },
       ).pipe(
         Effect.catchTag("CacheError", (error) =>
           terminal
@@ -2267,10 +2306,12 @@ const executeTask = (
     }
     if (cacheHit) {
       if (outputMode !== "none" && showHashEvent) {
-        yield* terminal.writeStdout(
+        yield* writeTaskEvent(
+          "info",
           renderLogEvent(
             { kind: "cache-hit", task: taskLabel, hash: hash.hash },
             color,
+            options.json ? false : prefixTask,
           ),
         );
       }
@@ -2294,21 +2335,28 @@ const executeTask = (
             ),
             Stream.runForEach((output) =>
               Effect.gen(function* () {
-                const rendered = renderTaskOutputChunk(
-                  renderState,
-                  taskLabel,
-                  output,
-                  color,
-                );
-                renderState = rendered.state;
-                for (const chunk of rendered.chunks) {
-                  yield* terminal.writeStdout(chunk);
+                if (options.json) {
+                  yield* writeTaskEvent("stdout", output);
+                } else {
+                  const rendered = renderTaskOutputChunk(
+                    renderState,
+                    taskLabel,
+                    output,
+                    color,
+                    prefixTask,
+                  );
+                  renderState = rendered.state;
+                  for (const chunk of rendered.chunks) {
+                    yield* terminal.writeStdout(chunk);
+                  }
                 }
               }),
             ),
           );
-          for (const chunk of finishTaskOutput(renderState)) {
-            yield* terminal.writeStdout(chunk);
+          if (!options.json) {
+            for (const chunk of finishTaskOutput(renderState)) {
+              yield* terminal.writeStdout(chunk);
+            }
           }
         }).pipe(
           Effect.catchTag("RepositoryError", (error) =>
@@ -2326,13 +2374,22 @@ const executeTask = (
           ),
         );
       }
-      return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
+      return {
+        id: node.id,
+        exitCode: 0,
+        hash: hash.hash,
+        skipped: false,
+        cacheSource,
+        cacheTimeSaved,
+      };
     }
     if (outputMode !== "none" && showHashEvent) {
-      yield* terminal.writeStdout(
+      yield* writeTaskEvent(
+        "info",
         renderLogEvent(
           { kind: "cache-miss", task: taskLabel, hash: hash.hash },
           color,
+          options.json ? false : prefixTask,
         ),
       );
     }
@@ -2344,13 +2401,21 @@ const executeTask = (
       scope,
     );
     const processService = yield* ProcessService;
-    const startProcess = (onOutputChunk?: (chunk: string) => void) =>
+    const startProcess = (
+      onOutputChunk?: (
+        chunk: string,
+        level: "stdout" | "stderr",
+      ) => void | PromiseLike<void>,
+    ) =>
       processService.run({
         command: invocation.command,
         args: invocation.arguments,
         cwd: invocation.cwd,
         inheritEnvironment: false,
-        stdio: node.definition.interactive === true ? "inherit" : "capture",
+        stdio:
+          node.definition.interactive === true && !options.json
+            ? "inherit"
+            : "capture",
         onOutputChunk,
         maxCapturedOutputCharacters:
           onOutputChunk === undefined
@@ -2361,7 +2426,8 @@ const executeTask = (
           TURBO_HASH: hash.hash,
         },
       });
-    const streamsCapturedOutput = node.definition.interactive !== true;
+    const streamsCapturedOutput =
+      node.definition.interactive !== true || options.json;
     const displaysStreamedOutput =
       streamsCapturedOutput && shouldReplayOutput(outputMode, false);
     const result = streamsCapturedOutput
@@ -2387,11 +2453,16 @@ const executeTask = (
                   }
                   yield* fileSystem.appendText(logPath, event.output);
                   if (!displaysStreamedOutput) continue;
+                  if (options.json) {
+                    yield* writeTaskEvent(event.level, event.output);
+                    continue;
+                  }
                   const rendered = renderTaskOutputChunk(
                     renderState,
                     taskLabel,
                     event.output,
                     color,
+                    prefixTask,
                   );
                   renderState = rendered.state;
                   for (const chunk of rendered.chunks) {
@@ -2401,11 +2472,13 @@ const executeTask = (
               }),
             );
             const processResult = yield* Effect.raceFirst(
-              startProcess((output) =>
+              startProcess((output, level) =>
                 Effect.runPromise(
-                  Queue.offer(outputQueue, { kind: "chunk", output }).pipe(
-                    Effect.asVoid,
-                  ),
+                  Queue.offer(outputQueue, {
+                    kind: "chunk",
+                    output,
+                    level,
+                  }).pipe(Effect.asVoid),
                 ),
               ),
               Fiber.join(outputFiber).pipe(Effect.flatMap(() => Effect.never)),
@@ -2424,8 +2497,13 @@ const executeTask = (
       (!displaysStreamedOutput && shouldReplayOutput(outputMode, false)) ||
       (outputMode === "errors-only" && result.exitCode !== 0)
     ) {
-      yield* terminal.writeStdout(
-        renderLogEvent({ kind: "task-output", task: taskLabel, output }, color),
+      yield* writeTaskEvent(
+        "stdout",
+        renderLogEvent(
+          { kind: "task-output", task: taskLabel, output },
+          color,
+          options.json ? false : prefixTask,
+        ),
       );
     }
     if (result.exitCode !== 0) {
@@ -3231,18 +3309,15 @@ export const executeRun = (
             `\t\t${JSON.stringify(`[root] ${source}`)} -> ${JSON.stringify(`[root] ${target}`)}`,
         )
         .join("\n")}\n\t}\n}\n\n`;
-      const mermaidIdentifier = (value: string): string =>
-        xxhash64Hex(value)
-          .slice(0, 4)
-          .split("")
-          .map((character) =>
-            String.fromCharCode(65 + Number.parseInt(character, 16)),
-          )
-          .join("");
+      const mermaidIdentifiers = new Map(
+        [...new Set(edges.flat())]
+          .sort((left, right) => left.localeCompare(right))
+          .map((value, index) => [value, `N${index}`]),
+      );
       const mermaidOutput = `graph TD\n${edges
         .map(
           ([source, target]) =>
-            `\t${mermaidIdentifier(source)}(${JSON.stringify(source)}) --> ${mermaidIdentifier(target)}(${JSON.stringify(target)})`,
+            `\t${mermaidIdentifiers.get(source)}(${JSON.stringify(source)}) --> ${mermaidIdentifiers.get(target)}(${JSON.stringify(target)})`,
         )
         .join("\n")}`;
       if (requestedPath === "") {
@@ -3462,57 +3537,59 @@ export const executeRun = (
     > => {
       const memberSet = new Set(members);
       const groupOutcomes = new Map<string, TaskOutcome>();
+      const taskStartedAt = new Map<string, number>();
       const runNode = (
         id: string,
-      ): Effect.Effect<TaskOutcome, CacheRollbackError, RunRequirements> => {
-        const node = graph.nodes.get(id)!;
-        const dependencyFailed = node.dependencies.some((dependency) => {
-          const outcome =
-            groupOutcomes.get(dependency) ?? outcomes.get(dependency);
-          return (
-            outcome !== undefined && (outcome.exitCode !== 0 || outcome.skipped)
-          );
-        });
-        if (
-          !options.parallel &&
-          dependencyFailed &&
-          options.continueMode !== "always"
-        ) {
-          return Effect.succeed({
-            id,
-            exitCode: 1,
-            skipped: true,
+      ): Effect.Effect<TaskOutcome, CacheRollbackError, RunRequirements> =>
+        Effect.gen(function* () {
+          const clock = yield* ClockService;
+          const startTime = yield* clock.now;
+          taskStartedAt.set(id, startTime);
+          const node = graph.nodes.get(id)!;
+          const dependencyFailed = node.dependencies.some((dependency) => {
+            const outcome =
+              groupOutcomes.get(dependency) ?? outcomes.get(dependency);
+            return (
+              outcome !== undefined &&
+              (outcome.exitCode !== 0 || outcome.skipped)
+            );
           });
-        }
-        return executeTask(
-          repository,
-          node,
-          options,
-          hashes.get(id)!,
-          environment,
-          cargoWorkspacePlan.scopes.get(id),
-          cacheabilityByTask.get(id)!.cacheable &&
-            !unrestorableCacheInputs.has(id),
-          withCachePublicationPermit,
-          logIdentifiers.get(id),
-        ).pipe(
-          Effect.catchAll((cause) =>
-            cause instanceof CacheRollbackError
-              ? Effect.fail(cause)
-              : Effect.gen(function* () {
-                  const terminal = yield* TerminalService;
-                  yield* terminal
-                    .writeStderr(`turbo-ts: ${String(cause)}\n`)
-                    .pipe(Effect.ignore);
-                  return {
-                    id,
-                    exitCode: 1,
-                    skipped: false,
-                  } satisfies TaskOutcome;
-                }),
-          ),
-        );
-      };
+          const result: TaskExecutionResult =
+            !options.parallel &&
+            dependencyFailed &&
+            options.continueMode !== "always"
+              ? { id, exitCode: 1, skipped: true }
+              : yield* executeTask(
+                  repository,
+                  node,
+                  options,
+                  hashes.get(id)!,
+                  environment,
+                  cargoWorkspacePlan.scopes.get(id),
+                  cacheabilityByTask.get(id)!.cacheable &&
+                    !unrestorableCacheInputs.has(id),
+                  withCachePublicationPermit,
+                  logIdentifiers.get(id),
+                ).pipe(
+                  Effect.catchAll((cause) =>
+                    cause instanceof CacheRollbackError
+                      ? Effect.fail(cause)
+                      : Effect.gen(function* () {
+                          const terminal = yield* TerminalService;
+                          yield* terminal
+                            .writeStderr(`turbo-ts: ${String(cause)}\n`)
+                            .pipe(Effect.ignore);
+                          return {
+                            id,
+                            exitCode: 1,
+                            skipped: false,
+                          } satisfies TaskExecutionResult;
+                        }),
+                  ),
+                );
+          const endTime = yield* clock.now;
+          return { ...result, startTime, endTime };
+        });
       const targets = new Set(
         members.flatMap((id) => graph.nodes.get(id)!.with),
       );
@@ -3537,13 +3614,22 @@ export const executeRun = (
               .get(id)!
               .with.filter((companion) => backgroundSet.has(companion))
               .every((companion) => startedBackground.has(companion));
-          const backgroundOutcomes = (): ReadonlyArray<TaskOutcome> =>
-            backgroundFibers.map(({ id }) => ({
-              id,
-              exitCode: 0,
-              hash: hashes.get(id)!.hash,
-              skipped: false,
-            }));
+          const backgroundOutcomes = (): Effect.Effect<
+            ReadonlyArray<TaskOutcome>,
+            never,
+            ClockService
+          > =>
+            Effect.gen(function* () {
+              const endTime = yield* (yield* ClockService).now;
+              return backgroundFibers.map(({ id }) => ({
+                id,
+                exitCode: 0,
+                hash: hashes.get(id)!.hash,
+                skipped: false,
+                startTime: taskStartedAt.get(id) ?? endTime,
+                endTime,
+              }));
+            });
           const firstBackgroundFailure = () => {
             const failures = backgroundFibers.map(({ fiber }) =>
               Fiber.join(fiber).pipe(
@@ -3664,6 +3750,7 @@ export const executeRun = (
                     firstBackgroundFailure(),
                   );
             if (completion._tag === "BackgroundFailed") {
+              const endTime = yield* (yield* ClockService).now;
               return members.map((id) =>
                 id === completion.outcome.id
                   ? completion.outcome
@@ -3671,6 +3758,8 @@ export const executeRun = (
                       id,
                       exitCode: 1,
                       skipped: true,
+                      startTime: taskStartedAt.get(id) ?? endTime,
+                      endTime,
                     },
               );
             }
@@ -3683,10 +3772,10 @@ export const executeRun = (
               options.continueMode === "never" &&
               completion.outcomes.some((outcome) => outcome.exitCode !== 0)
             ) {
-              return [...results, ...backgroundOutcomes()];
+              return [...results, ...(yield* backgroundOutcomes())];
             }
           }
-          return [...results, ...backgroundOutcomes()];
+          return [...results, ...(yield* backgroundOutcomes())];
         }),
       );
     };
@@ -3788,10 +3877,10 @@ export const executeRun = (
         ),
         hashOfExternalDependencies: "459c029558afe716",
         cache: {
-          local: false,
-          remote: false,
-          status: "MISS",
-          timeSaved: 0,
+          local: outcome?.cacheSource === "local",
+          remote: outcome?.cacheSource === "remote",
+          status: outcome?.cacheSource === undefined ? "MISS" : "HIT",
+          timeSaved: outcome?.cacheTimeSaved ?? 0,
         },
         command: node.command ?? "",
         cliArguments: parsed.passThroughArguments,
@@ -3834,8 +3923,8 @@ export const executeRun = (
           passthrough: null,
         },
         execution: {
-          startTime: runStartedAt,
-          endTime: runFinishedAt,
+          startTime: outcome?.startTime ?? runStartedAt,
+          endTime: outcome?.endTime ?? runFinishedAt,
           exitCode: outcome?.exitCode ?? 1,
         },
       };
@@ -3863,7 +3952,9 @@ export const executeRun = (
         repoPath: "",
         success: successfulTasks,
         failed: failedTasks,
-        cached: 0,
+        cached: [...outcomes.values()].filter(
+          (outcome) => outcome.cacheSource !== undefined,
+        ).length,
         attempted: outcomes.size,
         startTime: runStartedAt,
         endTime: runFinishedAt,
@@ -3884,15 +3975,20 @@ export const executeRun = (
         `${JSON.stringify({ ...summary, id: runId }, undefined, 2)}\n`,
       );
     }
-    const traceEvents = orderedNodes.map((node) => ({
-      name: parsed.anonymousProfile === undefined ? node.id : node.task,
-      cat: "turbo-ts",
-      ph: "X",
-      ts: runStartedAt * 1_000,
-      dur: Math.max(0, runFinishedAt - runStartedAt) * 1_000,
-      pid: 1,
-      tid: 1,
-    }));
+    const traceEvents = orderedNodes.map((node) => {
+      const outcome = outcomes.get(node.id);
+      const startTime = outcome?.startTime ?? runStartedAt;
+      const endTime = outcome?.endTime ?? runFinishedAt;
+      return {
+        name: parsed.anonymousProfile === undefined ? node.id : node.task,
+        cat: "turbo-ts",
+        ph: "X",
+        ts: startTime * 1_000,
+        dur: Math.max(0, endTime - startTime) * 1_000,
+        pid: 1,
+        tid: 1,
+      };
+    });
     for (const requestedPath of [
       parsed.profile,
       parsed.anonymousProfile,

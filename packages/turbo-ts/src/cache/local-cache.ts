@@ -185,6 +185,7 @@ export const restoreLocalCache = (
   hash: string,
   scope: CacheRestoreScope,
   windowsPathSeparators = true,
+  onHit?: (durationMilliseconds: number) => void,
 ): Effect.Effect<
   boolean,
   CacheError | CacheRollbackError,
@@ -298,6 +299,23 @@ export const restoreLocalCache = (
           }
           return yield* Effect.fail(outcome.left);
         }
+        const duration = yield* fileSystem.readText(paths.metadata).pipe(
+          Effect.map((contents) => {
+            const parsed: unknown = JSON.parse(contents);
+            if (
+              typeof parsed !== "object" ||
+              parsed === null ||
+              !("duration" in parsed) ||
+              typeof parsed.duration !== "number" ||
+              !Number.isFinite(parsed.duration)
+            ) {
+              return 0;
+            }
+            return Math.max(0, parsed.duration);
+          }),
+          Effect.catchAll(() => Effect.succeed(0)),
+        );
+        yield* Effect.sync(() => onHit?.(duration));
         return true;
       }),
     );

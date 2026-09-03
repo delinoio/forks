@@ -6,6 +6,7 @@ import {
   readdir,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import {
@@ -116,6 +117,46 @@ const sendMalformedDaemonFrame = async (socket: string): Promise<void> => {
     stream.end(Buffer.from([0, 0, 0, 0, 5, 1]));
   });
 };
+
+const protobufString = (field: number, value: string): Buffer => {
+  const encoded = Buffer.from(value);
+  if (encoded.length >= 128)
+    throw new Error("synthetic protobuf value is too long");
+  return Buffer.concat([Buffer.from([field * 8 + 2, encoded.length]), encoded]);
+};
+
+const sendDaemonRequest = async (
+  socket: string,
+  method: string,
+  payload: Uint8Array = Buffer.alloc(0),
+): Promise<Buffer> =>
+  new Promise<Buffer>((resolve, reject) => {
+    const session = connectHttp2("http://localhost", {
+      createConnection: () => createNetConnection(socket),
+    });
+    const chunks: Array<Buffer> = [];
+    const stream = session.request({
+      [http2Constants.HTTP2_HEADER_METHOD]: "POST",
+      [http2Constants.HTTP2_HEADER_PATH]: `/turbodprotocol.Turbod/${method}`,
+      [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+    });
+    const timeout = setTimeout(() => {
+      session.destroy();
+      reject(new Error(`timed out waiting for daemon ${method}`));
+    }, 5_000);
+    session.once("error", reject);
+    stream.once("error", reject);
+    stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+    stream.once("end", () => {
+      clearTimeout(timeout);
+      session.close();
+      const framed = Buffer.concat(chunks);
+      resolve(framed.length >= 5 ? framed.subarray(5) : framed);
+    });
+    const header = Buffer.alloc(5);
+    header.writeUInt32BE(payload.length, 1);
+    stream.end(Buffer.concat([header, payload]));
+  });
 
 const readTextTree = async (
   root: string,
@@ -266,6 +307,19 @@ describe("repository workflow gate", () => {
       expect(await readFile(join(directory, "task-graph.dot"), "utf8")).toBe(
         await readFile(join(directory, "reference-graph.dot"), "utf8"),
       );
+      await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--graph=task-graph.mmd",
+        "--cwd",
+        directory,
+      ]);
+      const mermaid = await readFile(join(directory, "task-graph.mmd"), "utf8");
+      const identifiers = [...mermaid.matchAll(/\bN\d+(?=\()/g)].map(
+        (match) => match[0],
+      );
+      expect(new Set(identifiers).size).toBe(3);
 
       const structured = await execFilePromise(process.execPath, [
         candidate,
@@ -282,7 +336,97 @@ describe("repository workflow gate", () => {
         "--cwd",
         directory,
       ]);
-      expect(structured.stdout).toContain('"type":"run_summary"');
+      const structuredRecords = structured.stdout
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(structuredRecords.length).toBeGreaterThan(1);
+      expect(
+        structuredRecords.every(
+          (record) =>
+            record.type === "run_summary" ||
+            (typeof record.timestamp === "number" &&
+              typeof record.source === "string" &&
+              typeof record.level === "string" &&
+              typeof record.text === "string"),
+        ),
+      ).toBe(true);
+      const runSummary = structuredRecords.at(-1) as {
+        readonly type: string;
+        readonly tasks: ReadonlyArray<{
+          readonly taskId: string;
+          readonly execution: {
+            readonly startTime: number;
+            readonly endTime: number;
+          };
+        }>;
+      };
+      expect(runSummary.type).toBe("run_summary");
+      const libraryTiming = runSummary.tasks.find(
+        (task) => task.taskId === "synthetic-library#build",
+      )!.execution;
+      const appTiming = runSummary.tasks.find(
+        (task) => task.taskId === "synthetic-app#build",
+      )!.execution;
+      expect(libraryTiming.endTime).toBeLessThanOrEqual(appTiming.startTime);
+      const unprefixed = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--no-cache",
+        "--log-prefix=none",
+        "--cwd",
+        directory,
+      ]);
+      expect(unprefixed.stdout).toContain("app build\n");
+      expect(unprefixed.stdout).not.toContain("synthetic-app: app build");
+      await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+      ]);
+      const cached = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--json",
+        "--cwd",
+        directory,
+      ]);
+      const cachedSummary = JSON.parse(
+        cached.stdout.trim().split("\n").at(-1)!,
+      ) as {
+        readonly execution: { readonly cached: number };
+        readonly tasks: ReadonlyArray<{
+          readonly cache: {
+            readonly local: boolean;
+            readonly remote: boolean;
+            readonly status: string;
+            readonly timeSaved: number;
+          };
+        }>;
+      };
+      expect(cachedSummary.execution.cached).toBe(2);
+      expect(
+        cachedSummary.tasks.every(
+          (task) =>
+            task.cache.local &&
+            !task.cache.remote &&
+            task.cache.status === "HIT" &&
+            task.cache.timeSaved >= 0,
+        ),
+      ).toBe(true);
+      const cachedUnprefixed = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--log-prefix=none",
+        "--cwd",
+        directory,
+      ]);
+      expect(cachedUnprefixed.stdout).not.toContain("synthetic-app:build:");
       for (const artifact of [
         "run.heapsnapshot",
         "trace.json",
@@ -323,6 +467,35 @@ describe("repository workflow gate", () => {
         pid_file: expect.stringContaining("turbod.pid"),
         sock_file: expect.stringContaining("turbod.sock"),
       });
+      expect((await runCandidate("info")).stdout).toContain(
+        "Daemon status: Running",
+      );
+      const discovered = await sendDaemonRequest(
+        officialState.sock_file,
+        "DiscoverPackages",
+      );
+      expect(discovered.toString("utf8")).toContain("synthetic-app");
+      expect(discovered.toString("utf8")).toContain("synthetic-library");
+      await sendDaemonRequest(
+        officialState.sock_file,
+        "NotifyOutputsWritten",
+        Buffer.concat([
+          protobufString(1, "synthetic-hash"),
+          protobufString(2, "packages/app/build/**"),
+        ]),
+      );
+      await mkdir(join(directory, "packages/app/build"), { recursive: true });
+      await writeFile(
+        join(directory, "packages/app/build/output.txt"),
+        "output\n",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const changed = await sendDaemonRequest(
+        officialState.sock_file,
+        "GetChangedOutputs",
+        protobufString(1, "synthetic-hash"),
+      );
+      expect(changed.toString("utf8")).toContain("packages/app/build/**");
       await sendMalformedDaemonFrame(officialState.sock_file);
       expect(
         (await runOfficial("daemon", "status", "--json")).stdout,
@@ -341,6 +514,38 @@ describe("repository workflow gate", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 30_000);
+
+  it("resets the daemon idle deadline after client activity", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-idle-"));
+    const runCandidate = (...arguments_: ReadonlyArray<string>) =>
+      execFilePromise(process.execPath, [
+        candidate,
+        ...arguments_,
+        "--cwd",
+        directory,
+      ]);
+    try {
+      await prepareFixture(directory);
+      await runCandidate("daemon", "start", "--idle-time=3000ms");
+      const state = JSON.parse(
+        (await runCandidate("daemon", "status", "--json")).stdout,
+      ) as { readonly sock_file: string };
+      for (let request = 0; request < 6; request += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        await sendDaemonRequest(
+          state.sock_file,
+          "Hello",
+          protobufString(1, "2.0.0"),
+        );
+      }
+      expect(
+        (await sendDaemonRequest(state.sock_file, "Status")).byteLength,
+      ).toBeGreaterThan(0);
+    } finally {
+      await runCandidate("daemon", "stop").catch(() => undefined);
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
 
   it("follows daemon logs until the client is interrupted", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-logs-"));
@@ -442,6 +647,16 @@ describe("repository workflow gate", () => {
   it("coalesces file storms, restarts watch runs, and closes on interruption", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-"));
     await prepareFixture(directory);
+    const appManifestPath = join(directory, "packages/app/package.json");
+    const appManifest = JSON.parse(await readFile(appManifestPath, "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    appManifest.scripts.build =
+      "node -e \"require('node:fs').mkdirSync('build',{recursive:true});require('node:fs').writeFileSync('build/generated.txt','generated');console.log('app build')\"";
+    await writeFile(
+      appManifestPath,
+      `${JSON.stringify(appManifest, undefined, 2)}\n`,
+    );
     const child = spawn(
       process.execPath,
       [candidate, "watch", "build", "--cwd", directory, "--no-cache"],
@@ -460,6 +675,8 @@ describe("repository workflow gate", () => {
     const closed = new Promise<void>((resolve) => child.once("close", resolve));
     try {
       await waitUntil(() => stdout.includes("app build"));
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(stdout).not.toContain("change detected");
       for (let index = 0; index < 8; index += 1) {
         await writeFile(
           join(directory, "packages/library/source.txt"),
@@ -571,6 +788,31 @@ describe("repository workflow gate", () => {
       expect(await query.json()).toEqual({
         data: { version: "2.10.12", packages: { length: 3 } },
       });
+      const relationships = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          query:
+            '{ package(name: "synthetic-app") { tasks { items { name directDependencies { items { fullName } } } } } }',
+        }),
+      });
+      expect(relationships.status).toBe(200);
+      expect(await relationships.json()).toMatchObject({
+        data: {
+          package: {
+            tasks: {
+              items: expect.arrayContaining([
+                {
+                  name: "build",
+                  directDependencies: {
+                    items: [{ fullName: "synthetic-library#build" }],
+                  },
+                },
+              ]),
+            },
+          },
+        },
+      });
     } finally {
       child.kill();
       await Promise.race([
@@ -590,6 +832,14 @@ describe("repository workflow gate", () => {
     const output = join(directory, "result");
     try {
       await prepareFixture(directory);
+      await writeFile(
+        join(directory, ".gitignore"),
+        "packages/app/generated.txt\n",
+      );
+      await writeFile(
+        join(directory, "packages/app/generated.txt"),
+        "ignored\n",
+      );
       const reference = await executeDifferentialCommand(official, [
         "--cwd",
         directory,
@@ -615,10 +865,44 @@ describe("repository workflow gate", () => {
         reference.stderr,
       );
       expect(await readTextTree(output)).toEqual(referenceTree);
+      expect(
+        await readFile(
+          join(output, "packages/app/generated.txt"),
+          "utf8",
+        ).catch(() => undefined),
+      ).toBeUndefined();
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
   }, 30_000);
+
+  it("rejects a selected symlinked workspace before prune traversal", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-link-"));
+    try {
+      await prepareFixture(directory);
+      await cp(
+        join(directory, "packages/app"),
+        join(directory, ".workspace-target"),
+        { recursive: true },
+      );
+      await rm(join(directory, "packages/app"), {
+        force: true,
+        recursive: true,
+      });
+      await symlink("../.workspace-target", join(directory, "packages/app"));
+      await expect(
+        execFilePromise(process.execPath, [
+          candidate,
+          "prune",
+          "synthetic-app",
+          "--cwd",
+          directory,
+        ]),
+      ).rejects.toThrow(/cannot prune symlinked workspace/);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
 
   it("matches affected task and package responses", async () => {
     const fixtureParent = join(repositoryRoot, ".turbo");
@@ -671,6 +955,22 @@ describe("repository workflow gate", () => {
           reference.stderr,
         );
       }
+      const affectedGraphql = await execFilePromise(process.execPath, [
+        candidate,
+        "query",
+        '{ affectedPackages(base: "HEAD~1", head: "HEAD", filter: { equal: { field: "name", value: "synthetic-app" } }) { length items { name } } affectedTasks(base: "HEAD", head: "HEAD", tasks: ["build"]) { length } }',
+        "--cwd",
+        directory,
+      ]);
+      expect(JSON.parse(affectedGraphql.stdout)).toEqual({
+        data: {
+          affectedPackages: {
+            length: 1,
+            items: [{ name: "synthetic-app" }],
+          },
+          affectedTasks: { length: 0 },
+        },
+      });
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -703,6 +1003,36 @@ snapshots:
     expect(output).toContain("kept@1.0.0:");
     expect(output).not.toContain("packages/unused:");
     expect(output).not.toContain("removed@2.0.0:");
+    const developmentSource = new TextEncoder().encode(`lockfileVersion: '9.0'
+importers:
+  packages/app:
+    devDependencies:
+      build-tool:
+        version: 3.0.0
+packages:
+  build-tool@3.0.0: {}
+snapshots:
+  build-tool@3.0.0: {}
+`);
+    expect(
+      new TextDecoder().decode(
+        pruneLockfile(
+          "/repo/pnpm-lock.yaml",
+          developmentSource,
+          new Set(["packages/app"]),
+        ),
+      ),
+    ).toContain("build-tool@3.0.0");
+    expect(
+      new TextDecoder().decode(
+        pruneLockfile(
+          "/repo/pnpm-lock.yaml",
+          developmentSource,
+          new Set(["packages/app"]),
+          { production: true },
+        ),
+      ),
+    ).not.toContain("build-tool");
     expect(() =>
       pruneLockfile(
         "/repo/pnpm-lock.yaml",

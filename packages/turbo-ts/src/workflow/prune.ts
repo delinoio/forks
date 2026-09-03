@@ -14,6 +14,10 @@ import {
   ProcessService,
   TerminalService,
 } from "../effect/services.js";
+import {
+  type GitIgnoreMatcher,
+  loadGitIgnoreMatcher,
+} from "../repository/git-ignore.js";
 import { pruneLockfile } from "../repository/lockfiles.js";
 import type {
   RepositoryModel,
@@ -141,10 +145,20 @@ const copyTree = (
   source: string,
   destination: string,
   excludedRoot: string,
+  ignoreMatcher?: GitIgnoreMatcher,
 ): Effect.Effect<void, unknown, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     if (isPathContained(excludedRoot, source)) return;
+    const sourceMetadata = yield* fileSystem.metadata(source);
+    if (sourceMetadata.kind !== "directory") {
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: source,
+          message: "prune source must be a real directory",
+        }),
+      );
+    }
     const entries = yield* fileSystem.list(source);
     yield* fileSystem.makeDirectory(destination);
     for (const entry of entries) {
@@ -153,8 +167,16 @@ const copyTree = (
       }
       const sourcePath = joinPath(source, entry.name);
       const destinationPath = joinPath(destination, entry.name);
+      if (ignoreMatcher?.ignores(sourcePath, entry.kind === "directory")) {
+        continue;
+      }
       if (entry.kind === "directory") {
-        yield* copyTree(sourcePath, destinationPath, excludedRoot);
+        yield* copyTree(
+          sourcePath,
+          destinationPath,
+          excludedRoot,
+          ignoreMatcher,
+        );
       } else if (entry.kind === "file") {
         yield* fileSystem.copyFile(sourcePath, destinationPath);
       }
@@ -245,6 +267,21 @@ export const executePrune = (
     const terminal = yield* TerminalService;
     const repository = yield* loadWorkflowRepository(options);
     const packages = selectedPackages(repository, options.scopes);
+    for (const packageModel of packages) {
+      const metadata = yield* fileSystem.metadata(packageModel.directory);
+      if (
+        metadata.kind !== "directory" ||
+        packageModel.relativeDirectory !==
+          packageModel.canonicalRelativeDirectory
+      ) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: packageModel.directory,
+            message: `cannot prune symlinked workspace ${packageModel.name}`,
+          }),
+        );
+      }
+    }
     if (repository.lockfile === undefined) {
       return yield* Effect.fail(
         new ConfigurationError({
@@ -258,6 +295,9 @@ export const executePrune = (
         ? options.outputDirectory
         : joinPath(repository.root, options.outputDirectory),
     );
+    const ignoreMatcher = options.useGitignore
+      ? yield* loadGitIgnoreMatcher(repository.root)
+      : undefined;
     if (
       outputRoot === normalizePath(repository.root) ||
       isPathContained(outputRoot, repository.root)
@@ -320,6 +360,7 @@ export const executePrune = (
         packageModel.directory,
         joinPath(fullRoot, packageModel.relativeDirectory),
         outputRoot,
+        ignoreMatcher,
       );
       if (options.docker) {
         yield* writeManifest(
@@ -335,6 +376,7 @@ export const executePrune = (
       repository.lockfile,
       lockfileContents,
       new Set(packages.map((packageModel) => packageModel.relativeDirectory)),
+      { production: options.production },
     );
     const lockfileName = repository.lockfile.slice(
       repository.lockfile.lastIndexOf("/") + 1,

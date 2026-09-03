@@ -66,6 +66,8 @@ import {
   ConcurrencyService,
   CredentialService,
   type DaemonConnection,
+  DaemonMethod,
+  type DaemonMethod as DaemonMethodType,
   type DaemonResponse,
   DaemonService,
   DigestService,
@@ -1092,10 +1094,10 @@ export const collectChildProcessOutput = (
         completeClose();
       });
     };
-    const emitOutput = (chunk: string) => {
+    const emitOutput = (chunk: string, level: "stdout" | "stderr") => {
       if (onOutputChunk === undefined) return;
       try {
-        const completion: unknown = onOutputChunk(chunk);
+        const completion: unknown = onOutputChunk(chunk, level);
         if (
           completion === null ||
           (typeof completion !== "object" &&
@@ -1126,13 +1128,13 @@ export const collectChildProcessOutput = (
       if (settled) return;
       stdout = appendCapturedOutput(stdout, chunk);
       combinedOutput = appendCapturedOutput(combinedOutput, chunk);
-      emitOutput(chunk);
+      emitOutput(chunk, "stdout");
     });
     child.stderr.on("data", (chunk: string) => {
       if (settled) return;
       stderr = appendCapturedOutput(stderr, chunk);
       combinedOutput = appendCapturedOutput(combinedOutput, chunk);
-      emitOutput(chunk);
+      emitOutput(chunk, "stderr");
     });
     child.onceError(fail);
     child.stdin.on("error", fail);
@@ -1731,7 +1733,93 @@ const daemonRequestPayload = (
       protocolInteger(3, 2),
     ]);
   }
+  if (request.method === "NotifyOutputsWritten") {
+    const params = request.params as
+      | {
+          readonly hash?: unknown;
+          readonly outputGlobs?: unknown;
+          readonly outputExclusionGlobs?: unknown;
+          readonly timeSaved?: unknown;
+        }
+      | undefined;
+    return Buffer.concat([
+      ...(typeof params?.hash === "string"
+        ? [protocolString(1, params.hash)]
+        : []),
+      ...(Array.isArray(params?.outputGlobs)
+        ? params.outputGlobs.flatMap((value) =>
+            typeof value === "string" ? [protocolString(2, value)] : [],
+          )
+        : []),
+      ...(Array.isArray(params?.outputExclusionGlobs)
+        ? params.outputExclusionGlobs.flatMap((value) =>
+            typeof value === "string" ? [protocolString(3, value)] : [],
+          )
+        : []),
+      ...(typeof params?.timeSaved === "number"
+        ? [protocolInteger(4, params.timeSaved)]
+        : []),
+    ]);
+  }
+  if (request.method === "GetChangedOutputs") {
+    const params = request.params as
+      | { readonly hashes?: unknown; readonly outputGlobsHash?: unknown }
+      | undefined;
+    return Buffer.concat([
+      ...(Array.isArray(params?.hashes)
+        ? params.hashes.flatMap((value) =>
+            typeof value === "string" ? [protocolString(1, value)] : [],
+          )
+        : []),
+      ...(typeof params?.outputGlobsHash === "number"
+        ? [protocolInteger(2, params.outputGlobsHash)]
+        : []),
+    ]);
+  }
   return Buffer.alloc(0);
+};
+
+const protocolStrings = (
+  fields: ReadonlyMap<number, ReadonlyArray<number | Buffer>>,
+  field: number,
+): ReadonlyArray<string> =>
+  (fields.get(field) ?? []).flatMap((value) =>
+    value instanceof Buffer ? [value.toString("utf8")] : [],
+  );
+
+const decodedDaemonRequest = (
+  method: DaemonMethodType,
+  payload: Uint8Array,
+): unknown => {
+  const fields = protocolFields(payload);
+  if (method === DaemonMethod.hello) {
+    const version = fields.get(1)?.[0];
+    const supportedVersion = fields.get(3)?.[0];
+    return {
+      version: version instanceof Buffer ? version.toString("utf8") : "",
+      supportedVersion:
+        typeof supportedVersion === "number" ? supportedVersion : 0,
+    };
+  }
+  if (method === DaemonMethod.notifyOutputsWritten) {
+    const hash = fields.get(1)?.[0];
+    const timeSaved = fields.get(4)?.[0];
+    return {
+      hash: hash instanceof Buffer ? hash.toString("utf8") : "",
+      outputGlobs: protocolStrings(fields, 2),
+      outputExclusionGlobs: protocolStrings(fields, 3),
+      timeSaved: typeof timeSaved === "number" ? timeSaved : 0,
+    };
+  }
+  if (method === DaemonMethod.getChangedOutputs) {
+    const outputGlobsHash = fields.get(2)?.[0];
+    return {
+      hashes: protocolStrings(fields, 1),
+      outputGlobsHash:
+        typeof outputGlobsHash === "number" ? outputGlobsHash : 0,
+    };
+  }
+  return {};
 };
 
 const daemonResponsePayload = (
@@ -1756,6 +1844,79 @@ const daemonResponsePayload = (
       ),
     ]);
     return protocolField(1, status);
+  }
+  if (method === "DiscoverPackages") {
+    const result = response.result as
+      | {
+          readonly packages?: unknown;
+          readonly packageManager?: unknown;
+        }
+      | undefined;
+    const packages = Array.isArray(result?.packages)
+      ? result.packages.flatMap((entry) => {
+          if (typeof entry !== "object" || entry === null) return [];
+          const value = entry as {
+            readonly name?: unknown;
+            readonly path?: unknown;
+          };
+          return [
+            protocolField(
+              1,
+              Buffer.concat([
+                protocolString(
+                  1,
+                  typeof value.name === "string" ? value.name : "",
+                ),
+                protocolString(
+                  2,
+                  typeof value.path === "string" ? value.path : "",
+                ),
+              ]),
+            ),
+          ];
+        })
+      : [];
+    return Buffer.concat([
+      ...packages,
+      protocolString(
+        2,
+        typeof result?.packageManager === "string" ? result.packageManager : "",
+      ),
+    ]);
+  }
+  if (method === "GetChangedOutputs") {
+    const result = response.result as
+      | { readonly changedOutputs?: unknown }
+      | undefined;
+    return Buffer.concat(
+      Array.isArray(result?.changedOutputs)
+        ? result.changedOutputs.flatMap((entry) => {
+            if (typeof entry !== "object" || entry === null) return [];
+            const value = entry as {
+              readonly hash?: unknown;
+              readonly changedOutputGlobs?: unknown;
+            };
+            return [
+              protocolField(
+                1,
+                Buffer.concat([
+                  protocolString(
+                    1,
+                    typeof value.hash === "string" ? value.hash : "",
+                  ),
+                  ...(Array.isArray(value.changedOutputGlobs)
+                    ? value.changedOutputGlobs.flatMap((glob) =>
+                        typeof glob === "string"
+                          ? [protocolString(2, glob)]
+                          : [],
+                      )
+                    : []),
+                ]),
+              ),
+            ];
+          })
+        : [],
+    );
   }
   return Buffer.alloc(0);
 };
@@ -1841,12 +2002,26 @@ const daemonLayer = Layer.succeed(DaemonService, {
                     headers[http2Constants.HTTP2_HEADER_PATH] ?? "",
                   );
                   const method = path.slice(path.lastIndexOf("/") + 1);
+                  if (
+                    !Object.values(DaemonMethod).includes(
+                      method as DaemonMethodType,
+                    )
+                  ) {
+                    respondGrpc(stream, DaemonMethod.status, {
+                      id: String(stream.id),
+                      error: `unsupported daemon method: ${method}`,
+                    }).pipe(Effect.runFork);
+                    return;
+                  }
                   const payload = grpcPayload(Buffer.concat(chunks));
                   emit.single({
                     requests: Stream.succeed({
                       id: String(stream.id),
-                      method,
-                      params: { payload: new Uint8Array(payload) },
+                      method: method as DaemonMethodType,
+                      params: decodedDaemonRequest(
+                        method as DaemonMethodType,
+                        new Uint8Array(payload),
+                      ),
                     }),
                     respond: (response) =>
                       respondGrpc(stream, method, response),

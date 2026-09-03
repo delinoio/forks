@@ -1,10 +1,15 @@
 import { Effect } from "effect";
 import { ConfigurationError } from "../effect/errors.js";
 import {
+  DaemonService,
+  DigestService,
   EnvironmentService,
+  FileSystemService,
+  ProcessService,
   SystemService,
   TerminalService,
 } from "../effect/services.js";
+import { daemonIsRunning } from "./daemon.js";
 import {
   loadWorkflowRepository,
   repositoryPackageManagerLabel,
@@ -54,8 +59,10 @@ export const executeInfo = (
   number,
   unknown,
   | EnvironmentService
-  | import("../effect/services.js").FileSystemService
-  | import("../effect/services.js").ProcessService
+  | DaemonService
+  | DigestService
+  | FileSystemService
+  | ProcessService
   | SystemService
   | TerminalService
 > =>
@@ -83,6 +90,7 @@ export const executeInfo = (
     const environment = yield* EnvironmentService;
     const system = yield* SystemService;
     const repository = yield* loadWorkflowRepository({ cwd });
+    const daemonRunning = yield* daemonIsRunning(repository.root);
     const information = yield* system.information;
     const executable =
       environment.executablePath === undefined
@@ -96,7 +104,7 @@ export const executeInfo = (
     yield* terminal.writeStdout(`CLI:
    Version: 0.1.0 (compatible with 2.10.12)
    Path to executable: ${executable}
-   Daemon status: Not running
+   Daemon status: ${daemonRunning ? "Running" : "Not running"}
    Package manager: ${repositoryPackageManagerLabel(repository)}
 
 Platform:

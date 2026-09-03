@@ -244,40 +244,52 @@ const packageKeyForDependency = (
 
 const dependencyEntries = (
   value: unknown,
+  includeDevelopmentDependencies: boolean,
 ): ReadonlyArray<readonly [string, string]> => {
   const object = objectValue(value);
   if (object === undefined) return [];
-  return ["dependencies", "optionalDependencies", "peerDependencies"].flatMap(
-    (field) => {
-      const dependencies = objectValue(object[field]);
-      if (dependencies === undefined) return [];
-      return Object.entries(dependencies).flatMap(([name, descriptor]) => {
-        const version = dependencyVersion(descriptor);
-        return version === undefined ? [] : [[name, version] as const];
-      });
-    },
-  );
+  return [
+    "dependencies",
+    "optionalDependencies",
+    "peerDependencies",
+    ...(includeDevelopmentDependencies ? ["devDependencies"] : []),
+  ].flatMap((field) => {
+    const dependencies = objectValue(object[field]);
+    if (dependencies === undefined) return [];
+    return Object.entries(dependencies).flatMap(([name, descriptor]) => {
+      const version = dependencyVersion(descriptor);
+      return version === undefined ? [] : [[name, version] as const];
+    });
+  });
 };
 
 const prunePnpmLockfile = (
   source: string,
   workspacePaths: ReadonlySet<string>,
+  production: boolean,
 ): string => {
   const document = objectValue(parseYamlDocument(source));
   if (document === undefined)
     throw new TypeError("pnpm lockfile is not an object");
   const importers = objectValue(document.importers) ?? {};
   const retainedImporters = Object.fromEntries(
-    Object.entries(importers).filter(
-      ([path]) => path === "." || workspacePaths.has(path),
-    ),
+    Object.entries(importers)
+      .filter(([path]) => path === "." || workspacePaths.has(path))
+      .map(([path, value]) => {
+        if (!production) return [path, value];
+        const importer = objectValue(value);
+        if (importer === undefined) return [path, value];
+        const { devDependencies: _devDependencies, ...productionImporter } =
+          importer;
+        return [path, productionImporter];
+      }),
   );
   const packages = objectValue(document.packages) ?? {};
   const snapshots = objectValue(document.snapshots) ?? {};
   const retained = new Set<string>();
   const pending: Array<string> = [];
   const enqueueDependencies = (value: unknown): void => {
-    for (const [name, version] of dependencyEntries(value)) {
+    for (const [name, version] of dependencyEntries(value, !production)) {
       const key = packageKeyForDependency(packages, name, version);
       if (key !== undefined && !retained.has(key)) pending.push(key);
     }
@@ -338,6 +350,7 @@ export const pruneLockfile = (
   path: string,
   contents: Uint8Array,
   workspacePaths: ReadonlySet<string>,
+  options: { readonly production?: boolean } = {},
 ): Uint8Array => {
   const parsed = parseLockfile(path, contents);
   if (parsed.format === "bun-binary" || parsed.format === "yarn-pnp") {
@@ -346,7 +359,7 @@ export const pruneLockfile = (
   const source = validateSource(contents);
   const output =
     parsed.format === "pnpm"
-      ? prunePnpmLockfile(source, workspacePaths)
+      ? prunePnpmLockfile(source, workspacePaths, options.production === true)
       : parsed.format === "npm"
         ? pruneNpmLockfile(source, workspacePaths)
         : source;

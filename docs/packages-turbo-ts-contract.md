@@ -476,7 +476,9 @@ debounces filesystem storms and uses switching Effect streams so a later file
 event interrupts an in-flight run before recovery. Watchers, child processes,
 fibers, signals, and task resources remain scope-owned. Watch mode reads cache
 by default and enables cache publication only with
-`--experimental-write-cache`.
+`--experimental-write-cache`. Repository and nested Git-ignore rules and every
+configured task-output pattern suppress generated-file triggers; changes to an
+ignore file reload the matcher and remain user-visible triggers.
 
 The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
 identity, per-user temporary state directory, atomic PID and start lock files,
@@ -484,29 +486,43 @@ identity, per-user temporary state directory, atomic PID and start lock files,
 official `turbodprotocol.Turbod` gRPC service over HTTP/2. Hello, status, and
 shutdown calls interoperate in both directions with the 2.10.12 executable;
 package and watch calls share the same bounded framing and scoped sessions.
-Start, stop, restart, status, logs, and clean are race-safe; log clients follow
-new records until interrupted, malformed streams remain isolated, and an idle
-server releases its state. Windows deliberately uses Node's forceful process
-termination because Node has no supported graceful Win32 Ctrl+C bridge.
+Package discovery and output-change registration/query calls return their
+protocol data rather than empty acknowledgments. Start-lock ownership is
+preserved across overlapping starts, stale locks are validated before removal,
+and a Hello response carrying an error is not healthy. Start, stop, restart,
+status, logs, and clean are race-safe; `info` reports the live daemon state,
+log clients follow new records until interrupted, malformed streams remain
+isolated, and an idle server resets its deadline after RPC or repository
+activity before releasing its state. Windows deliberately uses Node's forceful
+process termination because Node has no supported graceful Win32 Ctrl+C bridge.
 
 `query` provides the compatible repository GraphQL root, package graph,
 package and task collections, affected collections, variables, schema
-introspection, and a loopback GraphQL server. `query affected`, `query ls`, and
-`ls` share repository discovery and stable ordering. The server limits request
-bodies and closes HTTP handles in Scope.
+introspection, and a loopback GraphQL server. Task relationship collections
+come from the resolved task graph. GraphQL affected collections calculate the
+requested base/head range, include dependent packages, and apply package and
+task filters. `query affected`, `query ls`, and `ls` share repository discovery
+and stable ordering. The server limits request bodies and closes HTTP handles
+in Scope.
 
 `prune` selects the transitive internal package closure, emits ordinary and
 Docker layouts, creates reduced lockfiles with reference-compatible canonical
 configuration formatting, supports production manifests, and
 rejects output roots that could contain the source repository. It never
-follows workspace symlinks into a prune output.
+follows workspace symlinks into a prune output. Copying honors repository and
+nested Git-ignore files unless disabled; ordinary pnpm pruning retains
+development dependency closure, while production pruning removes it.
 
 Run workflows support text and JSON dry-runs; DOT, Mermaid, JSON, and HTML task
 graphs; JSON run summaries and structured log files; stream and NDJSON output;
 completion and info; Chrome-compatible named and anonymous profiles; and the
 approved V8 heap snapshot and trace substitutions. TUI requests retain stream
 semantics when no interactive terminal is available, and all color output
-continues to honor `NO_COLOR`.
+continues to honor `NO_COLOR`. JSON mode emits only newline-delimited JSON on
+stdout. Log-prefix selection applies to live and cached output. Summaries record
+the actual local or remote cache source and saved duration, and summaries and
+profiles use each task's scheduling timestamps. Mermaid graphs assign stable,
+unique node identifiers without truncated-hash collisions.
 
 Only behavior with automated ledger evidence is a compatibility claim. Hosted
 authentication, devtools, telemetry transports, and full platform matrices
