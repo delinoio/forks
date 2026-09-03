@@ -194,7 +194,10 @@ options, affected-range controls, hashing, and strict task execution.
 Repository discovery records the resolved root lockfile path. Gate 3 validates
 all modeled lockfile formats before prune, rewrites pnpm importer/package/
 snapshot closure and npm workspace package indexes, and preserves validated
-formats that do not expose a safely rewritable public workspace index. Without
+formats that do not expose a safely rewritable public workspace index. pnpm
+aliases retain their target package identity, peer-qualified snapshots retain
+both the base package and qualified snapshot, and npm pruning retains only the
+selected workspace dependency closure and its valid workspace links. Without
 Git, explicit task
 inputs under ordinary `dist` and `target` directories remain hashable.
 Cache directories equal to or containing the repository or any discovered
@@ -318,6 +321,8 @@ entry holds the same lock through validation and rejected-entry cleanup so it
 cannot remove a concurrent publication. Active entry locks renew their lease
 before the stale-lock threshold, and renewal or ownership loss interrupts the
 protected operation. Locks left by terminated writers remain reclaimable.
+Parent-directory durability sync is attempted after atomic rename and ignores
+only platform errors that explicitly report directory sync as unsupported.
 Cache archives use PAX
 extensions for paths beyond ustar limits. Tar header paths, link targets, and
 PAX metadata must be valid UTF-8, and numeric fields must contain complete octal
@@ -478,7 +483,9 @@ fibers, signals, and task resources remain scope-owned. Watch mode reads cache
 by default and enables cache publication only with
 `--experimental-write-cache`. Repository and nested Git-ignore rules and every
 configured task-output pattern suppress generated-file triggers; changes to an
-ignore file reload the matcher and remain user-visible triggers.
+ignore file reload the matcher and remain user-visible triggers. Run arguments
+after `--` remain task pass-through arguments, including text equal to the
+watch-only cache-publication flag.
 
 The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
 identity, per-user temporary state directory, atomic PID and start lock files,
@@ -490,8 +497,11 @@ Package discovery and output-change registration/query calls return their
 protocol data rather than empty acknowledgments. Start-lock ownership is
 preserved across overlapping starts, stale locks are validated before removal,
 and a Hello response carrying an error is not healthy. Start, stop, restart,
-status, logs, and clean are race-safe; `info` reports the live daemon state,
-log clients follow new records until interrupted, malformed streams remain
+status, logs, and clean are race-safe; `info` reports the live daemon state.
+Log clients follow the exact dated log reported by the running daemon until
+interrupted. Stop escalates only after a successful RPC identifies the process
+as the expected daemon; reused live PIDs without a healthy daemon RPC are
+treated as stale state and are never signaled. Malformed streams remain
 isolated, and an idle server resets its deadline after RPC or repository
 activity before releasing its state. Windows deliberately uses Node's forceful
 process termination because Node has no supported graceful Win32 Ctrl+C bridge.
@@ -503,23 +513,37 @@ come from the resolved task graph. GraphQL affected collections calculate the
 requested base/head range, include dependent packages, and apply package and
 task filters. `query affected`, `query ls`, and `ls` share repository discovery
 and stable ordering. The server limits request bodies and closes HTTP handles
-in Scope.
+in Scope; oversized requests receive HTTP 413 without resetting the
+connection. Top-level package predicates are applied, external dependencies
+come from manifest references resolved against the parsed lockfile, and file
+queries enforce repository containment after resolving symlinks. The startup
+message describes the static page as a GraphQL endpoint rather than an IDE.
 
 `prune` selects the transitive internal package closure, emits ordinary and
 Docker layouts, creates reduced lockfiles with reference-compatible canonical
 configuration formatting, supports production manifests, and
 rejects output roots that could contain the source repository. It never
-follows workspace symlinks into a prune output. Copying honors repository and
+follows workspace symlinks into a prune output. Output safety and traversal
+exclusions use canonical locations. Contained relative file symlinks are
+recreated without dereferencing; absolute, escaping, or output-targeting links
+are rejected. Root Yarn installation controls, including `.yarnrc.yml`,
+`.pnp.cjs`, releases, and patches, are retained in applicable ordinary and
+Docker layouts. Copying honors repository and
 nested Git-ignore files unless disabled; ordinary pnpm pruning retains
 development dependency closure, while production pruning removes it.
 
 Run workflows support text and JSON dry-runs; DOT, Mermaid, JSON, and HTML task
-graphs; JSON run summaries and structured log files; stream and NDJSON output;
+graphs; JSON run summaries and live newline-delimited structured log files;
+stream, grouped, timestamped stream, and NDJSON output;
 completion and info; Chrome-compatible named and anonymous profiles; and the
 approved V8 heap snapshot and trace substitutions. TUI requests retain stream
 semantics when no interactive terminal is available, and all color output
-continues to honor `NO_COLOR`. JSON mode emits only newline-delimited JSON on
-stdout. Log-prefix selection applies to live and cached output. Summaries record
+continues to honor `NO_COLOR`. Interactive TUI mode renders task status and
+falls back to stream mode when either terminal side is non-interactive. JSON
+mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
+completed task's full log replay. Structured log files append typed task events
+as work runs and end with a typed run summary. CLI `--global-deps` patterns are
+merged into task hash inputs. Log-prefix selection applies to live and cached output. Summaries record
 the actual local or remote cache source and saved duration, and summaries and
 profiles use each task's scheduling timestamps. Mermaid graphs assign stable,
 unique node identifiers without truncated-hash collisions.

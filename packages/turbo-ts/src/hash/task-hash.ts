@@ -743,6 +743,7 @@ export const hashTask = (
   runtimeEnvironment?: Readonly<Record<string, string | undefined>>,
   uvRuntimeIdentity?: UvRuntimeIdentity,
   packageManagerRuntimeIdentity?: PackageManagerRuntimeIdentity,
+  commandGlobalDependencies: ReadonlyArray<string> = [],
 ): Effect.Effect<
   TaskHashResult,
   RepositoryError,
@@ -938,11 +939,13 @@ export const hashTask = (
                 }),
             ),
           );
-    const globalDependencyPatterns =
-      repository.rootConfiguration.value.futureFlags?.globalConfiguration ===
-      true
+    const globalDependencyPatterns = [
+      ...(repository.rootConfiguration.value.futureFlags
+        ?.globalConfiguration === true
         ? []
-        : (globalSettings.inputs ?? []);
+        : (globalSettings.inputs ?? [])),
+      ...commandGlobalDependencies,
+    ];
     const discoveredGlobalInputFiles =
       globalDependencyPatterns.length === 0
         ? []

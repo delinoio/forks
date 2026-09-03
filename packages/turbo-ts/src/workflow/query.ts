@@ -22,6 +22,10 @@ import {
 } from "../effect/services.js";
 import { buildTaskGraph } from "../graph/task-graph.js";
 import { decodeNullDelimitedGitOutput } from "../hash/task-hash.js";
+import {
+  type LockfilePackage,
+  parseLockfile,
+} from "../repository/lockfiles.js";
 import type {
   RepositoryModel,
   RepositoryPackage,
@@ -446,6 +450,7 @@ const packageMatchesPredicate = (
 const repositoryQueryRoot = (
   repository: RepositoryModel,
   readFile: (path: string) => Promise<string>,
+  externalDependencies: ReadonlyArray<LockfilePackage>,
   affectedRepository: (
     base: string,
     head: string,
@@ -618,7 +623,10 @@ const repositoryQueryRoot = (
   );
   return {
     version: () => "2.10.12",
-    packages: () => list(packageViews),
+    packages: ({ filter }: { readonly filter?: PackagePredicate }) =>
+      list(
+        packageViews.filter((view) => packageMatchesPredicate(view, filter)),
+      ),
     package: ({ name }: { readonly name: string }) => {
       const model = models.find(
         (entry) => entry.name === name || entry.identity === name,
@@ -694,7 +702,7 @@ const repositoryQueryRoot = (
       );
     },
     boundaries: () => ({ errors: [], warnings: [] }),
-    externalDependencies: () => list([]),
+    externalDependencies: () => list(externalDependencies),
     file: async ({ path }: { readonly path: string }) => {
       const normalized = normalizePath(path);
       const absolutePath = joinPath(repository.root, normalized);
@@ -724,6 +732,43 @@ const executeGraphql = (
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const processService = yield* ProcessService;
+    const parsedLockfile =
+      repository.lockfile === undefined
+        ? undefined
+        : yield* fileSystem.readBytes(repository.lockfile).pipe(
+            Effect.mapError(
+              (error) =>
+                new ConfigurationError({
+                  path: repository.lockfile!,
+                  message: error.message,
+                }),
+            ),
+            Effect.flatMap((contents) =>
+              Effect.try({
+                try: () => parseLockfile(repository.lockfile!, contents),
+                catch: (cause) =>
+                  new ConfigurationError({
+                    path: repository.lockfile!,
+                    message: String(cause),
+                  }),
+              }),
+            ),
+          );
+    const models = [repository.rootPackage, ...repository.packages];
+    const externalNames = new Set(
+      models.flatMap((model) => {
+        const internalNames = new Set(
+          model.internalDependencies.flatMap((identity) => {
+            const dependency = repository.packagesByIdentity.get(identity);
+            return dependency === undefined ? [] : [dependency.name];
+          }),
+        );
+        return model.dependencyNames.filter((name) => !internalNames.has(name));
+      }),
+    );
+    const externalDependencies = (parsedLockfile?.packages ?? []).filter(
+      (dependency) => externalNames.has(dependency.name),
+    );
     return yield* Effect.tryPromise({
       try: () =>
         graphql({
@@ -731,7 +776,38 @@ const executeGraphql = (
           source,
           rootValue: repositoryQueryRoot(
             repository,
-            (path) => Effect.runPromise(fileSystem.readText(path)),
+            (path) =>
+              Effect.runPromise(
+                fileSystem.realPath(path).pipe(
+                  Effect.mapError(
+                    (error) =>
+                      new ConfigurationError({
+                        path,
+                        message: error.message,
+                      }),
+                  ),
+                  Effect.flatMap((resolved) =>
+                    isPathContained(repository.root, normalizePath(resolved))
+                      ? fileSystem.readText(resolved).pipe(
+                          Effect.mapError(
+                            (error) =>
+                              new ConfigurationError({
+                                path,
+                                message: error.message,
+                              }),
+                          ),
+                        )
+                      : Effect.fail(
+                          new ConfigurationError({
+                            path,
+                            message:
+                              "file path must stay within the repository",
+                          }),
+                        ),
+                  ),
+                ),
+              ),
+            externalDependencies,
             (base, head) =>
               Effect.runPromise(
                 calculateAffectedRepository(repository, base, head).pipe(
@@ -847,7 +923,7 @@ export const executeQuery = (
           );
         });
         yield* terminal.writeStdout(
-          `GraphiQL IDE: http://localhost:${server.port}\n`,
+          `GraphQL endpoint: http://localhost:${server.port}\n`,
         );
         yield* Stream.runHead(signals.signals);
         return 0;

@@ -12,6 +12,7 @@ import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import {
   collectChildProcessBytes,
   collectChildProcessOutput,
+  isUnsupportedDirectorySyncError,
   makeChildEnvironment,
   makeTerminalOperations,
   makeTerminalWriter,
@@ -42,6 +43,15 @@ const waitForTextFile = async (path: string): Promise<string> => {
 };
 
 describe("Effect foundation", () => {
+  it("only tolerates platform-specific parent-directory sync failures", () => {
+    expect(isUnsupportedDirectorySyncError({ code: "EINVAL" })).toBe(true);
+    expect(isUnsupportedDirectorySyncError({ code: "EOPNOTSUPP" })).toBe(true);
+    expect(isUnsupportedDirectorySyncError({ code: "EACCES" })).toBe(false);
+    expect(isUnsupportedDirectorySyncError(new Error("unsupported"))).toBe(
+      false,
+    );
+  });
+
   it("streams UTF-8 text through bounded filesystem chunks", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-text-stream-"));
     const path = join(directory, "large.log");

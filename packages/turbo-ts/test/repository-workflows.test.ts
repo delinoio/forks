@@ -5,6 +5,7 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  readlink,
   rm,
   symlink,
   writeFile,
@@ -23,10 +24,16 @@ import { graphql } from "graphql";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { normalizeOutput } from "../src/compatibility/normalizers.js";
 import { pruneLockfile } from "../src/repository/lockfiles.js";
+import {
+  renderRunTui,
+  renderTimestampedStreamText,
+  resolveRunUiMode,
+} from "../src/run/engine.js";
 import { parseRunArguments } from "../src/run/options.js";
 import { parseDaemonArguments } from "../src/workflow/daemon.js";
 import { parsePruneArguments } from "../src/workflow/prune.js";
 import { repositoryQuerySchema } from "../src/workflow/query.js";
+import { parseWatchArguments } from "../src/workflow/watch.js";
 
 const execFilePromise = promisify(execFile);
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -185,6 +192,7 @@ describe("repository workflow gate", () => {
       "--ui=stream",
       "--log-order=grouped",
       "--log-prefix=task",
+      "--global-deps=tooling/*.json",
       "--json",
     ]);
     expect(run).toMatchObject({
@@ -195,8 +203,28 @@ describe("repository workflow gate", () => {
       ui: "stream",
       logOrder: "grouped",
       logPrefix: "task",
+      globalDependencies: ["tooling/*.json"],
       json: true,
     });
+    expect(
+      parseWatchArguments(["build", "--", "--experimental-write-cache"]),
+    ).toMatchObject({
+      writeCache: false,
+      run: { passThroughArguments: ["--experimental-write-cache"] },
+    });
+    expect(resolveRunUiMode("tui", false, true, false)).toBe("stream");
+    expect(resolveRunUiMode("tui", true, true, false)).toBe("tui");
+    expect(renderTimestampedStreamText(0, "one\ntwo\n")).toBe(
+      "[1970-01-01T00:00:00.000Z] one\n[1970-01-01T00:00:00.000Z] two\n",
+    );
+    expect(
+      renderRunTui(
+        new Map([
+          ["app#build", "running"],
+          ["lib#build", "queued"],
+        ]),
+      ),
+    ).toContain("running   app#build");
     expect(
       parseDaemonArguments(["--idle-time=30s", "status", "--json"]),
     ).toMatchObject({
@@ -321,6 +349,27 @@ describe("repository workflow gate", () => {
       );
       expect(new Set(identifiers).size).toBe(3);
 
+      await writeFile(join(directory, "global-input.txt"), "one\n");
+      const hashWithGlobalInput = async () => {
+        const result = await execFilePromise(process.execPath, [
+          candidate,
+          "run",
+          "build",
+          "--dry=json",
+          "--global-deps=global-input.txt",
+          "--cwd",
+          directory,
+        ]);
+        return (
+          JSON.parse(result.stdout) as {
+            tasks: ReadonlyArray<{ hash: string }>;
+          }
+        ).tasks.map((task) => task.hash);
+      };
+      const firstGlobalHashes = await hashWithGlobalInput();
+      await writeFile(join(directory, "global-input.txt"), "two\n");
+      expect(await hashWithGlobalInput()).not.toEqual(firstGlobalHashes);
+
       const structured = await execFilePromise(process.execPath, [
         candidate,
         "run",
@@ -362,6 +411,12 @@ describe("repository workflow gate", () => {
         }>;
       };
       expect(runSummary.type).toBe("run_summary");
+      const logRecords = (await readFile(join(directory, "run.ndjson"), "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(logRecords.map((record) => record.type)).toContain("task_event");
+      expect(logRecords.at(-1)?.type).toBe("run_summary");
       const libraryTiming = runSummary.tasks.find(
         (task) => task.taskId === "synthetic-library#build",
       )!.execution;
@@ -444,6 +499,71 @@ describe("repository workflow gate", () => {
     }
   }, 45_000);
 
+  it("groups concurrent task output and keeps timestamped streaming distinct", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-run-output-"));
+    try {
+      await prepareFixture(directory);
+      for (const [name, delay] of [
+        ["app", 80],
+        ["library", 40],
+      ] as const) {
+        const manifestPath = join(directory, `packages/${name}/package.json`);
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          scripts: Record<string, string>;
+        };
+        manifest.scripts.grouped = `node -e "console.log('${name}-start');setTimeout(()=>console.log('${name}-end'),${delay})"`;
+        await writeFile(
+          manifestPath,
+          `${JSON.stringify(manifest, undefined, 2)}\n`,
+        );
+      }
+      const configurationPath = join(directory, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.grouped = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      const grouped = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "grouped",
+        "--parallel",
+        "--concurrency=2",
+        "--log-order=grouped",
+        "--log-prefix=none",
+        "--cwd",
+        directory,
+      ]);
+      const appStart = grouped.stdout.indexOf("app-start");
+      const appEnd = grouped.stdout.indexOf("app-end");
+      const libraryStart = grouped.stdout.indexOf("library-start");
+      const libraryEnd = grouped.stdout.indexOf("library-end");
+      expect(
+        Math.min(appStart, appEnd, libraryStart, libraryEnd),
+      ).toBeGreaterThan(-1);
+      expect(appEnd < libraryStart || libraryEnd < appStart).toBe(true);
+      const timestamped = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "grouped",
+        "--parallel",
+        "--concurrency=2",
+        "--ui=stream-with-experimental-timestamps",
+        "--log-prefix=none",
+        "--cwd",
+        directory,
+      ]);
+      expect(timestamped.stdout).toMatch(
+        /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\]/m,
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
   it(evidenceId.repositoryProtocol, async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-"));
     const runCandidate = (...arguments_: ReadonlyArray<string>) =>
@@ -460,10 +580,12 @@ describe("repository workflow gate", () => {
       await runCandidate("daemon", "start", "--idle-time=30s");
       const officialStatus = await runOfficial("daemon", "status", "--json");
       const officialState = JSON.parse(officialStatus.stdout) as {
+        readonly log_file: string;
         readonly pid_file: string;
         readonly sock_file: string;
       };
       expect(officialState).toMatchObject({
+        log_file: expect.stringMatching(/-turbo\.log\.\d{4}-\d{2}-\d{2}$/),
         pid_file: expect.stringContaining("turbod.pid"),
         sock_file: expect.stringContaining("turbod.sock"),
       });
@@ -606,6 +728,7 @@ describe("repository workflow gate", () => {
       ]);
     const runOfficial = (...arguments_: ReadonlyArray<string>) =>
       execFilePromise(official, [...arguments_, "--cwd", directory]);
+    let sentinel: ReturnType<typeof spawn> | undefined;
     try {
       await prepareFixture(directory);
       const starts = await Promise.allSettled([
@@ -617,6 +740,16 @@ describe("repository workflow gate", () => {
         (await runOfficial("daemon", "status", "--json")).stdout,
       ) as { readonly pid_file: string; readonly sock_file: string };
       await runCandidate("daemon", "stop");
+
+      sentinel = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+      if (sentinel.pid === undefined) throw new Error("sentinel did not start");
+      await writeFile(running.pid_file, `${sentinel.pid}\n`);
+      await writeFile(running.sock_file, "stale socket\n");
+      await runCandidate("daemon", "stop");
+      expect(sentinel.exitCode).toBeNull();
+      sentinel.kill();
+      await new Promise<void>((resolve) => sentinel?.once("close", resolve));
+      sentinel = undefined;
 
       await mkdir(dirname(running.pid_file), { recursive: true });
       await writeFile(running.pid_file, "99999999\n");
@@ -638,6 +771,7 @@ describe("repository workflow gate", () => {
         /daemon is not running/,
       );
     } finally {
+      sentinel?.kill("SIGKILL");
       await runCandidate("daemon", "stop").catch(() => undefined);
       await runOfficial("daemon", "stop").catch(() => undefined);
       await rm(directory, { force: true, recursive: true });
@@ -747,7 +881,42 @@ describe("repository workflow gate", () => {
 
   it("serves GraphQL queries and isolates malformed HTTP requests", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-query-server-"));
+    const outside = await mkdtemp(join(tmpdir(), "turbo-ts-query-outside-"));
     await prepareFixture(directory);
+    const appManifestPath = join(directory, "packages/app/package.json");
+    const appManifest = JSON.parse(await readFile(appManifestPath, "utf8")) as {
+      dependencies: Record<string, string>;
+    };
+    appManifest.dependencies["external-package"] = "1.2.3";
+    await writeFile(
+      appManifestPath,
+      `${JSON.stringify(appManifest, undefined, 2)}\n`,
+    );
+    await writeFile(
+      join(directory, "pnpm-lock.yaml"),
+      `lockfileVersion: '9.0'
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+importers:
+  .: {}
+  packages/app:
+    dependencies:
+      synthetic-library:
+        specifier: workspace:*
+        version: link:../library
+      external-package:
+        specifier: 1.2.3
+        version: 1.2.3
+  packages/library: {}
+packages:
+  external-package@1.2.3: {}
+snapshots:
+  external-package@1.2.3: {}
+`,
+    );
+    await writeFile(join(outside, "secret.txt"), "outside\n");
+    await symlink(join(outside, "secret.txt"), join(directory, "outside.txt"));
     const child = spawn(
       process.execPath,
       [candidate, "query", "--port=0", "--cwd", directory],
@@ -761,9 +930,11 @@ describe("repository workflow gate", () => {
     const closed = new Promise<void>((resolve) => child.once("close", resolve));
     try {
       await waitUntil(() =>
-        /GraphiQL IDE: http:\/\/localhost:\d+/.test(stdout),
+        /GraphQL endpoint: http:\/\/localhost:\d+/.test(stdout),
       );
-      const port = /GraphiQL IDE: http:\/\/localhost:(\d+)/.exec(stdout)?.[1];
+      const port = /GraphQL endpoint: http:\/\/localhost:(\d+)/.exec(
+        stdout,
+      )?.[1];
       expect(port).toBeDefined();
       const endpoint = `http://127.0.0.1:${port}`;
       const graphiql = await fetch(endpoint);
@@ -779,6 +950,12 @@ describe("repository workflow gate", () => {
         errors: [{ message: "invalid JSON request" }],
       });
 
+      const oversized = await fetch(endpoint, {
+        method: "POST",
+        body: "x".repeat(1024 * 1024 + 1),
+      });
+      expect(oversized.status).toBe(413);
+
       const query = await fetch(endpoint, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -788,6 +965,34 @@ describe("repository workflow gate", () => {
       expect(await query.json()).toEqual({
         data: { version: "2.10.12", packages: { length: 3 } },
       });
+      const filtered = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          query:
+            '{ packages(filter: { equal: { field: "name", value: "synthetic-app" } }) { length items { name } } externalDependencies { length items } }',
+        }),
+      });
+      expect(await filtered.json()).toEqual({
+        data: {
+          packages: { length: 1, items: [{ name: "synthetic-app" }] },
+          externalDependencies: {
+            length: 1,
+            items: [{ name: "external-package", version: "1.2.3" }],
+          },
+        },
+      });
+      const escapedFile = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          query: '{ file(path: "outside.txt") { contents } }',
+        }),
+      });
+      expect(escapedFile.status).toBe(400);
+      expect(JSON.stringify(await escapedFile.json())).toContain(
+        "file path must stay within the repository",
+      );
       const relationships = await fetch(endpoint, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -824,6 +1029,7 @@ describe("repository workflow gate", () => {
         await closed;
       }
       await rm(directory, { force: true, recursive: true });
+      await rm(outside, { force: true, recursive: true });
     }
   }, 30_000);
 
@@ -840,6 +1046,22 @@ describe("repository workflow gate", () => {
         join(directory, "packages/app/generated.txt"),
         "ignored\n",
       );
+      await mkdir(join(directory, ".yarn/releases"), { recursive: true });
+      await mkdir(join(directory, ".yarn/patches"), { recursive: true });
+      await writeFile(
+        join(directory, ".yarnrc.yml"),
+        "yarnPath: .yarn/releases/yarn.cjs\n",
+      );
+      await writeFile(join(directory, ".pnp.cjs"), "module.exports = {};\n");
+      await writeFile(join(directory, ".yarn/releases/yarn.cjs"), "release\n");
+      await writeFile(
+        join(directory, ".yarn/patches/example.patch"),
+        "patch\n",
+      );
+      await writeFile(
+        join(directory, "packages/library/shared.txt"),
+        "shared\n",
+      );
       const reference = await executeDifferentialCommand(official, [
         "--cwd",
         directory,
@@ -849,6 +1071,10 @@ describe("repository workflow gate", () => {
       ]);
       const referenceTree = await readTextTree(output);
       await rm(output, { force: true, recursive: true });
+      await symlink(
+        "../library/shared.txt",
+        join(directory, "packages/app/shared-link.txt"),
+      );
       const implementation = await executeDifferentialCommand(
         process.execPath,
         [
@@ -864,17 +1090,126 @@ describe("repository workflow gate", () => {
       expect(normalizeOutput(implementation.stderr, ["branding"])).toBe(
         reference.stderr,
       );
-      expect(await readTextTree(output)).toEqual(referenceTree);
+      const implementationTree = await readTextTree(output);
+      const {
+        ".pnp.cjs": pnpLoader,
+        ".yarn/patches/example.patch": yarnPatch,
+        ...referenceCompatibleTree
+      } = implementationTree;
+      expect(referenceCompatibleTree).toEqual(referenceTree);
+      expect(pnpLoader).toBe("module.exports = {};\n");
+      expect(yarnPatch).toBe("patch\n");
       expect(
         await readFile(
           join(output, "packages/app/generated.txt"),
           "utf8",
         ).catch(() => undefined),
       ).toBeUndefined();
+      expect(await readlink(join(output, "packages/app/shared-link.txt"))).toBe(
+        "../library/shared.txt",
+      );
+      expect(await readFile(join(output, ".yarnrc.yml"), "utf8")).toContain(
+        "yarnPath",
+      );
+      expect(
+        await readFile(join(output, ".yarn/releases/yarn.cjs"), "utf8"),
+      ).toBe("release\n");
+      await executeDifferentialCommand(process.execPath, [
+        candidate,
+        "--cwd",
+        directory,
+        "prune",
+        "synthetic-app",
+        "--docker",
+        "--out-dir=docker-result",
+      ]);
+      expect(
+        await readFile(
+          join(directory, "docker-result/json/.yarnrc.yml"),
+          "utf8",
+        ),
+      ).toContain("yarnPath");
+      expect(
+        await readFile(
+          join(directory, "docker-result/json/.yarn/patches/example.patch"),
+          "utf8",
+        ),
+      ).toBe("patch\n");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
   }, 30_000);
+
+  it("rejects unsafe prune output aliases and escaping package symlinks", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-safety-"));
+    try {
+      await prepareFixture(directory);
+      await symlink(".", join(directory, "output-alias"));
+      await expect(
+        execFilePromise(process.execPath, [
+          candidate,
+          "prune",
+          "synthetic-app",
+          "--out-dir=output-alias",
+          "--cwd",
+          directory,
+        ]),
+      ).rejects.toThrow(/prune output must not contain the repository root/);
+      await rm(join(directory, "output-alias"));
+      await symlink("packages/app", join(directory, "output-parent"));
+      await execFilePromise(process.execPath, [
+        candidate,
+        "prune",
+        "synthetic-app",
+        "--out-dir=output-parent/generated-out",
+        "--cwd",
+        directory,
+      ]);
+      expect(
+        await readdir(
+          join(
+            directory,
+            "packages/app/generated-out/packages/app/generated-out",
+          ),
+        ).catch(() => undefined),
+      ).toBeUndefined();
+      await rm(join(directory, "packages/app/generated-out"), {
+        force: true,
+        recursive: true,
+      });
+      await rm(join(directory, "output-parent"));
+      await writeFile(join(directory, "secret.txt"), "secret\n");
+      await symlink(
+        "../../secret.txt",
+        join(directory, "packages/app/secret-link.txt"),
+      );
+      await expect(
+        execFilePromise(process.execPath, [
+          candidate,
+          "prune",
+          "synthetic-app",
+          "--out-dir=safe-result",
+          "--cwd",
+          directory,
+        ]),
+      ).rejects.toThrow(/prune symlink must use a relative target/);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("rejects a workflow cwd that resolves to a regular file", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-workflow-cwd-"));
+    const file = join(directory, "not-a-directory");
+    try {
+      await writeFile(file, "file\n");
+      await expect(
+        execFilePromise(process.execPath, [candidate, "query", "--cwd", file]),
+      ).rejects.toThrow(/working directory is not a directory/);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("rejects a selected symlinked workspace before prune traversal", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-link-"));
@@ -1003,6 +1338,63 @@ snapshots:
     expect(output).toContain("kept@1.0.0:");
     expect(output).not.toContain("packages/unused:");
     expect(output).not.toContain("removed@2.0.0:");
+    const aliasesAndPeers = new TextDecoder().decode(
+      pruneLockfile(
+        "/repo/pnpm-lock.yaml",
+        new TextEncoder().encode(`lockfileVersion: '9.0'
+importers:
+  packages/app:
+    dependencies:
+      alias-name:
+        version: npm:actual-name@1.0.0
+      peer-qualified:
+        version: 2.0.0(peer-name@3.0.0)
+packages:
+  actual-name@1.0.0: {}
+  peer-qualified@2.0.0: {}
+snapshots:
+  actual-name@1.0.0: {}
+  peer-qualified@2.0.0(peer-name@3.0.0): {}
+`),
+        new Set(["packages/app"]),
+      ),
+    );
+    expect(aliasesAndPeers).toContain("actual-name@1.0.0");
+    expect(aliasesAndPeers).toContain("peer-qualified@2.0.0:");
+    expect(aliasesAndPeers).toContain("peer-qualified@2.0.0(peer-name@3.0.0)");
+    const npmPruned = JSON.parse(
+      new TextDecoder().decode(
+        pruneLockfile(
+          "/repo/package-lock.json",
+          new TextEncoder().encode(
+            JSON.stringify({
+              lockfileVersion: 3,
+              packages: {
+                "": {},
+                "packages/app": {
+                  dependencies: { shared: "1.0.0", unused: "workspace:*" },
+                },
+                "packages/unused": {
+                  dependencies: { "unused-only": "1.0.0" },
+                },
+                "node_modules/shared": { version: "1.0.0" },
+                "node_modules/unused": {
+                  link: true,
+                  resolved: "packages/unused",
+                },
+                "node_modules/unused-only": { version: "1.0.0" },
+              },
+            }),
+          ),
+          new Set(["packages/app"]),
+        ),
+      ),
+    ) as { packages: Record<string, unknown> };
+    expect(Object.keys(npmPruned.packages)).toEqual([
+      "",
+      "packages/app",
+      "node_modules/shared",
+    ]);
     const developmentSource = new TextEncoder().encode(`lockfileVersion: '9.0'
 importers:
   packages/app:

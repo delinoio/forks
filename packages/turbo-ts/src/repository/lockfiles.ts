@@ -218,28 +218,50 @@ const dependencyVersion = (value: unknown): string | undefined => {
   return typeof object?.version === "string" ? object.version : undefined;
 };
 
-const packageKeyForDependency = (
+interface PnpmDependencyKeys {
+  readonly packageKey?: string;
+  readonly snapshotKey?: string;
+}
+
+const pnpmKeyCandidates = (
+  name: string,
+  version: string,
+): ReadonlyArray<string> => [
+  `${name}@${version}`,
+  `/${name}@${version}`,
+  version.startsWith("/") ? version : `/${version}`,
+  version,
+];
+
+const packageKeysForDependency = (
   packages: Readonly<Record<string, unknown>>,
+  snapshots: Readonly<Record<string, unknown>>,
   name: string,
   rawVersion: string,
-): string | undefined => {
+): PnpmDependencyKeys => {
   if (
     rawVersion.startsWith("link:") ||
     rawVersion.startsWith("workspace:") ||
     rawVersion.startsWith("file:")
   ) {
-    return undefined;
+    return {};
   }
-  const version = rawVersion.startsWith("npm:")
-    ? rawVersion.slice(4).replace(/^((?:@[^/]+\/)?[^@]+)@/, "")
-    : rawVersion;
-  const candidates = [
-    `${name}@${version}`,
-    `/${name}@${version}`,
-    version.startsWith("/") ? version : `/${version}`,
-    version,
-  ];
-  return candidates.find((candidate) => candidate in packages);
+  const alias = /^npm:((?:@[^/]+\/)?[^@]+)@(.+)$/.exec(rawVersion);
+  const targetName = alias?.[1] ?? name;
+  const targetVersion = alias?.[2] ?? rawVersion;
+  const peerQualifier = targetVersion.indexOf("(");
+  const baseVersion =
+    peerQualifier === -1
+      ? targetVersion
+      : targetVersion.slice(0, peerQualifier);
+  return {
+    packageKey: pnpmKeyCandidates(targetName, baseVersion).find(
+      (candidate) => candidate in packages,
+    ),
+    snapshotKey: pnpmKeyCandidates(targetName, targetVersion).find(
+      (candidate) => candidate in snapshots,
+    ),
+  };
 };
 
 const dependencyEntries = (
@@ -286,34 +308,52 @@ const prunePnpmLockfile = (
   );
   const packages = objectValue(document.packages) ?? {};
   const snapshots = objectValue(document.snapshots) ?? {};
-  const retained = new Set<string>();
-  const pending: Array<string> = [];
+  const retainedPackages = new Set<string>();
+  const retainedSnapshots = new Set<string>();
+  const pending: Array<PnpmDependencyKeys> = [];
   const enqueueDependencies = (value: unknown): void => {
     for (const [name, version] of dependencyEntries(value, !production)) {
-      const key = packageKeyForDependency(packages, name, version);
-      if (key !== undefined && !retained.has(key)) pending.push(key);
+      const keys = packageKeysForDependency(packages, snapshots, name, version);
+      if (
+        (keys.packageKey !== undefined &&
+          !retainedPackages.has(keys.packageKey)) ||
+        (keys.snapshotKey !== undefined &&
+          !retainedSnapshots.has(keys.snapshotKey))
+      ) {
+        pending.push(keys);
+      }
     }
   };
   for (const importer of Object.values(retainedImporters)) {
     enqueueDependencies(importer);
   }
   while (pending.length > 0) {
-    const key = pending.pop()!;
-    if (retained.has(key)) continue;
-    retained.add(key);
-    enqueueDependencies(packages[key]);
-    enqueueDependencies(snapshots[key]);
+    const keys = pending.pop()!;
+    if (
+      keys.packageKey !== undefined &&
+      !retainedPackages.has(keys.packageKey)
+    ) {
+      retainedPackages.add(keys.packageKey);
+      enqueueDependencies(packages[keys.packageKey]);
+    }
+    if (
+      keys.snapshotKey !== undefined &&
+      !retainedSnapshots.has(keys.snapshotKey)
+    ) {
+      retainedSnapshots.add(keys.snapshotKey);
+      enqueueDependencies(snapshots[keys.snapshotKey]);
+    }
   }
   const pruned: Record<string, unknown> = { ...document };
   pruned.importers = retainedImporters;
   if (document.packages !== undefined) {
     pruned.packages = Object.fromEntries(
-      Object.entries(packages).filter(([key]) => retained.has(key)),
+      Object.entries(packages).filter(([key]) => retainedPackages.has(key)),
     );
   }
   if (document.snapshots !== undefined) {
     pruned.snapshots = Object.fromEntries(
-      Object.entries(snapshots).filter(([key]) => retained.has(key)),
+      Object.entries(snapshots).filter(([key]) => retainedSnapshots.has(key)),
     );
   }
   return stringifyYaml(pruned, { lineWidth: 0, singleQuote: true });
@@ -329,14 +369,68 @@ const pruneNpmLockfile = (
   const packages = objectValue(document.packages);
   if (packages === undefined)
     return `${JSON.stringify(document, undefined, 2)}\n`;
+  const selectedWorkspaces = new Set(
+    [...workspacePaths].map((path) => path.replace(/^\.\//, "")),
+  );
+  const retained = new Set<string>();
+  const pending = [
+    "",
+    ...[...selectedWorkspaces].filter((path) => path in packages),
+  ];
+  const packageDependencyNames = (value: unknown): ReadonlyArray<string> => {
+    const entry = objectValue(value);
+    if (entry === undefined) return [];
+    return [
+      "dependencies",
+      "optionalDependencies",
+      "peerDependencies",
+      "devDependencies",
+    ].flatMap((field) => Object.keys(objectValue(entry[field]) ?? {}));
+  };
+  const dependencyLocation = (
+    location: string,
+    name: string,
+  ): string | undefined => {
+    const segments = location === "" ? [] : location.split("/");
+    while (true) {
+      const candidate = [...segments, "node_modules", name].join("/");
+      if (candidate in packages) return candidate;
+      if (segments.length === 0) return undefined;
+      segments.pop();
+    }
+  };
+  const selectedLinkTarget = (value: unknown): boolean => {
+    const entry = objectValue(value);
+    if (entry?.link !== true || typeof entry.resolved !== "string") {
+      return true;
+    }
+    return selectedWorkspaces.has(entry.resolved.replace(/^\.\//, ""));
+  };
+  for (const [location, value] of Object.entries(packages)) {
+    const entry = objectValue(value);
+    if (
+      location.startsWith("node_modules/") &&
+      entry?.link === true &&
+      selectedLinkTarget(entry)
+    ) {
+      pending.push(location);
+    }
+  }
+  while (pending.length > 0) {
+    const location = pending.pop()!;
+    if (retained.has(location) || !(location in packages)) continue;
+    const value = packages[location];
+    if (!selectedLinkTarget(value)) continue;
+    retained.add(location);
+    for (const name of packageDependencyNames(value)) {
+      const dependency = dependencyLocation(location, name);
+      if (dependency !== undefined && !retained.has(dependency)) {
+        pending.push(dependency);
+      }
+    }
+  }
   document.packages = Object.fromEntries(
-    Object.entries(packages).filter(([path]) => {
-      if (path === "" || path.startsWith("node_modules/")) return true;
-      return [...workspacePaths].some(
-        (workspace) =>
-          path === workspace || path.startsWith(`${workspace}/node_modules/`),
-      );
-    }),
+    Object.entries(packages).filter(([path]) => retained.has(path)),
   );
   return `${JSON.stringify(document, undefined, 2)}\n`;
 };

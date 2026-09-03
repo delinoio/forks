@@ -11,6 +11,7 @@ export interface ParsedRunOptions {
   readonly passThroughArguments: ReadonlyArray<string>;
   readonly cwd?: string;
   readonly filters: ReadonlyArray<string>;
+  readonly globalDependencies: ReadonlyArray<string>;
   readonly affected: boolean;
   readonly concurrency?: string;
   readonly continueMode?: ContinueMode;
@@ -96,6 +97,7 @@ export const parseRunArguments = (
   const start = arguments_[0] === "run" ? 1 : 0;
   const tasks: Array<string> = [];
   const filters: Array<string> = [];
+  const globalDependencies: Array<string> = [];
   let cwd: string | undefined;
   let affected = false;
   let concurrency: string | undefined;
@@ -407,8 +409,13 @@ export const parseRunArguments = (
         [, index] = optionValue(arguments_, index, name);
         break;
       }
+      case "--global-deps": {
+        let value: string;
+        [value, index] = optionValue(arguments_, index, name);
+        globalDependencies.push(value);
+        break;
+      }
       case "--cache-workers":
-      case "--global-deps":
       case "--login":
       case "--experimental-otel-protocol":
       case "--experimental-otel-endpoint":
@@ -437,6 +444,7 @@ export const parseRunArguments = (
     passThroughArguments,
     cwd,
     filters,
+    globalDependencies,
     affected,
     concurrency,
     continueMode,

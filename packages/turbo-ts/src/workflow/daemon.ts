@@ -1,6 +1,7 @@
 import { Deferred, Effect, Queue, Stream } from "effect";
 import { matchesGlobsWithExclusions } from "../core/glob.js";
 import {
+  isPathContained,
   joinPath,
   normalizePath,
   parentPath,
@@ -48,6 +49,7 @@ interface DaemonPaths {
   readonly socket: string;
   readonly pid: string;
   readonly lock: string;
+  readonly activeLog: string;
   readonly log: string;
 }
 
@@ -175,6 +177,7 @@ const daemonPaths = (
       socket: joinPath(stateDirectory, "turbod.sock"),
       pid: joinPath(stateDirectory, "turbod.pid"),
       lock: joinPath(stateDirectory, "turbod.lock"),
+      activeLog: joinPath(stateDirectory, "turbod.log-path"),
       log: joinPath(root, ".turbo", "daemon", `${hash}-turbo.log.${date}`),
     };
   });
@@ -214,7 +217,22 @@ const cleanStaleState = (
     yield* Effect.all([
       fileSystem.remove(paths.pid).pipe(Effect.ignore),
       fileSystem.remove(paths.socket).pipe(Effect.ignore),
+      fileSystem.remove(paths.activeLog).pipe(Effect.ignore),
     ]);
+  });
+
+const readActiveLogPath = (
+  paths: DaemonPaths,
+): Effect.Effect<string | undefined, never, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const source = yield* fileSystem
+      .readText(paths.activeLog)
+      .pipe(Effect.orElseSucceed(() => ""));
+    const candidate = normalizePath(source.trim());
+    return candidate !== "" && isPathContained(parentPath(paths.log), candidate)
+      ? candidate
+      : undefined;
   });
 
 const daemonRequest = (
@@ -436,7 +454,19 @@ const stopDaemon = (
       yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);
       return;
     }
-    yield* daemonRequest(paths, DaemonMethod.shutdown).pipe(Effect.ignore);
+    if (!(yield* daemonHealthy(paths))) {
+      yield* cleanStaleState(paths);
+      yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);
+      return;
+    }
+    const shutdown = yield* daemonRequest(paths, DaemonMethod.shutdown).pipe(
+      Effect.either,
+    );
+    if (shutdown._tag === "Left" || shutdown.right.error !== undefined) {
+      yield* cleanStaleState(paths);
+      yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);
+      return;
+    }
     for (let attempt = 0; attempt < 40; attempt += 1) {
       if (!(yield* isAlive(pid))) break;
       yield* Effect.sleep("25 millis");
@@ -487,6 +517,7 @@ const serveDaemon = (
       const startedAt = yield* clock.now;
       yield* fileSystem.makeDirectory(paths.stateDirectory);
       yield* fileSystem.makeDirectory(parentPath(paths.log));
+      yield* fileSystem.writeTextAtomic(paths.activeLog, `${paths.log}\n`);
       yield* fileSystem.writeTextAtomic(
         paths.pid,
         `${information.processIdentifier}`,
@@ -714,18 +745,34 @@ export const executeDaemon = (
     if (options.command === "logs") {
       const watcher = yield* FileWatcherService;
       const signals = yield* SignalService;
+      if (!(yield* daemonHealthy(paths))) {
+        yield* cleanStaleState(paths);
+        yield* terminal.writeStderr(
+          "x daemon is not running, run `turbo daemon start` to start it\n",
+        );
+        return 1;
+      }
+      const status = yield* daemonRequest(paths, DaemonMethod.status).pipe(
+        Effect.either,
+      );
+      if (status._tag === "Left" || status.right.error !== undefined) {
+        yield* cleanStaleState(paths);
+        yield* terminal.writeStderr(
+          "x daemon is not running, run `turbo daemon start` to start it\n",
+        );
+        return 1;
+      }
+      const logPath = (yield* readActiveLogPath(paths)) ?? paths.log;
       return yield* Effect.scoped(
         Effect.gen(function* () {
           let contents = yield* fileSystem
-            .readText(paths.log)
+            .readText(logPath)
             .pipe(Effect.orElseSucceed(() => ""));
           yield* terminal.writeStdout(contents);
-          const follow = watcher.watch(parentPath(paths.log)).pipe(
-            Stream.filter((change) => change.path === paths.log),
+          const follow = watcher.watch(parentPath(logPath)).pipe(
+            Stream.filter((change) => change.path === logPath),
             Stream.mapEffect(() =>
-              fileSystem
-                .readText(paths.log)
-                .pipe(Effect.orElseSucceed(() => "")),
+              fileSystem.readText(logPath).pipe(Effect.orElseSucceed(() => "")),
             ),
             Stream.mapEffect((updated) => {
               const offset = updated.startsWith(contents) ? contents.length : 0;
@@ -771,12 +818,13 @@ export const executeDaemon = (
       typeof result.uptimeMilliseconds === "number"
         ? result.uptimeMilliseconds
         : 0;
+    const logPath = (yield* readActiveLogPath(paths)) ?? paths.log;
     if (options.json) {
       yield* terminal.writeStdout(
         `${JSON.stringify(
           {
             uptime_ms: uptime,
-            log_file: paths.log,
+            log_file: logPath,
             pid_file: paths.pid,
             sock_file: paths.socket,
           },
@@ -787,7 +835,7 @@ export const executeDaemon = (
       return 0;
     }
     yield* terminal.writeStdout(
-      `log file: ${paths.log}\nuptime: ${Math.floor(uptime / 1000)}s\npid file: ${paths.pid}\nsocket file: ${paths.socket}\n`,
+      `log file: ${logPath}\nuptime: ${Math.floor(uptime / 1000)}s\npid file: ${paths.pid}\nsocket file: ${paths.socket}\n`,
     );
     return 0;
   });

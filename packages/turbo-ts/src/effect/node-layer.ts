@@ -115,6 +115,33 @@ const filesystemError = (cause: unknown): BoundaryError =>
     retryable: false,
   });
 
+const unsupportedDirectorySyncErrorCodes = new Set([
+  "EINVAL",
+  "EISDIR",
+  "ENOTSUP",
+  "EOPNOTSUPP",
+]);
+
+export const isUnsupportedDirectorySyncError = (cause: unknown): boolean =>
+  typeof cause === "object" &&
+  cause !== null &&
+  "code" in cause &&
+  typeof cause.code === "string" &&
+  unsupportedDirectorySyncErrorCodes.has(cause.code);
+
+const syncParentDirectory = async (path: string): Promise<void> => {
+  if (operatingSystem() === "win32") return;
+  let directory: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    directory = await open(dirname(path), "r");
+    await directory.sync();
+  } catch (cause) {
+    if (!isUnsupportedDirectorySyncError(cause)) throw cause;
+  } finally {
+    await directory?.close();
+  }
+};
+
 const isMissingFileError = (cause: unknown): boolean =>
   typeof cause === "object" &&
   cause !== null &&
@@ -913,12 +940,7 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
           await handle.close();
           handle = undefined;
           await rename(temporary, path);
-          const directory = await open(dirname(path), "r");
-          try {
-            await directory.sync();
-          } finally {
-            await directory.close();
-          }
+          await syncParentDirectory(path);
         } catch (cause) {
           await handle?.close().catch(() => undefined);
           await rm(temporary, { force: true }).catch(() => undefined);
@@ -2155,10 +2177,13 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
         const server = createHttpServer((request, response) => {
           const chunks: Array<Buffer> = [];
           let size = 0;
+          let oversized = false;
           request.on("data", (chunk: Buffer) => {
+            if (oversized) return;
             size += chunk.length;
             if (size > 1024 * 1024) {
-              request.destroy();
+              oversized = true;
+              chunks.length = 0;
               response.writeHead(413);
               response.end();
               return;
@@ -2166,6 +2191,7 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
             chunks.push(chunk);
           });
           request.on("end", () => {
+            if (oversized) return;
             const headers = Object.fromEntries(
               Object.entries(request.headers).flatMap(([key, value]) =>
                 value === undefined

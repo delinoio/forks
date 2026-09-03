@@ -2,10 +2,12 @@ import { Effect } from "effect";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { parseJsonConfiguration } from "../config/runtime.js";
 import {
+  baseName,
   isAbsolutePath,
   isPathContained,
   joinPath,
   normalizePath,
+  parentPath,
 } from "../core/path.js";
 import { ConfigurationError } from "../effect/errors.js";
 import {
@@ -145,6 +147,7 @@ const copyTree = (
   source: string,
   destination: string,
   excludedRoot: string,
+  allowedSymlinkRoots: ReadonlyArray<string>,
   ignoreMatcher?: GitIgnoreMatcher,
 ): Effect.Effect<void, unknown, FileSystemService> =>
   Effect.gen(function* () {
@@ -175,14 +178,76 @@ const copyTree = (
           sourcePath,
           destinationPath,
           excludedRoot,
+          allowedSymlinkRoots,
           ignoreMatcher,
         );
       } else if (entry.kind === "file") {
         yield* fileSystem.copyFile(sourcePath, destinationPath);
+      } else if (entry.kind === "symlink") {
+        const target = yield* fileSystem.readLink(sourcePath);
+        const resolved = yield* fileSystem.realPath(sourcePath).pipe(
+          Effect.mapError(
+            (error) =>
+              new ConfigurationError({
+                path: sourcePath,
+                message: `cannot resolve prune symlink: ${error.message}`,
+              }),
+          ),
+        );
+        if (
+          isAbsolutePath(target) ||
+          isPathContained(excludedRoot, resolved) ||
+          !allowedSymlinkRoots.some((root) => isPathContained(root, resolved))
+        ) {
+          return yield* Effect.fail(
+            new ConfigurationError({
+              path: sourcePath,
+              message:
+                "prune symlink must use a relative target inside the selected package closure",
+            }),
+          );
+        }
+        yield* fileSystem.createSymlink(target, destinationPath);
       }
-      // Prune never follows or recreates workspace symlinks. This prevents a
-      // crafted repository from materializing paths outside the output root.
     }
+  });
+
+const canonicalOutputPath = (
+  path: string,
+): Effect.Effect<string, ConfigurationError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const suffix: Array<string> = [];
+    let current = normalizePath(path);
+    while (
+      !(yield* fileSystem
+        .exists(current)
+        .pipe(
+          Effect.mapError(
+            (error) => new ConfigurationError({ path, message: error.message }),
+          ),
+        ))
+    ) {
+      const parent = parentPath(current);
+      if (parent === current) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path,
+            message: "unable to resolve prune output ancestry",
+          }),
+        );
+      }
+      suffix.unshift(baseName(current));
+      current = parent;
+    }
+    const resolved = yield* fileSystem
+      .realPath(current)
+      .pipe(
+        Effect.mapError(
+          (error) => new ConfigurationError({ path, message: error.message }),
+        ),
+      );
+    return joinPath(resolved, ...suffix);
   });
 
 const copyIfPresent = (
@@ -295,12 +360,13 @@ export const executePrune = (
         ? options.outputDirectory
         : joinPath(repository.root, options.outputDirectory),
     );
+    const canonicalOutputRoot = yield* canonicalOutputPath(outputRoot);
     const ignoreMatcher = options.useGitignore
       ? yield* loadGitIgnoreMatcher(repository.root)
       : undefined;
     if (
-      outputRoot === normalizePath(repository.root) ||
-      isPathContained(outputRoot, repository.root)
+      canonicalOutputRoot === normalizePath(repository.root) ||
+      isPathContained(canonicalOutputRoot, repository.root)
     ) {
       return yield* Effect.fail(
         new ConfigurationError({
@@ -312,6 +378,9 @@ export const executePrune = (
     yield* fileSystem.remove(outputRoot);
     const fullRoot = options.docker ? joinPath(outputRoot, "full") : outputRoot;
     const jsonRoot = options.docker ? joinPath(outputRoot, "json") : outputRoot;
+    const installationRoots = options.docker
+      ? [fullRoot, jsonRoot]
+      : [fullRoot];
     yield* fileSystem.makeDirectory(fullRoot);
     yield* fileSystem.makeDirectory(jsonRoot);
     yield* terminal.writeStdout(
@@ -320,6 +389,9 @@ export const executePrune = (
     const rootFiles = [
       ".gitignore",
       ".npmrc",
+      ".pnp.cjs",
+      ".yarnrc",
+      ".yarnrc.yml",
       "bunfig.toml",
       "package.json",
       "pnpm-workspace.yaml",
@@ -350,16 +422,44 @@ export const executePrune = (
         }
       } else {
         yield* copyIfPresent(source, joinPath(fullRoot, name));
-        if (options.docker && name === ".npmrc") {
+        if (
+          options.docker &&
+          [".npmrc", ".pnp.cjs", ".yarnrc", ".yarnrc.yml"].includes(name)
+        ) {
           yield* copyIfPresent(source, joinPath(jsonRoot, name));
         }
       }
     }
+    const yarnDirectory = joinPath(repository.root, ".yarn");
+    if (yield* fileSystem.exists(yarnDirectory)) {
+      const metadata = yield* fileSystem.metadata(yarnDirectory);
+      if (metadata.kind !== "directory") {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: yarnDirectory,
+            message: ".yarn must be a real directory for prune",
+          }),
+        );
+      }
+      for (const root of installationRoots) {
+        yield* copyTree(
+          yarnDirectory,
+          joinPath(root, ".yarn"),
+          canonicalOutputRoot,
+          [yarnDirectory],
+          ignoreMatcher,
+        );
+      }
+    }
+    const selectedPackageRoots = packages.map(
+      (packageModel) => packageModel.directory,
+    );
     for (const packageModel of packages) {
       yield* copyTree(
         packageModel.directory,
         joinPath(fullRoot, packageModel.relativeDirectory),
-        outputRoot,
+        canonicalOutputRoot,
+        selectedPackageRoots,
         ignoreMatcher,
       );
       if (options.docker) {

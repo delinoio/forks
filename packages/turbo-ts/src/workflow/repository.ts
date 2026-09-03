@@ -59,6 +59,22 @@ export const loadWorkflowRepository = (
             new ConfigurationError({ path: requested, message: error.message }),
         ),
       );
+    const metadata = yield* fileSystem
+      .metadata(canonical)
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new ConfigurationError({ path: requested, message: error.message }),
+        ),
+      );
+    if (metadata.kind !== "directory") {
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: requested,
+          message: "working directory is not a directory",
+        }),
+      );
+    }
     const root = yield* discoverRepositoryRoot(canonical);
     const configuration = yield* loadRootConfiguration(
       root,

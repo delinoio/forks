@@ -137,6 +137,7 @@ interface ResolvedRunOptions {
   readonly tasks: ReadonlyArray<string>;
   readonly passThroughArguments: ReadonlyArray<string>;
   readonly filters: ReadonlyArray<string>;
+  readonly globalDependencies: ReadonlyArray<string>;
   readonly affected: boolean;
   readonly concurrency: number;
   readonly continueMode: "always" | "dependencies-successful" | "never";
@@ -154,8 +155,49 @@ interface ResolvedRunOptions {
   readonly remote?: RemoteCacheOptions;
   readonly colorEnabled: boolean;
   readonly json: boolean;
+  readonly ui: "tui" | "stream" | "stream-with-experimental-timestamps";
+  readonly logOrder: "auto" | "stream" | "grouped";
   readonly logPrefix: "auto" | "none" | "task";
 }
+
+type WriteStructuredRecord = (
+  record: Readonly<Record<string, unknown>>,
+) => Effect.Effect<void, unknown, never>;
+
+type OutputPermit = <A, E, R>(
+  output: Effect.Effect<A, E, R>,
+) => Effect.Effect<A, E, R>;
+
+export const resolveRunUiMode = (
+  requested: ResolvedRunOptions["ui"],
+  stdinIsTerminal: boolean,
+  stdoutIsTerminal: boolean,
+  json: boolean,
+): ResolvedRunOptions["ui"] =>
+  requested === "tui" && (json || !stdinIsTerminal || !stdoutIsTerminal)
+    ? "stream"
+    : requested;
+
+export const renderTimestampedStreamText = (
+  timestamp: number,
+  text: string,
+): string => {
+  if (text === "") return "";
+  const prefix = `[${new Date(timestamp).toISOString()}] `;
+  return `${prefix}${text.replaceAll("\n", `\n${prefix}`)}`.slice(
+    0,
+    text.endsWith("\n") ? -prefix.length : undefined,
+  );
+};
+
+type RunTuiStatus = "queued" | "running" | "succeeded" | "failed" | "skipped";
+
+export const renderRunTui = (
+  statuses: ReadonlyMap<string, RunTuiStatus>,
+): string =>
+  `\u001b[2J\u001b[Hturbo-ts\n\n${[...statuses]
+    .map(([id, status]) => `${status.padEnd(9)} ${id}`)
+    .join("\n")}\n`;
 
 interface TaskExecutionResult {
   readonly id: string;
@@ -508,6 +550,7 @@ export const resolveOptions = (
     tasks: parsed.tasks,
     passThroughArguments: parsed.passThroughArguments,
     filters: parsed.filters,
+    globalDependencies: parsed.globalDependencies,
     affected: parsed.affected,
     concurrency: parseConcurrency(
       concurrency ?? undefined,
@@ -553,6 +596,8 @@ export const resolveOptions = (
     remote,
     colorEnabled: !parsed.noColor && environmentValue("NO_COLOR") === undefined,
     json: parsed.json,
+    ui: parsed.ui ?? value.ui ?? global?.ui ?? "stream",
+    logOrder: parsed.logOrder ?? "auto",
     logPrefix: parsed.logPrefix ?? "auto",
   };
 };
@@ -2139,6 +2184,8 @@ const executeTask = (
   withCachePublicationPermit: CachePublicationPermit = (publication) =>
     publication,
   logIdentifier = node.task,
+  withOutputPermit: OutputPermit = (output) => output,
+  writeStructuredRecord: WriteStructuredRecord = () => Effect.void,
 ): Effect.Effect<TaskExecutionResult, unknown, RunRequirements> =>
   Effect.gen(function* () {
     const terminal = yield* TerminalService;
@@ -2155,19 +2202,52 @@ const executeTask = (
       : false;
     const taskLabel = `${node.package.name}:${node.task}`;
     const prefixTask = options.logPrefix !== "none";
+    const taskRecord = (
+      timestamp: number,
+      level: "info" | "stdout" | "stderr",
+      text: string,
+    ) =>
+      ({
+        type: "task_event",
+        timestamp,
+        source: taskLabel,
+        level,
+        text,
+      }) as const;
     const writeTaskEvent = (
       level: "info" | "stdout" | "stderr",
       text: string,
     ) =>
-      options.json
-        ? clock.now.pipe(
-            Effect.flatMap((timestamp) =>
-              terminal.writeStdout(
-                `${JSON.stringify({ timestamp, source: taskLabel, level, text })}\n`,
+      clock.now.pipe(
+        Effect.flatMap((timestamp) => {
+          const record = taskRecord(timestamp, level, text);
+          return writeStructuredRecord(record).pipe(
+            Effect.zipRight(
+              options.json
+                ? terminal.writeStdout(`${JSON.stringify(record)}\n`)
+                : options.ui === "tui"
+                  ? Effect.void
+                  : terminal.writeStdout(
+                      options.ui === "stream-with-experimental-timestamps"
+                        ? renderTimestampedStreamText(timestamp, text)
+                        : text,
+                    ),
+            ),
+          );
+        }),
+      );
+    const writeTaskWarning = (message: string) =>
+      clock.now.pipe(
+        Effect.flatMap((timestamp) =>
+          writeStructuredRecord(taskRecord(timestamp, "stderr", message)).pipe(
+            Effect.zipRight(
+              terminal.writeStderr(
+                renderLogEvent({ kind: "warning", message }, warningColor),
               ),
             ),
-          )
-        : terminal.writeStdout(text);
+          ),
+        ),
+      );
     if (node.command === undefined) {
       return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
     }
@@ -2199,6 +2279,60 @@ const executeTask = (
       ".turbo",
       `turbo-${encodeTaskLogIdentifier(logIdentifier)}.log`,
     );
+    const replayTaskLog = (recordOutput: boolean) =>
+      Effect.gen(function* () {
+        const hasLog = yield* fileSystem
+          .exists(logPath)
+          .pipe(
+            Effect.mapError(
+              (error) =>
+                new RepositoryError({ path: logPath, message: error.message }),
+            ),
+          );
+        if (!hasLog) return;
+        let renderState = initialTaskOutputRenderState;
+        yield* fileSystem.readTextChunks(logPath).pipe(
+          Stream.mapError(
+            (error) =>
+              new RepositoryError({ path: logPath, message: error.message }),
+          ),
+          Stream.runForEach((output) =>
+            Effect.gen(function* () {
+              const timestamp = yield* clock.now;
+              const record = taskRecord(timestamp, "stdout", output);
+              if (recordOutput) yield* writeStructuredRecord(record);
+              if (options.json) {
+                yield* terminal.writeStdout(`${JSON.stringify(record)}\n`);
+                return;
+              }
+              const rendered = renderTaskOutputChunk(
+                renderState,
+                taskLabel,
+                output,
+                color,
+                prefixTask,
+              );
+              renderState = rendered.state;
+              for (const chunk of rendered.chunks) {
+                yield* terminal.writeStdout(
+                  options.ui === "stream-with-experimental-timestamps"
+                    ? renderTimestampedStreamText(timestamp, chunk)
+                    : chunk,
+                );
+              }
+            }),
+          ),
+        );
+        if (!options.json) {
+          for (const chunk of finishTaskOutput(renderState)) {
+            yield* terminal.writeStdout(
+              options.ui === "stream-with-experimental-timestamps"
+                ? renderTimestampedStreamText(yield* clock.now, chunk)
+                : chunk,
+            );
+          }
+        }
+      });
     const cacheRestoreRequested =
       cacheable &&
       !options.force &&
@@ -2218,17 +2352,9 @@ const executeTask = (
             ),
           ),
           Effect.catchTag("RepositoryError", (error) =>
-            terminal
-              .writeStderr(
-                renderLogEvent(
-                  {
-                    kind: "warning",
-                    message: `cache restore preparation failed for ${taskLabel}; executing task locally without cache reads: ${error.message}`,
-                  },
-                  warningColor,
-                ),
-              )
-              .pipe(Effect.ignore, Effect.as(undefined)),
+            writeTaskWarning(
+              `cache restore preparation failed for ${taskLabel}; executing task locally without cache reads: ${error.message}`,
+            ).pipe(Effect.ignore, Effect.as(undefined)),
           ),
         )
       : [];
@@ -2258,17 +2384,9 @@ const executeTask = (
         },
       ).pipe(
         Effect.catchTag("CacheError", (error) =>
-          terminal
-            .writeStderr(
-              renderLogEvent(
-                {
-                  kind: "warning",
-                  message: `local cache restore failed for ${taskLabel}; continuing without local cache: ${error.message}`,
-                },
-                warningColor,
-              ),
-            )
-            .pipe(Effect.ignore, Effect.as(false)),
+          writeTaskWarning(
+            `local cache restore failed for ${taskLabel}; continuing without local cache: ${error.message}`,
+          ).pipe(Effect.ignore, Effect.as(false)),
         ),
       );
     }
@@ -2290,17 +2408,9 @@ const executeTask = (
         },
       ).pipe(
         Effect.catchTag("CacheError", (error) =>
-          terminal
-            .writeStderr(
-              renderLogEvent(
-                {
-                  kind: "warning",
-                  message: `remote cache restore failed for ${taskLabel}; executing task locally: ${error.message}`,
-                },
-                warningColor,
-              ),
-            )
-            .pipe(Effect.ignore, Effect.as(false)),
+          writeTaskWarning(
+            `remote cache restore failed for ${taskLabel}; executing task locally: ${error.message}`,
+          ).pipe(Effect.ignore, Effect.as(false)),
         ),
       );
     }
@@ -2316,61 +2426,11 @@ const executeTask = (
         );
       }
       if (shouldReplayOutput(outputMode, true)) {
-        yield* Effect.gen(function* () {
-          const hasLog = yield* fileSystem.exists(logPath).pipe(
-            Effect.mapError(
-              (error) =>
-                new RepositoryError({
-                  path: logPath,
-                  message: error.message,
-                }),
-            ),
-          );
-          if (!hasLog) return;
-          let renderState = initialTaskOutputRenderState;
-          yield* fileSystem.readTextChunks(logPath).pipe(
-            Stream.mapError(
-              (error) =>
-                new RepositoryError({ path: logPath, message: error.message }),
-            ),
-            Stream.runForEach((output) =>
-              Effect.gen(function* () {
-                if (options.json) {
-                  yield* writeTaskEvent("stdout", output);
-                } else {
-                  const rendered = renderTaskOutputChunk(
-                    renderState,
-                    taskLabel,
-                    output,
-                    color,
-                    prefixTask,
-                  );
-                  renderState = rendered.state;
-                  for (const chunk of rendered.chunks) {
-                    yield* terminal.writeStdout(chunk);
-                  }
-                }
-              }),
-            ),
-          );
-          if (!options.json) {
-            for (const chunk of finishTaskOutput(renderState)) {
-              yield* terminal.writeStdout(chunk);
-            }
-          }
-        }).pipe(
-          Effect.catchTag("RepositoryError", (error) =>
-            terminal
-              .writeStderr(
-                renderLogEvent(
-                  {
-                    kind: "warning",
-                    message: `cached log replay failed for ${taskLabel}; preserving successful cache hit: ${error.message}`,
-                  },
-                  warningColor,
-                ),
-              )
-              .pipe(Effect.ignore),
+        yield* withOutputPermit(replayTaskLog(true)).pipe(
+          Effect.catchAll((error) =>
+            writeTaskWarning(
+              `cached log replay failed for ${taskLabel}; preserving successful cache hit: ${String(error)}`,
+            ).pipe(Effect.ignore),
           ),
         );
       }
@@ -2429,7 +2489,10 @@ const executeTask = (
     const streamsCapturedOutput =
       node.definition.interactive !== true || options.json;
     const displaysStreamedOutput =
-      streamsCapturedOutput && shouldReplayOutput(outputMode, false);
+      streamsCapturedOutput &&
+      shouldReplayOutput(outputMode, false) &&
+      options.logOrder !== "grouped" &&
+      options.ui !== "tui";
     const result = streamsCapturedOutput
       ? yield* Effect.scoped(
           Effect.gen(function* () {
@@ -2452,7 +2515,16 @@ const executeTask = (
                     return;
                   }
                   yield* fileSystem.appendText(logPath, event.output);
-                  if (!displaysStreamedOutput) continue;
+                  if (!displaysStreamedOutput) {
+                    yield* clock.now.pipe(
+                      Effect.flatMap((timestamp) =>
+                        writeStructuredRecord(
+                          taskRecord(timestamp, event.level, event.output),
+                        ),
+                      ),
+                    );
+                    continue;
+                  }
                   if (options.json) {
                     yield* writeTaskEvent(event.level, event.output);
                     continue;
@@ -2466,7 +2538,7 @@ const executeTask = (
                   );
                   renderState = rendered.state;
                   for (const chunk of rendered.chunks) {
-                    yield* terminal.writeStdout(chunk);
+                    yield* writeTaskEvent(event.level, chunk);
                   }
                 }
               }),
@@ -2493,18 +2565,26 @@ const executeTask = (
     if (!streamsCapturedOutput) {
       yield* fileSystem.writeText(logPath, output);
     }
+    const replayCompletedOutput =
+      shouldReplayOutput(outputMode, false) ||
+      (outputMode === "errors-only" && result.exitCode !== 0);
     if (
-      (!displaysStreamedOutput && shouldReplayOutput(outputMode, false)) ||
-      (outputMode === "errors-only" && result.exitCode !== 0)
+      !displaysStreamedOutput &&
+      replayCompletedOutput &&
+      options.ui !== "tui"
     ) {
-      yield* writeTaskEvent(
-        "stdout",
-        renderLogEvent(
-          { kind: "task-output", task: taskLabel, output },
-          color,
-          options.json ? false : prefixTask,
-        ),
-      );
+      if (options.logOrder === "grouped" && streamsCapturedOutput) {
+        yield* withOutputPermit(replayTaskLog(false));
+      } else {
+        yield* writeTaskEvent(
+          "stdout",
+          renderLogEvent(
+            { kind: "task-output", task: taskLabel, output },
+            color,
+            options.json ? false : prefixTask,
+          ),
+        );
+      }
     }
     if (result.exitCode !== 0) {
       return {
@@ -2529,29 +2609,15 @@ const executeTask = (
             platform === "win32",
           ).pipe(
             Effect.catchAll((error) =>
-              terminal
-                .writeStderr(
-                  renderLogEvent(
-                    {
-                      kind: "warning",
-                      message: `cache output collection failed for ${taskLabel}; skipping cache publication while preserving successful task result: ${error.message}`,
-                    },
-                    warningColor,
-                  ),
-                )
-                .pipe(Effect.ignore, Effect.as(undefined)),
+              writeTaskWarning(
+                `cache output collection failed for ${taskLabel}; skipping cache publication while preserving successful task result: ${error.message}`,
+              ).pipe(Effect.ignore, Effect.as(undefined)),
             ),
           );
           if (collected === undefined) return;
           if (collected.kind === "too-large") {
-            yield* terminal.writeStderr(
-              renderLogEvent(
-                {
-                  kind: "warning",
-                  message: `cache write skipped for ${taskLabel}; ${collected.inputBytes} bytes of task outputs exceed the ${maximumCacheArchiveInputBytes} byte safety limit`,
-                },
-                warningColor,
-              ),
+            yield* writeTaskWarning(
+              `cache write skipped for ${taskLabel}; ${collected.inputBytes} bytes of task outputs exceed the ${maximumCacheArchiveInputBytes} byte safety limit`,
             );
             return;
           }
@@ -2565,17 +2631,9 @@ const executeTask = (
               platform === "win32",
             ).pipe(
               Effect.catchAll((error) =>
-                terminal
-                  .writeStderr(
-                    renderLogEvent(
-                      {
-                        kind: "warning",
-                        message: `local cache write failed for ${taskLabel}; preserving successful task result: ${error.message}`,
-                      },
-                      warningColor,
-                    ),
-                  )
-                  .pipe(Effect.ignore),
+                writeTaskWarning(
+                  `local cache write failed for ${taskLabel}; preserving successful task result: ${error.message}`,
+                ).pipe(Effect.ignore),
               ),
             );
           }
@@ -2588,17 +2646,9 @@ const executeTask = (
               platform === "win32",
             ).pipe(
               Effect.catchAll((error) =>
-                terminal
-                  .writeStderr(
-                    renderLogEvent(
-                      {
-                        kind: "warning",
-                        message: `remote cache upload failed for ${taskLabel}; preserving successful task result: ${error.message}`,
-                      },
-                      warningColor,
-                    ),
-                  )
-                  .pipe(Effect.ignore),
+                writeTaskWarning(
+                  `remote cache upload failed for ${taskLabel}; preserving successful task result: ${error.message}`,
+                ).pipe(Effect.ignore),
               ),
             );
           }
@@ -2645,6 +2695,7 @@ const computeTaskHashes = (
         ),
         cacheabilityByTask.get(id)?.uvRuntimeIdentity,
         cacheabilityByTask.get(id)?.packageManagerRuntimeIdentity,
+        options.globalDependencies,
       );
       hashes.set(id, result);
     }
@@ -2844,6 +2895,7 @@ const applyCargoWorkspaceHashes = (
           ),
           cacheabilityByTask.get(id)?.uvRuntimeIdentity,
           cacheabilityByTask.get(id)?.packageManagerRuntimeIdentity,
+          options.globalDependencies,
         ),
       );
       changed.add(id);
@@ -3057,8 +3109,23 @@ export const executeRun = (
         }),
       );
     }
+    const terminal = yield* TerminalService;
+    const stdinIsTerminal =
+      terminal.stdinIsTerminal === undefined
+        ? false
+        : yield* terminal.stdinIsTerminal;
+    const stdoutIsTerminal =
+      terminal.stdoutIsTerminal === undefined
+        ? false
+        : yield* terminal.stdoutIsTerminal;
     const options: ResolvedRunOptions = {
       ...unresolvedOptions,
+      ui: resolveRunUiMode(
+        unresolvedOptions.ui,
+        stdinIsTerminal,
+        stdoutIsTerminal,
+        unresolvedOptions.json,
+      ),
       cacheExclusionDirectory: isPathContained(
         canonicalRoot,
         canonicalCacheDirectory,
@@ -3504,7 +3571,29 @@ export const executeRun = (
       return 0;
     }
     const profileService = yield* Effect.serviceOption(RuntimeProfileService);
-    const runStartedAt = yield* (yield* ClockService).now;
+    const clock = yield* ClockService;
+    const runStartedAt = yield* clock.now;
+    const structuredLogPath =
+      parsed.logFile === undefined
+        ? undefined
+        : parsed.logFile === ""
+          ? joinPath(options.root, ".turbo", "logs", `${runStartedAt}.json`)
+          : isAbsolutePath(parsed.logFile)
+            ? parsed.logFile
+            : joinPath(options.root, parsed.logFile);
+    const structuredLogSemaphore = yield* Effect.makeSemaphore(1);
+    if (structuredLogPath !== undefined) {
+      yield* fileSystem.writeTextAtomic(structuredLogPath, "");
+    }
+    const writeStructuredRecord: WriteStructuredRecord = (record) =>
+      structuredLogPath === undefined
+        ? Effect.void
+        : structuredLogSemaphore.withPermits(1)(
+            fileSystem.appendText(
+              structuredLogPath,
+              `${JSON.stringify(record)}\n`,
+            ),
+          );
     if (parsed.heap !== undefined) {
       if (profileService._tag === "None") {
         return yield* Effect.fail(
@@ -3527,6 +3616,28 @@ export const executeRun = (
       options.concurrency,
     );
     const withCachePublicationPermit = yield* makeCachePublicationPermit;
+    const outputSemaphore = yield* Effect.makeSemaphore(1);
+    const withOutputPermit: OutputPermit = (output) =>
+      options.logOrder === "grouped"
+        ? outputSemaphore.withPermits(1)(output)
+        : output;
+    const tuiStatuses = new Map<string, RunTuiStatus>(
+      orderedNodes.map((node) => [node.id, "queued"]),
+    );
+    const tuiSemaphore = yield* Effect.makeSemaphore(1);
+    const updateTuiStatus = (
+      id: string,
+      status: RunTuiStatus,
+    ): Effect.Effect<void> => {
+      if (options.ui !== "tui") return Effect.void;
+      tuiStatuses.set(id, status);
+      return tuiSemaphore
+        .withPermits(1)(terminal.writeStdout(renderRunTui(tuiStatuses)))
+        .pipe(Effect.ignore);
+    };
+    if (options.ui === "tui") {
+      yield* terminal.writeStdout(`\u001b[?25l${renderRunTui(tuiStatuses)}`);
+    }
     const runGroup = ([, members]: readonly [
       string,
       ReadonlyArray<string>,
@@ -3546,6 +3657,7 @@ export const executeRun = (
           const startTime = yield* clock.now;
           taskStartedAt.set(id, startTime);
           const node = graph.nodes.get(id)!;
+          yield* updateTuiStatus(id, "running");
           const dependencyFailed = node.dependencies.some((dependency) => {
             const outcome =
               groupOutcomes.get(dependency) ?? outcomes.get(dependency);
@@ -3570,14 +3682,24 @@ export const executeRun = (
                     !unrestorableCacheInputs.has(id),
                   withCachePublicationPermit,
                   logIdentifiers.get(id),
+                  withOutputPermit,
+                  writeStructuredRecord,
                 ).pipe(
                   Effect.catchAll((cause) =>
                     cause instanceof CacheRollbackError
                       ? Effect.fail(cause)
                       : Effect.gen(function* () {
-                          const terminal = yield* TerminalService;
+                          const message = `turbo-ts: ${String(cause)}`;
+                          const timestamp = yield* clock.now;
+                          yield* writeStructuredRecord({
+                            type: "task_event",
+                            timestamp,
+                            source: `${node.package.name}:${node.task}`,
+                            level: "stderr",
+                            text: message,
+                          }).pipe(Effect.ignore);
                           yield* terminal
-                            .writeStderr(`turbo-ts: ${String(cause)}\n`)
+                            .writeStderr(`${message}\n`)
                             .pipe(Effect.ignore);
                           return {
                             id,
@@ -3588,6 +3710,14 @@ export const executeRun = (
                   ),
                 );
           const endTime = yield* clock.now;
+          yield* updateTuiStatus(
+            id,
+            result.skipped
+              ? "skipped"
+              : result.exitCode === 0
+                ? "succeeded"
+                : "failed",
+          );
           return { ...result, startTime, endTime };
         });
       const targets = new Set(
@@ -3846,6 +3976,12 @@ export const executeRun = (
           }
         }
       }),
+    ).pipe(
+      Effect.ensuring(
+        options.ui === "tui"
+          ? terminal.writeStdout("\u001b[?25h").pipe(Effect.ignore)
+          : Effect.void,
+      ),
     );
     const runFinishedAt = yield* (yield* ClockService).now;
     const exitCode = [...outcomes.values()].some(
@@ -4011,23 +4147,10 @@ export const executeRun = (
             : joinPath(options.root, requestedPath);
       yield* profileService.value.writeTrace(resolvedPath, traceEvents);
     }
-    if (parsed.logFile !== undefined) {
-      const logPath =
-        parsed.logFile === ""
-          ? joinPath(options.root, ".turbo", "logs", `${runStartedAt}.json`)
-          : isAbsolutePath(parsed.logFile)
-            ? parsed.logFile
-            : joinPath(options.root, parsed.logFile);
-      yield* fileSystem.writeTextAtomic(
-        logPath,
-        `${JSON.stringify(summary)}\n`,
-      );
-    }
+    const summaryRecord = { type: "run_summary", ...summary } as const;
+    yield* writeStructuredRecord(summaryRecord);
     if (parsed.json) {
-      const terminal = yield* TerminalService;
-      yield* terminal.writeStdout(
-        `${JSON.stringify({ type: "run_summary", ...summary })}\n`,
-      );
+      yield* terminal.writeStdout(`${JSON.stringify(summaryRecord)}\n`);
     }
     return exitCode;
   });

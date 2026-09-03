@@ -22,10 +22,18 @@ export interface WatchOptions {
 export const parseWatchArguments = (
   arguments_: ReadonlyArray<string>,
 ): WatchOptions => {
-  const writeCache = arguments_.includes("--experimental-write-cache");
-  const runArguments = arguments_.filter(
-    (argument) => argument !== "--experimental-write-cache",
-  );
+  const delimiter = arguments_.indexOf("--");
+  const optionArguments =
+    delimiter === -1 ? arguments_ : arguments_.slice(0, delimiter);
+  const passThroughArguments =
+    delimiter === -1 ? [] : arguments_.slice(delimiter);
+  const writeCache = optionArguments.includes("--experimental-write-cache");
+  const runArguments = [
+    ...optionArguments.filter(
+      (argument) => argument !== "--experimental-write-cache",
+    ),
+    ...passThroughArguments,
+  ];
   const parsed = parseRunArguments(["run", ...runArguments]);
   return {
     writeCache,
