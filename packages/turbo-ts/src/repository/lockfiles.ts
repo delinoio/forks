@@ -1,5 +1,5 @@
 import { parse as parseToml } from "smol-toml";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { baseName } from "../core/path.js";
 
 export interface LockfilePackage {
@@ -205,4 +205,150 @@ export const parseLockfile = (
     };
   }
   throw new TypeError(`unsupported lockfile: ${name}`);
+};
+
+const objectValue = (value: unknown): Record<string, unknown> | undefined =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+
+const dependencyVersion = (value: unknown): string | undefined => {
+  if (typeof value === "string") return value;
+  const object = objectValue(value);
+  return typeof object?.version === "string" ? object.version : undefined;
+};
+
+const packageKeyForDependency = (
+  packages: Readonly<Record<string, unknown>>,
+  name: string,
+  rawVersion: string,
+): string | undefined => {
+  if (
+    rawVersion.startsWith("link:") ||
+    rawVersion.startsWith("workspace:") ||
+    rawVersion.startsWith("file:")
+  ) {
+    return undefined;
+  }
+  const version = rawVersion.startsWith("npm:")
+    ? rawVersion.slice(4).replace(/^((?:@[^/]+\/)?[^@]+)@/, "")
+    : rawVersion;
+  const candidates = [
+    `${name}@${version}`,
+    `/${name}@${version}`,
+    version.startsWith("/") ? version : `/${version}`,
+    version,
+  ];
+  return candidates.find((candidate) => candidate in packages);
+};
+
+const dependencyEntries = (
+  value: unknown,
+): ReadonlyArray<readonly [string, string]> => {
+  const object = objectValue(value);
+  if (object === undefined) return [];
+  return ["dependencies", "optionalDependencies", "peerDependencies"].flatMap(
+    (field) => {
+      const dependencies = objectValue(object[field]);
+      if (dependencies === undefined) return [];
+      return Object.entries(dependencies).flatMap(([name, descriptor]) => {
+        const version = dependencyVersion(descriptor);
+        return version === undefined ? [] : [[name, version] as const];
+      });
+    },
+  );
+};
+
+const prunePnpmLockfile = (
+  source: string,
+  workspacePaths: ReadonlySet<string>,
+): string => {
+  const document = objectValue(parseYamlDocument(source));
+  if (document === undefined)
+    throw new TypeError("pnpm lockfile is not an object");
+  const importers = objectValue(document.importers) ?? {};
+  const retainedImporters = Object.fromEntries(
+    Object.entries(importers).filter(
+      ([path]) => path === "." || workspacePaths.has(path),
+    ),
+  );
+  const packages = objectValue(document.packages) ?? {};
+  const snapshots = objectValue(document.snapshots) ?? {};
+  const retained = new Set<string>();
+  const pending: Array<string> = [];
+  const enqueueDependencies = (value: unknown): void => {
+    for (const [name, version] of dependencyEntries(value)) {
+      const key = packageKeyForDependency(packages, name, version);
+      if (key !== undefined && !retained.has(key)) pending.push(key);
+    }
+  };
+  for (const importer of Object.values(retainedImporters)) {
+    enqueueDependencies(importer);
+  }
+  while (pending.length > 0) {
+    const key = pending.pop()!;
+    if (retained.has(key)) continue;
+    retained.add(key);
+    enqueueDependencies(packages[key]);
+    enqueueDependencies(snapshots[key]);
+  }
+  const pruned: Record<string, unknown> = { ...document };
+  pruned.importers = retainedImporters;
+  if (document.packages !== undefined) {
+    pruned.packages = Object.fromEntries(
+      Object.entries(packages).filter(([key]) => retained.has(key)),
+    );
+  }
+  if (document.snapshots !== undefined) {
+    pruned.snapshots = Object.fromEntries(
+      Object.entries(snapshots).filter(([key]) => retained.has(key)),
+    );
+  }
+  return stringifyYaml(pruned, { lineWidth: 0, singleQuote: true });
+};
+
+const pruneNpmLockfile = (
+  source: string,
+  workspacePaths: ReadonlySet<string>,
+): string => {
+  const document = objectValue(parseJson(source));
+  if (document === undefined)
+    throw new TypeError("npm lockfile is not an object");
+  const packages = objectValue(document.packages);
+  if (packages === undefined)
+    return `${JSON.stringify(document, undefined, 2)}\n`;
+  document.packages = Object.fromEntries(
+    Object.entries(packages).filter(([path]) => {
+      if (path === "" || path.startsWith("node_modules/")) return true;
+      return [...workspacePaths].some(
+        (workspace) =>
+          path === workspace || path.startsWith(`${workspace}/node_modules/`),
+      );
+    }),
+  );
+  return `${JSON.stringify(document, undefined, 2)}\n`;
+};
+
+/**
+ * Prunes independently parsed lockfile formats without consulting a package
+ * manager implementation. Formats whose public artifact does not expose a
+ * safely rewritable workspace index are validated and preserved byte-for-byte.
+ */
+export const pruneLockfile = (
+  path: string,
+  contents: Uint8Array,
+  workspacePaths: ReadonlySet<string>,
+): Uint8Array => {
+  const parsed = parseLockfile(path, contents);
+  if (parsed.format === "bun-binary" || parsed.format === "yarn-pnp") {
+    return contents;
+  }
+  const source = validateSource(contents);
+  const output =
+    parsed.format === "pnpm"
+      ? prunePnpmLockfile(source, workspacePaths)
+      : parsed.format === "npm"
+        ? pruneNpmLockfile(source, workspacePaths)
+        : source;
+  return new TextEncoder().encode(output);
 };

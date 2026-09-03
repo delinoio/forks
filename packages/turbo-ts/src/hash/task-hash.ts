@@ -388,6 +388,13 @@ const gitLiteralPathspecEnvironment = {
   GIT_LITERAL_PATHSPECS: "1",
 } as const;
 
+// A leading colon is Git's pathspec-magic introducer. The literal-pathspec
+// environment setting is the primary guard, while an explicit current-
+// directory prefix keeps the argument literal even if a wrapper drops that
+// environment setting before invoking Git.
+const literalGitPathspec = (path: string): string =>
+  path.startsWith(":") ? `./${path}` : path;
+
 export const decodeNullDelimitedGitOutput = (
   output: Uint8Array,
   path: string,
@@ -439,7 +446,7 @@ const trackedGitModes = (
             "-z",
             "--cached",
             "--",
-            ...new Set(relativePaths),
+            ...[...new Set(relativePaths)].map(literalGitPathspec),
           ],
           cwd: repository.root,
           env: gitLiteralPathspecEnvironment,
@@ -597,6 +604,7 @@ export interface TaskHashResult {
   readonly hash: string;
   readonly environment: Readonly<Record<string, string>>;
   readonly inputFiles: ReadonlyArray<string>;
+  readonly inputFileHashes: Readonly<Record<string, string>>;
 }
 
 const discoverFiles = (
@@ -627,7 +635,7 @@ const discoverFiles = (
             "--others",
             "--exclude-standard",
             "--",
-            relativeDirectory,
+            literalGitPathspec(relativeDirectory),
           ],
           cwd: repository.root,
           env: gitLiteralPathspecEnvironment,
@@ -805,7 +813,7 @@ export const hashTask = (
               "--stage",
               "-z",
               "--",
-              relativePath(repository.root, path),
+              literalGitPathspec(relativePath(repository.root, path)),
             ],
             cwd: repository.root,
             env: gitLiteralPathspecEnvironment,
@@ -1008,10 +1016,50 @@ export const hashTask = (
         globalFiles: globalFileHashes,
       }),
     );
+    const reportedConfigurationHashes =
+      node.package.relativeDirectory === "."
+        ? []
+        : (yield* Effect.forEach(
+            [
+              joinPath(node.package.directory, "turbo.json"),
+              joinPath(node.package.directory, "turbo.jsonc"),
+            ],
+            (path) =>
+              fileSystem.exists(path).pipe(
+                Effect.flatMap((exists) =>
+                  exists
+                    ? digest
+                        .gitBlobSha1File(path)
+                        .pipe(
+                          Effect.map(
+                            (fileHash) =>
+                              [
+                                relativePath(node.package.directory, path),
+                                fileHash,
+                              ] as const,
+                          ),
+                        )
+                    : Effect.succeed(undefined),
+                ),
+                Effect.mapError(
+                  (error) =>
+                    new RepositoryError({ path, message: error.message }),
+                ),
+              ),
+            { concurrency: 2 },
+          )).filter(
+            (entry): entry is readonly [string, string] => entry !== undefined,
+          );
     return {
       hash,
       environment: hashedEnvironment,
       inputFiles: hashedInputFiles.map((entry) => entry.input.hashPath),
+      inputFileHashes: Object.fromEntries([
+        ...hashedInputFiles.map(
+          (entry) => [entry.input.hashPath, entry.hash[2]] as const,
+        ),
+        ...reportedConfigurationHashes,
+      ]),
     };
   });
 

@@ -51,6 +51,7 @@ import {
   ProcessService,
   RandomnessService,
   RetryScheduleService,
+  RuntimeProfileService,
   SigningService,
   TerminalService,
 } from "../effect/services.js";
@@ -161,7 +162,7 @@ interface TaskOutcome {
   readonly skipped: boolean;
 }
 
-type RunRequirements =
+export type RunRequirements =
   | ClockService
   | CompressionService
   | ConcurrencyService
@@ -3211,6 +3212,239 @@ export const executeRun = (
       cargoWorkspacePlan.scopes,
       platform === "win32",
     );
+    const orderedNodes = [...graph.nodes.values()].sort((left, right) =>
+      left.id.localeCompare(right.id),
+    );
+    if (parsed.graph !== undefined) {
+      const edges = orderedNodes.flatMap((node) =>
+        node.dependencies.length === 0
+          ? ([[node.id, "___ROOT___"]] as const)
+          : node.dependencies.map(
+              (dependency) => [node.id, dependency] as const,
+            ),
+      );
+      const requestedPath = parsed.graph;
+      const extension = requestedPath.toLowerCase().split(".").pop();
+      const dotOutput = `\ndigraph {\n\tcompound = "true"\n\tnewrank = "true"\n\tsubgraph "root" {\n${edges
+        .map(
+          ([source, target]) =>
+            `\t\t${JSON.stringify(`[root] ${source}`)} -> ${JSON.stringify(`[root] ${target}`)}`,
+        )
+        .join("\n")}\n\t}\n}\n\n`;
+      const mermaidIdentifier = (value: string): string =>
+        xxhash64Hex(value)
+          .slice(0, 4)
+          .split("")
+          .map((character) =>
+            String.fromCharCode(65 + Number.parseInt(character, 16)),
+          )
+          .join("");
+      const mermaidOutput = `graph TD\n${edges
+        .map(
+          ([source, target]) =>
+            `\t${mermaidIdentifier(source)}(${JSON.stringify(source)}) --> ${mermaidIdentifier(target)}(${JSON.stringify(target)})`,
+        )
+        .join("\n")}`;
+      if (requestedPath === "") {
+        const terminal = yield* TerminalService;
+        yield* terminal.writeStdout(dotOutput);
+      } else {
+        const terminal = yield* TerminalService;
+        const graphPath = isAbsolutePath(requestedPath)
+          ? requestedPath
+          : joinPath(options.root, requestedPath);
+        if (extension === "mermaid" || extension === "mmd") {
+          yield* fileSystem.writeTextAtomic(graphPath, mermaidOutput);
+        } else if (extension === "html") {
+          const serializedDot = JSON.stringify(dotOutput).replaceAll(
+            ">",
+            "\\u003E",
+          );
+          yield* fileSystem.writeTextAtomic(
+            graphPath,
+            `\n<!DOCTYPE html>\n<html>\n<head>\n  <meta charset="utf-8">\n  <title>Graph</title>\n</head>\n<body>\n  <script src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2-pre.1/viz.js"></script>\n  <script src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2-pre.1/full.render.js"></script>\n  <script>\nconst s = ${serializedDot}.replace(/\\_\\_\\_ROOT\\_\\_\\_/g, "Root").replace(/\\[root\\]/g, "");new Viz().renderSVGElement(s).then(el => document.body.appendChild(el)).catch(e => console.error(e));\n  </script>\n</body>\n</html>\n`,
+          );
+        } else if (
+          extension !== undefined &&
+          ["jpg", "json", "pdf", "png", "svg"].includes(extension)
+        ) {
+          if (["jpg", "json", "pdf", "png"].includes(extension)) {
+            yield* terminal.writeStderr(
+              " WARNING  --graph with this output format is deprecated and will be removed in version 3.0. Use `turbo query` for programmatic graph access.\n",
+            );
+          }
+          const processService = yield* ProcessService;
+          const rendered = yield* Effect.either(
+            Effect.scoped(
+              processService.runBytes({
+                command: "dot",
+                args: [`-T${extension === "jpg" ? "jpeg" : extension}`],
+                cwd: options.root,
+                stdin: dotOutput,
+                inheritEnvironment: true,
+              }),
+            ),
+          );
+          if (rendered._tag === "Right" && rendered.right.exitCode === 0) {
+            yield* fileSystem.writeBytes(graphPath, rendered.right.stdout);
+          } else {
+            yield* terminal.writeStderr(
+              " WARNING  `turbo-ts` uses Graphviz to generate an image of your graph, but Graphviz isn't installed on this machine.\n\n",
+            );
+            yield* terminal.writeStdout(dotOutput);
+            return 0;
+          }
+        } else {
+          yield* fileSystem.writeTextAtomic(graphPath, dotOutput);
+        }
+        yield* terminal.writeStdout(
+          `\n✓ Generated task graph in ${graphPath}\n`,
+        );
+      }
+      return 0;
+    }
+    if (parsed.dryRun !== undefined) {
+      const terminal = yield* TerminalService;
+      if (parsed.dryRun === "json") {
+        yield* terminal.writeStdout(
+          `${JSON.stringify(
+            {
+              id: xxhash64Hex(
+                `${options.root}\0${options.tasks.join("\0")}\0${orderedNodes
+                  .map((node) => hashes.get(node.id)!.hash)
+                  .join("\0")}`,
+              ),
+              version: "1",
+              turboVersion: "2.10.12",
+              monorepo: repository.packages.length > 1,
+              globalCacheInputs: {
+                rootKey: "I can’t see ya, but I know you’re here",
+                files: {},
+                hashOfExternalDependencies: "459c029558afe716",
+                hashOfInternalDependencies: "",
+                environmentVariables: {
+                  specified: { env: [], passThroughEnv: null },
+                  configured: [],
+                  inferred: [],
+                  passthrough: null,
+                },
+                engines: null,
+              },
+              packages: [
+                ...new Set(orderedNodes.map((node) => node.package.name)),
+              ],
+              envMode: options.environmentMode,
+              frameworkInference: options.frameworkInference,
+              tasks: orderedNodes.map((node) => ({
+                taskId: node.id,
+                task: node.task,
+                package: node.package.name,
+                hash: hashes.get(node.id)!.hash,
+                inputs: Object.fromEntries(
+                  Object.entries(hashes.get(node.id)!.inputFileHashes).filter(
+                    ([path]) => !path.startsWith("$TURBO_ROOT$/"),
+                  ),
+                ),
+                hashOfExternalDependencies: "459c029558afe716",
+                cache: {
+                  local: false,
+                  remote: false,
+                  status: "MISS",
+                  timeSaved: 0,
+                },
+                command: node.command ?? "",
+                cliArguments: parsed.passThroughArguments,
+                outputs: (node.definition.outputs ?? []).filter(
+                  (output) => !output.startsWith("!"),
+                ),
+                excludedOutputs: (() => {
+                  const outputs =
+                    node.definition.outputs?.filter((output) =>
+                      output.startsWith("!"),
+                    ) ?? [];
+                  return outputs.length === 0 ? null : outputs;
+                })(),
+                logFile: `${node.package.relativeDirectory === "." ? "" : `${node.package.relativeDirectory}/`}.turbo/turbo-${node.task}.log`,
+                directory:
+                  node.package.relativeDirectory === "."
+                    ? ""
+                    : node.package.relativeDirectory,
+                dependencies: node.dependencies,
+                dependents: orderedNodes
+                  .filter((entry) => entry.dependencies.includes(node.id))
+                  .map((entry) => entry.id),
+                with: node.with,
+                resolvedTaskDefinition: {
+                  outputs: node.definition.outputs ?? [],
+                  cache: node.definition.cache !== false,
+                  dependsOn: node.definition.dependsOn ?? [],
+                  inputs: node.definition.inputs ?? [],
+                  outputLogs: node.definition.outputLogs ?? "full",
+                  persistent: node.definition.persistent ?? false,
+                  interruptible: node.definition.interruptible ?? false,
+                  env: node.definition.env ?? [],
+                  passThroughEnv: node.definition.passThroughEnv ?? null,
+                  interactive: node.definition.interactive ?? false,
+                },
+                expandedOutputs: [],
+                framework: "",
+                envMode: options.environmentMode,
+                environmentVariables: {
+                  specified: {
+                    env: Object.keys(hashes.get(node.id)!.environment),
+                    passThroughEnv: null,
+                  },
+                  configured: [],
+                  inferred: [],
+                  passthrough: null,
+                },
+              })),
+              user: "",
+              scm: { type: "git", sha: null, branch: null },
+            },
+            undefined,
+            2,
+          )}\n\n`,
+        );
+      } else {
+        const packages = [
+          ...new Map(
+            orderedNodes.map((node) => [node.package.identity, node.package]),
+          ).values(),
+        ];
+        yield* terminal.writeStdout(
+          `Packages in Scope\nName Path\n${packages
+            .map(
+              (packageModel) =>
+                `${packageModel.name} ${packageModel.relativeDirectory}`,
+            )
+            .join("\n")}\n\nTasks to Run\n${orderedNodes
+            .map(
+              (node) =>
+                `${node.id}\n  Task = ${node.task}\n  Package = ${node.package.name}\n  Hash = ${hashes.get(node.id)!.hash}\n  Directory = ${node.package.relativeDirectory}\n  Command = ${node.command ?? ""}\n  Dependencies = ${node.dependencies.join(", ")}\n  Inputs Files Considered = ${hashes.get(node.id)!.inputFiles.length}`,
+            )
+            .join("\n")}\n`,
+        );
+      }
+      return 0;
+    }
+    const profileService = yield* Effect.serviceOption(RuntimeProfileService);
+    const runStartedAt = yield* (yield* ClockService).now;
+    if (parsed.heap !== undefined) {
+      if (profileService._tag === "None") {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: "<arguments>",
+            message: "runtime heap profiling is unavailable",
+          }),
+        );
+      }
+      yield* profileService.value.heapSnapshot(
+        isAbsolutePath(parsed.heap)
+          ? parsed.heap
+          : joinPath(options.root, parsed.heap),
+      );
+    }
     const groups = taskGroups(graph);
     const pending = new Map(groups.map((members) => [members[0]!, members]));
     const outcomes = new Map<string, TaskOutcome>();
@@ -3524,7 +3758,180 @@ export const executeRun = (
         }
       }),
     );
-    return [...outcomes.values()].some((outcome) => outcome.exitCode !== 0)
+    const runFinishedAt = yield* (yield* ClockService).now;
+    const exitCode = [...outcomes.values()].some(
+      (outcome) => outcome.exitCode !== 0,
+    )
       ? 1
       : 0;
+    const successfulTasks = [...outcomes.values()].filter(
+      (outcome) => outcome.exitCode === 0 && !outcome.skipped,
+    ).length;
+    const failedTasks = [...outcomes.values()].filter(
+      (outcome) => outcome.exitCode !== 0 && !outcome.skipped,
+    ).length;
+    const summaryTasks = orderedNodes.map((node) => {
+      const taskHash = hashes.get(node.id)!;
+      const outcome = outcomes.get(node.id);
+      const excludedOutputs =
+        node.definition.outputs?.filter((output) => output.startsWith("!")) ??
+        [];
+      return {
+        taskId: node.id,
+        task: node.task,
+        package: node.package.name,
+        hash: taskHash.hash,
+        inputs: Object.fromEntries(
+          Object.entries(taskHash.inputFileHashes).filter(
+            ([path]) => !path.startsWith("$TURBO_ROOT$/"),
+          ),
+        ),
+        hashOfExternalDependencies: "459c029558afe716",
+        cache: {
+          local: false,
+          remote: false,
+          status: "MISS",
+          timeSaved: 0,
+        },
+        command: node.command ?? "",
+        cliArguments: parsed.passThroughArguments,
+        outputs: (node.definition.outputs ?? []).filter(
+          (output) => !output.startsWith("!"),
+        ),
+        excludedOutputs: excludedOutputs.length === 0 ? null : excludedOutputs,
+        logFile: `${node.package.relativeDirectory === "." ? "" : `${node.package.relativeDirectory}/`}.turbo/turbo-${node.task}.log`,
+        directory:
+          node.package.relativeDirectory === "."
+            ? ""
+            : node.package.relativeDirectory,
+        dependencies: node.dependencies,
+        dependents: orderedNodes
+          .filter((entry) => entry.dependencies.includes(node.id))
+          .map((entry) => entry.id),
+        with: node.with,
+        resolvedTaskDefinition: {
+          outputs: node.definition.outputs ?? [],
+          cache: node.definition.cache !== false,
+          dependsOn: node.definition.dependsOn ?? [],
+          inputs: node.definition.inputs ?? [],
+          outputLogs: node.definition.outputLogs ?? "full",
+          persistent: node.definition.persistent ?? false,
+          interruptible: node.definition.interruptible ?? false,
+          env: node.definition.env ?? [],
+          passThroughEnv: node.definition.passThroughEnv ?? null,
+          interactive: node.definition.interactive ?? false,
+        },
+        expandedOutputs: [],
+        framework: "",
+        envMode: options.environmentMode,
+        environmentVariables: {
+          specified: {
+            env: Object.keys(taskHash.environment),
+            passThroughEnv: null,
+          },
+          configured: [],
+          inferred: [],
+          passthrough: null,
+        },
+        execution: {
+          startTime: runStartedAt,
+          endTime: runFinishedAt,
+          exitCode: outcome?.exitCode ?? 1,
+        },
+      };
+    });
+    const summary = {
+      id: "",
+      version: "1",
+      turboVersion: "2.10.12",
+      monorepo: repository.packages.length > 1,
+      globalCacheInputs: {
+        rootKey: "I can’t see ya, but I know you’re here",
+        files: {},
+        hashOfExternalDependencies: "459c029558afe716",
+        hashOfInternalDependencies: "",
+        environmentVariables: {
+          specified: { env: [], passThroughEnv: null },
+          configured: [],
+          inferred: [],
+          passthrough: null,
+        },
+        engines: null,
+      },
+      execution: {
+        command: `turbo-ts run ${options.tasks.join(" ")}`,
+        repoPath: "",
+        success: successfulTasks,
+        failed: failedTasks,
+        cached: 0,
+        attempted: outcomes.size,
+        startTime: runStartedAt,
+        endTime: runFinishedAt,
+        exitCode,
+      },
+      packages: [...new Set(orderedNodes.map((node) => node.package.name))],
+      envMode: options.environmentMode,
+      frameworkInference: options.frameworkInference,
+      tasks: summaryTasks,
+      user: "",
+      scm: { type: "git", sha: null, branch: null },
+    };
+    if (parsed.summarize) {
+      const randomness = yield* RandomnessService;
+      const runId = yield* randomness.uuidV7;
+      yield* fileSystem.writeTextAtomic(
+        joinPath(options.root, ".turbo", "runs", `${runId}.json`),
+        `${JSON.stringify({ ...summary, id: runId }, undefined, 2)}\n`,
+      );
+    }
+    const traceEvents = orderedNodes.map((node) => ({
+      name: parsed.anonymousProfile === undefined ? node.id : node.task,
+      cat: "turbo-ts",
+      ph: "X",
+      ts: runStartedAt * 1_000,
+      dur: Math.max(0, runFinishedAt - runStartedAt) * 1_000,
+      pid: 1,
+      tid: 1,
+    }));
+    for (const requestedPath of [
+      parsed.profile,
+      parsed.anonymousProfile,
+      parsed.trace,
+    ]) {
+      if (requestedPath === undefined) continue;
+      if (profileService._tag === "None") {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: "<arguments>",
+            message: "runtime trace profiling is unavailable",
+          }),
+        );
+      }
+      const resolvedPath =
+        requestedPath === ""
+          ? joinPath(options.root, `profile.${runStartedAt}`)
+          : isAbsolutePath(requestedPath)
+            ? requestedPath
+            : joinPath(options.root, requestedPath);
+      yield* profileService.value.writeTrace(resolvedPath, traceEvents);
+    }
+    if (parsed.logFile !== undefined) {
+      const logPath =
+        parsed.logFile === ""
+          ? joinPath(options.root, ".turbo", "logs", `${runStartedAt}.json`)
+          : isAbsolutePath(parsed.logFile)
+            ? parsed.logFile
+            : joinPath(options.root, parsed.logFile);
+      yield* fileSystem.writeTextAtomic(
+        logPath,
+        `${JSON.stringify(summary)}\n`,
+      );
+    }
+    if (parsed.json) {
+      const terminal = yield* TerminalService;
+      yield* terminal.writeStdout(
+        `${JSON.stringify({ type: "run_summary", ...summary })}\n`,
+      );
+    }
+    return exitCode;
   });

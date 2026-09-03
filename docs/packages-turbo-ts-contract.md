@@ -191,9 +191,11 @@ compiler identity is not modeled. Effective `RUSTC_WRAPPER` and
 the wrapper executables are not repository hash inputs.
 Environment-name selection follows Windows case-insensitive semantics for run
 options, affected-range controls, hashing, and strict task execution.
-Repository discovery records the resolved root lockfile path without
-structurally parsing it;
-lockfile parsing and pruning remain Gate 3 work. Without Git, explicit task
+Repository discovery records the resolved root lockfile path. Gate 3 validates
+all modeled lockfile formats before prune, rewrites pnpm importer/package/
+snapshot closure and npm workspace package indexes, and preserves validated
+formats that do not expose a safely rewritable public workspace index. Without
+Git, explicit task
 inputs under ordinary `dist` and `target` directories remain hashable.
 Cache directories equal to or containing the repository or any discovered
 package directory are rejected by canonical filesystem location before cache
@@ -469,10 +471,46 @@ Structured `dependencyOutputs` task inputs are rejected during configuration
 validation until their dependency graph and output-hash semantics are
 implemented; they are never treated as ordinary local globs.
 
-Only Gate 2 behavior with automated ledger evidence is a compatibility claim.
-Gate 3 through Gate 5 commands, UI and profile formats, daemon/watch/query
-protocols, hosted authentication workflows, and platform matrices remain
-planned.
+Gate 3 adds repository workflows with automated ledger evidence. `watch`
+debounces filesystem storms and uses switching Effect streams so a later file
+event interrupts an in-flight run before recovery. Watchers, child processes,
+fibers, signals, and task resources remain scope-owned. Watch mode reads cache
+by default and enables cache publication only with
+`--experimental-write-cache`.
+
+The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
+identity, per-user temporary state directory, atomic PID and start lock files,
+0600 Unix sockets, and stale-state cleanup. Its public transport is the
+official `turbodprotocol.Turbod` gRPC service over HTTP/2. Hello, status, and
+shutdown calls interoperate in both directions with the 2.10.12 executable;
+package and watch calls share the same bounded framing and scoped sessions.
+Start, stop, restart, status, logs, and clean are race-safe; log clients follow
+new records until interrupted, malformed streams remain isolated, and an idle
+server releases its state. Windows deliberately uses Node's forceful process
+termination because Node has no supported graceful Win32 Ctrl+C bridge.
+
+`query` provides the compatible repository GraphQL root, package graph,
+package and task collections, affected collections, variables, schema
+introspection, and a loopback GraphQL server. `query affected`, `query ls`, and
+`ls` share repository discovery and stable ordering. The server limits request
+bodies and closes HTTP handles in Scope.
+
+`prune` selects the transitive internal package closure, emits ordinary and
+Docker layouts, creates reduced lockfiles with reference-compatible canonical
+configuration formatting, supports production manifests, and
+rejects output roots that could contain the source repository. It never
+follows workspace symlinks into a prune output.
+
+Run workflows support text and JSON dry-runs; DOT, Mermaid, JSON, and HTML task
+graphs; JSON run summaries and structured log files; stream and NDJSON output;
+completion and info; Chrome-compatible named and anonymous profiles; and the
+approved V8 heap snapshot and trace substitutions. TUI requests retain stream
+semantics when no interactive terminal is available, and all color output
+continues to honor `NO_COLOR`.
+
+Only behavior with automated ledger evidence is a compatibility claim. Hosted
+authentication, devtools, telemetry transports, and full platform matrices
+remain later gates.
 
 The approved compatibility differences are branding and version, Node-only
 distribution, hosted identity, default-disabled updates, V8 heap/trace output,

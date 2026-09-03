@@ -65,7 +65,7 @@ describe("CLI and external oracle", () => {
     await Effect.runPromise(
       cliProgram.pipe(
         Effect.provideService(EnvironmentService, {
-          argv: Effect.succeed(["node", "turbo-ts", "watch", "--no-color"]),
+          argv: Effect.succeed(["node", "turbo-ts", "docs", "--no-color"]),
           cwd: Effect.succeed(packageRoot),
           platform: Effect.succeed(process.platform),
           get: () => Effect.succeed(undefined),
@@ -90,7 +90,7 @@ describe("CLI and external oracle", () => {
       ),
     );
     expect(exitStatuses).toEqual([1]);
-    expect(stderr).toContain("watch is not implemented");
+    expect(stderr).toContain("docs is not implemented");
     expect(stderr).not.toContain("\u001B[");
     expect(process.exitCode).toBe(previousExitCode);
   });

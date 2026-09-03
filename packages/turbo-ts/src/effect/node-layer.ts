@@ -9,10 +9,15 @@ import {
   randomBytes,
   timingSafeEqual,
 } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import {
+  createReadStream,
+  createWriteStream,
+  watch as watchFileSystem,
+} from "node:fs";
 import {
   appendFile,
   chmod,
+  copyFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -27,11 +32,28 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
-import { availableParallelism, tmpdir } from "node:os";
-import { join } from "node:path";
+import { createServer as createHttpServer } from "node:http";
+import {
+  connect as connectHttp2,
+  createServer as createHttp2Server,
+  type Http2Server,
+  constants as http2Constants,
+  type ServerHttp2Session,
+  type ServerHttp2Stream,
+} from "node:http2";
+import { createConnection as createNetConnection } from "node:net";
+import {
+  arch,
+  availableParallelism,
+  freemem,
+  platform as operatingSystem,
+  tmpdir,
+} from "node:os";
+import { dirname, join } from "node:path";
 import { Readable, Transform, type Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
+import { writeHeapSnapshot } from "node:v8";
 import { createZstdDecompress, zstdCompress, zstdDecompress } from "node:zlib";
 import { Cause, Effect, Exit, Layer, Option, Ref, Stream } from "effect";
 import { createXxhash64 } from "../hash/xxhash64.js";
@@ -43,6 +65,8 @@ import {
   CompressionService,
   ConcurrencyService,
   CredentialService,
+  type DaemonConnection,
+  type DaemonResponse,
   DaemonService,
   DigestService,
   deterministicRetryLayer,
@@ -51,15 +75,19 @@ import {
   ExitStatusService,
   type FileSystemOperations,
   FileSystemService,
+  FileWatcherService,
   GitService,
   HttpService,
+  LoopbackHttpService,
   ObservabilityService,
   type OutputChunkHandler,
   PackageManagerService,
   ProcessService,
   RandomnessService,
+  RuntimeProfileService,
   SignalService,
   SigningService,
+  SystemService,
   TelemetryService,
   type TerminalOperations,
   TerminalService,
@@ -870,6 +898,33 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
       try: () => writeFile(path, contents, "utf8"),
       catch: filesystemError,
     }),
+  writeTextAtomic: (path, contents) =>
+    Effect.tryPromise({
+      try: async () => {
+        await mkdir(dirname(path), { recursive: true });
+        const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+        let handle: Awaited<ReturnType<typeof open>> | undefined;
+        try {
+          handle = await open(temporary, "wx", 0o600);
+          await handle.writeFile(contents, "utf8");
+          await handle.sync();
+          await handle.close();
+          handle = undefined;
+          await rename(temporary, path);
+          const directory = await open(dirname(path), "r");
+          try {
+            await directory.sync();
+          } finally {
+            await directory.close();
+          }
+        } catch (cause) {
+          await handle?.close().catch(() => undefined);
+          await rm(temporary, { force: true }).catch(() => undefined);
+          throw cause;
+        }
+      },
+      catch: filesystemError,
+    }),
   appendText: (path, contents) =>
     Effect.tryPromise({
       try: () => appendFile(path, contents, "utf8"),
@@ -931,6 +986,14 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
   remove: (path) =>
     Effect.tryPromise({
       try: () => rm(path, { force: true, recursive: true }),
+      catch: filesystemError,
+    }),
+  copyFile: (source, destination) =>
+    Effect.tryPromise({
+      try: async () => {
+        await mkdir(dirname(destination), { recursive: true });
+        await copyFile(source, destination);
+      },
       catch: filesystemError,
     }),
   realPath: (path) =>
@@ -1311,12 +1374,68 @@ const processLayer = Layer.succeed(ProcessService, {
         ),
       terminateChild,
     ),
+  spawnDetached: (request) =>
+    Effect.try({
+      try: () => {
+        const invocation = resolveSpawnInvocation(
+          request.command,
+          request.args,
+          process.platform,
+          configuredWindowsCommandInterpreter(),
+        );
+        const child = spawn(invocation.command, [...invocation.args], {
+          cwd: request.cwd,
+          detached: true,
+          env: makeChildEnvironment(
+            request.inheritEnvironment === false ? {} : process.env,
+            request.env,
+            process.platform,
+          ),
+          shell: false,
+          stdio: "ignore",
+          windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+        });
+        if (child.pid === undefined) {
+          throw new Error("detached process has no process identifier");
+        }
+        child.unref();
+        return child.pid;
+      },
+      catch: (cause) => processExecutionError(request.command, cause),
+    }),
+  isProcessAlive: (pid) =>
+    Effect.sync(() => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (cause) {
+        return !(
+          typeof cause === "object" &&
+          cause !== null &&
+          "code" in cause &&
+          cause.code === "ESRCH"
+        );
+      }
+    }),
+  terminateProcess: (pid, force) =>
+    Effect.try({
+      try: () => {
+        // Node cannot provide a graceful Win32 Ctrl+C bridge. Gate 3's
+        // documented Windows behavior is therefore forceful tree termination.
+        process.kill(
+          pid,
+          process.platform === "win32" || force ? "SIGKILL" : "SIGTERM",
+        );
+      },
+      catch: (cause) => processExecutionError(String(pid), cause),
+    }),
 });
 
 const environmentLayer = Layer.succeed(EnvironmentService, {
   argv: Effect.sync(() => [...process.argv]),
   cwd: Effect.sync(() => process.cwd()),
   platform: Effect.succeed(process.platform),
+  executablePath: Effect.succeed(process.execPath),
   get: (name) => Effect.sync(() => process.env[name]),
   entries: Effect.sync(() => ({ ...process.env })),
 });
@@ -1382,6 +1501,15 @@ export const makeTerminalOperations = (
   writeStderr: makeTerminalWriter(stderr),
   stdoutColorEnabled: Effect.sync(() => noColor() === undefined),
   stderrColorEnabled: Effect.sync(() => noColor() === undefined),
+  stdinIsTerminal: Effect.sync(() => process.stdin.isTTY === true),
+  stdoutIsTerminal: Effect.sync(
+    () => "isTTY" in stdout && stdout.isTTY === true,
+  ),
+  columns: Effect.sync(() =>
+    "columns" in stdout && typeof stdout.columns === "number"
+      ? stdout.columns
+      : 80,
+  ),
 });
 
 const terminalLayer = Layer.succeed(
@@ -1424,6 +1552,561 @@ const randomnessLayer = Layer.succeed(RandomnessService, {
         retryable: false,
       }),
   }),
+});
+
+const fileWatcherLayer = Layer.succeed(FileWatcherService, {
+  watch: (root) =>
+    Stream.asyncPush<
+      {
+        readonly path: string;
+        readonly kind: "modify" | "rename" | "remove" | "unknown";
+      },
+      BoundaryError
+    >(
+      (emit) =>
+        Effect.acquireRelease(
+          Effect.try({
+            try: () => {
+              const watcher = watchFileSystem(
+                root,
+                { recursive: true, persistent: true },
+                (event, filename) => {
+                  if (filename === null) {
+                    emit.single({ path: root, kind: "unknown" });
+                    return;
+                  }
+                  const path = join(root, String(filename));
+                  if (event === "change") {
+                    emit.single({ path, kind: "modify" });
+                    return;
+                  }
+                  lstat(path).then(
+                    () => emit.single({ path, kind: "rename" }),
+                    (cause) =>
+                      isMissingFileError(cause)
+                        ? emit.single({ path, kind: "remove" })
+                        : emit.fail(filesystemError(cause)),
+                  );
+                },
+              );
+              watcher.once("error", (cause) =>
+                emit.fail(filesystemError(cause)),
+              );
+              return watcher;
+            },
+            catch: filesystemError,
+          }),
+          (watcher) => Effect.sync(() => watcher.close()),
+        ),
+      { bufferSize: 4_096, strategy: "sliding" },
+    ),
+});
+
+const signalLayer = Layer.succeed(SignalService, {
+  signals: Stream.asyncPush<"SIGINT" | "SIGTERM">(
+    (emit) =>
+      Effect.acquireRelease(
+        Effect.sync(() => {
+          const onInterrupt = () => emit.single("SIGINT");
+          const onTerminate = () => emit.single("SIGTERM");
+          process.on("SIGINT", onInterrupt);
+          process.on("SIGTERM", onTerminate);
+          return { onInterrupt, onTerminate };
+        }),
+        ({ onInterrupt, onTerminate }) =>
+          Effect.sync(() => {
+            process.off("SIGINT", onInterrupt);
+            process.off("SIGTERM", onTerminate);
+          }),
+      ),
+    { bufferSize: 8, strategy: "sliding" },
+  ),
+});
+
+const daemonProtocolError = (cause: unknown): BoundaryError =>
+  new BoundaryError({
+    boundary: "daemon",
+    message: String(cause),
+    retryable: false,
+  });
+
+const protocolVarint = (value: number): Buffer => {
+  const bytes: Array<number> = [];
+  let remaining = Math.max(0, Math.floor(value));
+  do {
+    const byte = remaining % 128;
+    remaining = Math.floor(remaining / 128);
+    bytes.push(byte | (remaining > 0 ? 0x80 : 0));
+  } while (remaining > 0);
+  return Buffer.from(bytes);
+};
+
+const protocolField = (field: number, contents: Uint8Array): Buffer =>
+  Buffer.concat([
+    protocolVarint(field * 8 + 2),
+    protocolVarint(contents.length),
+    contents,
+  ]);
+
+const protocolString = (field: number, value: string): Buffer =>
+  protocolField(field, Buffer.from(value));
+
+const protocolInteger = (field: number, value: number): Buffer =>
+  Buffer.concat([protocolVarint(field * 8), protocolVarint(value)]);
+
+const grpcFrame = (payload: Uint8Array): Buffer => {
+  const header = Buffer.alloc(5);
+  header.writeUInt32BE(payload.length, 1);
+  return Buffer.concat([header, payload]);
+};
+
+const grpcPayload = (contents: Uint8Array): Buffer => {
+  if (contents.length < 5 || contents[0] !== 0) {
+    throw new TypeError("malformed gRPC daemon frame");
+  }
+  const length = Buffer.from(contents).readUInt32BE(1);
+  if (length > 1024 * 1024 || length + 5 > contents.length) {
+    throw new TypeError("daemon frame exceeds its declared size");
+  }
+  return Buffer.from(contents.subarray(5, length + 5));
+};
+
+const readProtocolVarint = (
+  bytes: Uint8Array,
+  start: number,
+): readonly [number, number] => {
+  let result = 0;
+  let scale = 1;
+  let index = start;
+  for (; index < bytes.length && index - start < 10; index += 1) {
+    const byte = bytes[index]!;
+    result += (byte & 0x7f) * scale;
+    if ((byte & 0x80) === 0) return [result, index + 1];
+    scale *= 128;
+  }
+  throw new TypeError("malformed protobuf varint");
+};
+
+const protocolFields = (
+  bytes: Uint8Array,
+): ReadonlyMap<number, ReadonlyArray<number | Buffer>> => {
+  const fields = new Map<number, Array<number | Buffer>>();
+  let offset = 0;
+  while (offset < bytes.length) {
+    const [tag, afterTag] = readProtocolVarint(bytes, offset);
+    offset = afterTag;
+    const field = Math.floor(tag / 8);
+    const wire = tag % 8;
+    let value: number | Buffer;
+    if (wire === 0) {
+      [value, offset] = readProtocolVarint(bytes, offset);
+    } else if (wire === 2) {
+      const [length, afterLength] = readProtocolVarint(bytes, offset);
+      offset = afterLength;
+      if (length > 1024 * 1024 || offset + length > bytes.length) {
+        throw new TypeError("malformed protobuf length");
+      }
+      value = Buffer.from(bytes.subarray(offset, offset + length));
+      offset += length;
+    } else {
+      throw new TypeError(`unsupported protobuf wire type ${wire}`);
+    }
+    const values = fields.get(field) ?? [];
+    values.push(value);
+    fields.set(field, values);
+  }
+  return fields;
+};
+
+const daemonRequestPayload = (
+  request: import("./services.js").DaemonRequest,
+): Buffer => {
+  if (request.method === "Hello") {
+    const params = request.params as { readonly version?: unknown } | undefined;
+    return Buffer.concat([
+      protocolString(
+        1,
+        typeof params?.version === "string" ? params.version : "2.0.0",
+      ),
+      protocolInteger(3, 2),
+    ]);
+  }
+  return Buffer.alloc(0);
+};
+
+const daemonResponsePayload = (
+  method: string,
+  response: DaemonResponse,
+): Buffer => {
+  if (response.error !== undefined) return Buffer.alloc(0);
+  if (method === "Status") {
+    const result = response.result as
+      | { readonly logFile?: unknown; readonly uptimeMilliseconds?: unknown }
+      | undefined;
+    const status = Buffer.concat([
+      protocolString(
+        1,
+        typeof result?.logFile === "string" ? result.logFile : "",
+      ),
+      protocolInteger(
+        2,
+        typeof result?.uptimeMilliseconds === "number"
+          ? result.uptimeMilliseconds
+          : 0,
+      ),
+    ]);
+    return protocolField(1, status);
+  }
+  return Buffer.alloc(0);
+};
+
+const decodedDaemonResponse = (
+  method: string,
+  payload: Uint8Array,
+): unknown => {
+  if (method !== "Status") return {};
+  const outer = protocolFields(payload);
+  const status = outer.get(1)?.[0];
+  if (!(status instanceof Buffer)) return {};
+  const fields = protocolFields(status);
+  const logFile = fields.get(1)?.[0];
+  const uptimeMilliseconds = fields.get(2)?.[0];
+  return {
+    logFile: logFile instanceof Buffer ? logFile.toString("utf8") : "",
+    uptimeMilliseconds:
+      typeof uptimeMilliseconds === "number" ? uptimeMilliseconds : 0,
+  };
+};
+
+const respondGrpc = (
+  stream: ServerHttp2Stream,
+  method: string,
+  response: DaemonResponse,
+): Effect.Effect<void, BoundaryError> =>
+  Effect.async((resume) => {
+    try {
+      stream.respond({
+        [http2Constants.HTTP2_HEADER_STATUS]: 200,
+        [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+        "grpc-status": response.error === undefined ? "0" : "13",
+        ...(response.error === undefined
+          ? {}
+          : { "grpc-message": encodeURIComponent(response.error) }),
+      });
+      stream.end(grpcFrame(daemonResponsePayload(method, response)), () =>
+        resume(Effect.void),
+      );
+    } catch (cause) {
+      resume(Effect.fail(daemonProtocolError(cause)));
+    }
+    return Effect.sync(() => stream.close());
+  });
+
+const daemonLayer = Layer.succeed(DaemonService, {
+  serve: (endpoint) =>
+    Stream.asyncPush<DaemonConnection, BoundaryError>(
+      (emit) =>
+        Effect.acquireRelease(
+          Effect.async<
+            {
+              readonly server: Http2Server;
+              readonly sessions: Set<ServerHttp2Session>;
+            },
+            BoundaryError
+          >((resume) => {
+            const sessions = new Set<ServerHttp2Session>();
+            const server = createHttp2Server();
+            server.on("session", (session) => {
+              sessions.add(session);
+              session.once("close", () => sessions.delete(session));
+            });
+            server.on("stream", (stream, headers) => {
+              // Stream protocol failures are handled by closing that stream;
+              // consume its error event so Node does not promote a hostile
+              // client frame into an uncaught process-level exception.
+              stream.on("error", () => undefined);
+              const chunks: Array<Buffer> = [];
+              let length = 0;
+              stream.on("data", (chunk: Buffer) => {
+                length += chunk.length;
+                if (length > 1024 * 1024 + 5) {
+                  stream.close(http2Constants.NGHTTP2_CANCEL);
+                  return;
+                }
+                chunks.push(chunk);
+              });
+              stream.on("end", () => {
+                try {
+                  const path = String(
+                    headers[http2Constants.HTTP2_HEADER_PATH] ?? "",
+                  );
+                  const method = path.slice(path.lastIndexOf("/") + 1);
+                  const payload = grpcPayload(Buffer.concat(chunks));
+                  emit.single({
+                    requests: Stream.succeed({
+                      id: String(stream.id),
+                      method,
+                      params: { payload: new Uint8Array(payload) },
+                    }),
+                    respond: (response) =>
+                      respondGrpc(stream, method, response),
+                  });
+                } catch {
+                  // A malformed client stream is isolated to that HTTP/2
+                  // stream. Failing the outer Stream would tear down the
+                  // shared daemon and let one corrupt frame deny service to
+                  // every healthy client.
+                  stream.close(http2Constants.NGHTTP2_PROTOCOL_ERROR);
+                }
+              });
+            });
+            const fail = (cause: Error) =>
+              resume(Effect.fail(daemonProtocolError(cause)));
+            server.once("error", fail);
+            mkdir(dirname(endpoint), { recursive: true, mode: 0o700 })
+              .then(() => rm(endpoint, { force: true }))
+              .then(() => {
+                server.listen(endpoint, () => {
+                  chmod(endpoint, 0o600)
+                    .then(() => {
+                      server.off("error", fail);
+                      server.on("error", (cause) =>
+                        emit.fail(daemonProtocolError(cause)),
+                      );
+                      resume(Effect.succeed({ server, sessions }));
+                    })
+                    .catch((cause) => fail(cause as Error));
+                });
+              })
+              .catch((cause) => fail(cause as Error));
+          }),
+          ({ server, sessions }) =>
+            Effect.promise(async () => {
+              for (const session of sessions) session.destroy();
+              await new Promise<void>((resolve) =>
+                server.close(() => resolve()),
+              );
+              await rm(endpoint, { force: true }).catch(() => undefined);
+            }),
+        ),
+      { bufferSize: 64, strategy: "sliding" },
+    ),
+  request: (endpoint, request, timeoutMilliseconds = 5_000) =>
+    Effect.async<DaemonResponse, BoundaryError>((resume) => {
+      const session = connectHttp2("http://localhost", {
+        createConnection: () => createNetConnection(endpoint),
+      });
+      let settled = false;
+      const complete = (
+        effect: Effect.Effect<DaemonResponse, BoundaryError>,
+      ) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        session.destroy();
+        resume(effect);
+      };
+      const timeout = setTimeout(
+        () =>
+          complete(
+            Effect.fail(daemonProtocolError("daemon request timed out")),
+          ),
+        timeoutMilliseconds,
+      );
+      session.once("error", (cause) =>
+        complete(Effect.fail(daemonProtocolError(cause))),
+      );
+      const stream = session.request({
+        [http2Constants.HTTP2_HEADER_METHOD]: "POST",
+        [http2Constants.HTTP2_HEADER_PATH]: `/turbodprotocol.Turbod/${request.method}`,
+        [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+        te: "trailers",
+      });
+      const chunks: Array<Buffer> = [];
+      let responseError: string | undefined;
+      stream.on("response", (headers) => {
+        if (
+          headers["grpc-status"] !== undefined &&
+          headers["grpc-status"] !== "0"
+        ) {
+          responseError = String(
+            headers["grpc-message"] ?? "daemon request failed",
+          );
+        }
+      });
+      stream.on("trailers", (headers) => {
+        if (
+          headers["grpc-status"] !== undefined &&
+          headers["grpc-status"] !== "0"
+        ) {
+          responseError = String(
+            headers["grpc-message"] ?? "daemon request failed",
+          );
+        }
+      });
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+      stream.on("end", () => {
+        try {
+          const payload = grpcPayload(Buffer.concat(chunks));
+          complete(
+            Effect.succeed({
+              id: request.id,
+              result: decodedDaemonResponse(request.method, payload),
+              error: responseError,
+            }),
+          );
+        } catch (cause) {
+          complete(Effect.fail(daemonProtocolError(cause)));
+        }
+      });
+      stream.once("error", (cause) =>
+        complete(Effect.fail(daemonProtocolError(cause))),
+      );
+      stream.end(grpcFrame(daemonRequestPayload(request)));
+      return Effect.sync(() => complete(Effect.interrupt));
+    }),
+});
+
+const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
+  serve: (requestedPort, handler) =>
+    Effect.acquireRelease(
+      Effect.async<
+        {
+          readonly server: ReturnType<typeof createHttpServer>;
+          readonly port: number;
+        },
+        BoundaryError
+      >((resume) => {
+        const server = createHttpServer((request, response) => {
+          const chunks: Array<Buffer> = [];
+          let size = 0;
+          request.on("data", (chunk: Buffer) => {
+            size += chunk.length;
+            if (size > 1024 * 1024) {
+              request.destroy();
+              response.writeHead(413);
+              response.end();
+              return;
+            }
+            chunks.push(chunk);
+          });
+          request.on("end", () => {
+            const headers = Object.fromEntries(
+              Object.entries(request.headers).flatMap(([key, value]) =>
+                value === undefined
+                  ? []
+                  : [[key, Array.isArray(value) ? value.join(", ") : value]],
+              ),
+            );
+            Effect.runPromise(
+              handler({
+                method: request.method ?? "GET",
+                path: request.url ?? "/",
+                headers,
+                body: new Uint8Array(Buffer.concat(chunks)),
+              }),
+            ).then(
+              (result) => {
+                response.writeHead(result.status, result.headers);
+                response.end(result.body);
+              },
+              (cause) => {
+                response.writeHead(500, {
+                  "content-type": "text/plain; charset=utf-8",
+                });
+                response.end(String(cause));
+              },
+            );
+          });
+        });
+        server.once("error", (cause) =>
+          resume(
+            Effect.fail(
+              new BoundaryError({
+                boundary: "http-server",
+                message: String(cause),
+                retryable: false,
+              }),
+            ),
+          ),
+        );
+        server.listen(requestedPort, "127.0.0.1", () => {
+          const address = server.address();
+          if (address === null || typeof address === "string") {
+            resume(
+              Effect.fail(
+                new BoundaryError({
+                  boundary: "http-server",
+                  message: "loopback server has no TCP address",
+                  retryable: false,
+                }),
+              ),
+            );
+            return;
+          }
+          resume(
+            Effect.succeed({
+              server,
+              port: address.port,
+            }),
+          );
+        });
+      }),
+      ({ server }) =>
+        Effect.promise(async () => {
+          server.closeAllConnections();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }),
+    ).pipe(
+      Effect.map(({ server, port }) => ({
+        port,
+        closed: Effect.async<void, BoundaryError>((resume) => {
+          server.once("close", () => resume(Effect.void));
+        }),
+      })),
+    ),
+});
+
+const runtimeProfileLayer = Layer.succeed(RuntimeProfileService, {
+  heapSnapshot: (path) =>
+    Effect.try({
+      try: () => {
+        writeHeapSnapshot(path);
+      },
+      catch: filesystemError,
+    }),
+  writeTrace: (path, events) =>
+    Effect.tryPromise({
+      try: async () => {
+        await mkdir(dirname(path), { recursive: true });
+        const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+        try {
+          await writeFile(
+            temporary,
+            `${JSON.stringify({ traceEvents: events })}\n`,
+            { encoding: "utf8", flag: "wx", mode: 0o600 },
+          );
+          await rename(temporary, path);
+        } catch (cause) {
+          await rm(temporary, { force: true }).catch(() => undefined);
+          throw cause;
+        }
+      },
+      catch: filesystemError,
+    }),
+});
+
+const systemLayer = Layer.succeed(SystemService, {
+  information: Effect.sync(() => ({
+    architecture: arch(),
+    operatingSystem: operatingSystem(),
+    availableMemoryMegabytes: Math.floor(freemem() / 1024 / 1024),
+    availableCpuCores: availableParallelism(),
+    temporaryDirectory: tmpdir(),
+    userIdentifier:
+      typeof process.getuid === "function" ? String(process.getuid()) : "user",
+    processIdentifier: process.pid,
+  })),
 });
 
 const compressionError = (cause: unknown): BoundaryError =>
@@ -1735,6 +2418,12 @@ const signingLayer = Layer.succeed(SigningService, {
 });
 
 const digestLayer = Layer.succeed(DigestService, {
+  sha256: (value) =>
+    Effect.sync(() =>
+      createHash("sha256")
+        .update(typeof value === "string" ? value : Buffer.from(value))
+        .digest("hex"),
+    ),
   gitBlobSha1: (contents) =>
     Effect.try({
       try: () =>
@@ -1857,17 +2546,21 @@ export const nodeFoundationLayer = Layer.mergeAll(
   terminalLayer,
   clockLayer,
   randomnessLayer,
+  fileWatcherLayer,
+  signalLayer,
   compressionLayer,
   httpLayer,
+  loopbackHttpLayer,
   signingLayer,
   digestLayer,
+  daemonLayer,
+  runtimeProfileLayer,
+  systemLayer,
   Layer.succeed(GitService, boundaryFailure("git")),
   Layer.succeed(PackageManagerService, boundaryFailure("package-manager")),
-  Layer.succeed(SignalService, boundaryFailure("signals")),
   concurrencyLayer,
   Layer.succeed(CredentialService, boundaryFailure("credentials")),
   Layer.succeed(CacheService, boundaryFailure("cache")),
-  Layer.succeed(DaemonService, boundaryFailure("daemon")),
   Layer.succeed(TelemetryService, boundaryFailure("telemetry")),
   Layer.succeed(ObservabilityService, boundaryFailure("observability")),
   deterministicRetryLayer,

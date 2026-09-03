@@ -8,15 +8,19 @@ Turborepo 2.10.12.
 
 ## Status
 
-Compatibility Gate 1 and substantial Gate 2 surfaces are implemented. In
-addition to the identity,
+Compatibility Gate 1, substantial Gate 2 surfaces, and the Gate 3 repository
+workflows are implemented. In addition to the identity,
 schema, Effect, oracle, fixture, hosted-mock, normalizer, and ledger foundation,
 `turbo-ts` now models JavaScript, Cargo, and uv workspaces; loads root and
 package JSON/JSONC configuration; builds package and task graphs; selects
 filters and affected packages; executes explicit or implicit tasks; controls
 task environments and concurrency; and reads and writes compatible local and
-remote cache archives. Only passing automated ledger rows are compatibility
-claims; later commands and protocols remain planned. Gate 2 is not closed
+remote cache archives. Repository workflows include watch/restart recovery, the
+shared daemon lifecycle and HTTP/2 gRPC transport, GraphQL query and affected
+responses, `ls`, lockfile-aware prune, dry runs, task graphs, summaries,
+structured output, completion, system information, and Node/V8 profile
+artifacts. Only passing automated ledger rows are compatibility claims; hosted
+and secondary commands remain planned. Gate 2 is not closed
 because the independent composed task-hash serializer does not yet match the
 official 2.10.12 keys. The bidirectional cache tests prove archive and artifact
 transport compatibility using oracle-provided hashes, not end-to-end cache-key
@@ -33,6 +37,10 @@ pnpm exec turbo --version
 pnpm exec turbo-ts --version
 pnpm exec turbo-ts run build
 pnpm exec turbo-ts build --filter=@scope/package
+pnpm exec turbo-ts watch build
+pnpm exec turbo-ts query '{ packages { length } }'
+pnpm exec turbo-ts ls --output=json
+pnpm exec turbo-ts prune @scope/application --docker
 ```
 
 The expected output is:

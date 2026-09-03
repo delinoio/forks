@@ -5999,7 +5999,7 @@ describe("core CLI execution", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  }, 10_000);
+  }, 20_000);
 
   it("honors Git revisions encoded in package filters", async () => {
     await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });

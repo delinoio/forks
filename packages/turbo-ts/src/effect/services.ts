@@ -66,6 +66,10 @@ export interface FileSystemOperations {
     path: string,
     contents: string,
   ) => Effect.Effect<void, BoundaryError>;
+  readonly writeTextAtomic: (
+    path: string,
+    contents: string,
+  ) => Effect.Effect<void, BoundaryError>;
   readonly appendText: (
     path: string,
     contents: string,
@@ -94,6 +98,10 @@ export interface FileSystemOperations {
     destination: string,
   ) => Effect.Effect<void, BoundaryError>;
   readonly remove: (path: string) => Effect.Effect<void, BoundaryError>;
+  readonly copyFile: (
+    source: string,
+    destination: string,
+  ) => Effect.Effect<void, BoundaryError>;
   readonly realPath: (path: string) => Effect.Effect<string, BoundaryError>;
   readonly withTemporaryDirectory: <A, E, R>(
     use: (path: string) => Effect.Effect<A, E, R>,
@@ -123,6 +131,14 @@ export interface ProcessOperations {
   readonly runBytes: (
     request: BinaryExecutionRequest,
   ) => Effect.Effect<BinaryExecutionResult, ProcessExecutionError, Scope.Scope>;
+  readonly spawnDetached?: (
+    request: BinaryExecutionRequest,
+  ) => Effect.Effect<number, ProcessExecutionError>;
+  readonly isProcessAlive?: (pid: number) => Effect.Effect<boolean>;
+  readonly terminateProcess?: (
+    pid: number,
+    force: boolean,
+  ) => Effect.Effect<void, ProcessExecutionError>;
 }
 
 export class ProcessService extends Context.Tag("turbo-ts/ProcessService")<
@@ -134,6 +150,7 @@ export interface EnvironmentOperations {
   readonly argv: Effect.Effect<ReadonlyArray<string>>;
   readonly cwd: Effect.Effect<string>;
   readonly platform: Effect.Effect<NodeJS.Platform>;
+  readonly executablePath?: Effect.Effect<string>;
   readonly get: (name: string) => Effect.Effect<string | undefined>;
   readonly entries: Effect.Effect<Readonly<Record<string, string | undefined>>>;
 }
@@ -155,6 +172,9 @@ export interface TerminalOperations {
   readonly writeStderr: (text: string) => Effect.Effect<void, BoundaryError>;
   readonly stdoutColorEnabled: Effect.Effect<boolean>;
   readonly stderrColorEnabled: Effect.Effect<boolean>;
+  readonly stdinIsTerminal?: Effect.Effect<boolean>;
+  readonly stdoutIsTerminal?: Effect.Effect<boolean>;
+  readonly columns?: Effect.Effect<number>;
 }
 
 export class TerminalService extends Context.Tag("turbo-ts/TerminalService")<
@@ -191,9 +211,26 @@ export class GitService extends Context.Tag("turbo-ts/GitService")<
 export class PackageManagerService extends Context.Tag(
   "turbo-ts/PackageManagerService",
 )<PackageManagerService, BoundaryOperations>() {}
+export interface FileChange {
+  readonly path: string;
+  readonly kind: "create" | "modify" | "remove" | "rename" | "unknown";
+}
+
+export interface FileWatcherOperations {
+  readonly watch: (root: string) => Stream.Stream<FileChange, BoundaryError>;
+}
+
+export class FileWatcherService extends Context.Tag(
+  "turbo-ts/FileWatcherService",
+)<FileWatcherService, FileWatcherOperations>() {}
+
+export interface SignalOperations {
+  readonly signals: Stream.Stream<"SIGINT" | "SIGTERM">;
+}
+
 export class SignalService extends Context.Tag("turbo-ts/SignalService")<
   SignalService,
-  BoundaryOperations
+  SignalOperations
 >() {}
 export interface ConcurrencyOperations {
   readonly availableParallelism: Effect.Effect<number>;
@@ -285,6 +322,9 @@ export class SigningService extends Context.Tag("turbo-ts/SigningService")<
   SigningOperations
 >() {}
 export interface DigestOperations {
+  readonly sha256?: (
+    value: string | Uint8Array,
+  ) => Effect.Effect<string, BoundaryError>;
   readonly gitBlobSha1: (
     contents: Uint8Array,
   ) => Effect.Effect<string, BoundaryError>;
@@ -298,9 +338,101 @@ export class DigestService extends Context.Tag("turbo-ts/DigestService")<
   DigestService,
   DigestOperations
 >() {}
+export interface DaemonRequest {
+  readonly id: string;
+  readonly method: string;
+  readonly params?: unknown;
+}
+
+export interface DaemonResponse {
+  readonly id: string;
+  readonly result?: unknown;
+  readonly error?: string;
+}
+
+export interface DaemonConnection {
+  readonly requests: Stream.Stream<DaemonRequest, BoundaryError>;
+  readonly respond: (
+    response: DaemonResponse,
+  ) => Effect.Effect<void, BoundaryError>;
+}
+
+export interface DaemonOperations {
+  readonly serve: (
+    endpoint: string,
+  ) => Stream.Stream<DaemonConnection, BoundaryError>;
+  readonly request: (
+    endpoint: string,
+    request: DaemonRequest,
+    timeoutMilliseconds?: number,
+  ) => Effect.Effect<DaemonResponse, BoundaryError>;
+}
+
 export class DaemonService extends Context.Tag("turbo-ts/DaemonService")<
   DaemonService,
-  BoundaryOperations
+  DaemonOperations
+>() {}
+
+export interface LoopbackHttpRequest {
+  readonly method: string;
+  readonly path: string;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly body: Uint8Array;
+}
+
+export interface LoopbackHttpResponse {
+  readonly status: number;
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly body: Uint8Array | string;
+}
+
+export interface LoopbackHttpServer {
+  readonly port: number;
+  readonly closed: Effect.Effect<void, BoundaryError>;
+}
+
+export interface LoopbackHttpOperations {
+  readonly serve: (
+    port: number,
+    handler: (
+      request: LoopbackHttpRequest,
+    ) => Effect.Effect<LoopbackHttpResponse, BoundaryError>,
+  ) => Effect.Effect<LoopbackHttpServer, BoundaryError, Scope.Scope>;
+}
+
+export class LoopbackHttpService extends Context.Tag(
+  "turbo-ts/LoopbackHttpService",
+)<LoopbackHttpService, LoopbackHttpOperations>() {}
+
+export interface RuntimeProfileOperations {
+  readonly heapSnapshot: (path: string) => Effect.Effect<void, BoundaryError>;
+  readonly writeTrace: (
+    path: string,
+    events: ReadonlyArray<Readonly<Record<string, unknown>>>,
+  ) => Effect.Effect<void, BoundaryError>;
+}
+
+export class RuntimeProfileService extends Context.Tag(
+  "turbo-ts/RuntimeProfileService",
+)<RuntimeProfileService, RuntimeProfileOperations>() {}
+
+export interface SystemInformation {
+  readonly architecture: string;
+  readonly operatingSystem: string;
+  readonly availableMemoryMegabytes: number;
+  readonly availableCpuCores: number;
+  readonly temporaryDirectory: string;
+  readonly userIdentifier: string;
+  readonly processIdentifier: number;
+}
+
+export interface SystemOperations {
+  readonly information: Effect.Effect<SystemInformation>;
+}
+
+export class SystemService extends Context.Tag("turbo-ts/SystemService")<
+  SystemService,
+  SystemOperations
 >() {}
 export class TelemetryService extends Context.Tag("turbo-ts/TelemetryService")<
   TelemetryService,

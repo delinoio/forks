@@ -33,29 +33,34 @@ export interface ParsedRunOptions {
   readonly rootTurboJson?: string;
   readonly noColor: boolean;
   readonly dangerouslyDisablePackageManagerCheck: boolean;
+  readonly dryRun?: "text" | "json";
+  readonly graph?: string;
+  readonly summarize: boolean;
+  readonly profile?: string;
+  readonly anonymousProfile?: string;
+  readonly heap?: string;
+  readonly trace?: string;
+  readonly ui?: "tui" | "stream" | "stream-with-experimental-timestamps";
+  readonly json: boolean;
+  readonly logFile?: string;
+  readonly logOrder?: "auto" | "stream" | "grouped";
+  readonly logPrefix?: "auto" | "none" | "task";
 }
 
 const unsupportedCommands = new Set([
   "bin",
   "boundaries",
-  "completion",
   "config",
-  "daemon",
   "devtools",
   "docs",
   "generate",
   "get-mfe-port",
-  "info",
   "link",
   "login",
   "logout",
-  "ls",
-  "prune",
-  "query",
   "scan",
   "telemetry",
   "unlink",
-  "watch",
 ]);
 
 export const isLaterGateCommand = (value: string): boolean =>
@@ -114,6 +119,18 @@ export const parseRunArguments = (
   let rootTurboJson: string | undefined;
   let noColor = false;
   let dangerouslyDisablePackageManagerCheck = false;
+  let dryRun: "text" | "json" | undefined;
+  let graph: string | undefined;
+  let summarize = false;
+  let profile: string | undefined;
+  let anonymousProfile: string | undefined;
+  let heap: string | undefined;
+  let trace: string | undefined;
+  let ui: ParsedRunOptions["ui"];
+  let json = false;
+  let logFile: string | undefined;
+  let logOrder: ParsedRunOptions["logOrder"];
+  let logPrefix: ParsedRunOptions["logPrefix"];
   for (let index = start; index < arguments_.length; index += 1) {
     const argument = arguments_[index]!;
     if (!argument.startsWith("-")) {
@@ -244,13 +261,161 @@ export const parseRunArguments = (
       case "--dangerously-disable-package-manager-check":
         dangerouslyDisablePackageManagerCheck = true;
         break;
+      case "--dry":
+      case "--dry-run": {
+        const adjacent = arguments_[index + 1];
+        const consumesAdjacent = adjacent === "text" || adjacent === "json";
+        const value = argument.includes("=")
+          ? argument.slice(argument.indexOf("=") + 1)
+          : consumesAdjacent
+            ? adjacent
+            : "text";
+        if (consumesAdjacent) index += 1;
+        if (value !== "text" && value !== "json") {
+          throw new ConfigurationError({
+            path: "<arguments>",
+            message: `invalid dry-run format: ${value}`,
+          });
+        }
+        dryRun = value;
+        break;
+      }
+      case "--graph": {
+        const adjacent = arguments_[index + 1];
+        const consumesAdjacent =
+          !argument.includes("=") &&
+          adjacent !== undefined &&
+          !adjacent.startsWith("-");
+        graph = argument.includes("=")
+          ? argument.slice(argument.indexOf("=") + 1)
+          : consumesAdjacent
+            ? adjacent
+            : "";
+        if (consumesAdjacent) index += 1;
+        break;
+      }
+      case "--summarize": {
+        const adjacent = arguments_[index + 1];
+        const consumesAdjacent = adjacent === "true" || adjacent === "false";
+        summarize = argument.includes("=")
+          ? !argument.endsWith("=false")
+          : consumesAdjacent
+            ? adjacent === "true"
+            : true;
+        if (consumesAdjacent) index += 1;
+        break;
+      }
+      case "--profile": {
+        const adjacent = arguments_[index + 1];
+        if (argument.includes("=")) {
+          profile = argument.slice(argument.indexOf("=") + 1);
+        } else if (adjacent !== undefined && !adjacent.startsWith("-")) {
+          profile = adjacent;
+          index += 1;
+        } else {
+          profile = "";
+        }
+        break;
+      }
+      case "--anon-profile": {
+        const adjacent = arguments_[index + 1];
+        if (argument.includes("=")) {
+          anonymousProfile = argument.slice(argument.indexOf("=") + 1);
+        } else if (adjacent !== undefined && !adjacent.startsWith("-")) {
+          anonymousProfile = adjacent;
+          index += 1;
+        } else {
+          anonymousProfile = "";
+        }
+        break;
+      }
+      case "--heap":
+        [heap, index] = optionValue(arguments_, index, name);
+        break;
+      case "--trace":
+        [trace, index] = optionValue(arguments_, index, name);
+        break;
+      case "--ui": {
+        let value: string;
+        [value, index] = optionValue(arguments_, index, name);
+        if (
+          value !== "tui" &&
+          value !== "stream" &&
+          value !== "stream-with-experimental-timestamps"
+        ) {
+          throw new ConfigurationError({
+            path: "<arguments>",
+            message: `invalid UI mode: ${value}`,
+          });
+        }
+        ui = value;
+        break;
+      }
+      case "--json":
+        json = true;
+        break;
+      case "--log-file": {
+        const adjacent = arguments_[index + 1];
+        const consumesAdjacent =
+          !argument.includes("=") &&
+          adjacent !== undefined &&
+          !adjacent.startsWith("-");
+        logFile = argument.includes("=")
+          ? argument.slice(argument.indexOf("=") + 1)
+          : consumesAdjacent
+            ? adjacent
+            : "";
+        if (consumesAdjacent) index += 1;
+        break;
+      }
+      case "--log-order": {
+        let value: string;
+        [value, index] = optionValue(arguments_, index, name);
+        if (value !== "auto" && value !== "stream" && value !== "grouped") {
+          throw new ConfigurationError({
+            path: "<arguments>",
+            message: `invalid log order: ${value}`,
+          });
+        }
+        logOrder = value;
+        break;
+      }
+      case "--log-prefix": {
+        let value: string;
+        [value, index] = optionValue(arguments_, index, name);
+        if (value !== "auto" && value !== "none" && value !== "task") {
+          throw new ConfigurationError({
+            path: "<arguments>",
+            message: `invalid log prefix: ${value}`,
+          });
+        }
+        logPrefix = value;
+        break;
+      }
       case "--color":
       case "--no-daemon":
       case "--daemon":
       case "--no-update-notifier":
+      case "--skip-infer":
+      case "--single-package":
+      case "--experimental-otel-enabled":
+      case "--experimental-otel-metrics-run-summary":
+      case "--experimental-otel-metrics-task-details":
+      case "--experimental-otel-use-remote-cache-token":
         break;
-      case "--ui":
       case "--verbosity": {
+        [, index] = optionValue(arguments_, index, name);
+        break;
+      }
+      case "--cache-workers":
+      case "--global-deps":
+      case "--login":
+      case "--experimental-otel-protocol":
+      case "--experimental-otel-endpoint":
+      case "--experimental-otel-timeout-ms":
+      case "--experimental-otel-interval-ms":
+      case "--experimental-otel-header":
+      case "--experimental-otel-resource": {
         [, index] = optionValue(arguments_, index, name);
         break;
       }
@@ -294,6 +459,18 @@ export const parseRunArguments = (
     rootTurboJson,
     noColor,
     dangerouslyDisablePackageManagerCheck,
+    dryRun,
+    graph,
+    summarize,
+    profile,
+    anonymousProfile,
+    heap,
+    trace,
+    ui,
+    json,
+    logFile,
+    logOrder,
+    logPrefix,
   };
 };
 
