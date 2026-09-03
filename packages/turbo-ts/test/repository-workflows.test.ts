@@ -33,6 +33,31 @@ const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const fixture = join(packageRoot, "test/fixtures/basic-workspace");
 const candidate = join(packageRoot, "dist/bin/turbo-ts.js");
 const official = join(repositoryRoot, "node_modules/.bin/turbo");
+// Keep Gate 3 output comparisons independent of ambient Gate 4 CI and color
+// behavior. Remove this override when environment.platform gains coverage.
+const ambientOutputEnvironmentNames = new Set([
+  "CI",
+  "FORCE_COLOR",
+  "GITHUB_ACTIONS",
+  "NO_COLOR",
+  "TURBO_TELEMETRY_DISABLED",
+]);
+const differentialEnvironment: NodeJS.ProcessEnv = {
+  ...Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name]) => !ambientOutputEnvironmentNames.has(name.toUpperCase()),
+    ),
+  ),
+  NO_COLOR: "1",
+  TURBO_TELEMETRY_DISABLED: "1",
+};
+const executeDifferentialCommand = (
+  executable: string,
+  arguments_: ReadonlyArray<string>,
+) =>
+  execFilePromise(executable, [...arguments_], {
+    env: differentialEnvironment,
+  });
 const workflowLockfile = `lockfileVersion: '9.0'
 settings:
   autoInstallPeers: true
@@ -145,14 +170,14 @@ describe("repository workflow gate", () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-workflow-"));
     try {
       await prepareFixture(directory);
-      const listed = await execFilePromise(process.execPath, [
+      const listed = await executeDifferentialCommand(process.execPath, [
         candidate,
         "--cwd",
         directory,
         "ls",
         "--output=json",
       ]);
-      const officialList = await execFilePromise(official, [
+      const officialList = await executeDifferentialCommand(official, [
         "--cwd",
         directory,
         "ls",
@@ -166,14 +191,14 @@ describe("repository workflow gate", () => {
         packageManager: "pnpm9",
         packages: { count: 2 },
       });
-      const queried = await execFilePromise(process.execPath, [
+      const queried = await executeDifferentialCommand(process.execPath, [
         candidate,
         "query",
         "{ packages { length } version }",
         "--cwd",
         directory,
       ]);
-      const officialQuery = await execFilePromise(official, [
+      const officialQuery = await executeDifferentialCommand(official, [
         "query",
         "{ packages { length } version }",
         "--cwd",
@@ -188,14 +213,14 @@ describe("repository workflow gate", () => {
       });
       const fileQuery =
         '{ file(path: "package.json") { path absolutePath contents ast } }';
-      const queriedFile = await execFilePromise(process.execPath, [
+      const queriedFile = await executeDifferentialCommand(process.execPath, [
         candidate,
         "query",
         fileQuery,
         "--cwd",
         directory,
       ]);
-      const officialFile = await execFilePromise(official, [
+      const officialFile = await executeDifferentialCommand(official, [
         "query",
         fileQuery,
         "--cwd",
@@ -565,7 +590,7 @@ describe("repository workflow gate", () => {
     const output = join(directory, "result");
     try {
       await prepareFixture(directory);
-      const reference = await execFilePromise(official, [
+      const reference = await executeDifferentialCommand(official, [
         "--cwd",
         directory,
         "prune",
@@ -574,14 +599,17 @@ describe("repository workflow gate", () => {
       ]);
       const referenceTree = await readTextTree(output);
       await rm(output, { force: true, recursive: true });
-      const implementation = await execFilePromise(process.execPath, [
-        candidate,
-        "--cwd",
-        directory,
-        "prune",
-        "synthetic-app",
-        "--out-dir=result",
-      ]);
+      const implementation = await executeDifferentialCommand(
+        process.execPath,
+        [
+          candidate,
+          "--cwd",
+          directory,
+          "prune",
+          "synthetic-app",
+          "--out-dir=result",
+        ],
+      );
       expect(implementation.stdout).toBe(reference.stdout);
       expect(normalizeOutput(implementation.stderr, ["branding"])).toBe(
         reference.stderr,
@@ -630,11 +658,14 @@ describe("repository workflow gate", () => {
           "--cwd",
           directory,
         ];
-        const reference = await execFilePromise(official, arguments_);
-        const implementation = await execFilePromise(process.execPath, [
-          candidate,
-          ...arguments_,
-        ]);
+        const reference = await executeDifferentialCommand(
+          official,
+          arguments_,
+        );
+        const implementation = await executeDifferentialCommand(
+          process.execPath,
+          [candidate, ...arguments_],
+        );
         expect(implementation.stdout).toBe(reference.stdout);
         expect(normalizeOutput(implementation.stderr, ["branding"])).toBe(
           reference.stderr,
