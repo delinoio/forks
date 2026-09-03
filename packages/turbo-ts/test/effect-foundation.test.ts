@@ -1,21 +1,30 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { fstatSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, it } from "@rstest/core";
-import { Effect, Fiber, Schedule, Schema } from "effect";
+import { Effect, Fiber, Schedule, Schema, Stream } from "effect";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import {
+  collectChildProcessBytes,
   collectChildProcessOutput,
   makeChildEnvironment,
   makeTerminalOperations,
   makeTerminalWriter,
+  makeWindowsProcessTreeState,
   makeWithTemporaryDirectory,
   nodeFoundationLayer,
+  resolveSpawnInvocation,
+  windowsProcessTreeTerminationInvocation,
 } from "../src/effect/node-layer.js";
 import {
+  CompressionService,
+  FileSystemService,
+  HttpService,
   ProcessService,
   RandomnessService,
   TerminalService,
@@ -33,6 +42,30 @@ const waitForTextFile = async (path: string): Promise<string> => {
 };
 
 describe("Effect foundation", () => {
+  it("streams UTF-8 text through bounded filesystem chunks", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-text-stream-"));
+    const path = join(directory, "large.log");
+    const source = `${"🙂value".repeat(40_000)}\n`;
+    try {
+      await writeFile(path, source);
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          return yield* fileSystem.readTextChunks(path).pipe(
+            Stream.runFold({ chunks: 0, text: "" }, (state, chunk) => ({
+              chunks: state.chunks + 1,
+              text: state.text + chunk,
+            })),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(result.chunks).toBeGreaterThan(1);
+      expect(result.text).toBe(source);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("schema-validates tagged boundary errors", () => {
     const error = Schema.decodeUnknownSync(BoundaryError)({
       _tag: "BoundaryError",
@@ -122,7 +155,7 @@ describe("Effect foundation", () => {
     expect(stream.listenerCount("error")).toBe(0);
   });
 
-  it("determines color support from each destination stream", async () => {
+  it("enables color for every destination unless NO_COLOR is set", async () => {
     const makeStream = (isTTY: boolean) =>
       Object.assign(
         new Writable({
@@ -139,7 +172,7 @@ describe("Effect foundation", () => {
       await Effect.runPromise(
         Effect.all([terminal.stdoutColorEnabled, terminal.stderrColorEnabled]),
       ),
-    ).toEqual([true, false]);
+    ).toEqual([true, true]);
 
     const noColorTerminal = makeTerminalOperations(stdout, stderr, () => "1");
     expect(
@@ -172,6 +205,211 @@ describe("Effect foundation", () => {
     }
   });
 
+  it("treats a zero HTTP timeout as unlimited", async () => {
+    const server = createServer((_request, response) => {
+      setTimeout(() => {
+        response.writeHead(200);
+        response.end("ok");
+      }, 25);
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    try {
+      const response = await Effect.runPromise(
+        HttpService.pipe(
+          Effect.flatMap((http) =>
+            http.request({
+              url: `http://127.0.0.1:${address.port}`,
+              method: "GET",
+              timeoutMilliseconds: 0,
+            }),
+          ),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(response.status).toBe(200);
+      expect(new TextDecoder().decode(response.body)).toBe("ok");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("bounds streamed HTTP responses and decompressed output", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200);
+      response.write("123");
+      response.end("45");
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-zstd-limit-"));
+    try {
+      const httpOutcome = await Effect.runPromise(
+        HttpService.pipe(
+          Effect.flatMap((http) =>
+            http.request({
+              url: `http://127.0.0.1:${address.port}`,
+              method: "GET",
+              maxResponseBodyBytes: 4,
+            }),
+          ),
+          Effect.either,
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(httpOutcome._tag).toBe("Left");
+      if (httpOutcome._tag === "Left") {
+        expect(httpOutcome.left.retryable).toBe(false);
+        expect(httpOutcome.left.message).toContain("4 byte limit");
+      }
+      const streamedHttpPath = join(directory, "response.bin");
+      const streamedHttpOutcome = await Effect.runPromise(
+        HttpService.pipe(
+          Effect.flatMap((http) =>
+            http.downloadToFile(
+              {
+                url: `http://127.0.0.1:${address.port}`,
+                method: "GET",
+                maxResponseBodyBytes: 4,
+              },
+              streamedHttpPath,
+            ),
+          ),
+          Effect.either,
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(streamedHttpOutcome._tag).toBe("Left");
+      await expect(readFile(streamedHttpPath)).rejects.toThrow();
+      await Effect.runPromise(
+        HttpService.pipe(
+          Effect.flatMap((http) =>
+            http.downloadToFile(
+              {
+                url: `http://127.0.0.1:${address.port}`,
+                method: "GET",
+                maxResponseBodyBytes: 5,
+              },
+              streamedHttpPath,
+            ),
+          ),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(await readFile(streamedHttpPath, "utf8")).toBe("12345");
+
+      const decompressionOutcome = await Effect.runPromise(
+        Effect.gen(function* () {
+          const compression = yield* CompressionService;
+          const compressed = yield* compression.compressZstd(
+            new TextEncoder().encode("12345"),
+          );
+          return yield* Effect.either(
+            compression.decompressZstd(compressed, 4),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(decompressionOutcome._tag).toBe("Left");
+
+      const streamedDecompressionOutcome = await Effect.runPromise(
+        Effect.gen(function* () {
+          const compression = yield* CompressionService;
+          const compressed = yield* compression.compressZstd(
+            new TextEncoder().encode("12345"),
+          );
+          return yield* Effect.either(
+            compression.decompressZstdToFile(
+              compressed,
+              join(directory, "archive.tar"),
+              4,
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(streamedDecompressionOutcome._tag).toBe("Left");
+
+      const fileDecompressionOutcome = await Effect.runPromise(
+        Effect.gen(function* () {
+          const compression = yield* CompressionService;
+          const compressed = yield* compression.compressZstd(
+            new TextEncoder().encode("12345"),
+          );
+          const source = join(directory, "archive.tar.zst");
+          yield* Effect.promise(() => writeFile(source, compressed));
+          return yield* Effect.either(
+            compression.decompressZstdFileToFile(
+              source,
+              join(directory, "archive-from-file.tar"),
+              4,
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(fileDecompressionOutcome._tag).toBe("Left");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("aborts HTTP requests when their Effect is interrupted", async () => {
+    let markRequestStarted: (() => void) | undefined;
+    const requestStarted = new Promise<void>((resolve) => {
+      markRequestStarted = resolve;
+    });
+    let markRequestClosed: (() => void) | undefined;
+    const requestClosed = new Promise<void>((resolve) => {
+      markRequestClosed = resolve;
+    });
+    const server = createServer((request, response) => {
+      markRequestStarted?.();
+      request.on("aborted", () => markRequestClosed?.());
+      response.on("close", () => markRequestClosed?.());
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    try {
+      const fiber = Effect.runFork(
+        HttpService.pipe(
+          Effect.flatMap((http) =>
+            http.request({
+              url: `http://127.0.0.1:${address.port}`,
+              method: "GET",
+              timeoutMilliseconds: 0,
+            }),
+          ),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      await requestStarted;
+      await Effect.runPromise(Fiber.interrupt(fiber));
+      await Promise.race([
+        requestClosed,
+        delay(1_000).then(() => {
+          throw new Error("interrupted request remained open");
+        }),
+      ]);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("removes undefined environment overrides before spawning", async () => {
     const environmentName = "TURBO_TS_UNDEFINED_OVERRIDE_TEST";
     const previousValue = process.env[environmentName];
@@ -193,7 +431,12 @@ describe("Effect foundation", () => {
           }),
         ).pipe(Effect.provide(nodeFoundationLayer)),
       );
-      expect(result).toEqual({ exitCode: 0, stdout: "false", stderr: "" });
+      expect(result).toEqual({
+        exitCode: 0,
+        stdout: "false",
+        stderr: "",
+        combinedOutput: "false",
+      });
     } finally {
       if (previousValue === undefined) {
         delete process.env[environmentName];
@@ -223,6 +466,47 @@ describe("Effect foundation", () => {
     ).toEqual({ Path: "inherited" });
   });
 
+  it("adapts Windows package-manager command shims without changing POSIX", () => {
+    const commandInterpreter = "C:\\Windows\\System32\\cmd.exe";
+    for (const manager of ["npm", "pnpm", "yarn"]) {
+      const invocation = resolveSpawnInvocation(
+        manager,
+        ["run", "build task", "", "a&b", "100%", 'say"hi', "tail\\"],
+        "win32",
+        commandInterpreter,
+      );
+      expect(invocation.command).toBe(commandInterpreter);
+      expect(invocation.args.slice(0, 4)).toEqual(["/d", "/s", "/v:off", "/c"]);
+      expect(invocation.args[4]).toContain(`${manager}.cmd`);
+      expect(invocation.args[4]).toContain("^^^&");
+      expect(invocation.args[4]).toContain("^^^%");
+      expect(invocation.windowsVerbatimArguments).toBe(true);
+    }
+    expect(resolveSpawnInvocation("pnpm", ["run", "build"], "linux")).toEqual({
+      command: "pnpm",
+      args: ["run", "build"],
+      windowsVerbatimArguments: false,
+    });
+    expect(windowsProcessTreeTerminationInvocation(42)).toEqual({
+      command: "taskkill.exe",
+      args: ["/pid", "42", "/t", "/f"],
+    });
+  });
+
+  it("retains live Windows descendants after parent exit without PID reuse", () => {
+    const state = makeWindowsProcessTreeState();
+    state.recordStart(102, 101);
+    state.registerRoot(100);
+    state.recordStart(101, 100);
+    state.recordStop(100);
+    state.recordStop(101);
+    expect(state.liveDescendantProcessIds()).toEqual([102]);
+
+    state.recordStop(102);
+    state.recordStart(102, 999);
+    expect(state.liveDescendantProcessIds()).toEqual([]);
+  });
+
   it("reports synchronous spawn failures as typed errors", async () => {
     const command = `${process.execPath}\u0000`;
     const outcome = await Effect.runPromise(
@@ -243,6 +527,42 @@ describe("Effect foundation", () => {
     if (outcome._tag === "Left") {
       expect(outcome.left).toBeInstanceOf(ProcessExecutionError);
       expect(outcome.left.command).toBe(command);
+    }
+  });
+
+  it("inherits all three parent descriptors for interactive processes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-inherit-test-"));
+    const resultPath = join(directory, "descriptors.json");
+    const descriptorIdentity = (descriptor: number): string => {
+      const metadata = fstatSync(descriptor, { bigint: true });
+      return `${metadata.dev}:${metadata.ino}`;
+    };
+    const expected = [0, 1, 2].map(descriptorIdentity);
+    const script =
+      'const fs = require("node:fs"); const actual = [0, 1, 2].map((fd) => { const value = fs.fstatSync(fd, { bigint: true }); return String(value.dev) + ":" + String(value.ino); }); fs.writeFileSync(process.argv[1], JSON.stringify(actual));';
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            return yield* processService.run({
+              command: process.execPath,
+              args: ["-e", script, resultPath],
+              cwd: directory,
+              stdio: "inherit",
+            });
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(result).toEqual({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        combinedOutput: "",
+      });
+      expect(JSON.parse(await readFile(resultPath, "utf8"))).toEqual(expected);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
     }
   });
 
@@ -297,6 +617,105 @@ describe("Effect foundation", () => {
           process.kill(pid, "SIGKILL");
         } catch {
           // The scoped finalizer already terminated the expected process tree.
+        }
+      }
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("terminates descendants launched through Windows command shims", async () => {
+    if (process.platform !== "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-shim-tree-"));
+    const workerPath = join(directory, "worker.cjs");
+    const parentPath = join(directory, "parent.cjs");
+    const shimPath = join(directory, "task.cmd");
+    const workerPidPath = join(directory, "worker-pid");
+    const heartbeatPath = join(directory, "heartbeat");
+    let workerPid: number | undefined;
+    try {
+      await writeFile(
+        workerPath,
+        'const fs = require("node:fs"); fs.writeFileSync(process.argv[2], String(process.pid)); setInterval(() => fs.writeFileSync(process.argv[3], String(Date.now())), 10);\n',
+      );
+      await writeFile(
+        parentPath,
+        'const { spawn } = require("node:child_process"); const fs = require("node:fs"); const worker = spawn(process.execPath, [process.argv[2], process.argv[3], process.argv[4]], { detached: true, stdio: "ignore" }); worker.unref(); const deadline = Date.now() + 2_000; while (!fs.existsSync(process.argv[3]) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); if (!fs.existsSync(process.argv[3])) process.exitCode = 1;\n',
+      );
+      await writeFile(
+        shimPath,
+        `@echo off\r\n"${process.execPath}" "${parentPath}" "${workerPath}" "${workerPidPath}" "${heartbeatPath}"\r\n`,
+      );
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            return yield* processService.run({
+              command: shimPath,
+              args: [],
+              cwd: directory,
+            });
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(result.exitCode).toBe(0);
+      workerPid = Number(await waitForTextFile(workerPidPath));
+      await waitForTextFile(heartbeatPath);
+      const heartbeat = await readFile(heartbeatPath, "utf8");
+      await delay(100);
+      expect(await readFile(heartbeatPath, "utf8")).toBe(heartbeat);
+      expect(() => process.kill(workerPid as number, 0)).toThrow();
+    } finally {
+      if (workerPid !== undefined) {
+        try {
+          process.kill(workerPid, "SIGKILL");
+        } catch {
+          // The scoped finalizer already terminated the expected descendant.
+        }
+      }
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("terminates owned process groups after their leaders exit", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-group-test-"));
+    const workerPidPath = join(directory, "worker-pid");
+    const heartbeatPath = join(directory, "heartbeat");
+    let workerPid: number | undefined;
+    try {
+      const workerScript =
+        'const fs = require("node:fs"); process.on("SIGTERM", () => {}); fs.writeFileSync(process.argv[1], String(process.pid)); fs.writeFileSync(process.argv[2], "ready"); setInterval(() => fs.writeFileSync(process.argv[2], String(Date.now())), 10);';
+      const leaderScript =
+        'const { spawn } = require("node:child_process"); const fs = require("node:fs"); const worker = spawn(process.execPath, ["-e", process.argv[3], process.argv[1], process.argv[2]], { stdio: "ignore" }); worker.unref(); const timer = setInterval(() => { if (fs.existsSync(process.argv[2])) clearInterval(timer); }, 10);';
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            return yield* processService.run({
+              command: process.execPath,
+              args: [
+                "-e",
+                leaderScript,
+                workerPidPath,
+                heartbeatPath,
+                workerScript,
+              ],
+              cwd: directory,
+            });
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(result.exitCode).toBe(0);
+      workerPid = Number(await waitForTextFile(workerPidPath));
+      const heartbeat = await readFile(heartbeatPath, "utf8");
+      await delay(100);
+      expect(await readFile(heartbeatPath, "utf8")).toBe(heartbeat);
+    } finally {
+      if (workerPid !== undefined) {
+        try {
+          process.kill(workerPid, "SIGKILL");
+        } catch {
+          // The scoped finalizer already terminated the expected descendant.
         }
       }
       await rm(directory, { force: true, recursive: true });
@@ -364,6 +783,213 @@ describe("Effect foundation", () => {
         expect(outcome.left.command).toBe(command);
       }
     }
+  });
+
+  it("waits for raw child output streams to drain after close", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let close: ((exitCode: number | null) => void) | undefined;
+    const fiber = Effect.runFork(
+      collectChildProcessBytes(
+        {
+          stdin,
+          stdout,
+          stderr,
+          onceClose: (listener) => {
+            close = listener;
+          },
+          onceError: () => {
+            // The synthetic process exits through the close callback.
+          },
+        },
+        "synthetic-raw-output",
+        undefined,
+      ),
+    );
+    await Effect.runPromise(Effect.yieldNow());
+    close?.(0);
+    expect((await Effect.runPromise(Fiber.poll(fiber)))._tag).toBe("None");
+    stdout.end(Buffer.from([0x70, 0xff]));
+    stderr.end(Buffer.from([0x65, 0xfe]));
+    const result = await Effect.runPromise(Fiber.join(fiber));
+    expect(result.exitCode).toBe(0);
+    expect([...result.stdout]).toEqual([0x70, 0xff]);
+    expect([...result.stderr]).toEqual([0x65, 0xfe]);
+  });
+
+  it("preserves observed stdout and stderr chunk order", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const observed: Array<string> = [];
+    let close: ((exitCode: number | null) => void) | undefined;
+    const fiber = Effect.runFork(
+      collectChildProcessOutput(
+        {
+          stdin,
+          stdout,
+          stderr,
+          onceClose: (listener) => {
+            close = listener;
+          },
+          onceError: () => {
+            // The synthetic process exits through the close callback.
+          },
+        },
+        "synthetic-interleaved-output",
+        undefined,
+        false,
+        (chunk) => observed.push(chunk),
+      ),
+    );
+    await Effect.runPromise(Effect.yieldNow());
+    stdout.write("stdout-one\n");
+    stderr.write("stderr-one\n");
+    stdout.write("stdout-two\n");
+    close?.(0);
+    const result = await Effect.runPromise(Fiber.join(fiber));
+    expect(result).toEqual({
+      exitCode: 0,
+      stdout: "stdout-one\nstdout-two\n",
+      stderr: "stderr-one\n",
+      combinedOutput: "stdout-one\nstderr-one\nstdout-two\n",
+    });
+    expect(observed).toEqual(["stdout-one\n", "stderr-one\n", "stdout-two\n"]);
+  });
+
+  it("bounds captured output while preserving streamed chunks", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const observed: Array<string> = [];
+    let close: ((exitCode: number | null) => void) | undefined;
+    const fiber = Effect.runFork(
+      collectChildProcessOutput(
+        {
+          stdin,
+          stdout,
+          stderr,
+          onceClose: (listener) => {
+            close = listener;
+          },
+          onceError: () => {
+            // The synthetic process exits through the close callback.
+          },
+        },
+        "synthetic-bounded-output",
+        undefined,
+        false,
+        (chunk) => observed.push(chunk),
+        8,
+      ),
+    );
+    await Effect.runPromise(Effect.yieldNow());
+    stdout.write("stdout-123");
+    stderr.write("stderr-456");
+    close?.(0);
+    const result = await Effect.runPromise(Fiber.join(fiber));
+    expect(result).toEqual({
+      exitCode: 0,
+      stdout: "dout-123",
+      stderr: "derr-456",
+      combinedOutput: "derr-456",
+    });
+    expect(observed).toEqual(["stdout-123", "stderr-456"]);
+  });
+
+  it("backpressures child output until an asynchronous sink catches up", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const observed: Array<string> = [];
+    let close: ((exitCode: number | null) => void) | undefined;
+    let releaseFirstChunk: (() => void) | undefined;
+    const firstChunkConsumed = new Promise<void>((resolve) => {
+      releaseFirstChunk = resolve;
+    });
+    const fiber = Effect.runFork(
+      collectChildProcessOutput(
+        {
+          stdin,
+          stdout,
+          stderr,
+          onceClose: (listener) => {
+            close = listener;
+          },
+          onceError: () => {
+            // The synthetic process exits through the close callback.
+          },
+        },
+        "synthetic-backpressured-output",
+        undefined,
+        false,
+        async (chunk) => {
+          observed.push(chunk);
+          if (observed.length === 1) await firstChunkConsumed;
+        },
+      ),
+    );
+    await Effect.runPromise(Effect.yieldNow());
+    stdout.write("first\n");
+    expect(stdout.isPaused()).toBe(true);
+    expect(stderr.isPaused()).toBe(true);
+    stderr.write("second\n");
+    close?.(0);
+    expect((await Effect.runPromise(Fiber.poll(fiber)))._tag).toBe("None");
+    releaseFirstChunk?.();
+    const result = await Effect.runPromise(Fiber.join(fiber));
+    expect(observed).toEqual(["first\n", "second\n"]);
+    expect(result.combinedOutput).toBe("first\nsecond\n");
+  });
+
+  it("waits for every concurrent asynchronous output sink", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const observed: Array<string> = [];
+    const releases: Array<() => void> = [];
+    let close: ((exitCode: number | null) => void) | undefined;
+    const fiber = Effect.runFork(
+      collectChildProcessOutput(
+        {
+          stdin,
+          stdout,
+          stderr,
+          onceClose: (listener) => {
+            close = listener;
+          },
+          onceError: () => {
+            // The synthetic process exits through the close callback.
+          },
+        },
+        "synthetic-concurrent-backpressure",
+        undefined,
+        false,
+        (chunk) =>
+          new Promise<void>((resolve) => {
+            observed.push(chunk);
+            releases.push(resolve);
+          }),
+      ),
+    );
+    await Effect.runPromise(Effect.yieldNow());
+    stdout.emit("data", "stdout\n");
+    stderr.emit("data", "stderr\n");
+    close?.(0);
+    expect(releases).toHaveLength(2);
+    releases[0]?.();
+    await delay(0);
+    const pausedAfterFirstCompletion = [stdout.isPaused(), stderr.isPaused()];
+    const statusAfterFirstCompletion = await Effect.runPromise(
+      Fiber.poll(fiber),
+    );
+    releases[1]?.();
+    const result = await Effect.runPromise(Fiber.join(fiber));
+    expect(pausedAfterFirstCompletion).toEqual([true, true]);
+    expect(statusAfterFirstCompletion._tag).toBe("None");
+    expect(observed).toEqual(["stdout\n", "stderr\n"]);
+    expect(result.combinedOutput).toBe("stdout\nstderr\n");
   });
 
   it("generates canonical lowercase UUID v7 identifiers", async () => {

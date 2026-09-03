@@ -44,6 +44,11 @@ export const validNullTasksWorkspaceType: WorkspaceSchema = {
   tasks: null,
 };
 
+export const validWorkspaceTaskExclusionType: WorkspaceSchema = {
+  extends: ["//"],
+  tasks: { lint: { extends: false } },
+};
+
 export const invalidRootType: RootSchema = {
   tasks: {
     build: {

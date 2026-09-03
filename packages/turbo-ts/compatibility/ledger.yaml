@@ -15,7 +15,7 @@ rows:
   - id: cli.commands
     category: command
     subject: accepted command and implicit-task inventory
-    targetGate: 2
+    targetGate: 3
     status: planned
     variants:
       - bin
@@ -43,10 +43,17 @@ rows:
       - watch
       - unlink
     source: issue-3-and-black-box-help
+  - id: cli.core-execution
+    category: command
+    subject: run and implicit task execution implemented by the core gate
+    targetGate: 2
+    status: passing
+    tests: [core.execution, core.differential]
+    source: issue-3-and-black-box-oracle
   - id: cli.global-options
     category: option
     subject: global options accepted by every applicable command
-    targetGate: 2
+    targetGate: 4
     status: planned
     variants:
       - --version
@@ -83,7 +90,7 @@ rows:
   - id: cli.run-options
     category: option
     subject: run, watch, pass-through, cache, graph, output, and profile options
-    targetGate: 2
+    targetGate: 3
     status: planned
     variants:
       - --cache
@@ -119,6 +126,13 @@ rows:
       - --experimental-write-cache
       - --
     source: black-box-help-and-issue-3
+  - id: cli.core-run-options
+    category: option
+    subject: core execution, filter, environment, concurrency, and cache options
+    targetGate: 2
+    status: passing
+    tests: [core.execution, core.model, core.cache]
+    source: issue-3-and-black-box-oracle
   - id: cli.secondary-options
     category: option
     subject: secondary, hidden, deprecated, and experimental command options
@@ -158,7 +172,7 @@ rows:
   - id: environment.turbo
     category: environment
     subject: Turbo configuration, cache, SCM, telemetry, update, and testing environment
-    targetGate: 2
+    targetGate: 4
     status: planned
     variants:
       - TURBO_API
@@ -187,6 +201,13 @@ rows:
       - TURBO_ROOT_TURBO_JSON
       - TURBO_DANGEROUSLY_DISABLE_PACKAGE_MANAGER_CHECK
     source: public-documentation-and-black-box
+  - id: environment.core
+    category: environment
+    subject: core cache, SCM, color, and task environment behavior
+    targetGate: 2
+    status: passing
+    tests: [core.execution, core.model, core.cache]
+    source: issue-3-and-public-documentation
   - id: environment.platform
     category: environment
     subject: color, CI, package-manager, OpenTelemetry, and test control variables
@@ -211,7 +232,8 @@ rows:
     category: configuration
     subject: distributed root and workspace schema keys
     targetGate: 2
-    status: planned
+    status: passing
+    tests: [configuration.generated, core.model]
     variants:
       - $schema
       - boundaries
@@ -311,7 +333,8 @@ rows:
     category: configuration
     subject: public and schema-hidden future flags
     targetGate: 2
-    status: planned
+    status: passing
+    tests: [configuration.generated, core.execution]
     variants:
       - affectedUsingTaskInputs
       - errorsOnlyShowHash
@@ -331,13 +354,15 @@ rows:
     category: configuration
     subject: accepted documents, inheritance, deprecated keys, and precedence
     targetGate: 2
-    status: planned
+    status: passing
+    tests: [core.model, core.execution]
     variants:
       - turbo.json
       - turbo.jsonc
       - root-configuration
       - package-configuration
       - package-inheritance
+      - package-task-exclusion
       - deprecated-accepted-keys
       - schema-hidden-runtime-keys
       - cli-over-environment-over-config
@@ -368,6 +393,19 @@ rows:
       - unlink
       - update-check
     source: issue-3-and-black-box-traffic
+  - id: protocol.core-cache
+    category: protocol
+    subject: local and Vercel-compatible archive and artifact transport used by core execution
+    targetGate: 2
+    status: passing
+    tests: [core.cache, core.differential]
+    source: issue-3-and-black-box-traffic
+  - id: protocol.core-task-hash
+    category: protocol
+    subject: exact official global and task input serialization and cache-key identity
+    targetGate: 2
+    status: planned
+    source: issue-3-and-black-box-oracle
   - id: protocol.daemon-query-watch
     category: protocol
     subject: daemon, GraphQL query, watch, devtools, telemetry, and observability
@@ -396,7 +434,8 @@ rows:
     category: package-manager
     subject: JavaScript package-manager identities and versions
     targetGate: 2
-    status: planned
+    status: passing
+    tests: [core.model, core.execution]
     variants:
       - npm@8.0.0
       - npm@8.19.4
@@ -432,19 +471,20 @@ rows:
     category: package-manager
     subject: experimental non-JavaScript workspaces
     targetGate: 4
-    status: planned
+    status: passing
+    tests: [core.model]
     variants: [cargo@1.97.1, rustc@1.97.1, uv@0.12.7]
     source: issue-3
   - id: success.core
     category: success
     subject: repository discovery, execution, cache, output, and workflow success paths
     targetGate: 2
-    status: planned
+    status: passing
+    tests: [core.model, core.execution, core.cache, core.differential]
     variants:
       - git-repository
       - no-vcs-repository
       - package-discovery
-      - lockfile-parse-and-prune
       - package-graph
       - task-graph
       - filter-and-affected
@@ -459,6 +499,20 @@ rows:
       - remote-cache-hit-and-miss
       - official-to-typescript-cache
       - typescript-to-official-cache
+    source: issue-3
+  - id: success.lockfile-pruning
+    category: success
+    subject: lockfile parsing and pruning workflow
+    targetGate: 3
+    status: planned
+    variants: [lockfile-parse-and-prune]
+    source: pull-request-review-5060889456
+  - id: success.repository-workflows
+    category: success
+    subject: graph formats, profiles, summaries, and alternate output workflows
+    targetGate: 3
+    status: planned
+    variants:
       - graph-formats
       - profiles-and-summaries
       - tui-stream-and-ndjson
@@ -488,7 +542,7 @@ rows:
   - id: failure.validation-runtime
     category: failure
     subject: validation, process, filesystem, network, and recovery failures
-    targetGate: 2
+    targetGate: 3
     status: planned
     variants:
       - malformed-input
@@ -514,6 +568,13 @@ rows:
       - stale-daemon
       - recovery-without-leaks
     source: issue-3
+  - id: failure.core
+    category: failure
+    subject: core validation, graph, process, cache, cancellation, and recovery failures
+    targetGate: 2
+    status: passing
+    tests: [core.model, core.execution, core.cache, core.security]
+    source: issue-3-and-black-box-oracle
   - id: security.automated
     category: security
     subject: required adversarial and shared-state cases
@@ -532,6 +593,13 @@ rows:
       - secret-redaction
       - cross-team-cache-isolation
       - shared-state-race
+    source: issue-3
+  - id: security.core
+    category: security
+    subject: core archive, path, lockfile, command, signature, and writer safety
+    targetGate: 2
+    status: passing
+    tests: [core.security, core.cache, core.differential]
     source: issue-3
   - id: normalization.approved
     category: normalization

@@ -9,6 +9,11 @@ import {
 export const evidenceId = {
   cliVersion: "cli.version",
   configurationGenerated: "configuration.generated",
+  coreCache: "core.cache",
+  coreDifferential: "core.differential",
+  coreExecution: "core.execution",
+  coreModel: "core.model",
+  coreSecurity: "core.security",
   dependenciesRuntime: "dependencies.runtime",
   effectsScoped: "effects.scoped",
   fixturesSynthetic: "fixtures.synthetic",
@@ -41,6 +46,31 @@ export const evidenceRegistry = {
   [evidenceId.configurationGenerated]: {
     kind: "package-script",
     script: "check:generated",
+  },
+  [evidenceId.coreCache]: {
+    kind: "rstest",
+    file: "test/core-execution-and-cache.test.ts",
+    binding: "coreCache",
+  },
+  [evidenceId.coreDifferential]: {
+    kind: "rstest",
+    file: "test/core-execution-and-cache.test.ts",
+    binding: "coreDifferential",
+  },
+  [evidenceId.coreExecution]: {
+    kind: "rstest",
+    file: "test/core-execution-and-cache.test.ts",
+    binding: "coreExecution",
+  },
+  [evidenceId.coreModel]: {
+    kind: "rstest",
+    file: "test/core-model.test.ts",
+    binding: "coreModel",
+  },
+  [evidenceId.coreSecurity]: {
+    kind: "rstest",
+    file: "test/core-model.test.ts",
+    binding: "coreSecurity",
   },
   [evidenceId.dependenciesRuntime]: {
     kind: "package-script",
