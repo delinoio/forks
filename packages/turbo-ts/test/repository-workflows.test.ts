@@ -31,6 +31,7 @@ import {
 } from "../src/run/engine.js";
 import { parseRunArguments } from "../src/run/options.js";
 import { parseDaemonArguments } from "../src/workflow/daemon.js";
+import { isWindowsSubsystemForLinux } from "../src/workflow/misc.js";
 import { parsePruneArguments } from "../src/workflow/prune.js";
 import { repositoryQuerySchema } from "../src/workflow/query.js";
 import { parseWatchArguments } from "../src/workflow/watch.js";
@@ -212,6 +213,36 @@ describe("repository workflow gate", () => {
       writeCache: false,
       run: { passThroughArguments: ["--experimental-write-cache"] },
     });
+    expect(
+      parseWatchArguments(["build", "--cache=local:rw,remote:w"]),
+    ).toMatchObject({
+      writeCache: false,
+      run: { cacheSpecification: "local:r", noCache: false },
+    });
+    expect(parseWatchArguments(["build", "--cache=remote:w"])).toMatchObject({
+      writeCache: false,
+      run: { cacheSpecification: undefined, noCache: true },
+    });
+    expect(
+      parseWatchArguments([
+        "build",
+        "--experimental-write-cache",
+        "--cache=local:rw",
+      ]),
+    ).toMatchObject({
+      writeCache: true,
+      run: { cacheSpecification: "local:rw", noCache: false },
+    });
+    expect(
+      isWindowsSubsystemForLinux("linux", "5.15.90.1-microsoft-standard-WSL2"),
+    ).toBe(true);
+    expect(isWindowsSubsystemForLinux("linux", "4.4.0-19041-Microsoft")).toBe(
+      true,
+    );
+    expect(isWindowsSubsystemForLinux("linux", "6.8.0-generic")).toBe(false);
+    expect(isWindowsSubsystemForLinux("win32", "10.0.26100-Microsoft")).toBe(
+      false,
+    );
     expect(resolveRunUiMode("tui", false, true, false)).toBe("stream");
     expect(resolveRunUiMode("tui", true, true, false)).toBe("tui");
     expect(renderTimestampedStreamText(0, "one\ntwo\n")).toBe(
@@ -786,7 +817,7 @@ describe("repository workflow gate", () => {
       scripts: Record<string, string>;
     };
     appManifest.scripts.build =
-      "node -e \"require('node:fs').mkdirSync('build',{recursive:true});require('node:fs').writeFileSync('build/generated.txt','generated');console.log('app build')\"";
+      "node -e \"const fs=require('node:fs');const output=JSON.parse(fs.readFileSync('turbo.json','utf8')).tasks.build.outputs[0].split('/')[0];fs.mkdirSync(output,{recursive:true});fs.writeFileSync(output+'/generated.txt','generated');console.log('app build')\"";
     await writeFile(
       appManifestPath,
       `${JSON.stringify(appManifest, undefined, 2)}\n`,
@@ -823,6 +854,36 @@ describe("repository workflow gate", () => {
           (stdout.match(/app build/g) ?? []).length >= 2,
       );
       expect((stdout.match(/change detected/g) ?? []).length).toBeLessThan(8);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const buildsBeforeConfigurationChange = (stdout.match(/app build/g) ?? [])
+        .length;
+      const workspaceConfigurationPath = join(
+        directory,
+        "packages/app/turbo.json",
+      );
+      const workspaceConfiguration = JSON.parse(
+        await readFile(workspaceConfigurationPath, "utf8"),
+      ) as { tasks: { build: { outputs: Array<string> } } };
+      workspaceConfiguration.tasks.build.outputs = ["dist/**"];
+      await writeFile(
+        workspaceConfigurationPath,
+        `${JSON.stringify(workspaceConfiguration, undefined, 2)}\n`,
+      );
+      await waitUntil(
+        () =>
+          (stdout.match(/app build/g) ?? []).length >=
+          buildsBeforeConfigurationChange + 1,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      expect(
+        await readFile(
+          join(directory, "packages/app/dist/generated.txt"),
+          "utf8",
+        ),
+      ).toBe("generated");
+      expect(stdout, stdout).not.toContain(
+        `change detected: ${join(directory, "packages/app/dist")}`,
+      );
       expect(stderr).toContain("• turbo-ts 0.1.0");
     } finally {
       child.kill();
@@ -982,6 +1043,42 @@ snapshots:
           },
         },
       });
+      const packageGraphs = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          query:
+            '{ centered: packageGraph(center: "synthetic-app") { nodes { items { name } } edges { items { source target } } } filtered: packageGraph(filter: { equal: { field: "name", value: "synthetic-library" } }) { nodes { items { name } } edges { items { source target } } } }',
+        }),
+      });
+      expect(await packageGraphs.json()).toEqual({
+        data: {
+          centered: {
+            nodes: {
+              items: [{ name: "synthetic-app" }, { name: "synthetic-library" }],
+            },
+            edges: {
+              items: [
+                {
+                  source: "synthetic-app",
+                  target: "synthetic-library",
+                },
+              ],
+            },
+          },
+          filtered: {
+            nodes: { items: [{ name: "synthetic-library" }] },
+            edges: {
+              items: [
+                {
+                  source: "synthetic-app",
+                  target: "synthetic-library",
+                },
+              ],
+            },
+          },
+        },
+      });
       const escapedFile = await fetch(endpoint, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1043,6 +1140,10 @@ snapshots:
         "packages/app/generated.txt\n",
       );
       await writeFile(
+        join(directory, ".pnpmfile.cjs"),
+        "module.exports = { hooks: {} };\n",
+      );
+      await writeFile(
         join(directory, "packages/app/generated.txt"),
         "ignored\n",
       );
@@ -1093,11 +1194,13 @@ snapshots:
       const implementationTree = await readTextTree(output);
       const {
         ".pnp.cjs": pnpLoader,
+        ".pnpmfile.cjs": pnpmHook,
         ".yarn/patches/example.patch": yarnPatch,
         ...referenceCompatibleTree
       } = implementationTree;
       expect(referenceCompatibleTree).toEqual(referenceTree);
       expect(pnpLoader).toBe("module.exports = {};\n");
+      expect(pnpmHook).toBe("module.exports = { hooks: {} };\n");
       expect(yarnPatch).toBe("patch\n");
       expect(
         await readFile(
@@ -1110,6 +1213,9 @@ snapshots:
       );
       expect(await readFile(join(output, ".yarnrc.yml"), "utf8")).toContain(
         "yarnPath",
+      );
+      expect(await readFile(join(output, ".pnpmfile.cjs"), "utf8")).toBe(
+        "module.exports = { hooks: {} };\n",
       );
       expect(
         await readFile(join(output, ".yarn/releases/yarn.cjs"), "utf8"),
@@ -1135,6 +1241,14 @@ snapshots:
           "utf8",
         ),
       ).toBe("patch\n");
+      for (const root of ["full", "json"]) {
+        expect(
+          await readFile(
+            join(directory, `docker-result/${root}/.pnpmfile.cjs`),
+            "utf8",
+          ),
+        ).toBe("module.exports = { hooks: {} };\n");
+      }
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1257,6 +1371,20 @@ snapshots:
       ]);
     try {
       await prepareFixture(directory);
+      if (process.platform !== "win32") {
+        await mkdir(join(directory, "real/linked"), { recursive: true });
+        await writeFile(
+          join(directory, "real/linked/package.json"),
+          `${JSON.stringify({
+            name: "synthetic-linked",
+            version: "1.0.0",
+            private: true,
+            scripts: { build: "node -e \"console.log('linked build')\"" },
+          })}\n`,
+        );
+        await writeFile(join(directory, "real/linked/source.txt"), "base\n");
+        await symlink("../real/linked", join(directory, "packages/linked"));
+      }
       await git("init", "--quiet");
       await git("add", ".");
       await git("commit", "--quiet", "-m", "base");
@@ -1306,6 +1434,29 @@ snapshots:
           affectedTasks: { length: 0 },
         },
       });
+      if (process.platform !== "win32") {
+        await writeFile(
+          join(directory, "real/linked/source.txt"),
+          "canonical change\n",
+        );
+        await git("add", ".");
+        await git("commit", "--quiet", "-m", "change canonical workspace");
+        const canonicalAffected = await execFilePromise(process.execPath, [
+          candidate,
+          "query",
+          '{ affectedPackages(base: "HEAD~1", head: "HEAD") { items { name } } affectedTasks(base: "HEAD~1", head: "HEAD", tasks: ["build"]) { items { fullName } } }',
+          "--cwd",
+          directory,
+        ]);
+        expect(JSON.parse(canonicalAffected.stdout)).toEqual({
+          data: {
+            affectedPackages: { items: [{ name: "synthetic-linked" }] },
+            affectedTasks: {
+              items: [{ fullName: "synthetic-linked#build" }],
+            },
+          },
+        });
+      }
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

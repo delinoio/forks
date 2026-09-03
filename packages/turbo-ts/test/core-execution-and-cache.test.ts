@@ -2024,6 +2024,52 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
+  it("keeps dry runs from evicting local cache entries", async () => {
+    const directory = await makeFixture();
+    const cacheDirectory = `${directory}/.turbo/cache`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.cacheMaxAge = "1h";
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      expect(
+        (await run(process.execPath, args, repositoryRoot)).stdout,
+      ).toContain("cache miss");
+      const archiveName = (await readdir(cacheDirectory)).find((name) =>
+        name.endsWith(".tar.zst"),
+      );
+      expect(archiveName).toBeDefined();
+      const archivePath = `${cacheDirectory}/${archiveName!}`;
+      const stale = new Date(Date.now() - 2 * 60 * 60 * 1_000);
+      await utimes(archivePath, stale, stale);
+      for (const dryRun of ["--dry", "--dry=json"]) {
+        const result = await run(
+          process.execPath,
+          [...args, dryRun],
+          repositoryRoot,
+        );
+        expect(result.exitCode, result.stderr).toBe(0);
+        expect((await lstat(archivePath)).isFile()).toBe(true);
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("accepts documented cache policies and rejects malformed policies", async () => {
     const directory = await makeFixture();
     try {

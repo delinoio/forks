@@ -26,6 +26,11 @@ export interface ParsedLockfile {
 const maximumLockfileBytes = 32 * 1024 * 1024;
 const maximumNodes = 500_000;
 
+const objectValue = (value: unknown): Record<string, unknown> | undefined =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+
 const validateSource = (contents: Uint8Array): string => {
   if (contents.length > maximumLockfileBytes) {
     throw new TypeError("lockfile exceeds the 32 MiB safety limit");
@@ -96,6 +101,49 @@ const parseYamlDocument = (source: string): unknown => {
     throw new TypeError("lockfile contains too many YAML aliases");
   }
   return parseYaml(source, { maxAliasCount: 1_000 });
+};
+
+const yarnDescriptorName = (descriptor: string): string | undefined => {
+  const separator = descriptor.startsWith("@")
+    ? descriptor.indexOf("@", 1)
+    : descriptor.indexOf("@");
+  return separator <= 0 ? undefined : descriptor.slice(0, separator);
+};
+
+const parseYarnBerry = (source: string): ReadonlyArray<LockfilePackage> => {
+  const document = objectValue(parseYamlDocument(source));
+  if (document === undefined) {
+    throw new TypeError("Yarn Berry lockfile is not an object");
+  }
+  const packages = new Map<string, LockfilePackage>();
+  for (const [descriptors, value] of Object.entries(document)) {
+    if (descriptors === "__metadata") continue;
+    const entry = objectValue(value);
+    if (typeof entry?.version !== "string") continue;
+    const descriptorNames = descriptors.split(/,\s+/).flatMap((descriptor) => {
+      const name = yarnDescriptorName(descriptor);
+      return name === undefined ? [] : [name];
+    });
+    const resolutionName =
+      typeof entry.resolution === "string"
+        ? yarnDescriptorName(entry.resolution)
+        : undefined;
+    const names =
+      descriptorNames.length === 0 && resolutionName !== undefined
+        ? [resolutionName]
+        : descriptorNames;
+    for (const name of names) {
+      packages.set(`${name}@${entry.version}`, {
+        name,
+        version: entry.version,
+      });
+    }
+  }
+  return [...packages.values()].sort((left, right) =>
+    `${left.name}@${left.version}`.localeCompare(
+      `${right.name}@${right.version}`,
+    ),
+  );
 };
 
 const parseCargo = (source: string): ReadonlyArray<LockfilePackage> => {
@@ -173,7 +221,7 @@ export const parseLockfile = (
     return isYarnBerry(source)
       ? {
           format: "yarn-berry",
-          packages: collectPackages(parseYamlDocument(source)),
+          packages: parseYarnBerry(source),
         }
       : { format: "yarn-classic", packages: parseYarnClassic(source) };
   }
@@ -206,11 +254,6 @@ export const parseLockfile = (
   }
   throw new TypeError(`unsupported lockfile: ${name}`);
 };
-
-const objectValue = (value: unknown): Record<string, unknown> | undefined =>
-  typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
 
 const dependencyVersion = (value: unknown): string | undefined => {
   if (typeof value === "string") return value;

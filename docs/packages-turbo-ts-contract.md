@@ -481,11 +481,14 @@ debounces filesystem storms and uses switching Effect streams so a later file
 event interrupts an in-flight run before recovery. Watchers, child processes,
 fibers, signals, and task resources remain scope-owned. Watch mode reads cache
 by default and enables cache publication only with
-`--experimental-write-cache`. Repository and nested Git-ignore rules and every
-configured task-output pattern suppress generated-file triggers; changes to an
-ignore file reload the matcher and remain user-visible triggers. Run arguments
-after `--` remain task pass-through arguments, including text equal to the
-watch-only cache-publication flag.
+`--experimental-write-cache`; supplied write-capable cache policies are reduced
+to their read-only capabilities until that flag is present. Repository and
+nested Git-ignore rules and every configured task-output pattern suppress
+generated-file triggers. Changes to an ignore file reload the matcher and
+remain user-visible triggers, while root, custom, and workspace Turbo
+configuration changes refresh output patterns before the next run. Run
+arguments after `--` remain task pass-through arguments, including text equal
+to the watch-only cache-publication flag.
 
 The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
 identity, per-user temporary state directory, atomic PID and start lock files,
@@ -511,13 +514,17 @@ package and task collections, affected collections, variables, schema
 introspection, and a loopback GraphQL server. Task relationship collections
 come from the resolved task graph. GraphQL affected collections calculate the
 requested base/head range, include dependent packages, and apply package and
-task filters. `query affected`, `query ls`, and `ls` share repository discovery
-and stable ordering. The server limits request bodies and closes HTTP handles
-in Scope; oversized requests receive HTTP 413 without resetting the
-connection. Top-level package predicates are applied, external dependencies
-come from manifest references resolved against the parsed lockfile, and file
-queries enforce repository containment after resolving symlinks. The startup
-message describes the static page as a GraphQL endpoint rather than an IDE.
+task filters. Package-graph center selection retains the named package and its
+direct dependencies, package predicates narrow the returned nodes, and graph
+edges retain the selected nodes' dependency context. `query affected`, `query
+ls`, and `ls` share repository discovery and stable ordering. The server limits
+request bodies and closes HTTP handles in Scope; oversized requests receive
+HTTP 413 without resetting the connection. Top-level package predicates are
+applied, external dependencies come from manifest references resolved against
+the parsed lockfile, and Yarn Berry entries report their installed `version`
+rather than descriptor ranges. File queries enforce repository containment
+after resolving symlinks. The startup message describes the static page as a
+GraphQL endpoint rather than an IDE.
 
 `prune` selects the transitive internal package closure, emits ordinary and
 Docker layouts, creates reduced lockfiles with reference-compatible canonical
@@ -526,7 +533,8 @@ rejects output roots that could contain the source repository. It never
 follows workspace symlinks into a prune output. Output safety and traversal
 exclusions use canonical locations. Contained relative file symlinks are
 recreated without dereferencing; absolute, escaping, or output-targeting links
-are rejected. Root Yarn installation controls, including `.yarnrc.yml`,
+are rejected. The root pnpm hook `.pnpmfile.cjs` is retained in every
+installation root. Root Yarn installation controls, including `.yarnrc.yml`,
 `.pnp.cjs`, releases, and patches, are retained in applicable ordinary and
 Docker layouts. Copying honors repository and
 nested Git-ignore files unless disabled; ordinary pnpm pruning retains
@@ -543,7 +551,9 @@ falls back to stream mode when either terminal side is non-interactive. JSON
 mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
 completed task's full log replay. Structured log files append typed task events
 as work runs and end with a typed run summary. CLI `--global-deps` patterns are
-merged into task hash inputs. Log-prefix selection applies to live and cached output. Summaries record
+merged into task hash inputs. Dry runs do not perform local cache eviction, and
+`info` derives WSL status from the Linux kernel release. Log-prefix selection
+applies to live and cached output. Summaries record
 the actual local or remote cache source and saved duration, and summaries and
 profiles use each task's scheduling timestamps. Mermaid graphs assign stable,
 unique node identifiers without truncated-hash collisions.

@@ -23,6 +23,12 @@ const completionShells = [
   "zsh",
 ] as const;
 
+export const isWindowsSubsystemForLinux = (
+  operatingSystem: string,
+  kernelRelease: string,
+): boolean =>
+  operatingSystem === "linux" && /(?:microsoft|wsl)/i.test(kernelRelease);
+
 export const executeCompletion = (
   arguments_: ReadonlyArray<string>,
 ): Effect.Effect<number, ConfigurationError | unknown, TerminalService> =>
@@ -110,7 +116,7 @@ export const executeInfo = (
 Platform:
    Architecture: ${information.architecture === "x64" ? "x86_64" : information.architecture}
    Operating system: ${information.operatingSystem}
-   WSL: false
+   WSL: ${isWindowsSubsystemForLinux(information.operatingSystem, information.kernelRelease)}
    Available memory (MB): ${information.availableMemoryMegabytes}
    Available CPU cores: ${information.availableCpuCores}
 

@@ -335,10 +335,16 @@ const calculateAffectedRepository = (
     let globalChange = false;
     for (const path of changedPaths) {
       const owners = repository.packages.filter((packageModel) => {
-        const directory = packageModel.relativeDirectory.replace(/^\.\/?/, "");
-        return (
-          directory !== "" &&
-          (path === directory || path.startsWith(`${directory}/`))
+        const directories = new Set(
+          [
+            packageModel.relativeDirectory,
+            packageModel.canonicalRelativeDirectory,
+          ].map((directory) => directory.replace(/^\.\/?/, "")),
+        );
+        return [...directories].some(
+          (directory) =>
+            directory !== "" &&
+            (path === directory || path.startsWith(`${directory}/`)),
         );
       });
       if (owners.length === 0) globalChange = true;
@@ -634,10 +640,44 @@ const repositoryQueryRoot = (
       if (model === undefined) throw new Error(`package not found: ${name}`);
       return packageView(model);
     },
-    packageGraph: () => ({
-      nodes: list(packageViews),
-      edges: list(graphEdges),
-    }),
+    packageGraph: ({
+      center,
+      filter,
+    }: {
+      readonly center?: string;
+      readonly filter?: PackagePredicate;
+    }) => {
+      const centerModel = models.find(
+        (model) => model.name === center || model.identity === center,
+      );
+      const centeredIdentities =
+        center === undefined || centerModel === undefined
+          ? undefined
+          : new Set([
+              centerModel.identity,
+              ...centerModel.internalDependencies,
+            ]);
+      const nodes = models
+        .filter(
+          (model) =>
+            centeredIdentities === undefined ||
+            centeredIdentities.has(model.identity),
+        )
+        .map(packageView)
+        .filter((view) => packageMatchesPredicate(view, filter));
+      const selectedNames = new Set(nodes.map((view) => view.name));
+      const edges = graphEdges.filter((edge) => {
+        const centered =
+          centerModel === undefined ||
+          edge.source === centerModel.name ||
+          edge.target === centerModel.name;
+        return (
+          centered &&
+          (selectedNames.has(edge.source) || selectedNames.has(edge.target))
+        );
+      });
+      return { nodes: list(nodes), edges: list(edges) };
+    },
     affectedPackages: async ({
       base = "main",
       head = "HEAD",

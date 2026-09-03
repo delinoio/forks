@@ -430,6 +430,7 @@ export class RuntimeProfileService extends Context.Tag(
 export interface SystemInformation {
   readonly architecture: string;
   readonly operatingSystem: string;
+  readonly kernelRelease: string;
   readonly availableMemoryMegabytes: number;
   readonly availableCpuCores: number;
   readonly temporaryDirectory: string;

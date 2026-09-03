@@ -389,6 +389,7 @@ export const executePrune = (
     const rootFiles = [
       ".gitignore",
       ".npmrc",
+      ".pnpmfile.cjs",
       ".pnp.cjs",
       ".yarnrc",
       ".yarnrc.yml",
@@ -424,7 +425,13 @@ export const executePrune = (
         yield* copyIfPresent(source, joinPath(fullRoot, name));
         if (
           options.docker &&
-          [".npmrc", ".pnp.cjs", ".yarnrc", ".yarnrc.yml"].includes(name)
+          [
+            ".npmrc",
+            ".pnpmfile.cjs",
+            ".pnp.cjs",
+            ".yarnrc",
+            ".yarnrc.yml",
+          ].includes(name)
         ) {
           yield* copyIfPresent(source, joinPath(jsonRoot, name));
         }

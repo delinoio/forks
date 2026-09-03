@@ -46,6 +46,7 @@ import {
   arch,
   availableParallelism,
   freemem,
+  release as kernelRelease,
   platform as operatingSystem,
   tmpdir,
 } from "node:os";
@@ -2301,6 +2302,7 @@ const systemLayer = Layer.succeed(SystemService, {
   information: Effect.sync(() => ({
     architecture: arch(),
     operatingSystem: operatingSystem(),
+    kernelRelease: kernelRelease(),
     availableMemoryMegabytes: Math.floor(freemem() / 1024 / 1024),
     availableCpuCores: availableParallelism(),
     temporaryDirectory: tmpdir(),

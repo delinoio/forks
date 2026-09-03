@@ -3,14 +3,25 @@ import {
   canMatchGlobDescendant,
   matchesGlobsWithExclusions,
 } from "../core/glob.js";
-import { isPathContained, normalizePath, relativePath } from "../core/path.js";
+import {
+  baseName,
+  isAbsolutePath,
+  isPathContained,
+  joinPath,
+  normalizePath,
+  relativePath,
+} from "../core/path.js";
 import { FileWatcherService, TerminalService } from "../effect/services.js";
 import {
   type GitIgnoreMatcher,
   loadGitIgnoreMatcher,
 } from "../repository/git-ignore.js";
 import type { RepositoryModel } from "../repository/model.js";
-import { executeRun, type RunRequirements } from "../run/engine.js";
+import {
+  executeRun,
+  parseCacheSpecification,
+  type RunRequirements,
+} from "../run/engine.js";
 import { type ParsedRunOptions, parseRunArguments } from "../run/options.js";
 import { loadWorkflowRepository } from "./repository.js";
 
@@ -35,13 +46,24 @@ export const parseWatchArguments = (
     ...passThroughArguments,
   ];
   const parsed = parseRunArguments(["run", ...runArguments]);
+  const readOnlyPolicy = parseCacheSpecification(
+    parsed.cacheSpecification ?? "local:r,remote:r",
+  );
+  const readableSources = [
+    ...(readOnlyPolicy.localRead ? ["local:r"] : []),
+    ...(readOnlyPolicy.remoteRead ? ["remote:r"] : []),
+  ];
   return {
     writeCache,
     run: writeCache
       ? parsed
       : {
           ...parsed,
-          cacheSpecification: parsed.cacheSpecification ?? "local:r,remote:r",
+          cacheSpecification:
+            readableSources.length === 0
+              ? undefined
+              : readableSources.join(","),
+          noCache: parsed.noCache || readableSources.length === 0,
         },
   };
 };
@@ -75,6 +97,19 @@ const configuredOutputPath = (
 const isGitIgnorePath = (path: string): boolean =>
   normalizePath(path).split("/").at(-1) === ".gitignore";
 
+const isTurboConfigurationPath = (
+  root: string,
+  configuredRootPath: string | undefined,
+  path: string,
+): boolean => {
+  if (["turbo.json", "turbo.jsonc"].includes(baseName(path))) return true;
+  if (configuredRootPath === undefined) return false;
+  const absoluteConfiguredPath = isAbsolutePath(configuredRootPath)
+    ? configuredRootPath
+    : joinPath(root, configuredRootPath);
+  return normalizePath(path) === normalizePath(absoluteConfiguredPath);
+};
+
 export const executeWatch = (
   options: WatchOptions,
 ): Effect.Effect<number, unknown, FileWatcherService | RunRequirements> =>
@@ -85,6 +120,7 @@ export const executeWatch = (
       cwd: options.run.cwd,
       rootTurboJson: options.run.rootTurboJson,
     });
+    const repositoryRef = yield* Ref.make(repository);
     const ignoreMatcher = yield* Ref.make<GitIgnoreMatcher>(
       yield* loadGitIgnoreMatcher(repository.root),
     );
@@ -99,11 +135,32 @@ export const executeWatch = (
             );
             return true;
           }
+          if (
+            isTurboConfigurationPath(
+              repository.root,
+              options.run.rootTurboJson,
+              change.path,
+            )
+          ) {
+            const refreshed = yield* Effect.either(
+              loadWorkflowRepository({
+                cwd: options.run.cwd,
+                rootTurboJson: options.run.rootTurboJson,
+              }),
+            );
+            if (refreshed._tag === "Right") {
+              yield* Ref.set(repositoryRef, refreshed.right);
+            }
+            return true;
+          }
           const ignored = (yield* Ref.get(ignoreMatcher)).ignores(
             change.path,
             change.kind !== "modify",
           );
-          return !ignored && !configuredOutputPath(repository, change.path);
+          return (
+            !ignored &&
+            !configuredOutputPath(yield* Ref.get(repositoryRef), change.path)
+          );
         }),
       ),
       Stream.debounce("100 millis"),

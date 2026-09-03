@@ -3151,33 +3151,6 @@ export const executeRun = (
         }),
       );
     }
-    if (options.cachePolicy.localRead || options.cachePolicy.localWrite) {
-      yield* evictLocalCache({
-        directory: options.cacheDirectory,
-        maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
-        maxSizeBytes: options.cacheMaxSizeBytes,
-      }).pipe(
-        Effect.catchTag("CacheError", (error) =>
-          Effect.gen(function* () {
-            const terminal = yield* TerminalService;
-            const warningColor = options.colorEnabled
-              ? yield* terminal.stderrColorEnabled
-              : false;
-            yield* terminal
-              .writeStderr(
-                renderLogEvent(
-                  {
-                    kind: "warning",
-                    message: `local cache eviction failed; continuing without cache maintenance: ${error.message}`,
-                  },
-                  warningColor,
-                ),
-              )
-              .pipe(Effect.ignore);
-          }),
-        ),
-      );
-    }
     const packageManagerCheckDisabled =
       parsed.dangerouslyDisablePackageManagerCheck ||
       environmentBoolean(
@@ -3569,6 +3542,33 @@ export const executeRun = (
         );
       }
       return 0;
+    }
+    if (options.cachePolicy.localRead || options.cachePolicy.localWrite) {
+      yield* evictLocalCache({
+        directory: options.cacheDirectory,
+        maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
+        maxSizeBytes: options.cacheMaxSizeBytes,
+      }).pipe(
+        Effect.catchTag("CacheError", (error) =>
+          Effect.gen(function* () {
+            const terminal = yield* TerminalService;
+            const warningColor = options.colorEnabled
+              ? yield* terminal.stderrColorEnabled
+              : false;
+            yield* terminal
+              .writeStderr(
+                renderLogEvent(
+                  {
+                    kind: "warning",
+                    message: `local cache eviction failed; continuing without cache maintenance: ${error.message}`,
+                  },
+                  warningColor,
+                ),
+              )
+              .pipe(Effect.ignore);
+          }),
+        ),
+      );
     }
     const profileService = yield* Effect.serviceOption(RuntimeProfileService);
     const clock = yield* ClockService;
