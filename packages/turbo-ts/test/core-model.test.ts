@@ -40,7 +40,10 @@ import {
   renderLogEvent,
   renderTaskOutputChunk,
 } from "../src/logging/events.js";
-import { parseLockfile } from "../src/repository/lockfiles.js";
+import {
+  parseLockfile,
+  resolveLockfilePackageClosure,
+} from "../src/repository/lockfiles.js";
 import type {
   RepositoryModel,
   RepositoryPackage,
@@ -385,6 +388,147 @@ describe("core repository model", () => {
       { name: "constructor", version: "1.0.0" },
     ]);
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it("resolves transitive dependency closures for graph-bearing lockfiles", () => {
+    const pnpmCompatible = `lockfileVersion: '9.0'
+importers:
+  packages/app:
+    dependencies:
+      a:
+        version: 1.0.0
+packages:
+  a@1.0.0: {}
+  b@2.0.0: {}
+  c@3.0.0: {}
+  unused@4.0.0: {}
+snapshots:
+  a@1.0.0:
+    dependencies:
+      b: 2.0.0
+  b@2.0.0:
+    dependencies:
+      c: 3.0.0
+  c@3.0.0: {}
+  unused@4.0.0: {}
+`;
+    const cases = [
+      {
+        path: "/repo/yarn.lock",
+        source: `a@^1.0.0:
+  version "1.0.0"
+  dependencies:
+    b "^2.0.0"
+b@^2.0.0:
+  version "2.0.0"
+  dependencies:
+    c "^3.0.0"
+c@^3.0.0:
+  version "3.0.0"
+unused@^4.0.0:
+  version "4.0.0"
+`,
+      },
+      {
+        path: "/repo/yarn.lock",
+        source: `__metadata:
+  version: 8
+"a@npm:^1.0.0":
+  version: 1.0.0
+  resolution: "a@npm:1.0.0"
+  dependencies:
+    b: "npm:^2.0.0"
+"b@npm:^2.0.0":
+  version: 2.0.0
+  resolution: "b@npm:2.0.0"
+  dependencies:
+    c: "npm:^3.0.0"
+"c@npm:^3.0.0":
+  version: 3.0.0
+  resolution: "c@npm:3.0.0"
+"unused@npm:^4.0.0":
+  version: 4.0.0
+  resolution: "unused@npm:4.0.0"
+`,
+      },
+      {
+        path: "/repo/Cargo.lock",
+        source: `version = 4
+
+[[package]]
+name = "a"
+version = "1.0.0"
+dependencies = ["b 2.0.0"]
+
+[[package]]
+name = "b"
+version = "2.0.0"
+dependencies = ["c 3.0.0"]
+
+[[package]]
+name = "c"
+version = "3.0.0"
+
+[[package]]
+name = "unused"
+version = "4.0.0"
+`,
+      },
+      {
+        path: "/repo/uv.lock",
+        source: `version = 1
+
+[[package]]
+name = "a"
+version = "1.0.0"
+dependencies = [{ name = "b", version = "2.0.0" }]
+
+[[package]]
+name = "b"
+version = "2.0.0"
+dependencies = [{ name = "c" }]
+
+[[package]]
+name = "c"
+version = "3.0.0"
+
+[[package]]
+name = "unused"
+version = "4.0.0"
+`,
+      },
+      {
+        path: "/repo/bun.lock",
+        source: JSON.stringify({
+          lockfileVersion: 1,
+          workspaces: {
+            "packages/app": {
+              name: "app",
+              version: "1.0.0",
+              dependencies: { a: "a@1.0.0" },
+            },
+          },
+          packages: {
+            "a@1.0.0": ["a@1.0.0", "", { dependencies: { b: "b@2.0.0" } }, ""],
+            "b@2.0.0": ["b@2.0.0", "", { dependencies: { c: "c@3.0.0" } }, ""],
+            "c@3.0.0": ["c@3.0.0", "", {}, ""],
+            "unused@4.0.0": ["unused@4.0.0", "", {}, ""],
+          },
+        }),
+      },
+      { path: "/repo/aube.lock", source: pnpmCompatible },
+      { path: "/repo/nub.lock", source: pnpmCompatible },
+    ];
+    for (const { path, source } of cases) {
+      expect(
+        resolveLockfilePackageClosure(
+          path,
+          encoder.encode(source),
+          "packages/app",
+          new Set(["a"]),
+        ).map((dependency) => `${dependency.name}@${dependency.version}`),
+      ).toEqual(["a@1.0.0", "b@2.0.0", "c@3.0.0"]);
+    }
   });
 
   it("accepts the complete core package-manager version matrix", () => {

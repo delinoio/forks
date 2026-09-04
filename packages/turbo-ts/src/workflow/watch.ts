@@ -143,6 +143,14 @@ export const executeWatch = (
             );
             return true;
           }
+          const currentRepository = yield* Ref.get(repositoryRef);
+          const ignored = (yield* Ref.get(ignoreMatcher)).ignores(
+            change.path,
+            change.kind !== "modify",
+          );
+          if (ignored || configuredOutputPath(currentRepository, change.path)) {
+            return false;
+          }
           if (
             isWorkspaceDiscoveryPath(repository.root, change.path) ||
             isTurboConfigurationPath(
@@ -162,14 +170,7 @@ export const executeWatch = (
             }
             return true;
           }
-          const ignored = (yield* Ref.get(ignoreMatcher)).ignores(
-            change.path,
-            change.kind !== "modify",
-          );
-          return (
-            !ignored &&
-            !configuredOutputPath(yield* Ref.get(repositoryRef), change.path)
-          );
+          return true;
         }),
       ),
       Stream.debounce("100 millis"),

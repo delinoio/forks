@@ -487,8 +487,10 @@ by default and enables cache publication only with
 `--experimental-write-cache`; supplied write-capable cache policies are reduced
 to their read-only capabilities until that flag is present. Repository and
 nested Git-ignore rules and every configured task-output pattern suppress
-generated-file triggers. Changes to an ignore file reload the matcher and
-remain user-visible triggers, while root, custom, and workspace Turbo
+generated-file triggers. Ignore and output filtering occurs before manifest or
+configuration refresh classification, so generated manifests cannot cause a
+watch loop. Changes to an ignore file reload the matcher and remain
+user-visible triggers, while root, custom, and workspace Turbo
 configuration changes and active JavaScript, Cargo, or uv workspace manifest
 changes refresh package discovery and output patterns before the next run.
 Internal-directory exclusions are matched relative to the watched repository,
@@ -556,10 +558,12 @@ installation controls, and an exact symlinked output root is rejected before
 replacement. The root pnpm
 hook `.pnpmfile.cjs` is retained in every
 installation root. Root Yarn installation controls, including `.yarnrc.yml`,
-`.pnp.cjs`, releases, and patches, are retained in applicable ordinary and
-Docker layouts. Copying honors repository and
+`.pnp.cjs`, releases, patches, and a repository-contained configured `yarnPath`
+executable, are retained at their repository-relative locations in applicable
+ordinary and Docker layouts. Copying honors repository and
 nested Git-ignore files unless disabled; ordinary pnpm pruning retains
-development dependency closure, while production pruning removes it.
+development dependency closure, while production npm and pnpm pruning removes
+development dependency edges and their package closure.
 
 Run workflows support text and JSON dry-runs; DOT, Mermaid, JSON, and HTML task
 graphs; JSON run summaries and live newline-delimited structured log files;
@@ -577,8 +581,11 @@ merged into task hash inputs. Dry runs do not perform local cache eviction, and
 applies to live and cached output. Summaries record
 the actual local or remote cache source and saved duration, and summaries and
 profiles use each task's scheduling timestamps. Task summaries record the
-resolved external-dependency closure hash and actual encoded log path,
-including collision-qualified identifiers and alternate execution scopes.
+resolved transitive external-dependency closure hash for graph-bearing npm,
+pnpm, Yarn, Cargo, uv, Bun, Aube, and Nub lockfiles and the actual encoded log
+path, including collision-qualified identifiers and alternate execution scopes.
+Summary `monorepo` fields are true whenever ordinary discovery finds at least
+one child workspace and false in explicit single-package mode.
 Persisted, stdout, and
 newline-delimited summaries from one run share one canonical UUID v7 identifier.
 Mermaid graphs assign stable,

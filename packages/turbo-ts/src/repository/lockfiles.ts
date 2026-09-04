@@ -281,6 +281,331 @@ export const parseLockfile = (
   throw new TypeError(`unsupported lockfile: ${name}`);
 };
 
+interface LockfileGraphEntry {
+  readonly packages: ReadonlyArray<LockfilePackage>;
+  readonly aliases: ReadonlyArray<string>;
+  readonly dependencies: ReadonlyArray<
+    readonly [name: string, reference: string | undefined]
+  >;
+}
+
+const lockfilePackageIdentity = (value: LockfilePackage): string =>
+  `${value.name}@${value.version}`;
+
+const dependencyObjectEntries = (
+  value: unknown,
+  includeDevelopmentDependencies: boolean,
+): ReadonlyArray<readonly [string, string | undefined]> => {
+  const object = objectValue(value);
+  if (object === undefined) return [];
+  return [
+    "dependencies",
+    "optionalDependencies",
+    "peerDependencies",
+    ...(includeDevelopmentDependencies ? ["devDependencies"] : []),
+  ].flatMap((field) => {
+    const dependencies = objectValue(object[field]);
+    if (dependencies === undefined) return [];
+    return Object.entries(dependencies).map(
+      ([name, reference]) =>
+        [
+          name,
+          typeof reference === "string"
+            ? reference
+            : typeof objectValue(reference)?.version === "string"
+              ? (objectValue(reference)!.version as string)
+              : undefined,
+        ] as const,
+    );
+  });
+};
+
+const resolveGraphPackageClosure = (
+  entries: ReadonlyArray<LockfileGraphEntry>,
+  directDependencyNames: ReadonlySet<string>,
+  directReferences: ReadonlyMap<string, string | undefined> = new Map(),
+): ReadonlyArray<LockfilePackage> => {
+  if (entries.length > maximumNodes) {
+    throw new TypeError("lockfile structure exceeds the node safety limit");
+  }
+  const aliases = new Map<string, Set<number>>();
+  const names = new Map<string, Set<number>>();
+  const addIndex = (
+    index: Map<string, Set<number>>,
+    key: string,
+    entryIndex: number,
+  ): void => {
+    const matches = index.get(key) ?? new Set<number>();
+    matches.add(entryIndex);
+    index.set(key, matches);
+  };
+  for (const [entryIndex, entry] of entries.entries()) {
+    for (const alias of entry.aliases) addIndex(aliases, alias, entryIndex);
+    for (const package_ of entry.packages) {
+      addIndex(names, package_.name, entryIndex);
+      addIndex(aliases, lockfilePackageIdentity(package_), entryIndex);
+    }
+  }
+  const matchesForReference = (
+    name: string,
+    reference: string | undefined,
+  ): ReadonlySet<number> => {
+    if (reference !== undefined) {
+      const exact = new Set([
+        ...(aliases.get(reference) ?? []),
+        ...(aliases.get(`${name}@${reference}`) ?? []),
+      ]);
+      if (exact.size > 0) return exact;
+    }
+    return names.get(name) ?? new Set();
+  };
+  const pending: Array<number> = [];
+  for (const name of directDependencyNames) {
+    pending.push(...matchesForReference(name, directReferences.get(name)));
+  }
+  const visited = new Set<number>();
+  const packages = new Map<string, LockfilePackage>();
+  while (pending.length > 0) {
+    const entryIndex = pending.pop()!;
+    if (visited.has(entryIndex)) continue;
+    visited.add(entryIndex);
+    const entry = entries[entryIndex]!;
+    for (const package_ of entry.packages) {
+      packages.set(lockfilePackageIdentity(package_), package_);
+    }
+    for (const [name, reference] of entry.dependencies) {
+      for (const dependencyIndex of matchesForReference(name, reference)) {
+        if (!visited.has(dependencyIndex)) pending.push(dependencyIndex);
+      }
+    }
+  }
+  return [...packages.values()].sort((left, right) =>
+    lockfilePackageIdentity(left).localeCompare(lockfilePackageIdentity(right)),
+  );
+};
+
+const parseYarnClassicGraph = (
+  source: string,
+): ReadonlyArray<LockfileGraphEntry> => {
+  const entries: Array<LockfileGraphEntry> = [];
+  let selectors: ReadonlyArray<string> = [];
+  let version: string | undefined;
+  let dependencies: Array<readonly [string, string | undefined]> = [];
+  let dependencySection = false;
+  const flush = (): void => {
+    if (version === undefined) return;
+    const packageNames = [
+      ...new Set(
+        selectors.flatMap((selector) => {
+          const name = yarnDescriptorName(selector);
+          return name === undefined ? [] : [name];
+        }),
+      ),
+    ];
+    entries.push({
+      packages: packageNames.map((name) => ({ name, version: version! })),
+      aliases: selectors,
+      dependencies,
+    });
+  };
+  for (const line of source.split(/\r?\n/)) {
+    if (line !== "" && !line.startsWith(" ") && line.endsWith(":")) {
+      flush();
+      selectors = line
+        .slice(0, -1)
+        .split(",")
+        .map((entry) => entry.trim().replace(/^"|"$/g, ""));
+      version = undefined;
+      dependencies = [];
+      dependencySection = false;
+      continue;
+    }
+    const parsedVersion = /^\s+version\s+"([^"]+)"/.exec(line)?.[1];
+    if (parsedVersion !== undefined) {
+      version = parsedVersion;
+      dependencySection = false;
+      continue;
+    }
+    if (/^\s{2}(?:dependencies|optionalDependencies):\s*$/.test(line)) {
+      dependencySection = true;
+      continue;
+    }
+    if (!dependencySection) continue;
+    const dependency =
+      /^\s{4}(?:"([^"]+)"|(\S+))\s+(?:"([^"]+)"|(\S+))\s*$/.exec(line);
+    if (dependency !== null) {
+      dependencies.push([
+        dependency[1] ?? dependency[2]!,
+        dependency[3] ?? dependency[4],
+      ]);
+    } else if (/^\s{2}\S/.test(line)) {
+      dependencySection = false;
+    }
+  }
+  flush();
+  return entries;
+};
+
+const parseYarnBerryGraph = (
+  source: string,
+): ReadonlyArray<LockfileGraphEntry> => {
+  const document = objectValue(parseYamlDocument(source));
+  if (document === undefined) {
+    throw new TypeError("Yarn Berry lockfile is not an object");
+  }
+  return Object.entries(document).flatMap(([descriptors, value]) => {
+    if (descriptors === "__metadata") return [];
+    const entry = objectValue(value);
+    if (typeof entry?.version !== "string") return [];
+    const selectorList = descriptors.split(/,\s+/);
+    const descriptorNames = selectorList.flatMap((descriptor) => {
+      const name = yarnDescriptorName(descriptor);
+      return name === undefined ? [] : [name];
+    });
+    const resolution =
+      typeof entry.resolution === "string" ? entry.resolution : undefined;
+    const resolutionName =
+      resolution === undefined ? undefined : yarnDescriptorName(resolution);
+    const packageNames = [
+      ...new Set(
+        descriptorNames.length === 0 && resolutionName !== undefined
+          ? [resolutionName]
+          : descriptorNames,
+      ),
+    ];
+    return [
+      {
+        packages: packageNames.map((name) => ({
+          name,
+          version: entry.version as string,
+        })),
+        aliases: [
+          ...selectorList,
+          ...(resolution === undefined ? [] : [resolution]),
+        ],
+        dependencies: dependencyObjectEntries(entry, false),
+      },
+    ];
+  });
+};
+
+const parseCargoGraph = (source: string): ReadonlyArray<LockfileGraphEntry> => {
+  const document = objectValue(parseToml(source));
+  const packages = document?.package;
+  if (!Array.isArray(packages)) return [];
+  return packages.flatMap((value) => {
+    const package_ = objectValue(value);
+    if (
+      typeof package_?.name !== "string" ||
+      typeof package_.version !== "string"
+    ) {
+      return [];
+    }
+    const dependencies = Array.isArray(package_.dependencies)
+      ? package_.dependencies.flatMap((dependency) => {
+          if (typeof dependency !== "string") return [];
+          const match = /^(\S+)(?:\s+(\S+))?(?:\s+\(.+\))?$/.exec(dependency);
+          return match === null ? [] : [[match[1]!, match[2]] as const];
+        })
+      : [];
+    return [
+      {
+        packages: [{ name: package_.name, version: package_.version }],
+        aliases: [`${package_.name}@${package_.version}`],
+        dependencies,
+      },
+    ];
+  });
+};
+
+const parseUvGraph = (source: string): ReadonlyArray<LockfileGraphEntry> => {
+  const document = objectValue(parseToml(source));
+  const packages = document?.package;
+  if (!Array.isArray(packages)) return [];
+  return packages.flatMap((value) => {
+    const package_ = objectValue(value);
+    if (
+      typeof package_?.name !== "string" ||
+      typeof package_.version !== "string"
+    ) {
+      return [];
+    }
+    const dependencies = Array.isArray(package_.dependencies)
+      ? package_.dependencies.flatMap((dependency) => {
+          const object = objectValue(dependency);
+          return typeof object?.name === "string"
+            ? [
+                [
+                  object.name,
+                  typeof object.version === "string"
+                    ? object.version
+                    : undefined,
+                ] as const,
+              ]
+            : [];
+        })
+      : [];
+    return [
+      {
+        packages: [{ name: package_.name, version: package_.version }],
+        aliases: [`${package_.name}@${package_.version}`],
+        dependencies,
+      },
+    ];
+  });
+};
+
+const bunPackageReference = (
+  reference: string,
+): LockfilePackage | undefined => {
+  const separator = reference.startsWith("@")
+    ? reference.indexOf("@", 1)
+    : reference.indexOf("@");
+  if (separator <= 0) return undefined;
+  const name = reference.slice(0, separator);
+  const rawVersion = reference.slice(separator + 1).replace(/^npm:/, "");
+  if (/^(?:file|git|github|link|root|tarball|workspace):/.test(rawVersion)) {
+    return undefined;
+  }
+  const version = rawVersion.split("(", 1)[0];
+  return version === undefined || version === ""
+    ? undefined
+    : { name, version };
+};
+
+const parseBunGraph = (
+  source: string,
+): {
+  readonly entries: ReadonlyArray<LockfileGraphEntry>;
+  readonly workspaces: Readonly<Record<string, unknown>>;
+} => {
+  const document = objectValue(parseYamlDocument(source));
+  if (document === undefined)
+    throw new TypeError("Bun lockfile is not an object");
+  const entries = Object.entries(objectValue(document.packages) ?? {}).flatMap(
+    ([key, value]) => {
+      if (!Array.isArray(value) || typeof value[0] !== "string") return [];
+      const package_ =
+        bunPackageReference(value[0]) ?? bunPackageReference(key);
+      if (package_ === undefined) return [];
+      const information = value.find(
+        (entry) => objectValue(entry) !== undefined,
+      );
+      return [
+        {
+          packages: [package_],
+          aliases: [key, value[0]],
+          dependencies: dependencyObjectEntries(information, false),
+        },
+      ];
+    },
+  );
+  return {
+    entries,
+    workspaces: objectValue(document.workspaces) ?? {},
+  };
+};
+
 const dependencyVersion = (value: unknown): string | undefined => {
   if (typeof value === "string") return value;
   const object = objectValue(value);
@@ -458,6 +783,7 @@ const prunePnpmLockfile = (
 const pruneNpmLockfile = (
   source: string,
   workspacePaths: ReadonlySet<string>,
+  production: boolean,
   includeRootPackage = true,
 ): string => {
   const document = objectValue(parseJson(source));
@@ -481,7 +807,7 @@ const pruneNpmLockfile = (
       "dependencies",
       "optionalDependencies",
       "peerDependencies",
-      "devDependencies",
+      ...(production ? [] : ["devDependencies"]),
     ].flatMap((field) => Object.keys(objectValue(entry[field]) ?? {}));
   };
   const dependencyLocation = (
@@ -527,7 +853,15 @@ const pruneNpmLockfile = (
     }
   }
   document.packages = Object.fromEntries(
-    Object.entries(packages).filter(([path]) => retained.has(path)),
+    Object.entries(packages)
+      .filter(([path]) => retained.has(path))
+      .map(([path, value]) => {
+        if (!production) return [path, value];
+        const entry = objectValue(value);
+        if (entry === undefined) return [path, value];
+        const { devDependencies: _devDependencies, ...productionEntry } = entry;
+        return [path, productionEntry];
+      }),
   );
   return `${JSON.stringify(document, undefined, 2)}\n`;
 };
@@ -552,7 +886,7 @@ export const pruneLockfile = (
     parsed.format === "pnpm"
       ? prunePnpmLockfile(source, workspacePaths, options.production === true)
       : parsed.format === "npm"
-        ? pruneNpmLockfile(source, workspacePaths)
+        ? pruneNpmLockfile(source, workspacePaths, options.production === true)
         : source;
   return new TextEncoder().encode(output);
 };
@@ -566,7 +900,11 @@ export const resolveLockfilePackageClosure = (
   const parsed = parseLockfile(path, contents);
   const includeRoot = workspacePath === ".";
   const workspacePaths = new Set(includeRoot ? [] : [workspacePath]);
-  if (parsed.format === "pnpm") {
+  if (
+    parsed.format === "pnpm" ||
+    parsed.format === "aube" ||
+    parsed.format === "nub"
+  ) {
     const source = validateSource(contents);
     return parseLockfile(
       path,
@@ -580,9 +918,49 @@ export const resolveLockfilePackageClosure = (
     return parseLockfile(
       path,
       new TextEncoder().encode(
-        pruneNpmLockfile(source, workspacePaths, includeRoot),
+        pruneNpmLockfile(source, workspacePaths, false, includeRoot),
       ),
     ).packages;
+  }
+  const source = validateSource(contents);
+  if (parsed.format === "yarn-classic") {
+    return resolveGraphPackageClosure(
+      parseYarnClassicGraph(source),
+      directDependencyNames,
+    );
+  }
+  if (parsed.format === "yarn-berry") {
+    return resolveGraphPackageClosure(
+      parseYarnBerryGraph(source),
+      directDependencyNames,
+    );
+  }
+  if (parsed.format === "cargo") {
+    return resolveGraphPackageClosure(
+      parseCargoGraph(source),
+      directDependencyNames,
+    );
+  }
+  if (parsed.format === "uv") {
+    return resolveGraphPackageClosure(
+      parseUvGraph(source),
+      directDependencyNames,
+    );
+  }
+  if (parsed.format === "bun-text") {
+    const graph = parseBunGraph(source);
+    const workspaceKey =
+      workspacePath === "." ? "" : workspacePath.replace(/^\.\//, "");
+    const directReferences = new Map(
+      dependencyObjectEntries(graph.workspaces[workspaceKey], true).filter(
+        ([name]) => directDependencyNames.has(name),
+      ),
+    );
+    return resolveGraphPackageClosure(
+      graph.entries,
+      directDependencyNames,
+      directReferences,
+    );
   }
   return parsed.packages.filter((dependency) =>
     directDependencyNames.has(dependency.name),

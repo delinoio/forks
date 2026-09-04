@@ -252,6 +252,12 @@ describe("repository workflow gate", () => {
     expect(
       parseRunArguments(["run", "build", "--dry-run=text", "json"]),
     ).toMatchObject({ tasks: ["build", "json"], dryRun: "text" });
+    expect(
+      parseRunArguments(["run", "build", "--summarize=false", "true"]),
+    ).toMatchObject({ tasks: ["build", "true"], summarize: false });
+    expect(
+      parseRunArguments(["run", "build", "--summarize", "false"]),
+    ).toMatchObject({ tasks: ["build"], summarize: false });
     expect(commandIndex(["--filter", "watch", "build"])).toBe(2);
     expect(commandIndex(["--cache", "watch", "build"])).toBe(2);
     expect(commandIndex(["--dry-run", "text", "watch"])).toBe(2);
@@ -338,6 +344,25 @@ describe("repository workflow gate", () => {
     expect(
       parsePruneArguments(["app", "--docker", "--production"]),
     ).toMatchObject({ scopes: ["app"], docker: true, production: true });
+
+    const completionScripts = {
+      bash: "complete -W 'run watch daemon query ls prune info completion' turbo-ts\n",
+      elvish:
+        "set edit:completion:arg-completer[turbo-ts] = { |@words| put run watch daemon query ls prune info completion }\n",
+      fish: "complete -c turbo-ts -f -a 'run watch daemon query ls prune info completion'\n",
+      powershell:
+        "Register-ArgumentCompleter -Native -CommandName turbo-ts -ScriptBlock { 'run','watch','daemon','query','ls','prune','info','completion' }\n",
+      zsh: "#compdef turbo-ts\n_arguments '1:command:(run watch daemon query ls prune info completion)'\n",
+    } as const;
+    for (const [shell, script] of Object.entries(completionScripts)) {
+      const completion = await executeDifferentialCommand(process.execPath, [
+        candidate,
+        "completion",
+        shell,
+      ]);
+      expect(completion.stdout).toBe(script);
+      expect(completion.stderr).toContain("• turbo-ts 0.1.0");
+    }
 
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-workflow-"));
     try {
@@ -616,6 +641,20 @@ describe("repository workflow gate", () => {
           (await readFile(join(directory, artifact))).byteLength,
         ).toBeGreaterThan(0);
       }
+      const profileNames = async (artifact: string) =>
+        (
+          JSON.parse(await readFile(join(directory, artifact), "utf8")) as {
+            readonly traceEvents: ReadonlyArray<{ readonly name: string }>;
+          }
+        ).traceEvents.map((event) => event.name);
+      const namedProfileNames = await profileNames("profile.json");
+      expect(new Set(namedProfileNames)).toEqual(
+        new Set(["synthetic-app#build", "synthetic-library#build"]),
+      );
+      expect(await profileNames("trace.json")).toEqual(namedProfileNames);
+      expect(new Set(await profileNames("anonymous.json"))).toEqual(
+        new Set(["build"]),
+      );
       const runFiles = await readdir(join(directory, ".turbo/runs"));
       expect(runFiles).toEqual([`${runSummary.id}.json`]);
       expect(
@@ -627,6 +666,67 @@ describe("repository workflow gate", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 60_000);
+
+  it("marks a repository with one child workspace as a monorepo", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-monorepo-"));
+    try {
+      await prepareFixture(directory);
+      await rm(join(directory, "packages/library"), {
+        force: true,
+        recursive: true,
+      });
+      const manifestPath = join(directory, "packages/app/package.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        dependencies?: Record<string, string>;
+      };
+      delete manifest.dependencies;
+      await writeFile(
+        manifestPath,
+        `${JSON.stringify(manifest, undefined, 2)}\n`,
+      );
+      const dryRun = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--dry=json",
+        "--cwd",
+        directory,
+      ]);
+      expect(
+        (JSON.parse(dryRun.stdout) as { readonly monorepo: boolean }).monorepo,
+      ).toBe(true);
+      const completedRun = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--no-cache",
+        "--json",
+        "--cwd",
+        directory,
+      ]);
+      const completedSummary = JSON.parse(
+        completedRun.stdout.trim().split("\n").at(-1)!,
+      ) as {
+        readonly monorepo: boolean;
+      };
+      expect(completedSummary.monorepo).toBe(true);
+      const singlePackage = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--single-package",
+        "--dry=json",
+        "--cwd",
+        directory,
+      ]);
+      expect(
+        (JSON.parse(singlePackage.stdout) as { readonly monorepo: boolean })
+          .monorepo,
+      ).toBe(false);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
 
   it("reports resolved dependency hashes and actual encoded task-log paths", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-summary-paths-"));
@@ -1166,7 +1266,7 @@ describe("repository workflow gate", () => {
       scripts: Record<string, string>;
     };
     appManifest.scripts.build =
-      "node -e \"const fs=require('node:fs');const output=JSON.parse(fs.readFileSync('turbo.json','utf8')).tasks.build.outputs[0].split('/')[0];fs.mkdirSync(output,{recursive:true});fs.writeFileSync(output+'/generated.txt','generated');console.log('app build')\"";
+      "node -e \"const fs=require('node:fs');const output=JSON.parse(fs.readFileSync('turbo.json','utf8')).tasks.build.outputs[0].split('/')[0];fs.mkdirSync(output,{recursive:true});fs.writeFileSync(output+'/generated.txt','generated');fs.writeFileSync(output+'/package.json','{}');console.log('app build')\"";
     await writeFile(
       appManifestPath,
       `${JSON.stringify(appManifest, undefined, 2)}\n`,
@@ -1621,6 +1721,62 @@ snapshots:
             "utf8",
           ),
         ).toBe("module.exports = { hooks: {} };\n");
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("copies a contained configured Yarn executable into prune outputs", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-yarn-"));
+    try {
+      await prepareFixture(directory);
+      const rootManifestPath = join(directory, "package.json");
+      const rootManifest = JSON.parse(
+        await readFile(rootManifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      rootManifest.packageManager = "yarn@4.18.0";
+      rootManifest.workspaces = ["packages/*"];
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, undefined, 2)}\n`,
+      );
+      await writeFile(join(directory, ".pnp.cjs"), "module.exports = {};\n");
+      await writeFile(
+        join(directory, ".yarnrc.yml"),
+        "yarnPath: scripts/yarn.cjs\n",
+      );
+      await mkdir(join(directory, "scripts"));
+      await writeFile(join(directory, "scripts/yarn.cjs"), "yarn executable\n");
+
+      await executeDifferentialCommand(process.execPath, [
+        candidate,
+        "prune",
+        "synthetic-app",
+        "--out-dir=yarn-result",
+        "--cwd",
+        directory,
+      ]);
+      expect(
+        await readFile(join(directory, "yarn-result/scripts/yarn.cjs"), "utf8"),
+      ).toBe("yarn executable\n");
+
+      await executeDifferentialCommand(process.execPath, [
+        candidate,
+        "prune",
+        "synthetic-app",
+        "--docker",
+        "--out-dir=yarn-docker-result",
+        "--cwd",
+        directory,
+      ]);
+      for (const root of ["full", "json"]) {
+        expect(
+          await readFile(
+            join(directory, `yarn-docker-result/${root}/scripts/yarn.cjs`),
+            "utf8",
+          ),
+        ).toBe("yarn executable\n");
       }
     } finally {
       await rm(directory, { force: true, recursive: true });
@@ -2104,6 +2260,50 @@ snapshots:
       "packages/app",
       "node_modules/shared",
     ]);
+    const npmDevelopmentSource = new TextEncoder().encode(
+      JSON.stringify({
+        lockfileVersion: 3,
+        packages: {
+          "": {},
+          "packages/app": {
+            dependencies: { runtime: "1.0.0" },
+            devDependencies: { "build-tool": "2.0.0" },
+          },
+          "node_modules/runtime": { version: "1.0.0" },
+          "node_modules/build-tool": { version: "2.0.0" },
+        },
+      }),
+    );
+    const npmDevelopment = JSON.parse(
+      new TextDecoder().decode(
+        pruneLockfile(
+          "/repo/package-lock.json",
+          npmDevelopmentSource,
+          new Set(["packages/app"]),
+        ),
+      ),
+    ) as { packages: Record<string, Record<string, unknown>> };
+    expect(Object.keys(npmDevelopment.packages)).toContain(
+      "node_modules/build-tool",
+    );
+    const npmProduction = JSON.parse(
+      new TextDecoder().decode(
+        pruneLockfile(
+          "/repo/package-lock.json",
+          npmDevelopmentSource,
+          new Set(["packages/app"]),
+          { production: true },
+        ),
+      ),
+    ) as { packages: Record<string, Record<string, unknown>> };
+    expect(Object.keys(npmProduction.packages)).toEqual([
+      "",
+      "packages/app",
+      "node_modules/runtime",
+    ]);
+    expect(
+      npmProduction.packages["packages/app"]?.devDependencies,
+    ).toBeUndefined();
     const developmentSource = new TextEncoder().encode(`lockfileVersion: '9.0'
 importers:
   packages/app:

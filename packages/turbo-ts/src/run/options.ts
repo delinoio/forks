@@ -305,7 +305,9 @@ export const parseRunArguments = (
       }
       case "--summarize": {
         const adjacent = arguments_[index + 1];
-        const consumesAdjacent = adjacent === "true" || adjacent === "false";
+        const consumesAdjacent =
+          !argument.includes("=") &&
+          (adjacent === "true" || adjacent === "false");
         summarize = argument.includes("=")
           ? !argument.endsWith("=false")
           : consumesAdjacent

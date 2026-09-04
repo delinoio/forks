@@ -260,6 +260,7 @@ const copyIfPresent = (
   destination: string,
   repositoryRoot: string,
   excludedRoot: string,
+  destinationRoot = parentPath(destination),
 ): Effect.Effect<void, unknown, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -303,7 +304,7 @@ const copyIfPresent = (
         );
       }
       const destinationTarget = joinPath(
-        parentPath(destination),
+        destinationRoot,
         relativePath(repositoryRoot, resolved),
       );
       yield* fileSystem.copyFile(resolved, destinationTarget);
@@ -536,6 +537,21 @@ export const executePrune = (
           canonicalOutputRoot,
           [yarnDirectory],
           ignoreMatcher,
+        );
+      }
+    }
+    const yarnExecutable = repository.packageManagerExecutableInput;
+    if (
+      yarnExecutable !== undefined &&
+      !isPathContained(yarnDirectory, yarnExecutable)
+    ) {
+      for (const root of installationRoots) {
+        yield* copyIfPresent(
+          yarnExecutable,
+          joinPath(root, relativePath(repository.root, yarnExecutable)),
+          repository.root,
+          canonicalOutputRoot,
+          root,
         );
       }
     }

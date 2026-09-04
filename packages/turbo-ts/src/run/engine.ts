@@ -3397,6 +3397,7 @@ export const executeRun = (
     const orderedNodes = [...graph.nodes.values()].sort((left, right) =>
       left.id.localeCompare(right.id),
     );
+    const isMonorepo = !parsed.singlePackage && repository.packages.length > 0;
     if (parsed.graph !== undefined) {
       const edges = orderedNodes.flatMap((node) =>
         node.dependencies.length === 0
@@ -3510,7 +3511,7 @@ export const executeRun = (
               ),
               version: "1",
               turboVersion: "2.10.12",
-              monorepo: repository.packages.length > 1,
+              monorepo: isMonorepo,
               globalCacheInputs: {
                 rootKey: "I can’t see ya, but I know you’re here",
                 files: {},
@@ -4171,7 +4172,7 @@ export const executeRun = (
       id: runId,
       version: "1",
       turboVersion: "2.10.12",
-      monorepo: repository.packages.length > 1,
+      monorepo: isMonorepo,
       globalCacheInputs: {
         rootKey: "I can’t see ya, but I know you’re here",
         files: {},
@@ -4211,25 +4212,28 @@ export const executeRun = (
         `${JSON.stringify(summary, undefined, 2)}\n`,
       );
     }
-    const traceEvents = orderedNodes.map((node) => {
-      const outcome = outcomes.get(node.id);
-      const startTime = outcome?.startTime ?? runStartedAt;
-      const endTime = outcome?.endTime ?? runFinishedAt;
-      return {
-        name: parsed.anonymousProfile === undefined ? node.id : node.task,
-        cat: "turbo-ts",
-        ph: "X",
-        ts: startTime * 1_000,
-        dur: Math.max(0, endTime - startTime) * 1_000,
-        pid: 1,
-        tid: 1,
-      };
-    });
-    for (const requestedPath of [
-      parsed.profile,
-      parsed.anonymousProfile,
-      parsed.trace,
-    ]) {
+    const profileEvents = (anonymous: boolean) =>
+      orderedNodes.map((node) => {
+        const outcome = outcomes.get(node.id);
+        const startTime = outcome?.startTime ?? runStartedAt;
+        const endTime = outcome?.endTime ?? runFinishedAt;
+        return {
+          name: anonymous ? node.task : node.id,
+          cat: "turbo-ts",
+          ph: "X",
+          ts: startTime * 1_000,
+          dur: Math.max(0, endTime - startTime) * 1_000,
+          pid: 1,
+          tid: 1,
+        };
+      });
+    const namedProfileEvents = profileEvents(false);
+    const anonymousProfileEvents = profileEvents(true);
+    for (const [requestedPath, traceEvents] of [
+      [parsed.profile, namedProfileEvents],
+      [parsed.anonymousProfile, anonymousProfileEvents],
+      [parsed.trace, namedProfileEvents],
+    ] as const) {
       if (requestedPath === undefined) continue;
       if (profileService._tag === "None") {
         return yield* Effect.fail(
