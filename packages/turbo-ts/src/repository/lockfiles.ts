@@ -372,6 +372,7 @@ const prunePnpmLockfile = (
   source: string,
   workspacePaths: ReadonlySet<string>,
   production: boolean,
+  includeRootImporter = true,
 ): string => {
   const document = objectValue(parseYamlDocument(source));
   if (document === undefined)
@@ -379,7 +380,10 @@ const prunePnpmLockfile = (
   const importers = objectValue(document.importers) ?? {};
   const retainedImporters = Object.fromEntries(
     Object.entries(importers)
-      .filter(([path]) => path === "." || workspacePaths.has(path))
+      .filter(
+        ([path]) =>
+          (includeRootImporter && path === ".") || workspacePaths.has(path),
+      )
       .map(([path, value]) => {
         if (!production) return [path, value];
         const importer = objectValue(value);
@@ -454,6 +458,7 @@ const prunePnpmLockfile = (
 const pruneNpmLockfile = (
   source: string,
   workspacePaths: ReadonlySet<string>,
+  includeRootPackage = true,
 ): string => {
   const document = objectValue(parseJson(source));
   if (document === undefined)
@@ -466,7 +471,7 @@ const pruneNpmLockfile = (
   );
   const retained = new Set<string>();
   const pending = [
-    "",
+    ...(includeRootPackage ? [""] : []),
     ...[...selectedWorkspaces].filter((path) => path in packages),
   ];
   const packageDependencyNames = (value: unknown): ReadonlyArray<string> => {
@@ -550,4 +555,36 @@ export const pruneLockfile = (
         ? pruneNpmLockfile(source, workspacePaths)
         : source;
   return new TextEncoder().encode(output);
+};
+
+export const resolveLockfilePackageClosure = (
+  path: string,
+  contents: Uint8Array,
+  workspacePath: string,
+  directDependencyNames: ReadonlySet<string>,
+): ReadonlyArray<LockfilePackage> => {
+  const parsed = parseLockfile(path, contents);
+  const includeRoot = workspacePath === ".";
+  const workspacePaths = new Set(includeRoot ? [] : [workspacePath]);
+  if (parsed.format === "pnpm") {
+    const source = validateSource(contents);
+    return parseLockfile(
+      path,
+      new TextEncoder().encode(
+        prunePnpmLockfile(source, workspacePaths, false, includeRoot),
+      ),
+    ).packages;
+  }
+  if (parsed.format === "npm") {
+    const source = validateSource(contents);
+    return parseLockfile(
+      path,
+      new TextEncoder().encode(
+        pruneNpmLockfile(source, workspacePaths, includeRoot),
+      ),
+    ).packages;
+  }
+  return parsed.packages.filter((dependency) =>
+    directDependencyNames.has(dependency.name),
+  );
 };

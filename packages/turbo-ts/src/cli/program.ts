@@ -44,11 +44,21 @@ const workflowCommands = new Set([
   "watch",
 ]);
 
-const globalOptionsWithValues = new Set([
+const runOptionsWithRequiredValues = new Set([
   "--api",
+  "--cache",
+  "--cache-dir",
+  "--cache-workers",
+  "--concurrency",
   "--cwd",
+  "--env-mode",
+  "--filter",
+  "--global-deps",
   "--heap",
   "--login",
+  "--log-order",
+  "--log-prefix",
+  "--output-logs",
   "--remote-cache-timeout",
   "--root-turbo-json",
   "--team",
@@ -62,17 +72,35 @@ const globalOptionsWithValues = new Set([
   "--experimental-otel-interval-ms",
   "--experimental-otel-header",
   "--experimental-otel-resource",
+  "-F",
 ]);
 
-const commandIndex = (arguments_: ReadonlyArray<string>): number => {
+const runOptionConsumesAdjacent = (
+  argument: string,
+  adjacent: string | undefined,
+): boolean => {
+  if (argument.includes("=")) return false;
+  const name = argument.split("=", 1)[0]!;
+  if (runOptionsWithRequiredValues.has(name)) return true;
+  if (name === "--dry" || name === "--dry-run") {
+    return adjacent === "text" || adjacent === "json";
+  }
+  if (name === "--summarize") {
+    return adjacent === "true" || adjacent === "false";
+  }
+  return (
+    ["--anon-profile", "--graph", "--log-file", "--profile"].includes(name) &&
+    adjacent !== undefined &&
+    !adjacent.startsWith("-")
+  );
+};
+
+export const commandIndex = (arguments_: ReadonlyArray<string>): number => {
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index]!;
     if (argument === "--") return -1;
     if (!argument.startsWith("-")) return index;
-    if (
-      !argument.includes("=") &&
-      globalOptionsWithValues.has(argument.split("=", 1)[0]!)
-    ) {
+    if (runOptionConsumesAdjacent(argument, arguments_[index + 1])) {
       index += 1;
     }
   }

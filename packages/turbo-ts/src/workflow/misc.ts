@@ -77,9 +77,21 @@ export const executeInfo = (
     for (let index = 0; index < arguments_.length; index += 1) {
       const argument = arguments_[index]!;
       if (argument === "--cwd" || argument.startsWith("--cwd=")) {
-        cwd = argument.includes("=")
-          ? argument.slice(argument.indexOf("=") + 1)
-          : arguments_[++index];
+        if (argument.includes("=")) {
+          cwd = argument.slice(argument.indexOf("=") + 1);
+        } else {
+          const value = arguments_[index + 1];
+          if (value === undefined || value.startsWith("-")) {
+            return yield* Effect.fail(
+              new ConfigurationError({
+                path: "<arguments>",
+                message: "--cwd requires a value",
+              }),
+            );
+          }
+          cwd = value;
+          index += 1;
+        }
       } else if (
         argument !== "--no-color" &&
         argument !== "--no-update-notifier"

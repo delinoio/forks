@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "@rstest/core";
 import { graphql } from "graphql";
+import { commandIndex } from "../src/cli/program.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { normalizeOutput } from "../src/compatibility/normalizers.js";
 import { pruneLockfile } from "../src/repository/lockfiles.js";
@@ -35,7 +36,10 @@ import { parseDaemonArguments } from "../src/workflow/daemon.js";
 import { isWindowsSubsystemForLinux } from "../src/workflow/misc.js";
 import { parsePruneArguments } from "../src/workflow/prune.js";
 import { repositoryQuerySchema } from "../src/workflow/query.js";
-import { repositoryPackageManagerLabel } from "../src/workflow/repository.js";
+import {
+  isInternalRepositoryPath,
+  repositoryPackageManagerLabel,
+} from "../src/workflow/repository.js";
 import { parseWatchArguments } from "../src/workflow/watch.js";
 
 const execFilePromise = promisify(execFile);
@@ -81,6 +85,40 @@ importers:
         specifier: workspace:*
         version: link:../library
   packages/library: {}
+`;
+
+const dependencyWorkflowLockfile = `lockfileVersion: '9.0'
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+importers:
+  .: {}
+  packages/app:
+    dependencies:
+      synthetic-library:
+        specifier: workspace:*
+        version: link:../library
+      foo:
+        specifier: 1.0.0
+        version: 1.0.0
+  packages/library:
+    dependencies:
+      bar:
+        specifier: 2.0.0
+        version: 2.0.0
+packages:
+  foo@1.0.0:
+    resolution: {integrity: sha512-Zm9v}
+  bar@2.0.0:
+    resolution: {integrity: sha512-YmFy}
+  baz@3.0.0:
+    resolution: {integrity: sha512-YmF6}
+snapshots:
+  foo@1.0.0:
+    dependencies:
+      baz: 3.0.0
+  bar@2.0.0: {}
+  baz@3.0.0: {}
 `;
 
 const prepareFixture = async (directory: string): Promise<void> => {
@@ -211,6 +249,24 @@ describe("repository workflow gate", () => {
       singlePackage: true,
       json: true,
     });
+    expect(
+      parseRunArguments(["run", "build", "--dry-run=text", "json"]),
+    ).toMatchObject({ tasks: ["build", "json"], dryRun: "text" });
+    expect(commandIndex(["--filter", "watch", "build"])).toBe(2);
+    expect(commandIndex(["--cache", "watch", "build"])).toBe(2);
+    expect(commandIndex(["--dry-run", "text", "watch"])).toBe(2);
+    expect(commandIndex(["--dry-run=text", "json"])).toBe(1);
+    expect(commandIndex(["--graph", "watch", "build"])).toBe(2);
+    const nestedRepository = join(tmpdir(), ".turbo", "repository");
+    expect(
+      isInternalRepositoryPath(nestedRepository, join(nestedRepository, "src")),
+    ).toBe(false);
+    expect(
+      isInternalRepositoryPath(
+        nestedRepository,
+        join(nestedRepository, ".turbo", "cache"),
+      ),
+    ).toBe(true);
     for (const [manager, label] of [
       ["npm", "npm"],
       ["pnpm", "pnpm9"],
@@ -286,6 +342,9 @@ describe("repository workflow gate", () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-workflow-"));
     try {
       await prepareFixture(directory);
+      await expect(
+        execFilePromise(process.execPath, [candidate, "info", "--cwd"]),
+      ).rejects.toThrow(/--cwd requires a value/);
       const listed = await executeDifferentialCommand(process.execPath, [
         candidate,
         "--cwd",
@@ -567,7 +626,122 @@ describe("repository workflow gate", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  }, 45_000);
+  }, 60_000);
+
+  it("reports resolved dependency hashes and actual encoded task-log paths", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-summary-paths-"));
+    try {
+      await prepareFixture(directory);
+      for (const [packageName, dependencies] of [
+        ["app", { "synthetic-library": "workspace:*", foo: "1.0.0" }],
+        ["library", { bar: "2.0.0" }],
+      ] as const) {
+        const manifestPath = join(
+          directory,
+          `packages/${packageName}/package.json`,
+        );
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          dependencies?: Record<string, string>;
+          scripts: Record<string, string>;
+        };
+        manifest.dependencies = dependencies;
+        manifest.scripts["lint:types"] = "node -e \"console.log('type lint')\"";
+        await writeFile(
+          manifestPath,
+          `${JSON.stringify(manifest, undefined, 2)}\n`,
+        );
+      }
+      const configurationPath = join(directory, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks["lint:types"] = { dependsOn: ["^lint:types"] };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      await writeFile(
+        join(directory, "pnpm-lock.yaml"),
+        dependencyWorkflowLockfile,
+      );
+
+      const dryResult = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "lint:types",
+        "--dry=json",
+        "--cwd",
+        directory,
+      ]);
+      const drySummary = JSON.parse(dryResult.stdout) as {
+        readonly tasks: ReadonlyArray<{
+          readonly taskId: string;
+          readonly hashOfExternalDependencies: string;
+          readonly logFile: string;
+        }>;
+      };
+      const officialDryResult = await executeDifferentialCommand(official, [
+        "run",
+        "lint:types",
+        "--dry=json",
+        "--cwd",
+        directory,
+      ]);
+      const officialHashes = (
+        JSON.parse(officialDryResult.stdout) as {
+          readonly tasks: ReadonlyArray<{
+            readonly hashOfExternalDependencies: string;
+          }>;
+        }
+      ).tasks.map((task) => task.hashOfExternalDependencies);
+      expect(new Set(officialHashes).size).toBe(2);
+
+      const hashes = drySummary.tasks.map(
+        (task) => task.hashOfExternalDependencies,
+      );
+      expect(new Set(hashes).size).toBe(2);
+      expect(hashes).not.toContain("459c029558afe716");
+      for (const task of drySummary.tasks) {
+        expect(task.logFile).toBe(
+          `${task.taskId.startsWith("synthetic-app") ? "packages/app" : "packages/library"}/.turbo/turbo-lint%003Atypes.log`,
+        );
+      }
+
+      const completedResult = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "lint:types",
+        "--no-cache",
+        "--summarize",
+        "--json",
+        "--cwd",
+        directory,
+      ]);
+      const completedSummary = JSON.parse(
+        completedResult.stdout.trim().split("\n").at(-1)!,
+      ) as typeof drySummary;
+      expect(
+        completedSummary.tasks.map((task) => ({
+          taskId: task.taskId,
+          hash: task.hashOfExternalDependencies,
+          logFile: task.logFile,
+        })),
+      ).toEqual(
+        drySummary.tasks.map((task) => ({
+          taskId: task.taskId,
+          hash: task.hashOfExternalDependencies,
+          logFile: task.logFile,
+        })),
+      );
+      for (const task of completedSummary.tasks) {
+        expect(
+          (await readFile(join(directory, task.logFile))).byteLength,
+        ).toBeGreaterThan(0);
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
 
   it("groups concurrent task output and keeps timestamped streaming distinct", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-run-output-"));
@@ -982,7 +1156,10 @@ describe("repository workflow gate", () => {
   }, 60_000);
 
   it("coalesces file storms, restarts watch runs, and closes on interruption", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-"));
+    const parent = await mkdtemp(join(tmpdir(), "turbo-ts-watch-parent-"));
+    const reservedParent = join(parent, ".turbo");
+    await mkdir(reservedParent);
+    const directory = await mkdtemp(join(reservedParent, "repository-"));
     await prepareFixture(directory);
     const appManifestPath = join(directory, "packages/app/package.json");
     const appManifest = JSON.parse(await readFile(appManifestPath, "utf8")) as {
@@ -1056,6 +1233,30 @@ describe("repository workflow gate", () => {
       expect(stdout, stdout).not.toContain(
         `change detected: ${join(directory, "packages/app/dist")}`,
       );
+      const addedWorkspace = join(directory, "packages/added");
+      await mkdir(addedWorkspace);
+      await writeFile(
+        join(addedWorkspace, "package.json"),
+        `${JSON.stringify({
+          name: "synthetic-added",
+          private: true,
+          scripts: {
+            build:
+              "node -e \"const fs=require('node:fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/generated.txt','generated');console.log('added workspace build')\"",
+          },
+        })}\n`,
+      );
+      await waitUntil(() => stdout.includes("added workspace build"));
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      const addedBuilds = (stdout.match(/added workspace build/g) ?? []).length;
+      expect(addedBuilds).toBeGreaterThan(0);
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      expect((stdout.match(/added workspace build/g) ?? []).length).toBe(
+        addedBuilds,
+      );
+      expect(stdout, stdout).not.toContain(
+        `change detected: ${join(addedWorkspace, "dist")}`,
+      );
       expect(stderr).toContain("• turbo-ts 0.1.0");
     } finally {
       child.kill();
@@ -1067,7 +1268,7 @@ describe("repository workflow gate", () => {
         child.kill("SIGKILL");
         await closed;
       }
-      await rm(directory, { force: true, recursive: true });
+      await rm(parent, { force: true, recursive: true });
     }
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
   }, 40_000);
@@ -1515,8 +1716,9 @@ importers:
     const outside = await mkdtemp(join(tmpdir(), "turbo-ts-prune-control-"));
     try {
       await prepareFixture(directory);
-      await writeFile(join(directory, ".yarnrc"), "safe-control\n");
-      await symlink(".yarnrc", join(directory, ".npmrc"));
+      await mkdir(join(directory, "config"));
+      await writeFile(join(directory, "config/npmrc"), "safe-control\n");
+      await symlink("config/npmrc", join(directory, ".npmrc"));
       await execFilePromise(process.execPath, [
         candidate,
         "prune",
@@ -1527,10 +1729,39 @@ importers:
       ]);
       expect(
         await readlink(join(directory, "safe-control-result/.npmrc")),
-      ).toBe(".yarnrc");
+      ).toBe("config/npmrc");
       expect(
         await readFile(join(directory, "safe-control-result/.npmrc"), "utf8"),
       ).toBe("safe-control\n");
+      expect(
+        await readFile(
+          join(directory, "safe-control-result/config/npmrc"),
+          "utf8",
+        ),
+      ).toBe("safe-control\n");
+      await execFilePromise(process.execPath, [
+        candidate,
+        "prune",
+        "synthetic-app",
+        "--docker",
+        "--out-dir=safe-control-docker",
+        "--cwd",
+        directory,
+      ]);
+      for (const root of ["full", "json"]) {
+        expect(
+          await readFile(
+            join(directory, `safe-control-docker/${root}/.npmrc`),
+            "utf8",
+          ),
+        ).toBe("safe-control\n");
+        expect(
+          await readFile(
+            join(directory, `safe-control-docker/${root}/config/npmrc`),
+            "utf8",
+          ),
+        ).toBe("safe-control\n");
+      }
       await rm(join(directory, ".npmrc"));
       const outsideControl = join(outside, ".npmrc");
       await writeFile(outsideControl, "registry-token=secret\n");
@@ -1551,6 +1782,21 @@ importers:
         /prune root control symlink must use a relative target/,
       );
       await rm(join(directory, ".npmrc"));
+      const exactOutput = join(directory, "packages/app/exact-output");
+      await symlink(outside, exactOutput);
+      await expect(
+        execFilePromise(process.execPath, [
+          candidate,
+          "prune",
+          "synthetic-app",
+          "--out-dir=packages/app/exact-output",
+          "--use-gitignore=false",
+          "--cwd",
+          directory,
+        ]),
+      ).rejects.toThrow(/prune output must not be a symlink/);
+      expect(await readlink(exactOutput)).toBe(outside);
+      await rm(exactOutput);
       await symlink(".", join(directory, "output-alias"));
       await expect(
         execFilePromise(process.execPath, [

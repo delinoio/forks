@@ -694,7 +694,7 @@ const discoverFiles = (
       }));
   });
 
-const owningLockfile = (
+export const owningLockfile = (
   repository: RepositoryModel,
   node: TaskNode,
 ): Effect.Effect<string | undefined, RepositoryError, FileSystemService> =>

@@ -489,9 +489,12 @@ to their read-only capabilities until that flag is present. Repository and
 nested Git-ignore rules and every configured task-output pattern suppress
 generated-file triggers. Changes to an ignore file reload the matcher and
 remain user-visible triggers, while root, custom, and workspace Turbo
-configuration changes refresh output patterns before the next run. Run
-arguments after `--` remain task pass-through arguments, including text equal
-to the watch-only cache-publication flag.
+configuration changes and active JavaScript, Cargo, or uv workspace manifest
+changes refresh package discovery and output patterns before the next run.
+Internal-directory exclusions are matched relative to the watched repository,
+so reserved names in ancestor directories do not suppress repository events.
+Run arguments after `--` remain task pass-through arguments, including text
+equal to the watch-only cache-publication flag.
 
 The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
 identity, per-user temporary state directory, atomic PID and start lock files,
@@ -546,8 +549,11 @@ configuration formatting, supports production manifests, and
 rejects output roots that could contain the source repository. It never
 follows workspace symlinks into a prune output. Output safety and traversal
 exclusions use canonical locations. Contained relative file symlinks are
-recreated without dereferencing; absolute, escaping, or output-targeting links
-are rejected, including symlinked root installation controls. The root pnpm
+recreated without dereferencing; copied root controls include their contained
+regular-file targets at the corresponding installation paths. Absolute,
+escaping, or output-targeting links are rejected, including symlinked root
+installation controls, and an exact symlinked output root is rejected before
+replacement. The root pnpm
 hook `.pnpmfile.cjs` is retained in every
 installation root. Root Yarn installation controls, including `.yarnrc.yml`,
 `.pnp.cjs`, releases, and patches, are retained in applicable ordinary and
@@ -570,7 +576,10 @@ merged into task hash inputs. Dry runs do not perform local cache eviction, and
 `info` derives WSL status from the Linux kernel release. Log-prefix selection
 applies to live and cached output. Summaries record
 the actual local or remote cache source and saved duration, and summaries and
-profiles use each task's scheduling timestamps. Persisted, stdout, and
+profiles use each task's scheduling timestamps. Task summaries record the
+resolved external-dependency closure hash and actual encoded log path,
+including collision-qualified identifiers and alternate execution scopes.
+Persisted, stdout, and
 newline-delimited summaries from one run share one canonical UUID v7 identifier.
 Mermaid graphs assign stable,
 unique node identifiers without truncated-hash collisions.

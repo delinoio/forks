@@ -271,7 +271,9 @@ export const parseRunArguments = (
       case "--dry":
       case "--dry-run": {
         const adjacent = arguments_[index + 1];
-        const consumesAdjacent = adjacent === "text" || adjacent === "json";
+        const consumesAdjacent =
+          !argument.includes("=") &&
+          (adjacent === "text" || adjacent === "json");
         const value = argument.includes("=")
           ? argument.slice(argument.indexOf("=") + 1)
           : consumesAdjacent

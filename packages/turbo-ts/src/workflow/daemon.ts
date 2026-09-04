@@ -23,6 +23,7 @@ import {
   TerminalService,
 } from "../effect/services.js";
 import {
+  isInternalRepositoryPath,
   loadWorkflowRepository,
   repositoryPackageManagerLabel,
 } from "./repository.js";
@@ -544,12 +545,9 @@ const serveDaemon = (
         }),
       );
       const repositoryChanges = fileWatcher.watch(repository.root).pipe(
-        Stream.filter((change) => {
-          const normalized = `/${normalizePath(change.path)}/`;
-          return !["/.git/", "/.turbo/", "/node_modules/"].some((component) =>
-            normalized.includes(component),
-          );
-        }),
+        Stream.filter(
+          (change) => !isInternalRepositoryPath(repository.root, change.path),
+        ),
         Stream.runForEach((change) =>
           Effect.gen(function* () {
             const relative = relativePath(repository.root, change.path);

@@ -23,7 +23,10 @@ import {
   type RunRequirements,
 } from "../run/engine.js";
 import { type ParsedRunOptions, parseRunArguments } from "../run/options.js";
-import { loadWorkflowRepository } from "./repository.js";
+import {
+  isInternalRepositoryPath,
+  loadWorkflowRepository,
+} from "./repository.js";
 
 export interface WatchOptions {
   readonly run: ParsedRunOptions;
@@ -68,13 +71,6 @@ export const parseWatchArguments = (
   };
 };
 
-const ignoredWatchPath = (path: string): boolean => {
-  const normalized = `/${normalizePath(path)}/`;
-  return ["/.git/", "/.turbo/", "/node_modules/"].some((component) =>
-    normalized.includes(component),
-  );
-};
-
 const configuredOutputPath = (
   repository: RepositoryModel,
   path: string,
@@ -110,6 +106,16 @@ const isTurboConfigurationPath = (
   return normalizePath(path) === normalizePath(absoluteConfiguredPath);
 };
 
+const workspaceManifestNames = new Set([
+  "Cargo.toml",
+  "package.json",
+  "pyproject.toml",
+]);
+
+const isWorkspaceDiscoveryPath = (root: string, path: string): boolean =>
+  workspaceManifestNames.has(baseName(path)) ||
+  normalizePath(path) === normalizePath(joinPath(root, "pnpm-workspace.yaml"));
+
 export const executeWatch = (
   options: WatchOptions,
 ): Effect.Effect<number, unknown, FileWatcherService | RunRequirements> =>
@@ -127,7 +133,9 @@ export const executeWatch = (
     const changes = watcher.watch(repository.root).pipe(
       Stream.filterEffect((change) =>
         Effect.gen(function* () {
-          if (ignoredWatchPath(change.path)) return false;
+          if (isInternalRepositoryPath(repository.root, change.path)) {
+            return false;
+          }
           if (isGitIgnorePath(change.path)) {
             yield* Ref.set(
               ignoreMatcher,
@@ -136,6 +144,7 @@ export const executeWatch = (
             return true;
           }
           if (
+            isWorkspaceDiscoveryPath(repository.root, change.path) ||
             isTurboConfigurationPath(
               repository.root,
               options.run.rootTurboJson,

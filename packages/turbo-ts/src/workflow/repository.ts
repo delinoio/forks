@@ -1,6 +1,11 @@
 import { Effect } from "effect";
 import { loadRootConfiguration } from "../config/runtime.js";
-import { isAbsolutePath, joinPath } from "../core/path.js";
+import {
+  isAbsolutePath,
+  joinPath,
+  normalizePath,
+  relativePath,
+} from "../core/path.js";
 import { ConfigurationError } from "../effect/errors.js";
 import {
   EnvironmentService,
@@ -90,3 +95,13 @@ export const loadWorkflowRepository = (
 export const repositoryPackageManagerLabel = (
   repository: Pick<RepositoryModel, "manager">,
 ): string => (repository.manager === "pnpm" ? "pnpm9" : repository.manager);
+
+export const isInternalRepositoryPath = (
+  root: string,
+  path: string,
+): boolean => {
+  const relative = `/${normalizePath(relativePath(root, path))}/`;
+  return ["/.git/", "/.turbo/", "/node_modules/"].some((component) =>
+    relative.includes(component),
+  );
+};

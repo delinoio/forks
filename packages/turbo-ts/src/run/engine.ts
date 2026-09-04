@@ -69,6 +69,7 @@ import {
   effectiveTaskInputs,
   hashTask,
   implicitTaskInputCandidates,
+  owningLockfile,
   type TaskHashResult,
   taskEnvironment,
 } from "../hash/task-hash.js";
@@ -79,6 +80,7 @@ import {
   renderLogEvent,
   renderTaskOutputChunk,
 } from "../logging/events.js";
+import { resolveLockfilePackageClosure } from "../repository/lockfiles.js";
 import {
   cargoHomeConfigurationPresent,
   configuredEnvironmentValue,
@@ -1758,6 +1760,70 @@ const taskExecutionDirectory = (
 ): string =>
   scope?.kind === "cargo-workspace" ? scope.directory : node.package.directory;
 
+const taskLogPath = (
+  node: TaskNode,
+  scope: TaskCommandScope | undefined,
+  identifier = node.task,
+): string =>
+  joinPath(
+    taskExecutionDirectory(node, scope),
+    ".turbo",
+    `turbo-${encodeTaskLogIdentifier(identifier)}.log`,
+  );
+
+const emptyExternalDependenciesHash = "459c029558afe716";
+
+const taskExternalDependenciesHash = (
+  repository: RepositoryModel,
+  node: TaskNode,
+): Effect.Effect<string, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    const lockfile = yield* owningLockfile(repository, node);
+    if (lockfile === undefined) return emptyExternalDependenciesHash;
+    const fileSystem = yield* FileSystemService;
+    const contents = yield* fileSystem
+      .readBytes(lockfile)
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({ path: lockfile, message: error.message }),
+        ),
+      );
+    const internalNames = new Set([
+      node.package.name,
+      ...node.package.internalDependencies.flatMap((identity) => {
+        const dependency = repository.packagesByIdentity.get(identity);
+        return dependency === undefined ? [] : [dependency.name];
+      }),
+    ]);
+    const directExternalNames = new Set(
+      node.package.dependencyNames.filter((name) => !internalNames.has(name)),
+    );
+    const dependencies = yield* Effect.try({
+      try: () =>
+        resolveLockfilePackageClosure(
+          lockfile,
+          contents,
+          node.package.relativeDirectory,
+          directExternalNames,
+        ),
+      catch: (cause) =>
+        new RepositoryError({ path: lockfile, message: String(cause) }),
+    });
+    const identities = [
+      ...new Set(
+        dependencies.flatMap((dependency) =>
+          internalNames.has(dependency.name)
+            ? []
+            : [`${dependency.name}@${dependency.version}`],
+        ),
+      ),
+    ].sort();
+    return identities.length === 0
+      ? emptyExternalDependenciesHash
+      : xxhash64Hex(JSON.stringify(identities));
+  });
+
 const taskLogIdentifiers = (
   repository: RepositoryModel,
   graph: TaskGraph,
@@ -2274,11 +2340,7 @@ const executeTask = (
       maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
       maxSizeBytes: options.cacheMaxSizeBytes,
     };
-    const logPath = joinPath(
-      executionDirectory,
-      ".turbo",
-      `turbo-${encodeTaskLogIdentifier(logIdentifier)}.log`,
-    );
+    const logPath = taskLogPath(node, scope, logIdentifier);
     const replayTaskLog = (recordOutput: boolean) =>
       Effect.gen(function* () {
         const hasLog = yield* fileSystem
@@ -3420,6 +3482,21 @@ export const executeRun = (
       }
       return 0;
     }
+    const externalDependencyHashes = new Map(
+      parsed.dryRun === "json" ||
+        parsed.summarize ||
+        parsed.json ||
+        parsed.logFile !== undefined
+        ? yield* Effect.forEach(
+            orderedNodes,
+            (node) =>
+              taskExternalDependenciesHash(repository, node).pipe(
+                Effect.map((hash) => [node.id, hash] as const),
+              ),
+            { concurrency: 8 },
+          )
+        : [],
+    );
     if (parsed.dryRun !== undefined) {
       const terminal = yield* TerminalService;
       if (parsed.dryRun === "json") {
@@ -3437,7 +3514,7 @@ export const executeRun = (
               globalCacheInputs: {
                 rootKey: "I can’t see ya, but I know you’re here",
                 files: {},
-                hashOfExternalDependencies: "459c029558afe716",
+                hashOfExternalDependencies: emptyExternalDependenciesHash,
                 hashOfInternalDependencies: "",
                 environmentVariables: {
                   specified: { env: [], passThroughEnv: null },
@@ -3462,7 +3539,9 @@ export const executeRun = (
                     ([path]) => !path.startsWith("$TURBO_ROOT$/"),
                   ),
                 ),
-                hashOfExternalDependencies: "459c029558afe716",
+                hashOfExternalDependencies: externalDependencyHashes.get(
+                  node.id,
+                )!,
                 cache: {
                   local: false,
                   remote: false,
@@ -3481,7 +3560,14 @@ export const executeRun = (
                     ) ?? [];
                   return outputs.length === 0 ? null : outputs;
                 })(),
-                logFile: `${node.package.relativeDirectory === "." ? "" : `${node.package.relativeDirectory}/`}.turbo/turbo-${node.task}.log`,
+                logFile: relativePath(
+                  repository.root,
+                  taskLogPath(
+                    node,
+                    cargoWorkspacePlan.scopes.get(node.id),
+                    logIdentifiers.get(node.id),
+                  ),
+                ),
                 directory:
                   node.package.relativeDirectory === "."
                     ? ""
@@ -4013,7 +4099,9 @@ export const executeRun = (
             ([path]) => !path.startsWith("$TURBO_ROOT$/"),
           ),
         ),
-        hashOfExternalDependencies: "459c029558afe716",
+        hashOfExternalDependencies:
+          externalDependencyHashes.get(node.id) ??
+          emptyExternalDependenciesHash,
         cache: {
           local: outcome?.cacheSource === "local",
           remote: outcome?.cacheSource === "remote",
@@ -4026,7 +4114,14 @@ export const executeRun = (
           (output) => !output.startsWith("!"),
         ),
         excludedOutputs: excludedOutputs.length === 0 ? null : excludedOutputs,
-        logFile: `${node.package.relativeDirectory === "." ? "" : `${node.package.relativeDirectory}/`}.turbo/turbo-${node.task}.log`,
+        logFile: relativePath(
+          repository.root,
+          taskLogPath(
+            node,
+            cargoWorkspacePlan.scopes.get(node.id),
+            logIdentifiers.get(node.id),
+          ),
+        ),
         directory:
           node.package.relativeDirectory === "."
             ? ""

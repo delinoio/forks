@@ -8,6 +8,7 @@ import {
   joinPath,
   normalizePath,
   parentPath,
+  relativePath,
 } from "../core/path.js";
 import { ConfigurationError } from "../effect/errors.js";
 import {
@@ -301,7 +302,15 @@ const copyIfPresent = (
           }),
         );
       }
-      yield* fileSystem.createSymlink(target, destination);
+      const destinationTarget = joinPath(
+        parentPath(destination),
+        relativePath(repositoryRoot, resolved),
+      );
+      yield* fileSystem.copyFile(resolved, destinationTarget);
+      yield* fileSystem.createSymlink(
+        relativePath(parentPath(destination), destinationTarget),
+        destination,
+      );
       return;
     }
     return yield* Effect.fail(
@@ -425,6 +434,17 @@ export const executePrune = (
           message: "prune output must not contain the repository root",
         }),
       );
+    }
+    if (yield* fileSystem.exists(outputRoot)) {
+      const outputMetadata = yield* fileSystem.metadata(outputRoot);
+      if (outputMetadata.kind === "symlink") {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: outputRoot,
+            message: "prune output must not be a symlink",
+          }),
+        );
+      }
     }
     yield* fileSystem.remove(outputRoot);
     const fullRoot = options.docker ? joinPath(outputRoot, "full") : outputRoot;
