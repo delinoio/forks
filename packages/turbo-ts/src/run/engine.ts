@@ -3417,6 +3417,26 @@ export const executeRun = (
         { concurrency: 8 },
       ),
     );
+    const profileService = yield* Effect.serviceOption(RuntimeProfileService);
+    if (
+      parsed.heap !== undefined &&
+      parsed.graph === undefined &&
+      parsed.dryRun === undefined
+    ) {
+      if (profileService._tag === "None") {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: "<arguments>",
+            message: "runtime heap profiling is unavailable",
+          }),
+        );
+      }
+      yield* profileService.value.heapSnapshot(
+        isAbsolutePath(parsed.heap)
+          ? parsed.heap
+          : joinPath(options.root, parsed.heap),
+      );
+    }
     const hashes = yield* applyCargoWorkspaceHashes(
       repository,
       graph,
@@ -3718,7 +3738,6 @@ export const executeRun = (
         ),
       );
     }
-    const profileService = yield* Effect.serviceOption(RuntimeProfileService);
     const clock = yield* ClockService;
     const runStartedAt = yield* clock.now;
     const structuredLogPath =
@@ -3742,21 +3761,6 @@ export const executeRun = (
               `${JSON.stringify(record)}\n`,
             ),
           );
-    if (parsed.heap !== undefined) {
-      if (profileService._tag === "None") {
-        return yield* Effect.fail(
-          new ConfigurationError({
-            path: "<arguments>",
-            message: "runtime heap profiling is unavailable",
-          }),
-        );
-      }
-      yield* profileService.value.heapSnapshot(
-        isAbsolutePath(parsed.heap)
-          ? parsed.heap
-          : joinPath(options.root, parsed.heap),
-      );
-    }
     const groups = taskGroups(graph);
     const pending = new Map(groups.map((members) => [members[0]!, members]));
     const outcomes = new Map<string, TaskOutcome>();
@@ -4272,19 +4276,20 @@ export const executeRun = (
       );
     }
     const profileEvents = (anonymous: boolean) =>
-      orderedNodes.map((node) => {
+      orderedNodes.flatMap((node) => {
         const outcome = outcomes.get(node.id);
-        const startTime = outcome?.startTime ?? runStartedAt;
-        const endTime = outcome?.endTime ?? runFinishedAt;
-        return {
-          name: anonymous ? node.task : node.id,
-          cat: "turbo-ts",
-          ph: "X",
-          ts: startTime * 1_000,
-          dur: Math.max(0, endTime - startTime) * 1_000,
-          pid: 1,
-          tid: 1,
-        };
+        if (outcome === undefined) return [];
+        return [
+          {
+            name: anonymous ? node.task : node.id,
+            cat: "turbo-ts",
+            ph: "X",
+            ts: outcome.startTime * 1_000,
+            dur: Math.max(0, outcome.endTime - outcome.startTime) * 1_000,
+            pid: 1,
+            tid: 1,
+          },
+        ];
       });
     const namedProfileEvents = profileEvents(false);
     const anonymousProfileEvents = profileEvents(true);

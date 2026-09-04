@@ -629,7 +629,7 @@ const boundaryDiagnostics = (
 const repositoryQueryRoot = (
   repository: RepositoryModel,
   readFile: (path: string) => Promise<string>,
-  externalDependencies: ReadonlyArray<LockfilePackage>,
+  loadExternalDependencies: () => Promise<ReadonlyArray<LockfilePackage>>,
   affectedRepository: (
     base: string,
     head: string,
@@ -927,7 +927,7 @@ const repositoryQueryRoot = (
       errors: boundaryDiagnostics(repository),
       warnings: [],
     }),
-    externalDependencies: () => list(externalDependencies),
+    externalDependencies: async () => list(await loadExternalDependencies()),
     file: async ({ path }: { readonly path: string }) => {
       const normalized = normalizePath(path);
       const absolutePath = joinPath(repository.root, normalized);
@@ -957,23 +957,26 @@ const executeGraphql = (
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const processService = yield* ProcessService;
-    const lockfileContents =
-      repository.lockfile === undefined
-        ? undefined
-        : yield* fileSystem.readBytes(repository.lockfile).pipe(
-            Effect.mapError(
-              (error) =>
-                new ConfigurationError({
-                  path: repository.lockfile!,
-                  message: error.message,
-                }),
-            ),
-          );
-    const models = repositoryModels(repository);
-    const externalDependencies =
-      repository.lockfile === undefined || lockfileContents === undefined
-        ? []
-        : yield* Effect.try({
+    let externalDependenciesPromise:
+      | Promise<ReadonlyArray<LockfilePackage>>
+      | undefined;
+    const loadExternalDependencies = () => {
+      externalDependenciesPromise ??= Effect.runPromise(
+        Effect.gen(function* () {
+          if (repository.lockfile === undefined) return [];
+          const lockfileContents = yield* fileSystem
+            .readBytes(repository.lockfile)
+            .pipe(
+              Effect.mapError(
+                (error) =>
+                  new ConfigurationError({
+                    path: repository.lockfile!,
+                    message: error.message,
+                  }),
+              ),
+            );
+          const models = repositoryModels(repository);
+          return yield* Effect.try({
             try: () => {
               const dependencies = new Map<string, LockfilePackage>();
               for (const model of models) {
@@ -1026,6 +1029,10 @@ const executeGraphql = (
                 message: String(cause),
               }),
           });
+        }),
+      );
+      return externalDependenciesPromise;
+    };
     return yield* Effect.tryPromise({
       try: () =>
         graphql({
@@ -1064,7 +1071,7 @@ const executeGraphql = (
                   ),
                 ),
               ),
-            externalDependencies,
+            loadExternalDependencies,
             (base, head) =>
               Effect.runPromise(
                 calculateAffectedRepository(repository, base, head).pipe(

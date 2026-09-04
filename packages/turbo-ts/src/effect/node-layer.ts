@@ -1994,8 +1994,46 @@ const respondGrpc = (
     return Effect.sync(() => stream.close());
   });
 
-const daemonLayer = Layer.succeed(DaemonService, {
-  serve: (endpoint) =>
+interface DaemonEndpointIdentity {
+  readonly device: number;
+  readonly inode: number;
+}
+
+interface DaemonEndpointSetup {
+  readonly metadata: (path: string) => Promise<DaemonEndpointIdentity>;
+  readonly setPermissions: (path: string, mode: number) => Promise<void>;
+}
+
+const closeBoundDaemonServer = async (
+  endpoint: string,
+  server: Http2Server,
+  sessions: ReadonlySet<ServerHttp2Session>,
+  endpointIdentity?: DaemonEndpointIdentity,
+): Promise<void> => {
+  for (const session of sessions) session.destroy();
+  if (server.listening) {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+  if (endpointIdentity === undefined) return;
+  const currentIdentity = await lstat(endpoint).catch(() => undefined);
+  if (
+    currentIdentity !== undefined &&
+    currentIdentity.dev === endpointIdentity.device &&
+    currentIdentity.ino === endpointIdentity.inode
+  ) {
+    await rm(endpoint, { force: true }).catch(() => undefined);
+  }
+};
+
+export const makeDaemonServe = (setup: Partial<DaemonEndpointSetup> = {}) => {
+  const metadata =
+    setup.metadata ??
+    (async (path: string) => {
+      const value = await lstat(path);
+      return { device: value.dev, inode: value.ino };
+    });
+  const setPermissions = setup.setPermissions ?? chmod;
+  return (endpoint: string) =>
     Stream.asyncPush<DaemonConnection, BoundaryError>(
       (emit) =>
         Effect.acquireRelease(
@@ -2003,10 +2041,7 @@ const daemonLayer = Layer.succeed(DaemonService, {
             {
               readonly server: Http2Server;
               readonly sessions: Set<ServerHttp2Session>;
-              readonly endpointIdentity: {
-                readonly device: number;
-                readonly inode: number;
-              };
+              readonly endpointIdentity: DaemonEndpointIdentity;
             },
             BoundaryError
           >((resume) => {
@@ -2049,7 +2084,7 @@ const daemonLayer = Layer.succeed(DaemonService, {
                     return;
                   }
                   const payload = grpcPayload(Buffer.concat(chunks));
-                  emit.single({
+                  const accepted = emit.single({
                     requests: Stream.succeed({
                       id: String(stream.id),
                       method: method as DaemonMethodType,
@@ -2061,6 +2096,12 @@ const daemonLayer = Layer.succeed(DaemonService, {
                     respond: (response) =>
                       respondGrpc(stream, method, response),
                   });
+                  if (!accepted) {
+                    respondGrpc(stream, method, {
+                      id: String(stream.id),
+                      error: "daemon request queue is full",
+                    }).pipe(Effect.runFork);
+                  }
                 } catch {
                   // A malformed client stream is isolated to that HTTP/2
                   // stream. Failing the outer Stream would tear down the
@@ -2076,9 +2117,13 @@ const daemonLayer = Layer.succeed(DaemonService, {
             mkdir(dirname(endpoint), { recursive: true, mode: 0o700 })
               .then(() => {
                 server.listen(endpoint, () => {
-                  chmod(endpoint, 0o600)
-                    .then(() => lstat(endpoint))
+                  let endpointIdentity: DaemonEndpointIdentity | undefined;
+                  metadata(endpoint)
                     .then((endpointMetadata) => {
+                      endpointIdentity = endpointMetadata;
+                      return setPermissions(endpoint, 0o600);
+                    })
+                    .then(() => {
                       server.off("error", fail);
                       server.on("error", (cause) =>
                         emit.fail(daemonProtocolError(cause)),
@@ -2087,38 +2132,43 @@ const daemonLayer = Layer.succeed(DaemonService, {
                         Effect.succeed({
                           server,
                           sessions,
-                          endpointIdentity: {
-                            device: endpointMetadata.dev,
-                            inode: endpointMetadata.ino,
-                          },
+                          endpointIdentity: endpointIdentity!,
                         }),
                       );
                     })
-                    .catch((cause) => fail(cause as Error));
+                    .catch((cause) => {
+                      server.off("error", fail);
+                      server.on("error", () => undefined);
+                      void closeBoundDaemonServer(
+                        endpoint,
+                        server,
+                        sessions,
+                        endpointIdentity,
+                      ).then(
+                        () => fail(cause as Error),
+                        (closeCause) => fail(closeCause as Error),
+                      );
+                    });
                 });
               })
               .catch((cause) => fail(cause as Error));
           }),
           ({ server, sessions, endpointIdentity }) =>
-            Effect.promise(async () => {
-              for (const session of sessions) session.destroy();
-              await new Promise<void>((resolve) =>
-                server.close(() => resolve()),
-              );
-              const currentIdentity = await lstat(endpoint).catch(
-                () => undefined,
-              );
-              if (
-                currentIdentity !== undefined &&
-                currentIdentity.dev === endpointIdentity.device &&
-                currentIdentity.ino === endpointIdentity.inode
-              ) {
-                await rm(endpoint, { force: true }).catch(() => undefined);
-              }
-            }),
+            Effect.promise(() =>
+              closeBoundDaemonServer(
+                endpoint,
+                server,
+                sessions,
+                endpointIdentity,
+              ),
+            ),
         ),
-      { bufferSize: 64, strategy: "sliding" },
-    ),
+      { bufferSize: 64, strategy: "dropping" },
+    );
+};
+
+const daemonLayer = Layer.succeed(DaemonService, {
+  serve: makeDaemonServe(),
   request: (endpoint, request, timeoutMilliseconds = 5_000) =>
     Effect.async<DaemonResponse, BoundaryError>((resume) => {
       const session = connectHttp2("http://localhost", {

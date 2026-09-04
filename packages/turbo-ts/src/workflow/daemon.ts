@@ -404,6 +404,19 @@ const waitForDaemonHealthy = (
     return false;
   });
 
+const waitForDaemonExit = (
+  paths: DaemonPaths,
+  pid: number,
+): Effect.Effect<boolean, never, FileSystemService | ProcessService> =>
+  Effect.gen(function* () {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if ((yield* readPid(paths.pid)) !== pid) return true;
+      if (!(yield* isAlive(pid))) return true;
+      yield* Effect.sleep("25 millis");
+    }
+    return (yield* readPid(paths.pid)) !== pid || !(yield* isAlive(pid));
+  });
+
 const cleanStaleStateIfOwned = (
   paths: DaemonPaths,
   expectedPid: number | undefined,
@@ -540,7 +553,7 @@ const stopDaemonWithLock = (
     const processService = yield* ProcessService;
     const terminal = yield* TerminalService;
     const pid = yield* readPid(paths.pid);
-    if (!(yield* isAlive(pid))) {
+    if (pid === undefined || !(yield* isAlive(pid))) {
       yield* cleanStaleStateIfOwned(paths, pid);
       yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);
       return;
@@ -559,15 +572,6 @@ const stopDaemonWithLock = (
           }),
         );
       }
-      if (yield* isAlive(currentPid)) {
-        return yield* Effect.fail(
-          new BoundaryError({
-            boundary: "daemon",
-            message: "daemon is still starting",
-            retryable: true,
-          }),
-        );
-      }
       yield* cleanStaleStateIfOwned(paths, pid);
       yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);
       return;
@@ -582,17 +586,35 @@ const stopDaemonWithLock = (
         }),
       );
     }
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      if (!(yield* isAlive(pid))) break;
-      yield* Effect.sleep("25 millis");
-    }
-    const remainsAlive = yield* isAlive(pid);
-    if (
-      remainsAlive &&
-      pid !== undefined &&
-      processService.terminateProcess !== undefined
-    ) {
-      yield* processService.terminateProcess(pid, true).pipe(Effect.ignore);
+    if (!(yield* waitForDaemonExit(paths, pid))) {
+      if (processService.terminateProcess === undefined) {
+        return yield* Effect.fail(
+          new BoundaryError({
+            boundary: "daemon",
+            message: "daemon process termination is unavailable",
+            retryable: true,
+          }),
+        );
+      }
+      yield* processService.terminateProcess(pid, true).pipe(
+        Effect.mapError(
+          (error) =>
+            new BoundaryError({
+              boundary: "daemon",
+              message: `daemon process termination failed: ${error.message}`,
+              retryable: true,
+            }),
+        ),
+      );
+      if (!(yield* waitForDaemonExit(paths, pid))) {
+        return yield* Effect.fail(
+          new BoundaryError({
+            boundary: "daemon",
+            message: "daemon process did not terminate",
+            retryable: true,
+          }),
+        );
+      }
     }
     yield* cleanStaleStateIfOwned(paths, pid);
     yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);

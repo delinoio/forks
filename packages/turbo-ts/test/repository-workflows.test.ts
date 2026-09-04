@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import {
   cp,
   mkdir,
@@ -27,11 +28,15 @@ import { graphql } from "graphql";
 import { commandIndex } from "../src/cli/program.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { normalizeOutput } from "../src/compatibility/normalizers.js";
-import { BoundaryError } from "../src/effect/errors.js";
-import { nodeFoundationLayer } from "../src/effect/node-layer.js";
+import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
+import {
+  makeDaemonServe,
+  nodeFoundationLayer,
+} from "../src/effect/node-layer.js";
 import {
   DaemonMethod,
   DaemonService,
+  EnvironmentService,
   FileSystemService,
   FileWatcherService,
   ProcessService,
@@ -48,6 +53,7 @@ import {
   parseDaemonArguments,
   watcherPathsMatch,
 } from "../src/workflow/daemon.js";
+import { executeList } from "../src/workflow/list.js";
 import { isWindowsSubsystemForLinux } from "../src/workflow/misc.js";
 import { executePrune, parsePruneArguments } from "../src/workflow/prune.js";
 import { repositoryQuerySchema } from "../src/workflow/query.js";
@@ -188,20 +194,31 @@ const protobufString = (field: number, value: string): Buffer => {
   return Buffer.concat([Buffer.from([field * 8 + 2, encoded.length]), encoded]);
 };
 
-const sendDaemonRequest = async (
+const sendDaemonRequestResult = async (
   socket: string,
   method: string,
   payload: Uint8Array = Buffer.alloc(0),
-): Promise<Buffer> =>
-  new Promise<Buffer>((resolve, reject) => {
+): Promise<{ readonly payload: Buffer; readonly error?: string }> =>
+  new Promise((resolve, reject) => {
     const session = connectHttp2("http://localhost", {
       createConnection: () => createNetConnection(socket),
     });
     const chunks: Array<Buffer> = [];
+    let responseError: string | undefined;
     const stream = session.request({
       [http2Constants.HTTP2_HEADER_METHOD]: "POST",
       [http2Constants.HTTP2_HEADER_PATH]: `/turbodprotocol.Turbod/${method}`,
       [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+    });
+    stream.on("response", (headers) => {
+      if (
+        headers["grpc-status"] !== undefined &&
+        headers["grpc-status"] !== "0"
+      ) {
+        responseError = decodeURIComponent(
+          String(headers["grpc-message"] ?? "daemon request failed"),
+        );
+      }
     });
     const timeout = setTimeout(() => {
       session.destroy();
@@ -214,12 +231,22 @@ const sendDaemonRequest = async (
       clearTimeout(timeout);
       session.close();
       const framed = Buffer.concat(chunks);
-      resolve(framed.length >= 5 ? framed.subarray(5) : framed);
+      resolve({
+        payload: framed.length >= 5 ? framed.subarray(5) : framed,
+        ...(responseError === undefined ? {} : { error: responseError }),
+      });
     });
     const header = Buffer.alloc(5);
     header.writeUInt32BE(payload.length, 1);
     stream.end(Buffer.concat([header, payload]));
   });
+
+const sendDaemonRequest = async (
+  socket: string,
+  method: string,
+  payload: Uint8Array = Buffer.alloc(0),
+): Promise<Buffer> =>
+  (await sendDaemonRequestResult(socket, method, payload)).payload;
 
 const readTextTree = async (
   root: string,
@@ -706,6 +733,73 @@ describe("repository workflow gate", () => {
     }
   }, 60_000);
 
+  it("omits unscheduled tasks from profiles", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-profile-stop-"));
+    try {
+      await prepareFixture(directory);
+      const manifestPath = join(directory, "packages/library/package.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"console.log('library failed'); process.exit(7)\"";
+      await writeFile(
+        manifestPath,
+        `${JSON.stringify(manifest, undefined, 2)}\n`,
+      );
+      await expect(
+        execFilePromise(process.execPath, [
+          candidate,
+          "run",
+          "build",
+          "--no-cache",
+          "--profile=profile.json",
+          "--cwd",
+          directory,
+        ]),
+      ).rejects.toThrow();
+      const profile = JSON.parse(
+        await readFile(join(directory, "profile.json"), "utf8"),
+      ) as {
+        readonly traceEvents: ReadonlyArray<{ readonly name: string }>;
+      };
+      expect(profile.traceEvents.map((event) => event.name)).toEqual([
+        "synthetic-library#build",
+      ]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("hashes repository-contained heap snapshots before execution", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-heap-input-"));
+    try {
+      await prepareFixture(directory);
+      const result = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--single-package",
+        "--no-cache",
+        "--json",
+        "--heap=run.heapsnapshot",
+        "--cwd",
+        directory,
+      ]);
+      const summary = JSON.parse(result.stdout.trim().split("\n").at(-1)!) as {
+        readonly tasks: ReadonlyArray<{
+          readonly inputs: Readonly<Record<string, string>>;
+        }>;
+      };
+      expect(summary.tasks).toHaveLength(1);
+      expect(summary.tasks[0]!.inputs["run.heapsnapshot"]).toMatch(
+        /^[0-9a-f]{40}$/,
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("marks a repository with one child workspace as a monorepo", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-monorepo-"));
     try {
@@ -1190,6 +1284,69 @@ describe("repository workflow gate", () => {
     }
   }, 30_000);
 
+  it("closes a bound daemon server when endpoint setup fails", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-setup-"));
+    const socket = join(directory, "turbod.sock");
+    try {
+      await expect(
+        Effect.runPromise(
+          Stream.runDrain(
+            makeDaemonServe({
+              setPermissions: async () => {
+                throw new Error("synthetic endpoint setup failure");
+              },
+            })(socket),
+          ),
+        ),
+      ).rejects.toThrow(/synthetic endpoint setup failure/);
+      expect(existsSync(socket)).toBe(false);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects daemon requests that exceed the transport queue", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-queue-"));
+    const socket = join(directory, "turbod.sock");
+    let releaseRequests: () => void = () => undefined;
+    const requestsReleased = new Promise<void>((resolve) => {
+      releaseRequests = resolve;
+    });
+    const serveFiber = Effect.runFork(
+      Stream.runForEach(makeDaemonServe()(socket), (connection) =>
+        Effect.promise(() => requestsReleased).pipe(
+          Effect.zipRight(
+            Stream.runForEach(connection.requests, (request) =>
+              connection.respond({ id: request.id, result: {} }),
+            ),
+          ),
+        ),
+      ),
+    );
+    try {
+      await waitUntil(() => existsSync(socket));
+      const requests = Array.from({ length: 66 }, () =>
+        sendDaemonRequestResult(socket, "Hello", protobufString(1, "2.0.0")),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      releaseRequests();
+      const responses = await Promise.all(requests);
+      const errors = responses.flatMap((response) =>
+        response.error === undefined ? [] : [response.error],
+      );
+      expect(errors.length).toBeGreaterThan(0);
+      expect(new Set(errors)).toEqual(
+        new Set(["daemon request queue is full"]),
+      );
+    } finally {
+      releaseRequests();
+      await Effect.runPromise(Fiber.interrupt(serveFiber));
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("terminates daemon serve when its repository watcher fails", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-watcher-"));
     try {
@@ -1329,6 +1486,10 @@ describe("repository workflow gate", () => {
             let pidPath: string | undefined;
             let socketPath: string | undefined;
             let terminationAttempts = 0;
+            let daemonAlive = true;
+            let shutdownLeavesDaemonAlive = false;
+            let terminationBehavior: "fails" | "ineffective" | "succeeds" =
+              "succeeds";
             const shutdownTransportFailure = new BoundaryError({
               boundary: "daemon",
               message: "synthetic shutdown transport failure",
@@ -1358,15 +1519,26 @@ describe("repository workflow gate", () => {
                           error: "synthetic status response failure",
                         });
                   }
-                  if (
-                    request.method !== DaemonMethod.shutdown ||
-                    shutdownFailure === undefined
-                  ) {
+                  if (request.method !== DaemonMethod.shutdown) {
                     return daemon.request(
                       endpoint,
                       request,
                       timeoutMilliseconds,
                     );
+                  }
+                  if (shutdownFailure === undefined) {
+                    if (shutdownLeavesDaemonAlive) {
+                      return Effect.succeed({ id: request.id, result: {} });
+                    }
+                    return daemon
+                      .request(endpoint, request, timeoutMilliseconds)
+                      .pipe(
+                        Effect.tap(() =>
+                          Effect.sync(() => {
+                            daemonAlive = false;
+                          }),
+                        ),
+                      );
                   }
                   return shutdownFailure === "transport"
                     ? Effect.fail(shutdownTransportFailure)
@@ -1393,9 +1565,26 @@ describe("repository workflow gate", () => {
               }),
               Layer.succeed(ProcessService, {
                 ...processService,
+                isProcessAlive: (pid) =>
+                  pid === process.pid
+                    ? Effect.succeed(daemonAlive)
+                    : (processService.isProcessAlive?.(pid) ??
+                      Effect.succeed(false)),
                 terminateProcess: () =>
-                  Effect.sync(() => {
+                  Effect.suspend(() => {
                     terminationAttempts += 1;
+                    if (terminationBehavior === "fails") {
+                      return Effect.fail(
+                        new ProcessExecutionError({
+                          command: "synthetic-daemon",
+                          message: "synthetic termination failure",
+                        }),
+                      );
+                    }
+                    if (terminationBehavior === "succeeds") {
+                      daemonAlive = false;
+                    }
+                    return Effect.void;
                   }),
               }),
             );
@@ -1452,6 +1641,42 @@ describe("repository workflow gate", () => {
                 expect(yield* runDaemon("status")).toBe(0);
               }
             }
+            shutdownLeavesDaemonAlive = true;
+            terminationBehavior = "fails";
+            const failedTermination = yield* runDaemon("stop").pipe(
+              Effect.either,
+            );
+            expect(failedTermination).toMatchObject({
+              _tag: "Left",
+              left: {
+                boundary: "daemon",
+                message:
+                  "daemon process termination failed: synthetic termination failure",
+              },
+            });
+            expect(yield* fileSystem.exists(pidPath!)).toBe(true);
+            expect(yield* fileSystem.exists(socketPath!)).toBe(true);
+            expect(
+              yield* fileSystem.exists(
+                join(dirname(pidPath!), "turbod.log-path"),
+              ),
+            ).toBe(true);
+            terminationBehavior = "ineffective";
+            const ineffectiveTermination = yield* runDaemon("stop").pipe(
+              Effect.either,
+            );
+            expect(ineffectiveTermination).toMatchObject({
+              _tag: "Left",
+              left: {
+                boundary: "daemon",
+                message: "daemon process did not terminate",
+              },
+            });
+            expect(yield* fileSystem.exists(pidPath!)).toBe(true);
+            expect(yield* fileSystem.exists(socketPath!)).toBe(true);
+            expect(terminationAttempts).toBe(2);
+            shutdownLeavesDaemonAlive = false;
+            terminationBehavior = "succeeds";
             expect(yield* runDaemon("stop")).toBe(0);
             expect(yield* Fiber.join(serveFiber)).toBe(0);
           }),
@@ -1570,9 +1795,7 @@ describe("repository workflow gate", () => {
       if (sentinel.pid === undefined) throw new Error("sentinel did not start");
       await writeFile(running.pid_file, `${sentinel.pid}\n`);
       await writeFile(running.sock_file, "stale socket\n");
-      await expect(runCandidate("daemon", "status", "--json")).rejects.toThrow(
-        /daemon is not running/,
-      );
+      await runCandidate("daemon", "stop");
       expect(
         await readFile(running.pid_file, "utf8").catch(() => undefined),
       ).toBeUndefined();
@@ -1580,7 +1803,9 @@ describe("repository workflow gate", () => {
         await readFile(running.sock_file, "utf8").catch(() => undefined),
       ).toBeUndefined();
       expect(sentinel.exitCode).toBeNull();
-      await runCandidate("daemon", "stop");
+      await expect(runCandidate("daemon", "status", "--json")).rejects.toThrow(
+        /daemon is not running/,
+      );
       expect(sentinel.exitCode).toBeNull();
       sentinel.kill();
       await new Promise<void>((resolve) => sentinel?.once("close", resolve));
@@ -2088,6 +2313,32 @@ snapshots:
           },
         },
       });
+      await rm(join(directory, "pnpm-lock.yaml"));
+      const independent = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          query: "{ version packageGraph { nodes { length } } }",
+        }),
+      });
+      expect(independent.status).toBe(200);
+      expect(await independent.json()).toEqual({
+        data: {
+          version: "2.10.12",
+          packageGraph: { nodes: { length: 3 } },
+        },
+      });
+      const missingExternalDependencies = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          query: "{ externalDependencies { length } }",
+        }),
+      });
+      expect(missingExternalDependencies.status).toBe(400);
+      expect(
+        JSON.stringify(await missingExternalDependencies.json()),
+      ).toContain("externalDependencies");
     } finally {
       child.kill();
       await Promise.race([
@@ -2115,6 +2366,10 @@ snapshots:
       await writeFile(
         join(directory, ".pnpmfile.cjs"),
         "module.exports = { hooks: {} };\n",
+      );
+      await writeFile(
+        join(directory, "bunfig.toml"),
+        '[install]\nlinker = "isolated"\n',
       );
       await writeFile(
         join(directory, "packages/app/generated.txt"),
@@ -2221,6 +2476,12 @@ snapshots:
             "utf8",
           ),
         ).toBe("module.exports = { hooks: {} };\n");
+        expect(
+          await readFile(
+            join(directory, `docker-result/${root}/bunfig.toml`),
+            "utf8",
+          ),
+        ).toBe('[install]\nlinker = "isolated"\n');
       }
       const applicationManifestPath = join(
         directory,
@@ -3054,6 +3315,49 @@ importers:
           ],
         },
       });
+      let requestedRange: string | undefined;
+      expect(
+        await Effect.runPromise(
+          Effect.gen(function* () {
+            const environment = yield* EnvironmentService;
+            const processService = yield* ProcessService;
+            const entries = yield* environment.entries;
+            return yield* executeList({
+              cwd: directory,
+              filters: [],
+              output: "json",
+              affected: true,
+            }).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  Layer.succeed(EnvironmentService, {
+                    ...environment,
+                    platform: Effect.succeed("win32" as const),
+                    entries: Effect.succeed({
+                      ...entries,
+                      turbo_scm_base: "HEAD~1",
+                      Turbo_Scm_Head: "HEAD",
+                    }),
+                  }),
+                  Layer.succeed(ProcessService, {
+                    ...processService,
+                    runBytes: (request) => {
+                      if (
+                        request.command === "git" &&
+                        request.args[0] === "diff"
+                      ) {
+                        requestedRange = request.args.at(-1);
+                      }
+                      return processService.runBytes(request);
+                    },
+                  }),
+                ),
+              ),
+            );
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).toBe(0);
+      expect(requestedRange).toBe("HEAD~1...HEAD");
       if (process.platform !== "win32") {
         await writeFile(
           join(directory, "real/linked/source.txt"),

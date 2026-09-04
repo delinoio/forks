@@ -577,6 +577,7 @@ export const executePrune = (
             ".pnp.cjs",
             ".yarnrc",
             ".yarnrc.yml",
+            "bunfig.toml",
           ].includes(name)
         ) {
           yield* copyIfPresent(

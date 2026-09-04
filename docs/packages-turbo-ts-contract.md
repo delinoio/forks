@@ -516,6 +516,8 @@ identity, per-user temporary state directory, atomic PID and start lock files,
 official `turbodprotocol.Turbod` gRPC service over HTTP/2. Hello, status, and
 shutdown calls interoperate in both directions with the 2.10.12 executable;
 package and watch calls share the same bounded framing and scoped sessions.
+Requests that exceed the transport queue receive an immediate protocol error
+instead of displacing an older request.
 Package discovery reloads the repository model for each request so workspace
 additions, removals, and renames are visible without a daemon restart.
 Output-change registration/query calls return their protocol data rather than
@@ -533,13 +535,15 @@ interrupted. Stop escalates only after a successful RPC identifies the process
 as the expected daemon; reused live PIDs without a healthy daemon RPC are
 treated as stale state and are never signaled. A failed shutdown RPC preserves
 the live daemon's PID, socket, and active-log state and reports the failure so
-the operation can be retried. Malformed streams remain
+the operation can be retried. Forced termination must be available, succeed,
+and be confirmed before the same state is removed. Malformed streams remain
 isolated, and an idle server resets its deadline after RPC or repository
 activity before releasing its state. Serve startup acquires exclusive PID
 ownership, a competing server cannot unlink a live daemon endpoint, endpoint
-cleanup is limited to the owning server instance, and repository watcher
-failure terminates the daemon rather than leaving an apparently healthy RPC
-server. Windows deliberately uses Node's forceful
+cleanup is limited to the owning server instance, and a post-bind endpoint
+setup failure closes the server and all sessions. Repository watcher failure
+terminates the daemon rather than leaving an apparently healthy RPC server.
+Windows deliberately uses Node's forceful
 process termination because Node has no supported graceful Win32 Ctrl+C bridge.
 
 `query` provides the compatible repository GraphQL root, package graph,
@@ -565,7 +569,10 @@ HTTP 413 without resetting the connection. Top-level package predicates are
 applied, external dependencies come from manifest references resolved against
 the parsed lockfile, including npm v2/v3 package locations whose entries omit
 the package name, and Yarn Berry entries report their installed `version`
-rather than descriptor ranges. Package-manager fields use protocol identifiers;
+rather than descriptor ranges. Lockfile reading and parsing are deferred until
+the `externalDependencies` field is selected, so independent fields remain
+available if the discovered lockfile later becomes unavailable or invalid.
+Package-manager fields use protocol identifiers;
 only pnpm's compatibility family uses the versioned `pnpm9` label. File queries
 enforce repository containment
 after resolving symlinks. The startup message describes the static page as a
@@ -590,7 +597,8 @@ escaping, or output-targeting links are rejected, including symlinked root
 installation controls, and an exact symlinked output root is rejected before
 replacement. The root pnpm
 hook `.pnpmfile.cjs` is retained in every
-installation root. Root Yarn installation controls, including `.yarnrc.yml`,
+installation root. Root Bun `bunfig.toml` configuration is retained in the
+ordinary output and both Docker installation roots. Root Yarn installation controls, including `.yarnrc.yml`,
 `.pnp.cjs`, releases, patches, and a repository-contained configured `yarnPath`
 executable, are retained at their repository-relative locations in applicable
 ordinary and Docker layouts. Copying honors repository and
@@ -625,7 +633,10 @@ cache eviction, and
 `info` derives WSL status from the Linux kernel release. Log-prefix selection
 applies to live and cached output. Summaries record
 the actual local or remote cache source and saved duration, and summaries and
-profiles use each task's scheduling timestamps. Task summaries record the
+profiles use each task's scheduling timestamps. Generated profiles omit tasks
+that were never scheduled, and requested heap snapshots are written
+before task input hashes are computed so repository-contained snapshots cannot
+invalidate a cache key after hashing. Task summaries record the
 resolved transitive external-dependency closure hash for graph-bearing npm,
 pnpm, Yarn, Cargo, uv, Bun, Aube, and Nub lockfiles and the actual encoded log
 path, including collision-qualified identifiers and alternate execution scopes.

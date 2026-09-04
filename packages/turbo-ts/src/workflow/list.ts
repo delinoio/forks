@@ -7,6 +7,7 @@ import {
   TerminalService,
 } from "../effect/services.js";
 import { selectPackages } from "../graph/task-graph.js";
+import { configuredEnvironmentValue } from "../repository/model.js";
 import {
   loadWorkflowRepository,
   repositoryPackageManagerLabel,
@@ -89,9 +90,23 @@ export const executeList = (
     const repository = yield* loadWorkflowRepository(options);
     let packages = selectPackages(repository, options.filters);
     if (options.affected) {
-      const entries = yield* environment.entries;
-      const base = entries.TURBO_SCM_BASE ?? "main";
-      const head = entries.TURBO_SCM_HEAD ?? "HEAD";
+      const [entries, platform] = yield* Effect.all([
+        environment.entries,
+        environment.platform,
+      ]);
+      const caseInsensitiveNames = platform === "win32";
+      const base =
+        configuredEnvironmentValue(
+          entries,
+          "TURBO_SCM_BASE",
+          caseInsensitiveNames,
+        ) ?? "main";
+      const head =
+        configuredEnvironmentValue(
+          entries,
+          "TURBO_SCM_HEAD",
+          caseInsensitiveNames,
+        ) ?? "HEAD";
       const git = yield* Effect.scoped(
         processService.runBytes({
           command: "git",
