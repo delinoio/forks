@@ -393,6 +393,7 @@ const waitForDaemonHealthy = (
   ClockService | DaemonService | FileSystemService | ProcessService
 > =>
   Effect.gen(function* () {
+    const clock = yield* ClockService;
     for (let attempt = 0; attempt < daemonStartupAttempts; attempt += 1) {
       const currentPid = yield* readPid(paths.pid);
       if (currentPid !== undefined && currentPid !== expectedPid) return false;
@@ -400,7 +401,7 @@ const waitForDaemonHealthy = (
         if (!(yield* isAlive(currentPid))) return false;
         if (yield* daemonHealthy(paths)) return true;
       }
-      yield* Effect.sleep(`${daemonStartupPollMilliseconds} millis`);
+      yield* clock.sleep(daemonStartupPollMilliseconds);
     }
     return false;
   });
@@ -416,6 +417,46 @@ const waitForDaemonExit = (
       yield* Effect.sleep("25 millis");
     }
     return (yield* readPid(paths.pid)) !== pid || !(yield* isAlive(pid));
+  });
+
+const terminateStartedDaemon = (
+  pid: number,
+): Effect.Effect<void, BoundaryError, ClockService | ProcessService> =>
+  Effect.gen(function* () {
+    const clock = yield* ClockService;
+    const processService = yield* ProcessService;
+    if (processService.terminateProcess === undefined) {
+      return yield* Effect.fail(
+        new BoundaryError({
+          boundary: "daemon",
+          message: "daemon process termination is unavailable",
+          retryable: true,
+        }),
+      );
+    }
+    yield* processService.terminateProcess(pid, true).pipe(
+      Effect.mapError(
+        (error) =>
+          new BoundaryError({
+            boundary: "daemon",
+            message: `daemon process termination failed: ${error.message}`,
+            retryable: true,
+          }),
+      ),
+    );
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if (!(yield* isAlive(pid))) return;
+      yield* clock.sleep(25);
+    }
+    if (yield* isAlive(pid)) {
+      return yield* Effect.fail(
+        new BoundaryError({
+          boundary: "daemon",
+          message: "daemon process did not terminate",
+          retryable: true,
+        }),
+      );
+    }
   });
 
 const cleanStaleStateIfOwned = (
@@ -536,12 +577,13 @@ const startDaemon = (
           });
           const ready = yield* waitForDaemonHealthy(paths, childPid);
           if (!ready) {
-            if (processService.terminateProcess !== undefined) {
-              yield* processService
-                .terminateProcess(childPid, true)
-                .pipe(Effect.ignore);
+            if (yield* isAlive(childPid)) {
+              yield* terminateStartedDaemon(childPid);
             }
-            yield* cleanStaleState(paths);
+            const recordedPid = yield* readPid(paths.pid);
+            if (recordedPid === undefined || recordedPid === childPid) {
+              yield* cleanStaleStateIfOwned(paths, recordedPid);
+            }
             return yield* Effect.fail(
               new BoundaryError({
                 boundary: "daemon",

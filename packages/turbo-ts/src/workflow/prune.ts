@@ -217,6 +217,9 @@ const copyTree = (
         if (
           isAbsolutePath(target) ||
           isPathContained(excludedRoot, resolved) ||
+          [...excludedSourceRoots].some((root) =>
+            isPathContained(root, resolved),
+          ) ||
           !allowedSymlinkRoots.some((root) => isPathContained(root, resolved))
         ) {
           return yield* Effect.fail(

@@ -25,7 +25,6 @@ import {
 import type { RepositoryModel } from "../repository/model.js";
 import {
   executeRun,
-  parseCacheSpecification,
   type RunRequirements,
   resolveOptions,
 } from "../run/engine.js";
@@ -56,25 +55,34 @@ export const parseWatchArguments = (
     ...passThroughArguments,
   ];
   const parsed = parseRunArguments(["run", ...runArguments]);
-  const readOnlyPolicy = parseCacheSpecification(
-    parsed.cacheSpecification ?? "local:r,remote:r",
-  );
+  return { writeCache, run: parsed };
+};
+
+export const resolvedWatchRunOptions = (
+  options: WatchOptions,
+  repository: RepositoryModel,
+  environment: Readonly<Record<string, string | undefined>>,
+  availableParallelism: number,
+  windowsPathSeparators: boolean,
+): ParsedRunOptions => {
+  if (options.writeCache) return options.run;
+  const policy = resolveOptions(
+    options.run,
+    repository.root,
+    environment,
+    repository.rootConfiguration,
+    availableParallelism,
+    windowsPathSeparators,
+  ).cachePolicy;
   const readableSources = [
-    ...(readOnlyPolicy.localRead ? ["local:r"] : []),
-    ...(readOnlyPolicy.remoteRead ? ["remote:r"] : []),
+    ...(policy.localRead ? ["local:r"] : []),
+    ...(policy.remoteRead ? ["remote:r"] : []),
   ];
   return {
-    writeCache,
-    run: writeCache
-      ? parsed
-      : {
-          ...parsed,
-          cacheSpecification:
-            readableSources.length === 0
-              ? undefined
-              : readableSources.join(","),
-          noCache: parsed.noCache || readableSources.length === 0,
-        },
+    ...options.run,
+    cacheSpecification:
+      readableSources.length === 0 ? undefined : readableSources.join(","),
+    noCache: options.run.noCache || readableSources.length === 0,
   };
 };
 
@@ -261,9 +269,16 @@ export const executeWatch = (
             return true;
           }
           const currentRepository = yield* Ref.get(repositoryRef);
+          const currentRunOptions = resolvedWatchRunOptions(
+            options,
+            currentRepository,
+            environment,
+            availableParallelism,
+            windowsPathSeparators,
+          );
           const isRunOwnedPath = runOwnedPath(
             currentRepository,
-            options.run,
+            currentRunOptions,
             change.path,
             environment,
             availableParallelism,
@@ -376,11 +391,19 @@ export const executeWatch = (
                   `\n• change detected: ${paths.join(", ")}\n`,
                 );
               }
+              const currentRepository = yield* Ref.get(repositoryRef);
+              const currentRunOptions = resolvedWatchRunOptions(
+                options,
+                currentRepository,
+                environment,
+                availableParallelism,
+                windowsPathSeparators,
+              );
               return yield* Effect.acquireUseRelease(
                 Ref.update(activeRuns, (count) => count + 1),
                 () =>
                   executeRun(
-                    options.run,
+                    currentRunOptions,
                     paths.length === 0 || invalidateAll
                       ? {}
                       : { changedPaths: paths },

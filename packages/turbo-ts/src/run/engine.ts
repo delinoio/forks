@@ -658,13 +658,17 @@ const affectedPackagesFromChangedFiles = (
   changedFiles: ReadonlyArray<string>,
   globalInputsAreTaskAware: boolean,
   windowsPathSeparators: boolean,
+  commandGlobalDependencies: ReadonlyArray<string> = [],
 ): AffectedPackages => {
-  const globalDependencyPatterns =
-    repository.rootConfiguration.value.futureFlags?.globalConfiguration === true
+  const globalDependencyPatterns = [
+    ...(repository.rootConfiguration.value.futureFlags?.globalConfiguration ===
+    true
       ? globalInputsAreTaskAware
         ? []
         : (repository.rootConfiguration.value.global?.inputs ?? [])
-      : (repository.rootConfiguration.value.globalDependencies ?? []);
+      : (repository.rootConfiguration.value.globalDependencies ?? [])),
+    ...commandGlobalDependencies,
+  ];
   const globalDependencyChanged =
     selectByGlobs(changedFiles, globalDependencyPatterns, windowsPathSeparators)
       .length > 0;
@@ -1392,6 +1396,48 @@ const collectOutputPaths = (
     }
     return [...selected].sort();
   });
+
+const taskOutputContainsPath = (
+  repository: RepositoryModel,
+  node: TaskNode,
+  path: string,
+  windowsPathSeparators: boolean,
+): boolean => {
+  const rootOutputPrefix = "$TURBO_ROOT$/";
+  const outputPatterns = node.definition.outputs ?? [];
+  const packagePatterns = outputPatterns.filter(
+    (pattern) => !pattern.replace(/^!/, "").startsWith(rootOutputPrefix),
+  );
+  if (
+    packagePatterns.length > 0 &&
+    isPathContained(node.package.directory, path, windowsPathSeparators) &&
+    matchesGlobsWithExclusions(
+      [relativePath(node.package.directory, path, windowsPathSeparators)],
+      packagePatterns,
+      windowsPathSeparators,
+    )
+  ) {
+    return true;
+  }
+  if (!isPathContained(repository.root, path, windowsPathSeparators)) {
+    return false;
+  }
+  const rootPatterns = outputPatterns.flatMap((pattern) => {
+    const negative = pattern.startsWith("!");
+    const value = negative ? pattern.slice(1) : pattern;
+    return value.startsWith(rootOutputPrefix)
+      ? [`${negative ? "!" : ""}${value.slice(rootOutputPrefix.length)}`]
+      : [];
+  });
+  return (
+    rootPatterns.length > 0 &&
+    matchesGlobsWithExclusions(
+      [relativePath(repository.root, path, windowsPathSeparators)],
+      rootPatterns,
+      windowsPathSeparators,
+    )
+  );
+};
 
 const collectCacheEntries = (
   repository: RepositoryModel,
@@ -3298,6 +3344,7 @@ export const executeRun = (
             ),
             true,
             platform === "win32",
+            options.globalDependencies,
           )
         : undefined;
     const useTaskInputs =
@@ -3452,6 +3499,23 @@ export const executeRun = (
             path: configuredStructuredLogPath,
             message:
               "structured log path must not replace a task control input",
+          }),
+        );
+      }
+      const outputCollision = [...selectedGraph.nodes.values()].some((node) =>
+        taskOutputContainsPath(
+          repository,
+          node,
+          configuredStructuredLogPath,
+          platform === "win32",
+        ),
+      );
+      if (outputCollision) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: configuredStructuredLogPath,
+            message:
+              "structured log path must not match a declared task output",
           }),
         );
       }

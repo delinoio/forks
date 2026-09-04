@@ -34,6 +34,7 @@ import {
   nodeFoundationLayer,
 } from "../src/effect/node-layer.js";
 import {
+  ClockService,
   DaemonMethod,
   DaemonService,
   EnvironmentService,
@@ -60,9 +61,13 @@ import { executePrune, parsePruneArguments } from "../src/workflow/prune.js";
 import { executeQuery, repositoryQuerySchema } from "../src/workflow/query.js";
 import {
   isInternalRepositoryPath,
+  loadWorkflowRepository,
   repositoryPackageManagerLabel,
 } from "../src/workflow/repository.js";
-import { parseWatchArguments } from "../src/workflow/watch.js";
+import {
+  parseWatchArguments,
+  resolvedWatchRunOptions,
+} from "../src/workflow/watch.js";
 
 const execFilePromise = promisify(execFile);
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -363,11 +368,11 @@ describe("repository workflow gate", () => {
       parseWatchArguments(["build", "--cache=local:rw,remote:w"]),
     ).toMatchObject({
       writeCache: false,
-      run: { cacheSpecification: "local:r", noCache: false },
+      run: { cacheSpecification: "local:rw,remote:w", noCache: false },
     });
     expect(parseWatchArguments(["build", "--cache=remote:w"])).toMatchObject({
       writeCache: false,
-      run: { cacheSpecification: undefined, noCache: true },
+      run: { cacheSpecification: "remote:w", noCache: false },
     });
     expect(
       parseWatchArguments([
@@ -759,6 +764,53 @@ describe("repository workflow gate", () => {
     }
   }, 60_000);
 
+  it("derives read-only watch caching after environment resolution", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-cache-"));
+    try {
+      await prepareFixture(directory);
+      const repository = await Effect.runPromise(
+        loadWorkflowRepository({ cwd: directory }).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const options = parseWatchArguments(["build"]);
+      expect(
+        resolvedWatchRunOptions(
+          options,
+          repository,
+          { TURBO_CACHE: "remote:w" },
+          8,
+          process.platform === "win32",
+        ),
+      ).toMatchObject({ cacheSpecification: undefined, noCache: true });
+      expect(
+        resolvedWatchRunOptions(
+          options,
+          repository,
+          { TURBO_CACHE: "local:r" },
+          8,
+          process.platform === "win32",
+        ),
+      ).toMatchObject({ cacheSpecification: "local:r", noCache: false });
+
+      const writeOptions = parseWatchArguments([
+        "build",
+        "--experimental-write-cache",
+      ]);
+      expect(
+        resolvedWatchRunOptions(
+          writeOptions,
+          repository,
+          { TURBO_CACHE: "remote:w" },
+          8,
+          process.platform === "win32",
+        ),
+      ).toBe(writeOptions.run);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("excludes an explicit structured log from task hashes", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-log-hash-"));
     try {
@@ -823,6 +875,30 @@ describe("repository workflow gate", () => {
         "structured log path must not replace a task control input",
       );
       expect(await readFile(manifestPath, "utf8")).toBe(manifest);
+
+      const outputLogPath = join(directory, "packages/app/build/run.ndjson");
+      await mkdir(dirname(outputLogPath), { recursive: true });
+      await writeFile(outputLogPath, "existing log\n");
+      const outputCollision = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--filter=synthetic-app",
+        "--log-file=packages/app/build/run.ndjson",
+        "--cwd",
+        directory,
+      ]).then(
+        () => ({ failed: false, stderr: "" }),
+        (error: { readonly stderr?: string }) => ({
+          failed: true,
+          stderr: error.stderr ?? "",
+        }),
+      );
+      expect(outputCollision.failed).toBe(true);
+      expect(outputCollision.stderr).toContain(
+        "structured log path must not match a declared task output",
+      );
+      expect(await readFile(outputLogPath, "utf8")).toBe("existing log\n");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2151,6 +2227,167 @@ describe("repository workflow gate", () => {
     }
   }, 15_000);
 
+  it("preserves startup state until a timed-out daemon exits", async () => {
+    const runScenario = async (
+      behavior: "fails" | "ineffective" | "succeeds" | "unavailable",
+    ) => {
+      const directory = await mkdtemp(
+        join(tmpdir(), `turbo-ts-daemon-start-${behavior}-`),
+      );
+      let stateDirectory: string | undefined;
+      try {
+        await prepareFixture(directory);
+        await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const clock = yield* ClockService;
+              const daemon = yield* DaemonService;
+              const environment = yield* EnvironmentService;
+              const fileSystem = yield* FileSystemService;
+              const processService = yield* ProcessService;
+              const childPid = 9_000_001;
+              let alive = true;
+              let terminationAttempts = 0;
+              const clockLayer = Layer.succeed(ClockService, {
+                ...clock,
+                sleep: () => Effect.yieldNow(),
+              });
+              const fileSystemLayer = Layer.succeed(FileSystemService, {
+                ...fileSystem,
+                createExclusiveFile: (path, contents) => {
+                  if (path.endsWith("turbod.lock")) {
+                    stateDirectory = dirname(path);
+                  }
+                  return fileSystem.createExclusiveFile(path, contents);
+                },
+              });
+              const daemonLayer = Layer.succeed(DaemonService, {
+                ...daemon,
+                request: (_endpoint, request) =>
+                  Effect.succeed({
+                    id: request.id,
+                    error: "synthetic daemon is not ready",
+                  }),
+              });
+              const environmentLayer = Layer.succeed(EnvironmentService, {
+                ...environment,
+                argv: Effect.succeed([process.execPath, candidate]),
+                executablePath: Effect.succeed(process.execPath),
+              });
+              const processLayer = Layer.succeed(ProcessService, {
+                ...processService,
+                spawnDetached: () =>
+                  Effect.tryPromise({
+                    try: async () => {
+                      if (stateDirectory === undefined) {
+                        throw new Error(
+                          "daemon state directory was not captured",
+                        );
+                      }
+                      await Promise.all([
+                        writeFile(
+                          join(stateDirectory, "turbod.pid"),
+                          `${childPid}\n`,
+                        ),
+                        writeFile(
+                          join(stateDirectory, "turbod.sock"),
+                          "synthetic socket\n",
+                        ),
+                        writeFile(
+                          join(stateDirectory, "turbod.log-path"),
+                          `${join(directory, "synthetic.log")}\n`,
+                        ),
+                      ]);
+                      return childPid;
+                    },
+                    catch: (cause) =>
+                      new ProcessExecutionError({
+                        command: "synthetic-daemon",
+                        message: String(cause),
+                      }),
+                  }),
+                isProcessAlive: (pid) =>
+                  Effect.succeed(pid === childPid && alive),
+                terminateProcess:
+                  behavior === "unavailable"
+                    ? undefined
+                    : () =>
+                        Effect.suspend(() => {
+                          terminationAttempts += 1;
+                          if (behavior === "fails") {
+                            return Effect.fail(
+                              new ProcessExecutionError({
+                                command: "synthetic-daemon",
+                                message: "synthetic termination failure",
+                              }),
+                            );
+                          }
+                          if (behavior === "succeeds") alive = false;
+                          return Effect.void;
+                        }),
+              });
+              const result = yield* executeDaemon({
+                command: "start",
+                cwd: directory,
+                idleMilliseconds: 30_000,
+                json: false,
+              }).pipe(
+                Effect.provide(
+                  Layer.mergeAll(
+                    clockLayer,
+                    daemonLayer,
+                    environmentLayer,
+                    fileSystemLayer,
+                    processLayer,
+                  ),
+                ),
+                Effect.either,
+              );
+              const expectedMessage =
+                behavior === "unavailable"
+                  ? "daemon process termination is unavailable"
+                  : behavior === "fails"
+                    ? "daemon process termination failed: synthetic termination failure"
+                    : behavior === "ineffective"
+                      ? "daemon process did not terminate"
+                      : "daemon did not become ready";
+              expect(result).toMatchObject({
+                _tag: "Left",
+                left: { boundary: "daemon", message: expectedMessage },
+              });
+              expect(terminationAttempts).toBe(
+                behavior === "unavailable" ? 0 : 1,
+              );
+              expect(stateDirectory).toBeDefined();
+              for (const name of [
+                "turbod.pid",
+                "turbod.sock",
+                "turbod.log-path",
+              ]) {
+                expect(
+                  yield* fileSystem.exists(join(stateDirectory!, name)),
+                ).toBe(behavior !== "succeeds");
+              }
+            }),
+          ).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      } finally {
+        await rm(directory, { force: true, recursive: true });
+        if (stateDirectory !== undefined) {
+          await rm(stateDirectory, { force: true, recursive: true });
+        }
+      }
+    };
+    for (const behavior of [
+      "unavailable",
+      "fails",
+      "ineffective",
+      "succeeds",
+    ] as const) {
+      await runScenario(behavior);
+    }
+  }, 15_000);
+
   it("resets the daemon idle deadline after client activity", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-idle-"));
     const runCandidate = (...arguments_: ReadonlyArray<string>) =>
@@ -2627,6 +2864,9 @@ describe("repository workflow gate", () => {
       join(applicationDirectory, ".gitignore"),
       "ignored-source/\ngenerated/\n",
     );
+    const globalDependencyPath = join(directory, "shared/config.json");
+    await mkdir(dirname(globalDependencyPath), { recursive: true });
+    await writeFile(globalDependencyPath, "initial\n");
     const child = spawn(
       process.execPath,
       [
@@ -2635,6 +2875,7 @@ describe("repository workflow gate", () => {
         "alpha",
         "beta",
         "--filter=synthetic-app",
+        "--global-deps=shared/**",
         "--cwd",
         directory,
         "--no-cache",
@@ -2712,6 +2953,21 @@ describe("repository workflow gate", () => {
           .length,
         stdout,
       ).toBe(betaRuns + 1);
+
+      const globalAlphaRuns = (
+        stdout.match(/synthetic-app:alpha: cache miss, executing/g) ?? []
+      ).length;
+      const globalBetaRuns = (
+        stdout.match(/synthetic-app:beta: cache miss, executing/g) ?? []
+      ).length;
+      await writeFile(globalDependencyPath, "changed\n");
+      await waitUntil(
+        () =>
+          (stdout.match(/synthetic-app:alpha: cache miss, executing/g) ?? [])
+            .length > globalAlphaRuns &&
+          (stdout.match(/synthetic-app:beta: cache miss, executing/g) ?? [])
+            .length > globalBetaRuns,
+      );
     } finally {
       child.kill();
       await Promise.race([
@@ -3531,6 +3787,22 @@ importers:
       expect(
         await readFile(join(directory, "result/pnpm-lock.yaml"), "utf8"),
       ).not.toContain("packages/parent/nested");
+      await symlink(
+        "nested/source.txt",
+        join(parentDirectory, "nested-source-link.txt"),
+      );
+      await expect(
+        execFilePromise(process.execPath, [
+          candidate,
+          "prune",
+          "synthetic-parent",
+          "--out-dir=result",
+          "--cwd",
+          directory,
+        ]),
+      ).rejects.toThrow(
+        /prune symlink must use a relative target inside the selected package closure/,
+      );
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

@@ -488,10 +488,11 @@ Gate 3 adds repository workflows with automated ledger evidence. `watch`
 debounces filesystem storms, retains every distinct changed path in each
 settled debounce batch, and uses switching Effect streams so a later batch
 interrupts an in-flight run before recovery. Watchers, child processes, fibers,
-signals, and task resources remain scope-owned. Watch mode reads cache
-by default and enables cache publication only with
-`--experimental-write-cache`; supplied write-capable cache policies are reduced
-to their read-only capabilities until that flag is present. Repository and
+signals, and task resources remain scope-owned. Watch mode resolves cache
+policy from CLI and environment configuration, reads cache by default, and
+enables cache publication only with `--experimental-write-cache`; the effective
+policy is reduced to its readable capabilities until that flag is present, and
+a write-only policy disables cache access. Repository and
 nested Git-ignore rules and configured task-output patterns suppress generated
 files except where an output exclusion denies the changed file. Partial output
 matching is limited to directory events. Ignore and output filtering occurs
@@ -516,9 +517,10 @@ Run arguments after `--` remain task pass-through arguments, including text
 equal to the watch-only cache-publication flag.
 When `futureFlags.watchUsingTaskInputs` is enabled, file-triggered runs retain
 only requested task entrypoints whose effective inputs match the changed paths,
-plus their dependency and `with` closure. Root configuration and `.gitignore`
-changes retain the all-task fallback. Watcher entry types distinguish regular
-file renames from directories when applying directory-only ignore rules.
+plus their dependency and `with` closure. Root configuration, `.gitignore`, and
+CLI `--global-deps` matches retain the all-task fallback. Watcher entry types
+distinguish regular file renames from directories when applying directory-only
+ignore rules.
 
 The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
 identity, per-user temporary state directory, atomic PID and start lock files,
@@ -548,7 +550,9 @@ as the expected daemon; reused live PIDs without a healthy daemon RPC are
 treated as stale state and are never signaled. A failed shutdown RPC preserves
 the live daemon's PID, socket, and active-log state and reports the failure so
 the operation can be retried. Forced termination must be available, succeed,
-and be confirmed before the same state is removed. Malformed streams remain
+and be confirmed before the same state is removed. A timed-out daemon start
+applies the same termination and state-retention rules to its spawned process.
+Malformed streams remain
 isolated, and an idle server resets its deadline after RPC or repository
 activity before releasing its state. Serve startup acquires exclusive PID
 ownership, a competing server cannot unlink a live daemon endpoint, endpoint
@@ -611,7 +615,8 @@ Generated installation manifests and configuration files use readable `0644`
 modes. It
 never follows workspace symlinks into a prune output. Output safety and traversal
 exclusions use canonical locations. Contained relative file symlinks are
-recreated without dereferencing; copied root controls include their contained
+recreated without dereferencing unless their resolved target enters an
+unselected nested workspace; copied root controls include their contained
 regular-file targets at the corresponding installation paths. Absolute,
 escaping, or output-targeting links are rejected, including symlinked root
 installation controls, and an exact symlinked output root is rejected before
@@ -649,7 +654,8 @@ mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
 completed task's full log replay. Structured log files append typed task events
 as work runs and end with a typed run summary. An explicit structured-log
 artifact is excluded from task and global file hashes, and it may not replace a
-mandatory task control input. Timestamped streaming applies the timestamp
+mandatory task control input or match a declared task output. Timestamped
+streaming applies the timestamp
 writer to a final unterminated task line. Errors-only failure replay does
 not duplicate output already recorded while the task ran. CLI `--global-deps`
 patterns are merged into task hash inputs, and their repository-relative Git
