@@ -69,6 +69,7 @@ export interface FileSystemOperations {
   readonly writeTextAtomic: (
     path: string,
     contents: string,
+    mode?: number,
   ) => Effect.Effect<void, BoundaryError>;
   readonly appendText: (
     path: string,

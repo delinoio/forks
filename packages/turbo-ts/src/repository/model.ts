@@ -786,6 +786,7 @@ const polyglotScripts = (
 
 interface CargoPackageMetadata {
   readonly name: string;
+  readonly version?: string;
   readonly dependencies: ReadonlyArray<CargoDependencyMetadata>;
   readonly dependencyNames: ReadonlyArray<string>;
   readonly entrypointNames: ReadonlyArray<string>;
@@ -832,6 +833,7 @@ export const parseCargoMetadata = (
     readonly packages?: ReadonlyArray<{
       readonly id?: unknown;
       readonly name?: unknown;
+      readonly version?: unknown;
       readonly manifest_path?: unknown;
       readonly dependencies?: ReadonlyArray<{
         readonly name?: unknown;
@@ -892,6 +894,9 @@ export const parseCargoMetadata = (
     return [
       {
         name: packageMetadata.name,
+        ...(typeof packageMetadata.version === "string"
+          ? { version: packageMetadata.version }
+          : {}),
         manifestPath: normalizePath(packageMetadata.manifest_path),
         dependencies,
         dependencyNames: [
@@ -1040,6 +1045,7 @@ const rustCompilerIdentity = (
 
 interface PythonProjectMetadata {
   readonly name?: string;
+  readonly version?: string;
   readonly cacheInputsComplete: boolean;
   readonly dependencyNames: ReadonlyArray<string>;
   readonly dependencySources: ReadonlyMap<
@@ -1906,6 +1912,7 @@ const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
   }
   return {
     name: typeof project?.name === "string" ? project.name : undefined,
+    version: typeof project?.version === "string" ? project.version : undefined,
     cacheInputsComplete: [...directRequirementNames].every((name) =>
       dependencySources.has(name),
     ),
@@ -2506,6 +2513,9 @@ export const discoverRepository = (
               ),
               manifest: {
                 name: metadata.name,
+                ...(metadata.version === undefined
+                  ? {}
+                  : { version: metadata.version }),
                 private: true,
               } satisfies PackageManifest,
             };
@@ -2596,6 +2606,9 @@ export const discoverRepository = (
             ),
             manifest: {
               name: metadata.name,
+              ...(metadata.version === undefined
+                ? {}
+                : { version: metadata.version }),
               private: true,
             } satisfies PackageManifest,
           };

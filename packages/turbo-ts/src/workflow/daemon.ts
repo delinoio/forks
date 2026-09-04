@@ -520,21 +520,36 @@ const serveDaemon = (
       const startedAt = yield* clock.now;
       yield* fileSystem.makeDirectory(paths.stateDirectory);
       yield* fileSystem.makeDirectory(parentPath(paths.log));
-      yield* fileSystem.writeTextAtomic(paths.activeLog, `${paths.log}\n`);
-      yield* fileSystem.writeTextAtomic(
-        paths.pid,
-        `${information.processIdentifier}`,
+      const pidContents = `${information.processIdentifier}`;
+      if (!(yield* fileSystem.createExclusiveFile(paths.pid, pidContents))) {
+        return yield* Effect.fail(
+          new BoundaryError({
+            boundary: "daemon",
+            message: "daemon is already running",
+            retryable: false,
+          }),
+        );
+      }
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          const current = yield* fileSystem
+            .readText(paths.pid)
+            .pipe(Effect.either);
+          if (current._tag === "Right" && current.right === pidContents) {
+            yield* fileSystem.remove(paths.pid).pipe(Effect.ignore);
+          }
+        }),
       );
       yield* fileSystem
         .setFileMetadata(paths.pid, 0o644, startedAt)
         .pipe(Effect.ignore);
+      yield* fileSystem.writeTextAtomic(paths.activeLog, `${paths.log}\n`);
       yield* fileSystem.appendText(
         paths.log,
         `${new Date(startedAt).toISOString()} daemon started pid=${information.processIdentifier}\n`,
       );
       yield* Effect.addFinalizer(() =>
         Effect.gen(function* () {
-          yield* fileSystem.remove(paths.pid).pipe(Effect.ignore);
           const stoppedAt = yield* clock.now;
           yield* fileSystem
             .appendText(
@@ -568,8 +583,8 @@ const serveDaemon = (
             yield* Queue.offer(activity, undefined);
           }),
         ),
+        Effect.zipRight(Effect.never),
       );
-      yield* Effect.forkScoped(repositoryChanges);
       const serve = Stream.runForEach(
         daemon.serve(paths.socket),
         (connection) =>
@@ -697,9 +712,12 @@ const serveDaemon = (
           if (outcome === "idle") return;
         }
       });
-      yield* Effect.race(
+      yield* Effect.raceFirst(
         serve,
-        Effect.race(Deferred.await(shutdown), waitForIdle),
+        Effect.raceFirst(
+          repositoryChanges,
+          Effect.race(Deferred.await(shutdown), waitForIdle),
+        ),
       );
       return 0;
     }),

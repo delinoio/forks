@@ -288,12 +288,21 @@ interface LockfileGraphEntry {
     readonly [name: string, reference: string | undefined]
   >;
   readonly sourceKey?: string;
+  readonly localWorkspace?: boolean;
+  readonly workspacePaths?: ReadonlyArray<string>;
 }
 
-type LockfileDependencyReference = readonly [
+export type LockfileDependencyReference = readonly [
   name: string,
   reference: string | undefined,
 ];
+
+export interface LockfilePackageClosureContext {
+  readonly workspacePath: string;
+  readonly packageName: string;
+  readonly packageVersion?: string;
+  readonly directDependencies: ReadonlyArray<LockfileDependencyReference>;
+}
 
 const lockfilePackageIdentity = (value: LockfilePackage): string =>
   `${value.name}@${value.version}`;
@@ -362,7 +371,7 @@ const resolveGraphEntryClosure = (
         ...(aliases.get(`${name}@${reference}`) ?? []),
         ...(aliases.get(`${name}@npm:${reference}`) ?? []),
       ]);
-      if (exact.size > 0) return exact;
+      return exact;
     }
     return names.get(name) ?? new Set();
   };
@@ -390,17 +399,18 @@ const resolveGraphEntryClosure = (
 
 const resolveGraphPackageClosure = (
   entries: ReadonlyArray<LockfileGraphEntry>,
-  directDependencyNames: ReadonlySet<string>,
-  directReferences: ReadonlyMap<string, string | undefined> = new Map(),
+  directDependencies: ReadonlyArray<LockfileDependencyReference>,
+  initialEntries: ReadonlyArray<LockfileGraphEntry> = [],
 ): ReadonlyArray<LockfilePackage> => {
   const packages = new Map<string, LockfilePackage>();
   const closure = resolveGraphEntryClosure(
     entries,
-    [...directDependencyNames].map(
-      (name) => [name, directReferences.get(name)] as const,
-    ),
+    directDependencies,
+    initialEntries,
   );
+  const declaringEntries = new Set(initialEntries);
   for (const entry of closure) {
+    if (declaringEntries.has(entry)) continue;
     for (const package_ of entry.packages) {
       packages.set(lockfilePackageIdentity(package_), package_);
     }
@@ -544,6 +554,7 @@ const parseCargoGraph = (source: string): ReadonlyArray<LockfileGraphEntry> => {
         packages: [{ name: package_.name, version: package_.version }],
         aliases: [`${package_.name}@${package_.version}`],
         dependencies,
+        localWorkspace: package_.source === undefined,
       },
     ];
   });
@@ -576,11 +587,18 @@ const parseUvGraph = (source: string): ReadonlyArray<LockfileGraphEntry> => {
             : [];
         })
       : [];
+    const source = objectValue(package_.source);
+    const workspacePaths = [source?.virtual, source?.editable].flatMap(
+      (path) =>
+        typeof path === "string" ? [normalizeWorkspacePath(path)] : [],
+    );
     return [
       {
         packages: [{ name: package_.name, version: package_.version }],
         aliases: [`${package_.name}@${package_.version}`],
         dependencies,
+        localWorkspace: workspacePaths.length > 0,
+        workspacePaths,
       },
     ];
   });
@@ -1179,12 +1197,14 @@ export const pruneLockfile = (
 export const resolveLockfilePackageClosure = (
   path: string,
   contents: Uint8Array,
-  workspacePath: string,
-  directDependencyNames: ReadonlySet<string>,
+  context: LockfilePackageClosureContext,
 ): ReadonlyArray<LockfilePackage> => {
   const parsed = parseLockfile(path, contents);
-  const includeRoot = workspacePath === ".";
-  const workspacePaths = new Set(includeRoot ? [] : [workspacePath]);
+  const includeRoot = context.workspacePath === ".";
+  const workspacePaths = new Set(includeRoot ? [] : [context.workspacePath]);
+  const directDependencyNames = new Set(
+    context.directDependencies.map(([name]) => name),
+  );
   if (
     parsed.format === "pnpm" ||
     parsed.format === "aube" ||
@@ -1211,41 +1231,80 @@ export const resolveLockfilePackageClosure = (
   if (parsed.format === "yarn-classic") {
     return resolveGraphPackageClosure(
       parseYarnClassicGraph(source),
-      directDependencyNames,
+      context.directDependencies,
     );
   }
   if (parsed.format === "yarn-berry") {
+    const graph = parseYarnBerryGraph(source);
+    const workspacePath = normalizeWorkspacePath(context.workspacePath);
+    const workspaceEntries = graph.filter((entry) =>
+      entry.aliases.some(
+        (alias) => workspaceReferencePath(alias) === workspacePath,
+      ),
+    );
     return resolveGraphPackageClosure(
-      parseYarnBerryGraph(source),
-      directDependencyNames,
+      graph,
+      context.directDependencies,
+      workspaceEntries,
     );
   }
   if (parsed.format === "cargo") {
+    const graph = parseCargoGraph(source);
+    const workspaceEntries = graph.filter(
+      (entry) =>
+        entry.localWorkspace === true &&
+        entry.packages.some(
+          (package_) =>
+            package_.name === context.packageName &&
+            (context.packageVersion === undefined ||
+              package_.version === context.packageVersion),
+        ),
+    );
     return resolveGraphPackageClosure(
-      parseCargoGraph(source),
-      directDependencyNames,
+      graph,
+      workspaceEntries.length === 0 ? context.directDependencies : [],
+      workspaceEntries,
     );
   }
   if (parsed.format === "uv") {
+    const graph = parseUvGraph(source);
+    const workspacePath = normalizeWorkspacePath(context.workspacePath);
+    const matchingPaths = graph.filter((entry) =>
+      entry.workspacePaths?.includes(workspacePath),
+    );
+    const workspaceEntries =
+      matchingPaths.length > 0
+        ? matchingPaths
+        : graph.filter(
+            (entry) =>
+              entry.localWorkspace === true &&
+              entry.packages.some(
+                (package_) =>
+                  package_.name === context.packageName &&
+                  (context.packageVersion === undefined ||
+                    package_.version === context.packageVersion),
+              ),
+          );
     return resolveGraphPackageClosure(
-      parseUvGraph(source),
-      directDependencyNames,
+      graph,
+      workspaceEntries.length === 0 ? context.directDependencies : [],
+      workspaceEntries,
     );
   }
   if (parsed.format === "bun-text") {
     const graph = parseBunGraph(source);
     const workspaceKey =
-      workspacePath === "." ? "" : workspacePath.replace(/^\.\//, "");
-    const directReferences = new Map(
-      dependencyObjectEntries(graph.workspaces[workspaceKey], true).filter(
-        ([name]) => directDependencyNames.has(name),
-      ),
-    );
-    return resolveGraphPackageClosure(
-      graph.entries,
-      directDependencyNames,
-      directReferences,
-    );
+      context.workspacePath === "."
+        ? ""
+        : context.workspacePath.replace(/^\.\//, "");
+    const workspaceReferences = dependencyObjectEntries(
+      graph.workspaces[workspaceKey],
+      true,
+    ).filter(([name]) => directDependencyNames.has(name));
+    return resolveGraphPackageClosure(graph.entries, [
+      ...context.directDependencies,
+      ...workspaceReferences,
+    ]);
   }
   return parsed.packages.filter((dependency) =>
     directDependencyNames.has(dependency.name),

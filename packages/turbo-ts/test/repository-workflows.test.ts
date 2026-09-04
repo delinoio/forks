@@ -8,6 +8,7 @@ import {
   readlink,
   rename,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -21,10 +22,14 @@ import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "@rstest/core";
+import { Effect, Layer, Stream } from "effect";
 import { graphql } from "graphql";
 import { commandIndex } from "../src/cli/program.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { normalizeOutput } from "../src/compatibility/normalizers.js";
+import { BoundaryError } from "../src/effect/errors.js";
+import { nodeFoundationLayer } from "../src/effect/node-layer.js";
+import { FileWatcherService } from "../src/effect/services.js";
 import { pruneLockfile } from "../src/repository/lockfiles.js";
 import {
   renderRunTui,
@@ -32,7 +37,7 @@ import {
   resolveRunUiMode,
 } from "../src/run/engine.js";
 import { parseRunArguments } from "../src/run/options.js";
-import { parseDaemonArguments } from "../src/workflow/daemon.js";
+import { executeDaemon, parseDaemonArguments } from "../src/workflow/daemon.js";
 import { isWindowsSubsystemForLinux } from "../src/workflow/misc.js";
 import { parsePruneArguments } from "../src/workflow/prune.js";
 import { repositoryQuerySchema } from "../src/workflow/query.js";
@@ -1075,6 +1080,9 @@ describe("repository workflow gate", () => {
     try {
       await prepareFixture(directory);
       await runCandidate("daemon", "start", "--idle-time=30s");
+      await expect(
+        runCandidate("daemon", "serve", "--idle-time=30s"),
+      ).rejects.toThrow(/daemon is already running/);
       const officialStatus = await runOfficial("daemon", "status", "--json");
       const officialState = JSON.parse(officialStatus.stdout) as {
         readonly log_file: string;
@@ -1164,6 +1172,42 @@ describe("repository workflow gate", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 30_000);
+
+  it("terminates daemon serve when its repository watcher fails", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-watcher-"));
+    try {
+      await prepareFixture(directory);
+      const watcherFailure = new BoundaryError({
+        boundary: "filesystem",
+        message: "synthetic repository watcher failure",
+        retryable: false,
+      });
+      await expect(
+        Effect.runPromise(
+          executeDaemon({
+            command: "serve",
+            cwd: directory,
+            idleMilliseconds: 30_000,
+            json: false,
+          }).pipe(
+            Effect.provide(
+              Layer.succeed(FileWatcherService, {
+                watch: () =>
+                  Stream.fromEffect(
+                    Effect.sleep("100 millis").pipe(
+                      Effect.zipRight(Effect.fail(watcherFailure)),
+                    ),
+                  ),
+              }),
+            ),
+            Effect.provide(nodeFoundationLayer),
+          ),
+        ),
+      ).rejects.toThrow(/synthetic repository watcher failure/);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("resets the daemon idle deadline after client activity", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-idle-"));
@@ -1783,6 +1827,25 @@ snapshots:
           ),
         ).toBe("module.exports = { hooks: {} };\n");
       }
+      await executeDifferentialCommand(process.execPath, [
+        candidate,
+        "--cwd",
+        directory,
+        "prune",
+        "synthetic-app",
+        "--production",
+        "--out-dir=production-result",
+      ]);
+      for (const path of [
+        "package.json",
+        "turbo.json",
+        "pnpm-workspace.yaml",
+        "packages/app/package.json",
+      ]) {
+        expect(
+          (await stat(join(directory, "production-result", path))).mode & 0o777,
+        ).toBe(0o644);
+      }
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2175,10 +2238,30 @@ importers:
           reference.stderr,
         );
       }
+      const rootManifestPath = join(directory, "package.json");
+      const rootManifest = JSON.parse(
+        await readFile(rootManifestPath, "utf8"),
+      ) as { dependencies?: Record<string, string> };
+      rootManifest.dependencies = {
+        ...rootManifest.dependencies,
+        "synthetic-library": "workspace:*",
+      };
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, undefined, 2)}\n`,
+      );
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "add root dependency");
+      await writeFile(
+        join(directory, "packages/library/source.txt"),
+        "changed for root dependent\n",
+      );
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "change root dependency");
       const affectedGraphql = await execFilePromise(process.execPath, [
         candidate,
         "query",
-        '{ affectedPackages(base: "HEAD~1", head: "HEAD", filter: { equal: { field: "name", value: "synthetic-app" } }) { length items { name } } affectedTasks(base: "HEAD", head: "HEAD", tasks: ["build"]) { length } }',
+        '{ affectedPackages(base: "HEAD~1", head: "HEAD", filter: { equal: { field: "name", value: "synthetic-app" } }) { length items { name } } rootPackage: affectedPackages(base: "HEAD~1", head: "HEAD", filter: { equal: { field: "name", value: "//" } }) { length items { name } } rootTask: affectedTasks(base: "HEAD~1", head: "HEAD", tasks: ["build"], filter: { equal: { field: "name", value: "//" } }) { length items { fullName } } affectedTasks(base: "HEAD", head: "HEAD", tasks: ["build"]) { length } }',
         "--cwd",
         directory,
       ]);
@@ -2188,6 +2271,8 @@ importers:
             length: 1,
             items: [{ name: "synthetic-app" }],
           },
+          rootPackage: { length: 1, items: [{ name: "//" }] },
+          rootTask: { length: 1, items: [{ fullName: "//#build" }] },
           affectedTasks: { length: 0 },
         },
       });
@@ -2261,6 +2346,65 @@ importers:
       await rm(directory, { force: true, recursive: true });
     }
   }, 60_000);
+
+  it("includes the root package in affected GraphQL collections", async () => {
+    const fixtureParent = join(repositoryRoot, ".turbo");
+    await mkdir(fixtureParent, { recursive: true });
+    const directory = await mkdtemp(
+      join(fixtureParent, "turbo-ts-query-root-affected-"),
+    );
+    const git = (...arguments_: ReadonlyArray<string>) =>
+      execFilePromise("/usr/bin/git", [
+        "-C",
+        directory,
+        "-c",
+        "user.email=synthetic@example.test",
+        "-c",
+        "user.name=Synthetic Fixture",
+        ...arguments_,
+      ]);
+    try {
+      await writeFile(
+        join(directory, "package.json"),
+        `${JSON.stringify({
+          name: "root-only",
+          private: true,
+          packageManager: "pnpm@10.34.5",
+          scripts: { build: "node -e \"console.log('root build')\"" },
+        })}\n`,
+      );
+      await writeFile(
+        join(directory, "turbo.json"),
+        `${JSON.stringify({ tasks: { build: {} } })}\n`,
+      );
+      await writeFile(
+        join(directory, "pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\nimporters:\n  .: {}\n",
+      );
+      await writeFile(join(directory, "source.txt"), "base\n");
+      await git("init", "--quiet");
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "base");
+      await writeFile(join(directory, "source.txt"), "changed\n");
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "changed");
+      const affected = await execFilePromise(process.execPath, [
+        candidate,
+        "query",
+        '{ affectedPackages(base: "HEAD~1", head: "HEAD") { items { name path } } affectedTasks(base: "HEAD~1", head: "HEAD", tasks: ["build"]) { items { fullName } } }',
+        "--cwd",
+        directory,
+      ]);
+      expect(JSON.parse(affected.stdout)).toEqual({
+        data: {
+          affectedPackages: { items: [{ name: "//", path: "" }] },
+          affectedTasks: { items: [{ fullName: "//#build" }] },
+        },
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it(evidenceId.repositorySecurity, async () => {
     const source = new TextEncoder().encode(`lockfileVersion: '9.0'

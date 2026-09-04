@@ -1796,17 +1796,25 @@ const taskExternalDependenciesHash = (
         return dependency === undefined ? [] : [dependency.name];
       }),
     ]);
-    const directExternalNames = new Set(
-      node.package.dependencyNames.filter((name) => !internalNames.has(name)),
+    const manifestDependencyReferences = new Map(
+      [
+        node.package.manifest.dependencies,
+        node.package.manifest.devDependencies,
+        node.package.manifest.optionalDependencies,
+        node.package.manifest.peerDependencies,
+      ].flatMap((dependencies) => Object.entries(dependencies ?? {})),
     );
+    const directExternalDependencies = node.package.dependencyNames
+      .filter((name) => !internalNames.has(name))
+      .map((name) => [name, manifestDependencyReferences.get(name)] as const);
     const dependencies = yield* Effect.try({
       try: () =>
-        resolveLockfilePackageClosure(
-          lockfile,
-          contents,
-          node.package.relativeDirectory,
-          directExternalNames,
-        ),
+        resolveLockfilePackageClosure(lockfile, contents, {
+          workspacePath: node.package.relativeDirectory,
+          packageName: node.package.name,
+          packageVersion: node.package.manifest.version,
+          directDependencies: directExternalDependencies,
+        }),
       catch: (cause) =>
         new RepositoryError({ path: lockfile, message: String(cause) }),
     });
@@ -2283,11 +2291,14 @@ const executeTask = (
     const writeTaskEvent = (
       level: "info" | "stdout" | "stderr",
       text: string,
+      recordStructuredOutput = true,
     ) =>
       clock.now.pipe(
         Effect.flatMap((timestamp) => {
           const record = taskRecord(timestamp, level, text);
-          return writeStructuredRecord(record).pipe(
+          return (
+            recordStructuredOutput ? writeStructuredRecord(record) : Effect.void
+          ).pipe(
             Effect.zipRight(
               options.json
                 ? terminal.writeStdout(`${JSON.stringify(record)}\n`)
@@ -2645,6 +2656,7 @@ const executeTask = (
             color,
             options.json ? false : prefixTask,
           ),
+          !streamsCapturedOutput,
         );
       }
     }

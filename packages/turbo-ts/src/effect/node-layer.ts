@@ -928,15 +928,16 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
       try: () => writeFile(path, contents, "utf8"),
       catch: filesystemError,
     }),
-  writeTextAtomic: (path, contents) =>
+  writeTextAtomic: (path, contents, mode = 0o600) =>
     Effect.tryPromise({
       try: async () => {
         await mkdir(dirname(path), { recursive: true });
         const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
         let handle: Awaited<ReturnType<typeof open>> | undefined;
         try {
-          handle = await open(temporary, "wx", 0o600);
+          handle = await open(temporary, "wx", mode);
           await handle.writeFile(contents, "utf8");
+          await handle.chmod(mode);
           await handle.sync();
           await handle.close();
           handle = undefined;
@@ -1995,6 +1996,10 @@ const daemonLayer = Layer.succeed(DaemonService, {
             {
               readonly server: Http2Server;
               readonly sessions: Set<ServerHttp2Session>;
+              readonly endpointIdentity: {
+                readonly device: number;
+                readonly inode: number;
+              };
             },
             BoundaryError
           >((resume) => {
@@ -2062,29 +2067,47 @@ const daemonLayer = Layer.succeed(DaemonService, {
               resume(Effect.fail(daemonProtocolError(cause)));
             server.once("error", fail);
             mkdir(dirname(endpoint), { recursive: true, mode: 0o700 })
-              .then(() => rm(endpoint, { force: true }))
               .then(() => {
                 server.listen(endpoint, () => {
                   chmod(endpoint, 0o600)
-                    .then(() => {
+                    .then(() => lstat(endpoint))
+                    .then((endpointMetadata) => {
                       server.off("error", fail);
                       server.on("error", (cause) =>
                         emit.fail(daemonProtocolError(cause)),
                       );
-                      resume(Effect.succeed({ server, sessions }));
+                      resume(
+                        Effect.succeed({
+                          server,
+                          sessions,
+                          endpointIdentity: {
+                            device: endpointMetadata.dev,
+                            inode: endpointMetadata.ino,
+                          },
+                        }),
+                      );
                     })
                     .catch((cause) => fail(cause as Error));
                 });
               })
               .catch((cause) => fail(cause as Error));
           }),
-          ({ server, sessions }) =>
+          ({ server, sessions, endpointIdentity }) =>
             Effect.promise(async () => {
               for (const session of sessions) session.destroy();
               await new Promise<void>((resolve) =>
                 server.close(() => resolve()),
               );
-              await rm(endpoint, { force: true }).catch(() => undefined);
+              const currentIdentity = await lstat(endpoint).catch(
+                () => undefined,
+              );
+              if (
+                currentIdentity !== undefined &&
+                currentIdentity.dev === endpointIdentity.device &&
+                currentIdentity.ino === endpointIdentity.inode
+              ) {
+                await rm(endpoint, { force: true }).catch(() => undefined);
+              }
             }),
         ),
       { bufferSize: 64, strategy: "sliding" },

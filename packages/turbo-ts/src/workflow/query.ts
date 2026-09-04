@@ -290,6 +290,15 @@ interface AffectedRepository {
   readonly directlyAffected: ReadonlySet<string>;
 }
 
+const repositoryModels = (
+  repository: RepositoryModel,
+): ReadonlyArray<RepositoryPackage> => [
+  repository.rootPackage,
+  ...repository.packages.filter(
+    (packageModel) => packageModel.identity !== repository.rootPackage.identity,
+  ),
+];
+
 const calculateAffectedRepository = (
   repository: RepositoryModel,
   base: string,
@@ -336,10 +345,15 @@ const calculateAffectedRepository = (
           message: String(cause),
         }),
     });
+    const models = repositoryModels(repository);
+    const childPackages = models.filter(
+      (packageModel) =>
+        packageModel.identity !== repository.rootPackage.identity,
+    );
     const directlyAffected = new Map<string, RepositoryPackage>();
     let globalChange = false;
     for (const path of changedPaths) {
-      const owners = repository.packages.filter((packageModel) => {
+      const owners = childPackages.filter((packageModel) => {
         const directories = new Set(
           [
             packageModel.relativeDirectory,
@@ -356,7 +370,7 @@ const calculateAffectedRepository = (
       for (const owner of owners) directlyAffected.set(owner.identity, owner);
     }
     if (globalChange) {
-      for (const packageModel of repository.packages) {
+      for (const packageModel of models) {
         directlyAffected.set(packageModel.identity, packageModel);
       }
     }
@@ -364,7 +378,7 @@ const calculateAffectedRepository = (
     let changed = true;
     while (changed) {
       changed = false;
-      for (const packageModel of repository.packages) {
+      for (const packageModel of models) {
         if (
           !affected.has(packageModel.identity) &&
           packageModel.internalDependencies.some((dependency) =>
@@ -601,7 +615,7 @@ const repositoryQueryRoot = (
     head: string,
   ) => Promise<AffectedRepository>,
 ) => {
-  const models = [repository.rootPackage, ...repository.packages];
+  const models = repositoryModels(repository);
   const byIdentity = new Map(models.map((model) => [model.identity, model]));
   const dependents = new Map<string, Array<RepositoryPackage>>();
   for (const model of models) {
@@ -761,11 +775,21 @@ const repositoryQueryRoot = (
   const packageViews = models.map(packageView);
   const graphEdges = models.flatMap((model) =>
     model.internalDependencies.map((target) => ({
-      source: model.name,
-      target: byIdentity.get(target)?.name ?? target,
+      source: model.identity,
+      target,
       kind: "dependency",
     })),
   );
+  const graphEndpoint = (identity: string): string => {
+    const model = byIdentity.get(identity);
+    if (model === undefined) return identity;
+    return models.some(
+      (candidate) =>
+        candidate.identity !== model.identity && candidate.name === model.name,
+    )
+      ? model.identity
+      : model.name;
+  };
   return {
     version: () => "2.10.12",
     packages: ({ filter }: { readonly filter?: PackagePredicate }) =>
@@ -796,25 +820,34 @@ const repositoryQueryRoot = (
               centerModel.identity,
               ...centerModel.internalDependencies,
             ]);
-      const nodes = models
+      const selectedModels = models
         .filter(
           (model) =>
             centeredIdentities === undefined ||
             centeredIdentities.has(model.identity),
         )
-        .map(packageView)
-        .filter((view) => packageMatchesPredicate(view, filter));
-      const selectedNames = new Set(nodes.map((view) => view.name));
-      const edges = graphEdges.filter((edge) => {
-        const centered =
-          centerModel === undefined ||
-          edge.source === centerModel.name ||
-          edge.target === centerModel.name;
-        return (
-          centered &&
-          (selectedNames.has(edge.source) || selectedNames.has(edge.target))
-        );
-      });
+        .filter((model) => packageMatchesPredicate(packageView(model), filter));
+      const nodes = selectedModels.map(packageView);
+      const selectedIdentities = new Set(
+        selectedModels.map((model) => model.identity),
+      );
+      const edges = graphEdges
+        .filter((edge) => {
+          const centered =
+            centerModel === undefined ||
+            edge.source === centerModel.identity ||
+            edge.target === centerModel.identity;
+          return (
+            centered &&
+            (selectedIdentities.has(edge.source) ||
+              selectedIdentities.has(edge.target))
+          );
+        })
+        .map((edge) => ({
+          ...edge,
+          source: graphEndpoint(edge.source),
+          target: graphEndpoint(edge.target),
+        }));
       return { nodes: list(nodes), edges: list(edges) };
     },
     affectedPackages: async ({
@@ -936,7 +969,7 @@ const executeGraphql = (
               }),
             ),
           );
-    const models = [repository.rootPackage, ...repository.packages];
+    const models = repositoryModels(repository);
     const externalNames = new Set(
       models.flatMap((model) => {
         const internalNames = new Set(

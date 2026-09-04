@@ -520,7 +520,11 @@ interrupted. Stop escalates only after a successful RPC identifies the process
 as the expected daemon; reused live PIDs without a healthy daemon RPC are
 treated as stale state and are never signaled. Malformed streams remain
 isolated, and an idle server resets its deadline after RPC or repository
-activity before releasing its state. Windows deliberately uses Node's forceful
+activity before releasing its state. Serve startup acquires exclusive PID
+ownership, a competing server cannot unlink a live daemon endpoint, endpoint
+cleanup is limited to the owning server instance, and repository watcher
+failure terminates the daemon rather than leaving an apparently healthy RPC
+server. Windows deliberately uses Node's forceful
 process termination because Node has no supported graceful Win32 Ctrl+C bridge.
 
 `query` provides the compatible repository GraphQL root, package graph,
@@ -533,7 +537,11 @@ and dependent permissions against manifest and configured implicit package
 dependencies. Package-graph
 center selection retains the named package and its
 direct dependencies, package predicates narrow the returned nodes, and graph
-edges retain the selected nodes' dependency context. `query affected`, `query
+edges retain the selected nodes' dependency context. Graph filtering uses
+package identities, and same-named cross-ecosystem edge endpoints use qualified
+identities. Affected collections include the root package for root changes and
+when it depends on an affected workspace without allowing the root path to
+claim workspace-owned files. `query affected`, `query
 ls`, and `ls` share repository discovery and stable ordering. The server limits
 request bodies and closes HTTP handles in Scope; oversized requests receive
 HTTP 413 without resetting the connection. Top-level package predicates are
@@ -555,8 +563,9 @@ packages and workspace dependencies retained by the copied root manifest,
 emits ordinary and Docker layouts, creates reduced lockfiles with
 reference-compatible canonical
 configuration formatting, supports production manifests, and
-rejects output roots that could contain the source repository. It never
-follows workspace symlinks into a prune output. Output safety and traversal
+rejects output roots that could contain the source repository. Generated
+installation manifests and configuration files use readable `0644` modes. It
+never follows workspace symlinks into a prune output. Output safety and traversal
 exclusions use canonical locations. Contained relative file symlinks are
 recreated without dereferencing; copied root controls include their contained
 regular-file targets at the corresponding installation paths. Absolute,
@@ -583,9 +592,10 @@ continues to honor `NO_COLOR`. Interactive TUI mode renders task status and
 falls back to stream mode when either terminal side is non-interactive. JSON
 mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
 completed task's full log replay. Structured log files append typed task events
-as work runs and end with a typed run summary. CLI `--global-deps` patterns are
-merged into task hash inputs, and their repository-relative Git blob hashes are
-reported in summary `globalCacheInputs.files`. Dry runs do not perform local
+as work runs and end with a typed run summary. Errors-only failure replay does
+not duplicate output already recorded while the task ran. CLI `--global-deps`
+patterns are merged into task hash inputs, and their repository-relative Git
+blob hashes are reported in summary `globalCacheInputs.files`. Dry runs do not perform local
 cache eviction, and
 `info` derives WSL status from the Linux kernel release. Log-prefix selection
 applies to live and cached output. Summaries record
@@ -594,6 +604,9 @@ profiles use each task's scheduling timestamps. Task summaries record the
 resolved transitive external-dependency closure hash for graph-bearing npm,
 pnpm, Yarn, Cargo, uv, Bun, Aube, and Nub lockfiles and the actual encoded log
 path, including collision-qualified identifiers and alternate execution scopes.
+Graph-bearing closures retain the declaring manifest reference or resolved
+workspace entry so multiple locked versions of one name do not broaden a task's
+external dependency hash.
 Summary `monorepo` fields are true whenever ordinary discovery finds at least
 one child workspace and false in explicit single-package mode.
 Persisted, stdout, and

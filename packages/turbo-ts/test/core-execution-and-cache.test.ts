@@ -316,7 +316,7 @@ describe("core CLI execution", () => {
         scripts: Record<string, string>;
       };
       manifest.scripts["large-output"] =
-        "node -e \"process.stdout.write('x'.repeat(96 * 1024) + 'END-MARKER\\n'); process.exit(7)\"";
+        "node -e \"process.stdout.write('x'.repeat(96 * 1024) + Buffer.from('RU5ELU1BUktFUg==', 'base64').toString() + '\\n'); process.exit(7)\"";
       await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
       const result = await run(
         process.execPath,
@@ -329,6 +329,7 @@ describe("core CLI execution", () => {
           "--filter=synthetic-library",
           "--no-cache",
           "--output-logs=errors-only",
+          "--log-file=run.ndjson",
         ],
         repositoryRoot,
       );
@@ -341,6 +342,15 @@ describe("core CLI execution", () => {
       );
       expect(log.length).toBeGreaterThan(96 * 1024);
       expect(log).toContain("END-MARKER");
+      const structuredOutput = (
+        await readFile(`${directory}/run.ndjson`, "utf8")
+      )
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { readonly text?: string })
+        .flatMap((record) => record.text ?? [])
+        .join("");
+      expect(structuredOutput.match(/END-MARKER/g)).toHaveLength(1);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -742,6 +752,37 @@ describe("core CLI execution", () => {
           }
         }
       }
+      const packageGraph = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "query",
+          `{ full: packageGraph { edges { items { source target } } } centered: packageGraph(center: "cargo:${packageName}") { nodes { length } edges { length } } }`,
+          "--cwd",
+          directory,
+        ],
+        repositoryRoot,
+        env,
+      );
+      expect(packageGraph.exitCode, packageGraph.stderr).toBe(0);
+      expect(JSON.parse(packageGraph.stdout)).toMatchObject({
+        data: {
+          full: {
+            edges: {
+              items: expect.arrayContaining([
+                {
+                  source: "synthetic-app",
+                  target: `javascript:${packageName}`,
+                },
+              ]),
+            },
+          },
+          centered: {
+            nodes: { length: 1 },
+            edges: { length: 0 },
+          },
+        },
+      });
       const dependent = await run(
         process.execPath,
         [

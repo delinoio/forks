@@ -521,13 +521,147 @@ version = "4.0.0"
     ];
     for (const { path, source } of cases) {
       expect(
+        resolveLockfilePackageClosure(path, encoder.encode(source), {
+          workspacePath: "packages/app",
+          packageName: "app",
+          directDependencies: [["a", undefined]],
+        }).map((dependency) => `${dependency.name}@${dependency.version}`),
+      ).toEqual(["a@1.0.0", "b@2.0.0", "c@3.0.0"]);
+    }
+  });
+
+  it("uses declaring references to disambiguate lockfile graph closures", () => {
+    const cases = [
+      {
+        path: "/repo/yarn.lock",
+        source: `a@^1.0.0:
+  version "1.0.0"
+  dependencies:
+    selected "^1.0.0"
+a@^2.0.0:
+  version "2.0.0"
+  dependencies:
+    unselected "^2.0.0"
+selected@^1.0.0:
+  version "1.0.0"
+unselected@^2.0.0:
+  version "2.0.0"
+`,
+        context: {
+          workspacePath: "packages/app",
+          packageName: "app",
+          directDependencies: [["a", "^1.0.0"]] as const,
+        },
+      },
+      {
+        path: "/repo/yarn.lock",
+        source: `__metadata:
+  version: 8
+"a@npm:^1.0.0":
+  version: 1.0.0
+  resolution: "a@npm:1.0.0"
+  dependencies:
+    selected: "npm:^1.0.0"
+"a@npm:^2.0.0":
+  version: 2.0.0
+  resolution: "a@npm:2.0.0"
+  dependencies:
+    unselected: "npm:^2.0.0"
+"selected@npm:^1.0.0":
+  version: 1.0.0
+  resolution: "selected@npm:1.0.0"
+"unselected@npm:^2.0.0":
+  version: 2.0.0
+  resolution: "unselected@npm:2.0.0"
+`,
+        context: {
+          workspacePath: "packages/app",
+          packageName: "app",
+          directDependencies: [["a", "^1.0.0"]] as const,
+        },
+      },
+      {
+        path: "/repo/Cargo.lock",
+        source: `version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["a 1.0.0"]
+
+[[package]]
+name = "a"
+version = "1.0.0"
+dependencies = ["selected 1.0.0"]
+
+[[package]]
+name = "a"
+version = "2.0.0"
+dependencies = ["unselected 2.0.0"]
+
+[[package]]
+name = "selected"
+version = "1.0.0"
+
+[[package]]
+name = "unselected"
+version = "2.0.0"
+`,
+        context: {
+          workspacePath: "packages/app",
+          packageName: "app",
+          packageVersion: "0.1.0",
+          directDependencies: [["a", undefined]] as const,
+        },
+      },
+      {
+        path: "/repo/uv.lock",
+        source: `version = 1
+
+[[package]]
+name = "app"
+version = "0.1.0"
+source = { editable = "packages/app" }
+dependencies = [{ name = "a", version = "1.0.0" }]
+
+[[package]]
+name = "a"
+version = "1.0.0"
+source = { registry = "https://example.test/simple" }
+dependencies = [{ name = "selected", version = "1.0.0" }]
+
+[[package]]
+name = "a"
+version = "2.0.0"
+source = { registry = "https://example.test/simple" }
+dependencies = [{ name = "unselected", version = "2.0.0" }]
+
+[[package]]
+name = "selected"
+version = "1.0.0"
+source = { registry = "https://example.test/simple" }
+
+[[package]]
+name = "unselected"
+version = "2.0.0"
+source = { registry = "https://example.test/simple" }
+`,
+        context: {
+          workspacePath: "packages/app",
+          packageName: "app",
+          packageVersion: "0.1.0",
+          directDependencies: [["a", undefined]] as const,
+        },
+      },
+    ];
+    for (const { path, source, context } of cases) {
+      expect(
         resolveLockfilePackageClosure(
           path,
           encoder.encode(source),
-          "packages/app",
-          new Set(["a"]),
+          context,
         ).map((dependency) => `${dependency.name}@${dependency.version}`),
-      ).toEqual(["a@1.0.0", "b@2.0.0", "c@3.0.0"]);
+      ).toEqual(["a@1.0.0", "selected@1.0.0"]);
     }
   });
 
@@ -808,6 +942,7 @@ version = "4.0.0"
           packages: [
             {
               name: "app",
+              version: "0.1.0",
               manifest_path: "/repo/crates/app/Cargo.toml",
               dependencies: [{ name: "util", rename: "util_alias" }],
               targets: [
@@ -822,6 +957,7 @@ version = "4.0.0"
       ),
     ).toEqual({
       name: "app",
+      version: "0.1.0",
       dependencies: [{ name: "util" }],
       dependencyNames: ["util"],
       entrypointNames: ["app"],

@@ -341,6 +341,7 @@ const writeManifest = (
     yield* fileSystem.writeTextAtomic(
       destination,
       `${JSON.stringify(manifest, undefined, 2)}\n`,
+      0o644,
     );
   });
 
@@ -360,6 +361,7 @@ const writeRootConfiguration = (
     yield* fileSystem.writeTextAtomic(
       destination,
       JSON.stringify(document, undefined, 2),
+      0o644,
     );
   });
 
@@ -378,6 +380,7 @@ const writeWorkspaceConfiguration = (
         lineWidth: 0,
         singleQuote: true,
       }),
+      0o644,
     );
   });
 
