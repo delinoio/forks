@@ -502,6 +502,10 @@ configuration changes and active JavaScript, Cargo, or uv workspace manifest
 changes refresh package discovery and output patterns before the next run.
 Internal-directory exclusions are matched relative to the watched repository,
 so reserved names in ancestor directories do not suppress repository events.
+Windows-originated `.git`, `.turbo`, and `node_modules` components are matched
+case-insensitively. The bounded native watcher transport converts overflow into
+a retried repository-wide invalidation; watch refreshes discovery and reruns all
+requested tasks, while the daemon marks every registered output glob changed.
 Run arguments after `--` remain task pass-through arguments, including text
 equal to the watch-only cache-publication flag.
 When `futureFlags.watchUsingTaskInputs` is enabled, file-triggered runs retain
@@ -586,7 +590,8 @@ GraphQL endpoint rather than an IDE.
 
 Affected package listing disables Git rename detection so moves between
 workspaces select both the source and destination owners before dependent
-closure is applied.
+closure is applied. Environment-provided revisions are separated from Git
+options and pathspecs before the affected diff executes.
 
 `prune` selects the transitive internal package closure of both requested
 packages and workspace dependencies retained by the copied root manifest,
@@ -615,7 +620,9 @@ including development-marked trees in legacy npm v1 lockfiles.
 Production pruning also removes `devDependencies` from selected JavaScript
 workspace manifests in the ordinary or Docker full tree. Docker JSON subsets
 contain manifests only for selected JavaScript packages; selected Cargo and uv
-package manifests remain in the full tree. When
+package manifests remain in the full tree. Selected Cargo and uv packages also
+retain their owning workspace manifest and lockfile in the ordinary or Docker
+full tree. When
 `futureFlags.pruneIncludesGlobalFiles` is enabled, ordered
 `globalDependencies` or `global.inputs` globs copy their safe, non-ignored
 matches into the ordinary output or Docker full tree before generated controls
@@ -631,7 +638,10 @@ continues to honor `NO_COLOR`. Interactive TUI mode renders task status and
 falls back to stream mode when either terminal side is non-interactive. JSON
 mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
 completed task's full log replay. Structured log files append typed task events
-as work runs and end with a typed run summary. Errors-only failure replay does
+as work runs and end with a typed run summary. An explicit structured-log
+artifact is excluded from task and global file hashes, and it may not replace a
+mandatory task control input. Timestamped streaming applies the timestamp
+writer to a final unterminated task line. Errors-only failure replay does
 not duplicate output already recorded while the task ran. CLI `--global-deps`
 patterns are merged into task hash inputs, and their repository-relative Git
 blob hashes are reported in summary `globalCacheInputs.files`. Dry runs do not perform local

@@ -14,6 +14,7 @@ import {
   collectChildProcessBytes,
   collectChildProcessOutput,
   isUnsupportedDirectorySyncError,
+  makeBufferedFileWatcherEmitter,
   makeChildEnvironment,
   makeTerminalOperations,
   makeTerminalWriter,
@@ -45,6 +46,34 @@ const waitForTextFile = async (path: string): Promise<string> => {
 };
 
 describe("Effect foundation", () => {
+  it("collapses bounded watcher overflow into one repository invalidation", () => {
+    const scheduled: Array<() => void> = [];
+    const accepted: Array<{ readonly path: string; readonly kind: string }> =
+      [];
+    let capacityAvailable = false;
+    const emitter = makeBufferedFileWatcherEmitter(
+      "/repository",
+      (change) => {
+        if (!capacityAvailable) return false;
+        accepted.push(change);
+        return true;
+      },
+      (retry) => {
+        scheduled.push(retry);
+        return () => undefined;
+      },
+    );
+    emitter.push({ path: "/repository/packages/app/early.ts", kind: "modify" });
+    emitter.push({ path: "/repository/packages/lib/later.ts", kind: "modify" });
+    expect(scheduled).toHaveLength(1);
+    capacityAvailable = true;
+    scheduled.shift()!();
+    expect(accepted).toEqual([{ path: "/repository", kind: "unknown" }]);
+    emitter.close();
+    emitter.push({ path: "/repository/after-close.ts", kind: "modify" });
+    expect(accepted).toHaveLength(1);
+  });
+
   it("only tolerates platform-specific parent-directory sync failures", () => {
     expect(isUnsupportedDirectorySyncError({ code: "EINVAL" })).toBe(true);
     expect(isUnsupportedDirectorySyncError({ code: "EOPNOTSUPP" })).toBe(true);

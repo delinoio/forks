@@ -745,6 +745,7 @@ export const hashTask = (
   uvRuntimeIdentity?: UvRuntimeIdentity,
   packageManagerRuntimeIdentity?: PackageManagerRuntimeIdentity,
   commandGlobalDependencies: ReadonlyArray<string> = [],
+  excludedInputPaths: ReadonlyArray<string> = [],
 ): Effect.Effect<
   TaskHashResult,
   RepositoryError,
@@ -757,6 +758,13 @@ export const hashTask = (
     const environmentService = yield* EnvironmentService;
     const environment = yield* environmentService.entries;
     const platform = yield* environmentService.platform;
+    const comparableInputPath = (path: string): string => {
+      const normalized = normalizePath(path, platform === "win32");
+      return platform === "win32" ? normalized.toLowerCase() : normalized;
+    };
+    const excludedInputs = new Set(excludedInputPaths.map(comparableInputPath));
+    const isExcludedInput = (path: string): boolean =>
+      excludedInputs.has(comparableInputPath(path));
     const uvControls =
       node.package.manager === "uv"
         ? yield* uvControlInputs(
@@ -804,7 +812,9 @@ export const hashTask = (
           )),
         ].map((input) => [input.absolutePath, input] as const),
       ).values(),
-    ].sort((left, right) => compareCodeUnits(left.hashPath, right.hashPath));
+    ]
+      .filter((input) => !isExcludedInput(input.absolutePath))
+      .sort((left, right) => compareCodeUnits(left.hashPath, right.hashPath));
     const gitlinkObjectId = (path: string) =>
       Effect.gen(function* () {
         const result = yield* Effect.scoped(
@@ -966,6 +976,11 @@ export const hashTask = (
       [...globalInputFilesByRelativePath.keys()],
       globalDependencyPatterns,
       platform === "win32",
+    ).filter(
+      (relative) =>
+        !isExcludedInput(
+          globalInputFilesByRelativePath.get(relative)!.absolutePath,
+        ),
     );
     const globalFileHashes = (yield* Effect.forEach(
       globalInputFiles,

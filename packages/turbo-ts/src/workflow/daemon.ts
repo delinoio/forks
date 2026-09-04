@@ -701,6 +701,15 @@ const serveDaemon = (
         ),
         Stream.runForEach((change) =>
           Effect.gen(function* () {
+            if (change.kind === "unknown") {
+              for (const registration of outputRegistrations.values()) {
+                for (const glob of registration.outputGlobs) {
+                  registration.changedOutputGlobs.add(glob);
+                }
+              }
+              yield* Queue.offer(activity, undefined);
+              return;
+            }
             const relative = relativePath(repository.root, change.path);
             for (const registration of outputRegistrations.values()) {
               const patterns = [

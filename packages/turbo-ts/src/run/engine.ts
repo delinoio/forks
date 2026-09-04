@@ -2600,12 +2600,13 @@ const executeTask = (
             const outputFiber = yield* Effect.forkScoped(
               Effect.gen(function* () {
                 let renderState = initialTaskOutputRenderState;
+                let renderLevel: "stdout" | "stderr" = "stdout";
                 while (true) {
                   const event = yield* Queue.take(outputQueue);
                   if (event.kind === "end") {
                     if (displaysStreamedOutput) {
                       for (const chunk of finishTaskOutput(renderState)) {
-                        yield* terminal.writeStdout(chunk);
+                        yield* writeTaskEvent(renderLevel, chunk);
                       }
                     }
                     return;
@@ -2625,6 +2626,7 @@ const executeTask = (
                     yield* writeTaskEvent(event.level, event.output);
                     continue;
                   }
+                  renderLevel = event.level;
                   const rendered = renderTaskOutputChunk(
                     renderState,
                     taskLabel,
@@ -2762,6 +2764,7 @@ const computeTaskHashes = (
   sourceEnvironment: Readonly<Record<string, string | undefined>>,
   caseInsensitiveEnvironmentNames: boolean,
   cacheabilityByTask: ReadonlyMap<string, TaskScopeCacheability>,
+  excludedInputPaths: ReadonlyArray<string>,
 ): Effect.Effect<
   ReadonlyMap<string, TaskHashResult>,
   RepositoryError,
@@ -2793,6 +2796,7 @@ const computeTaskHashes = (
         cacheabilityByTask.get(id)?.uvRuntimeIdentity,
         cacheabilityByTask.get(id)?.packageManagerRuntimeIdentity,
         options.globalDependencies,
+        excludedInputPaths,
       );
       hashes.set(id, result);
     }
@@ -2937,6 +2941,7 @@ const applyCargoWorkspaceHashes = (
   sourceEnvironment: Readonly<Record<string, string | undefined>>,
   caseInsensitiveEnvironmentNames: boolean,
   cacheabilityByTask: ReadonlyMap<string, TaskScopeCacheability>,
+  excludedInputPaths: ReadonlyArray<string>,
 ): Effect.Effect<
   ReadonlyMap<string, TaskHashResult>,
   RepositoryError,
@@ -2993,6 +2998,7 @@ const applyCargoWorkspaceHashes = (
           cacheabilityByTask.get(id)?.uvRuntimeIdentity,
           cacheabilityByTask.get(id)?.packageManagerRuntimeIdentity,
           options.globalDependencies,
+          excludedInputPaths,
         ),
       );
       changed.add(id);
@@ -3412,6 +3418,48 @@ export const executeRun = (
       affected.filters.length === 0,
     );
     const graph = cargoWorkspacePlan.graph;
+    const configuredStructuredLogPath =
+      parsed.graph === undefined &&
+      parsed.dryRun === undefined &&
+      parsed.logFile !== undefined &&
+      parsed.logFile !== ""
+        ? isAbsolutePath(parsed.logFile)
+          ? parsed.logFile
+          : joinPath(options.root, parsed.logFile)
+        : undefined;
+    const comparableInputPath = (path: string): string => {
+      const normalized = normalizePath(path, platform === "win32");
+      return platform === "win32" ? normalized.toLowerCase() : normalized;
+    };
+    if (configuredStructuredLogPath !== undefined) {
+      const structuredLogIdentity = comparableInputPath(
+        configuredStructuredLogPath,
+      );
+      const controlCollision = [...selectedGraph.nodes.values()].some((node) =>
+        implicitTaskInputCandidates(
+          repository,
+          node,
+          environment,
+          platform === "win32",
+        ).some(
+          (candidate) =>
+            comparableInputPath(candidate) === structuredLogIdentity,
+        ),
+      );
+      if (controlCollision) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: configuredStructuredLogPath,
+            message:
+              "structured log path must not replace a task control input",
+          }),
+        );
+      }
+    }
+    const excludedInputPaths =
+      configuredStructuredLogPath === undefined
+        ? []
+        : [configuredStructuredLogPath];
     const cacheabilityByTask = new Map(
       yield* Effect.forEach(
         [...graph.nodes],
@@ -3457,12 +3505,14 @@ export const executeRun = (
         environment,
         platform === "win32",
         cacheabilityByTask,
+        excludedInputPaths,
       ),
       cargoWorkspacePlan.scopes,
       options,
       environment,
       platform === "win32",
       cacheabilityByTask,
+      excludedInputPaths,
     );
     const unrestorableCacheInputs = taskIdsWithUnrestorableCacheInputs(
       graph,
@@ -3764,9 +3814,7 @@ export const executeRun = (
         ? undefined
         : parsed.logFile === ""
           ? joinPath(options.root, ".turbo", "logs", `${runStartedAt}.json`)
-          : isAbsolutePath(parsed.logFile)
-            ? parsed.logFile
-            : joinPath(options.root, parsed.logFile);
+          : configuredStructuredLogPath;
     const structuredLogSemaphore = yield* Effect.makeSemaphore(1);
     if (structuredLogPath !== undefined) {
       yield* fileSystem.writeTextAtomic(structuredLogPath, "");

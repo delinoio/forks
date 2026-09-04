@@ -96,6 +96,7 @@ const configuredOutputPath = (
 interface PendingWatchChange {
   readonly sequence: number;
   readonly path: string;
+  readonly invalidateAll: boolean;
 }
 
 interface PendingWatchChanges {
@@ -153,6 +154,22 @@ export const executeWatch = (
           if (isInternalRepositoryPath(repository.root, change.path)) {
             return false;
           }
+          if (change.kind === "unknown") {
+            const refreshed = yield* Effect.either(
+              loadWorkflowRepository({
+                cwd: options.run.cwd,
+                rootTurboJson: options.run.rootTurboJson,
+              }),
+            );
+            if (refreshed._tag === "Right") {
+              yield* Ref.set(repositoryRef, refreshed.right);
+            }
+            yield* Ref.set(
+              ignoreMatcher,
+              yield* loadGitIgnoreMatcher(repository.root),
+            );
+            return true;
+          }
           const currentRepository = yield* Ref.get(repositoryRef);
           const ignored = (yield* Ref.get(ignoreMatcher)).ignores(
             change.path,
@@ -204,7 +221,14 @@ export const executeWatch = (
             sequence,
             {
               nextSequence: sequence + 1,
-              changes: [...pending.changes, { sequence, path: change.path }],
+              changes: [
+                ...pending.changes,
+                {
+                  sequence,
+                  path: change.path,
+                  invalidateAll: change.kind === "unknown",
+                },
+              ],
             },
           ] as const;
         }),
@@ -216,7 +240,10 @@ export const executeWatch = (
             (change) => change.sequence <= sequence,
           );
           return [
-            [...new Set(included.map((change) => change.path))],
+            {
+              paths: [...new Set(included.map((change) => change.path))],
+              invalidateAll: included.some((change) => change.invalidateAll),
+            },
             {
               ...pending,
               changes: pending.changes.filter(
@@ -228,22 +255,31 @@ export const executeWatch = (
       ),
     );
     const triggers = Stream.concat(
-      Stream.succeed<ReadonlyArray<string>>([]),
+      Stream.succeed({
+        paths: [] satisfies ReadonlyArray<string>,
+        invalidateAll: false,
+      }),
       changes,
     );
     yield* triggers.pipe(
       Stream.flatMap(
-        (paths) =>
+        ({ paths, invalidateAll }) =>
           Stream.fromEffect(
             Effect.gen(function* () {
-              if (paths.length > 0) {
+              if (invalidateAll) {
+                yield* terminal.writeStdout(
+                  "\n• change detected: repository-wide invalidation\n",
+                );
+              } else if (paths.length > 0) {
                 yield* terminal.writeStdout(
                   `\n• change detected: ${paths.join(", ")}\n`,
                 );
               }
               return yield* executeRun(
                 options.run,
-                paths.length === 0 ? {} : { changedPaths: paths },
+                paths.length === 0 || invalidateAll
+                  ? {}
+                  : { changedPaths: paths },
               ).pipe(
                 Effect.catchAll((cause) =>
                   terminal

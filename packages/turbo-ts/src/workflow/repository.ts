@@ -100,7 +100,15 @@ export const isInternalRepositoryPath = (
   root: string,
   path: string,
 ): boolean => {
-  const relative = `/${normalizePath(relativePath(root, path))}/`;
+  const windowsPathSeparators =
+    /^[A-Za-z]:[\\/]/.test(root) || /^[\\/]{2}[^\\/]+[\\/][^\\/]+/.test(root);
+  const normalized = `/${normalizePath(
+    relativePath(root, path, windowsPathSeparators),
+    windowsPathSeparators,
+  )}/`;
+  const relative = windowsPathSeparators
+    ? normalized.toLowerCase()
+    : normalized;
   return ["/.git/", "/.turbo/", "/node_modules/"].some((component) =>
     relative.includes(component),
   );

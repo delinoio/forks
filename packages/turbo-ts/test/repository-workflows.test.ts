@@ -323,6 +323,24 @@ describe("repository workflow gate", () => {
         join(nestedRepository, ".turbo", "cache"),
       ),
     ).toBe(true);
+    expect(
+      isInternalRepositoryPath(
+        "C:\\repository",
+        "c:\\repository\\.TURBO\\logs\\task.log",
+      ),
+    ).toBe(true);
+    expect(
+      isInternalRepositoryPath(
+        "\\\\server\\share\\repository",
+        "\\\\SERVER\\SHARE\\repository\\Node_Modules\\package",
+      ),
+    ).toBe(true);
+    expect(
+      isInternalRepositoryPath(
+        "/repository",
+        "/repository/.TURBO/logs/task.log",
+      ),
+    ).toBe(false);
     for (const [manager, label] of [
       ["npm", "npm"],
       ["pnpm", "pnpm9"],
@@ -741,6 +759,75 @@ describe("repository workflow gate", () => {
     }
   }, 60_000);
 
+  it("excludes an explicit structured log from task hashes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-log-hash-"));
+    try {
+      await prepareFixture(directory);
+      const logPath = "packages/app/run.ndjson";
+      const execute = async () => {
+        const result = await execFilePromise(process.execPath, [
+          candidate,
+          "run",
+          "build",
+          "--filter=synthetic-app",
+          "--no-cache",
+          "--summarize",
+          "--json",
+          `--global-deps=${logPath}`,
+          `--log-file=${logPath}`,
+          "--cwd",
+          directory,
+        ]);
+        return JSON.parse(result.stdout.trim().split("\n").at(-1)!) as {
+          readonly globalCacheInputs: {
+            readonly files: Readonly<Record<string, string>>;
+          };
+          readonly tasks: ReadonlyArray<{
+            readonly taskId: string;
+            readonly hash: string;
+            readonly inputs: Readonly<Record<string, string>>;
+          }>;
+        };
+      };
+      const first = await execute();
+      const second = await execute();
+      expect(
+        second.tasks.map(({ taskId, hash }) => ({ taskId, hash })),
+      ).toEqual(first.tasks.map(({ taskId, hash }) => ({ taskId, hash })));
+      expect(first.globalCacheInputs.files).not.toHaveProperty(logPath);
+      expect(
+        first.tasks.find((task) => task.taskId === "synthetic-app#build")
+          ?.inputs,
+      ).not.toHaveProperty("run.ndjson");
+
+      const manifestPath = join(directory, "packages/app/package.json");
+      const manifest = await readFile(manifestPath, "utf8");
+      const collision = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--filter=synthetic-app",
+        "--no-cache",
+        "--log-file=packages/app/package.json",
+        "--cwd",
+        directory,
+      ]).then(
+        () => ({ failed: false, stderr: "" }),
+        (error: { readonly stderr?: string }) => ({
+          failed: true,
+          stderr: error.stderr ?? "",
+        }),
+      );
+      expect(collision.failed).toBe(true);
+      expect(collision.stderr).toContain(
+        "structured log path must not replace a task control input",
+      );
+      expect(await readFile(manifestPath, "utf8")).toBe(manifest);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("omits unscheduled tasks from profiles", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-profile-stop-"));
     try {
@@ -1087,6 +1174,39 @@ describe("repository workflow gate", () => {
       expect(timestamped.stdout).toMatch(
         /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\]/m,
       );
+      const applicationManifestPath = join(
+        directory,
+        "packages/app/package.json",
+      );
+      const applicationManifest = JSON.parse(
+        await readFile(applicationManifestPath, "utf8"),
+      ) as { scripts: Record<string, string> };
+      applicationManifest.scripts.unterminated =
+        "node -e \"process.stdout.write('unterminated-tail')\"";
+      await writeFile(
+        applicationManifestPath,
+        `${JSON.stringify(applicationManifest, undefined, 2)}\n`,
+      );
+      configuration.tasks.unterminated = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      const unterminated = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "unterminated",
+        "--filter=synthetic-app",
+        "--ui=stream-with-experimental-timestamps",
+        "--log-prefix=none",
+        "--cwd",
+        directory,
+      ]);
+      expect(
+        unterminated.stdout
+          .split("\n")
+          .find((line) => line.includes("unterminated-tail")),
+      ).toMatch(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] /);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -3157,6 +3277,12 @@ importers:
         ),
       ).toContain(packageName);
       expect(
+        await readFile(join(qualifiedOutput, "rust/Cargo.toml"), "utf8"),
+      ).toContain("[workspace]");
+      expect(
+        await readFile(join(qualifiedOutput, "rust/Cargo.lock"), "utf8"),
+      ).toContain("synthetic-cargo-leaf");
+      expect(
         await readFile(join(qualifiedOutput, "rust/leaf/Cargo.toml"), "utf8"),
       ).toContain("synthetic-cargo-leaf");
       expect(
@@ -3176,8 +3302,12 @@ importers:
       expect(await runPrune([packageName], plainOutput)).toBe(0);
       for (const path of [
         "packages/polyglot/package.json",
+        "rust/Cargo.toml",
+        "rust/Cargo.lock",
         "rust/polyglot/Cargo.toml",
         "rust/leaf/Cargo.toml",
+        "pyproject.toml",
+        "uv.lock",
         "python/polyglot/pyproject.toml",
       ]) {
         expect(await readFile(join(plainOutput, path), "utf8")).not.toBe("");
@@ -3185,8 +3315,12 @@ importers:
       const dockerOutput = join(directory, "docker-result");
       expect(await runPrune([packageName], dockerOutput, true)).toBe(0);
       for (const path of [
+        "rust/Cargo.toml",
+        "rust/Cargo.lock",
         "rust/polyglot/Cargo.toml",
         "rust/leaf/Cargo.toml",
+        "pyproject.toml",
+        "uv.lock",
         "python/polyglot/pyproject.toml",
       ]) {
         expect(
@@ -3557,7 +3691,7 @@ importers:
           ],
         },
       });
-      let requestedRange: string | undefined;
+      let requestedArguments: ReadonlyArray<string> | undefined;
       expect(
         await Effect.runPromise(
           Effect.gen(function* () {
@@ -3588,7 +3722,7 @@ importers:
                         request.command === "git" &&
                         request.args[0] === "diff"
                       ) {
-                        requestedRange = request.args.at(-1);
+                        requestedArguments = request.args;
                       }
                       return processService.runBytes(request);
                     },
@@ -3599,7 +3733,34 @@ importers:
           }).pipe(Effect.provide(nodeFoundationLayer)),
         ),
       ).toBe(0);
-      expect(requestedRange).toBe("HEAD~1...HEAD");
+      expect(requestedArguments?.slice(-3)).toEqual([
+        "--end-of-options",
+        "HEAD~1...HEAD",
+        "--",
+      ]);
+      const optionOutput = join(directory, "list-option-output");
+      const optionRevision = await execFilePromise(
+        process.execPath,
+        [candidate, "ls", "--affected", "--output=json", "--cwd", directory],
+        {
+          env: {
+            ...differentialEnvironment,
+            TURBO_SCM_BASE: `--output=${optionOutput}`,
+            TURBO_SCM_HEAD: "HEAD",
+          },
+        },
+      ).then(
+        () => ({ failed: false, stderr: "" }),
+        (error: { readonly stderr?: string }) => ({
+          failed: true,
+          stderr: error.stderr ?? "",
+        }),
+      );
+      expect(optionRevision.failed).toBe(true);
+      expect(optionRevision.stderr).toContain(
+        "unable to calculate affected packages",
+      );
+      expect(existsSync(optionOutput)).toBe(false);
       if (process.platform !== "win32") {
         await writeFile(
           join(directory, "real/linked/source.txt"),

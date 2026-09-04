@@ -76,6 +76,7 @@ import {
   EnvironmentService,
   type ExecutionRequest,
   ExitStatusService,
+  type FileChange,
   type FileSystemOperations,
   FileSystemService,
   FileWatcherService,
@@ -1581,43 +1582,93 @@ const randomnessLayer = Layer.succeed(RandomnessService, {
   }),
 });
 
+type WatcherOverflowRetry = (retry: () => void) => () => void;
+
+const defaultWatcherOverflowRetry: WatcherOverflowRetry = (retry) => {
+  const timeout = setTimeout(retry, 10);
+  timeout.unref();
+  return () => clearTimeout(timeout);
+};
+
+export const makeBufferedFileWatcherEmitter = (
+  root: string,
+  offer: (change: FileChange) => boolean,
+  scheduleRetry: WatcherOverflowRetry = defaultWatcherOverflowRetry,
+) => {
+  let closed = false;
+  let overflowed = false;
+  let cancelRetry: (() => void) | undefined;
+  const invalidation: FileChange = { path: root, kind: "unknown" };
+  const scheduleInvalidation = () => {
+    if (closed || cancelRetry !== undefined) return;
+    cancelRetry = scheduleRetry(() => {
+      cancelRetry = undefined;
+      if (closed || !overflowed) return;
+      if (offer(invalidation)) {
+        overflowed = false;
+      } else {
+        scheduleInvalidation();
+      }
+    });
+  };
+  return {
+    push: (change: FileChange) => {
+      if (closed) return;
+      if (overflowed) {
+        if (offer(invalidation)) {
+          overflowed = false;
+        } else {
+          scheduleInvalidation();
+        }
+        return;
+      }
+      if (!offer(change)) {
+        overflowed = true;
+        scheduleInvalidation();
+      }
+    },
+    close: () => {
+      closed = true;
+      cancelRetry?.();
+      cancelRetry = undefined;
+    },
+  };
+};
+
 const fileWatcherLayer = Layer.succeed(FileWatcherService, {
   watch: (root) =>
-    Stream.asyncPush<
-      {
-        readonly path: string;
-        readonly kind: "modify" | "rename" | "remove" | "unknown";
-        readonly entryKind?: "directory" | "file" | "symlink" | "other";
-      },
-      BoundaryError
-    >(
+    Stream.asyncPush<FileChange, BoundaryError>(
       (emit) =>
         Effect.acquireRelease(
           Effect.try({
             try: () => {
+              const transport = makeBufferedFileWatcherEmitter(
+                root,
+                emit.single,
+              );
               const watcher = watchFileSystem(
                 root,
                 { recursive: true, persistent: true },
                 (event, filename) => {
                   if (filename === null) {
-                    emit.single({ path: root, kind: "unknown" });
+                    transport.push({ path: root, kind: "unknown" });
                     return;
                   }
                   const path = join(root, String(filename));
                   if (event === "change") {
-                    emit.single({ path, kind: "modify" });
+                    transport.push({ path, kind: "modify" });
                     return;
                   }
                   lstat(path).then(
                     (metadata) =>
-                      emit.single({
+                      transport.push({
                         path,
                         kind: "rename",
                         entryKind: metadataKind(metadata),
                       }),
                     (cause) =>
                       isMissingFileError(cause)
-                        ? emit.single({ path, kind: "remove" })
+                        ? transport.push({ path, kind: "remove" })
                         : emit.fail(filesystemError(cause)),
                   );
                 },
@@ -1625,13 +1676,17 @@ const fileWatcherLayer = Layer.succeed(FileWatcherService, {
               watcher.once("error", (cause) =>
                 emit.fail(filesystemError(cause)),
               );
-              return watcher;
+              return { transport, watcher };
             },
             catch: filesystemError,
           }),
-          (watcher) => Effect.sync(() => watcher.close()),
+          ({ transport, watcher }) =>
+            Effect.sync(() => {
+              transport.close();
+              watcher.close();
+            }),
         ),
-      { bufferSize: 4_096, strategy: "sliding" },
+      { bufferSize: 4_096, strategy: "dropping" },
     ),
 });
 

@@ -625,6 +625,38 @@ export const executePrune = (
         );
       }
     }
+    const ecosystemWorkspaceControls = new Map<string, ReadonlyArray<string>>();
+    for (const packageModel of packages) {
+      if (packageModel.manager !== "cargo" && packageModel.manager !== "uv") {
+        continue;
+      }
+      const workspaceDirectory =
+        packageModel.workspaceDirectory ?? packageModel.directory;
+      const key = `${packageModel.manager}\0${workspaceDirectory}`;
+      ecosystemWorkspaceControls.set(
+        key,
+        packageModel.manager === "cargo"
+          ? [
+              joinPath(workspaceDirectory, "Cargo.toml"),
+              joinPath(workspaceDirectory, "Cargo.lock"),
+            ]
+          : [
+              joinPath(workspaceDirectory, "pyproject.toml"),
+              joinPath(workspaceDirectory, "uv.lock"),
+            ],
+      );
+    }
+    for (const controls of ecosystemWorkspaceControls.values()) {
+      for (const source of controls) {
+        yield* copyIfPresent(
+          source,
+          joinPath(fullRoot, relativePath(repository.root, source)),
+          repository.root,
+          canonicalOutputRoot,
+          fullRoot,
+        );
+      }
+    }
     const selectedPackageRoots = packages.map(
       (packageModel) => packageModel.directory,
     );
