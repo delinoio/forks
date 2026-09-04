@@ -549,13 +549,15 @@ const stopDaemonWithLock = (
       yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);
       return;
     }
-    const shutdown = yield* daemonRequest(paths, DaemonMethod.shutdown).pipe(
-      Effect.either,
-    );
-    if (shutdown._tag === "Left" || shutdown.right.error !== undefined) {
-      yield* cleanStaleStateIfOwned(paths, pid);
-      yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);
-      return;
+    const shutdown = yield* daemonRequest(paths, DaemonMethod.shutdown);
+    if (shutdown.error !== undefined) {
+      return yield* Effect.fail(
+        new BoundaryError({
+          boundary: "daemon",
+          message: `daemon shutdown failed: ${shutdown.error}`,
+          retryable: true,
+        }),
+      );
     }
     for (let attempt = 0; attempt < 40; attempt += 1) {
       if (!(yield* isAlive(pid))) break;

@@ -45,7 +45,7 @@ import {
 import { parseRunArguments } from "../src/run/options.js";
 import { executeDaemon, parseDaemonArguments } from "../src/workflow/daemon.js";
 import { isWindowsSubsystemForLinux } from "../src/workflow/misc.js";
-import { parsePruneArguments } from "../src/workflow/prune.js";
+import { executePrune, parsePruneArguments } from "../src/workflow/prune.js";
 import { repositoryQuerySchema } from "../src/workflow/query.js";
 import {
   isInternalRepositoryPath,
@@ -1302,6 +1302,105 @@ describe("repository workflow gate", () => {
     }
   }, 15_000);
 
+  it("preserves live daemon state when shutdown RPC fails", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-failure-"));
+    try {
+      await prepareFixture(directory);
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const daemon = yield* DaemonService;
+            const fileSystem = yield* FileSystemService;
+            const processService = yield* ProcessService;
+            const pidCreated = yield* Deferred.make<void>();
+            let shutdownFailure: "response" | "transport" | undefined;
+            let terminationAttempts = 0;
+            const transportFailure = new BoundaryError({
+              boundary: "daemon",
+              message: "synthetic shutdown transport failure",
+              retryable: true,
+            });
+            const overrides = Layer.mergeAll(
+              Layer.succeed(DaemonService, {
+                ...daemon,
+                request: (endpoint, request, timeoutMilliseconds) => {
+                  if (
+                    request.method !== DaemonMethod.shutdown ||
+                    shutdownFailure === undefined
+                  ) {
+                    return daemon.request(
+                      endpoint,
+                      request,
+                      timeoutMilliseconds,
+                    );
+                  }
+                  return shutdownFailure === "transport"
+                    ? Effect.fail(transportFailure)
+                    : Effect.succeed({
+                        id: request.id,
+                        error: "synthetic shutdown response failure",
+                      });
+                },
+              }),
+              Layer.succeed(FileSystemService, {
+                ...fileSystem,
+                createExclusiveFile: (path, contents) =>
+                  fileSystem
+                    .createExclusiveFile(path, contents)
+                    .pipe(
+                      Effect.tap((created) =>
+                        created && path.endsWith("turbod.pid")
+                          ? Deferred.succeed(pidCreated, undefined).pipe(
+                              Effect.ignore,
+                            )
+                          : Effect.void,
+                      ),
+                    ),
+              }),
+              Layer.succeed(ProcessService, {
+                ...processService,
+                terminateProcess: () =>
+                  Effect.sync(() => {
+                    terminationAttempts += 1;
+                  }),
+              }),
+            );
+            const runDaemon = (command: "serve" | "status" | "stop") =>
+              executeDaemon({
+                command,
+                cwd: directory,
+                idleMilliseconds: 30_000,
+                json: command === "status",
+              }).pipe(Effect.provide(overrides));
+            const serveFiber = yield* Effect.forkScoped(runDaemon("serve"));
+            yield* Deferred.await(pidCreated);
+            for (const [failure, message] of [
+              ["transport", "synthetic shutdown transport failure"],
+              [
+                "response",
+                "daemon shutdown failed: synthetic shutdown response failure",
+              ],
+            ] as const) {
+              shutdownFailure = failure;
+              const result = yield* runDaemon("stop").pipe(Effect.either);
+              expect(result).toMatchObject({
+                _tag: "Left",
+                left: { boundary: "daemon", message },
+              });
+              expect(yield* runDaemon("status")).toBe(0);
+              expect(terminationAttempts).toBe(0);
+            }
+            shutdownFailure = undefined;
+            expect(yield* runDaemon("stop")).toBe(0);
+            expect(yield* Fiber.join(serveFiber)).toBe(0);
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("resets the daemon idle deadline after client activity", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-idle-"));
     const runCandidate = (...arguments_: ReadonlyArray<string>) =>
@@ -2134,6 +2233,181 @@ importers:
     }
   }, 30_000);
 
+  it("selects every cross-ecosystem package matching a plain prune scope", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-scopes-"));
+    const packageName = "synthetic-polyglot";
+    const javascriptDirectory = join(directory, "packages/polyglot");
+    const cargoWorkspaceDirectory = join(directory, "rust");
+    const cargoDirectory = join(cargoWorkspaceDirectory, "polyglot");
+    const cargoDependencyDirectory = join(cargoWorkspaceDirectory, "leaf");
+    const uvDirectory = join(directory, "python/polyglot");
+    const cargoPackageId = `path+file://${cargoDirectory}#${packageName}@0.1.0`;
+    const cargoDependencyId = `path+file://${cargoDependencyDirectory}#synthetic-cargo-leaf@0.1.0`;
+    try {
+      await prepareFixture(directory);
+      const configurationPath = join(directory, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { futureFlags?: Record<string, boolean> };
+      configuration.futureFlags = {
+        ...configuration.futureFlags,
+        experimentalCargoWorkspaces: true,
+        experimentalPythonWorkspaces: true,
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      await mkdir(javascriptDirectory, { recursive: true });
+      await writeFile(
+        join(javascriptDirectory, "package.json"),
+        `${JSON.stringify({ name: packageName, private: true }, undefined, 2)}\n`,
+      );
+      await mkdir(cargoDirectory, { recursive: true });
+      await mkdir(cargoDependencyDirectory, { recursive: true });
+      await writeFile(
+        join(cargoWorkspaceDirectory, "Cargo.toml"),
+        '[workspace]\nmembers = ["polyglot", "leaf"]\nresolver = "3"\n',
+      );
+      await writeFile(
+        join(cargoDirectory, "Cargo.toml"),
+        `[package]\nname = "${packageName}"\nversion = "0.1.0"\nedition = "2024"\n`,
+      );
+      await writeFile(
+        join(cargoDependencyDirectory, "Cargo.toml"),
+        '[package]\nname = "synthetic-cargo-leaf"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(
+        join(cargoWorkspaceDirectory, "Cargo.lock"),
+        `version = 4\n\n[[package]]\nname = "${packageName}"\nversion = "0.1.0"\n\n[[package]]\nname = "synthetic-cargo-leaf"\nversion = "0.1.0"\n`,
+      );
+      await writeFile(
+        join(directory, "pyproject.toml"),
+        '[tool.uv.workspace]\nmembers = ["python/polyglot"]\n',
+      );
+      await mkdir(uvDirectory, { recursive: true });
+      await writeFile(
+        join(uvDirectory, "pyproject.toml"),
+        `[project]\nname = "${packageName}"\nversion = "0.1.0"\ndependencies = []\n`,
+      );
+      await writeFile(
+        join(directory, "uv.lock"),
+        "version = 1\nrevision = 1\n",
+      );
+      const cargoMetadata = JSON.stringify({
+        workspace_root: cargoWorkspaceDirectory,
+        workspace_members: [cargoPackageId, cargoDependencyId],
+        target_directory: join(cargoWorkspaceDirectory, "target"),
+        packages: [
+          {
+            id: cargoPackageId,
+            name: packageName,
+            version: "0.1.0",
+            manifest_path: join(cargoDirectory, "Cargo.toml"),
+            dependencies: [
+              {
+                name: "synthetic-cargo-leaf",
+                path: cargoDependencyDirectory,
+              },
+            ],
+            targets: [{ kind: ["lib"], name: "synthetic_polyglot" }],
+          },
+          {
+            id: cargoDependencyId,
+            name: "synthetic-cargo-leaf",
+            version: "0.1.0",
+            manifest_path: join(cargoDependencyDirectory, "Cargo.toml"),
+            dependencies: [],
+            targets: [{ kind: ["lib"], name: "synthetic_cargo_leaf" }],
+          },
+        ],
+      });
+      const runPrune = (
+        scopes: ReadonlyArray<string>,
+        outputDirectory: string,
+      ) =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            return yield* executePrune({
+              scopes,
+              cwd: directory,
+              outputDirectory,
+              docker: false,
+              production: false,
+              useGitignore: false,
+            }).pipe(
+              Effect.provide(
+                Layer.succeed(ProcessService, {
+                  ...processService,
+                  run: (request) => {
+                    if (
+                      request.command === "cargo" &&
+                      request.args[0] === "metadata"
+                    ) {
+                      return Effect.succeed({
+                        exitCode: 0,
+                        stdout: cargoMetadata,
+                        stderr: "",
+                        combinedOutput: cargoMetadata,
+                      });
+                    }
+                    if (request.command === "rustc") {
+                      const stdout =
+                        "rustc 1.96.0-nightly\nhost: synthetic-target-triple\n";
+                      return Effect.succeed({
+                        exitCode: 0,
+                        stdout,
+                        stderr: "",
+                        combinedOutput: stdout,
+                      });
+                    }
+                    return processService.run(request);
+                  },
+                }),
+              ),
+            );
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      const qualifiedOutput = join(directory, "qualified-result");
+      expect(await runPrune([`cargo:${packageName}`], qualifiedOutput)).toBe(0);
+      expect(
+        await readFile(
+          join(qualifiedOutput, "rust/polyglot/Cargo.toml"),
+          "utf8",
+        ),
+      ).toContain(packageName);
+      expect(
+        await readFile(join(qualifiedOutput, "rust/leaf/Cargo.toml"), "utf8"),
+      ).toContain("synthetic-cargo-leaf");
+      expect(
+        await readFile(
+          join(qualifiedOutput, "packages/polyglot/package.json"),
+          "utf8",
+        ).catch(() => undefined),
+      ).toBeUndefined();
+      expect(
+        await readFile(
+          join(qualifiedOutput, "python/polyglot/pyproject.toml"),
+          "utf8",
+        ).catch(() => undefined),
+      ).toBeUndefined();
+      await rm(qualifiedOutput, { force: true, recursive: true });
+      const plainOutput = join(directory, "plain-result");
+      expect(await runPrune([packageName], plainOutput)).toBe(0);
+      for (const path of [
+        "packages/polyglot/package.json",
+        "rust/polyglot/Cargo.toml",
+        "rust/leaf/Cargo.toml",
+        "python/polyglot/pyproject.toml",
+      ]) {
+        expect(await readFile(join(plainOutput, path), "utf8")).not.toBe("");
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("rejects unsafe prune output aliases and escaping package symlinks", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-safety-"));
     const outside = await mkdtemp(join(tmpdir(), "turbo-ts-prune-control-"));
@@ -2607,7 +2881,7 @@ snapshots:
           "/repo/package-lock.json",
           new TextEncoder().encode(
             JSON.stringify({
-              lockfileVersion: 3,
+              lockfileVersion: 2,
               packages: {
                 "": {},
                 "packages/app": {
@@ -2616,23 +2890,51 @@ snapshots:
                 "packages/unused": {
                   dependencies: { "unused-only": "1.0.0" },
                 },
-                "node_modules/shared": { version: "1.0.0" },
+                "node_modules/shared": {
+                  version: "1.0.0",
+                  dependencies: { "shared-leaf": "1.1.0" },
+                },
+                "node_modules/shared/node_modules/shared-leaf": {
+                  version: "1.1.0",
+                },
                 "node_modules/unused": {
                   link: true,
                   resolved: "packages/unused",
                 },
                 "node_modules/unused-only": { version: "1.0.0" },
               },
+              dependencies: {
+                shared: {
+                  version: "1.0.0",
+                  dependencies: { "shared-leaf": { version: "1.1.0" } },
+                },
+                unused: {
+                  version: "file:packages/unused",
+                  dependencies: { "unused-only": { version: "1.0.0" } },
+                },
+                "unused-only": { version: "1.0.0" },
+              },
             }),
           ),
           new Set(["packages/app"]),
         ),
       ),
-    ) as { packages: Record<string, unknown> };
+    ) as {
+      packages: Record<string, unknown>;
+      dependencies: Record<
+        string,
+        { readonly dependencies?: Readonly<Record<string, unknown>> }
+      >;
+    };
     expect(Object.keys(npmPruned.packages)).toEqual([
       "",
       "packages/app",
       "node_modules/shared",
+      "node_modules/shared/node_modules/shared-leaf",
+    ]);
+    expect(Object.keys(npmPruned.dependencies)).toEqual(["shared"]);
+    expect(Object.keys(npmPruned.dependencies.shared!.dependencies!)).toEqual([
+      "shared-leaf",
     ]);
     const npmDevelopmentSource = new TextEncoder().encode(
       JSON.stringify({

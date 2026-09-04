@@ -195,8 +195,9 @@ Environment-name selection follows Windows case-insensitive semantics for run
 options, affected-range controls, hashing, and strict task execution.
 Repository discovery records the resolved root lockfile path. Gate 3 validates
 all modeled lockfile formats before prune, rewrites pnpm importer/package/
-snapshot closure, npm workspace package indexes, Yarn Classic and Berry entry
-closures, and text Bun workspace/package indexes. Binary Bun, Yarn PnP, and
+snapshot closure, npm workspace package indexes and version 2 legacy dependency
+trees, Yarn Classic and Berry entry closures, and text Bun workspace/package
+indexes. Binary Bun, Yarn PnP, and
 other validated formats without a safely rewritable public workspace index are
 preserved. pnpm
 aliases derive their target identity from importer specifiers and
@@ -518,7 +519,9 @@ been reused by an unrelated live process.
 Log clients follow the exact dated log reported by the running daemon until
 interrupted. Stop escalates only after a successful RPC identifies the process
 as the expected daemon; reused live PIDs without a healthy daemon RPC are
-treated as stale state and are never signaled. Malformed streams remain
+treated as stale state and are never signaled. A failed shutdown RPC preserves
+the live daemon's PID, socket, and active-log state and reports the failure so
+the operation can be retried. Malformed streams remain
 isolated, and an idle server resets its deadline after RPC or repository
 activity before releasing its state. Serve startup acquires exclusive PID
 ownership, a competing server cannot unlink a live daemon endpoint, endpoint

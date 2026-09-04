@@ -963,6 +963,33 @@ const pruneNpmLockfile = (
         return [path, productionEntry];
       }),
   );
+  if (document.dependencies !== undefined) {
+    const pruneLegacyDependencies = (
+      value: unknown,
+      parentLocation = "",
+    ): Readonly<Record<string, unknown>> =>
+      Object.fromEntries(
+        Object.entries(objectValue(value) ?? {}).flatMap(([name, rawEntry]) => {
+          const location = `${parentLocation === "" ? "" : `${parentLocation}/`}node_modules/${name}`;
+          if (!retained.has(location)) return [];
+          const entry = objectValue(rawEntry);
+          if (entry?.dependencies === undefined) return [[name, rawEntry]];
+          return [
+            [
+              name,
+              {
+                ...entry,
+                dependencies: pruneLegacyDependencies(
+                  entry.dependencies,
+                  location,
+                ),
+              },
+            ],
+          ];
+        }),
+      );
+    document.dependencies = pruneLegacyDependencies(document.dependencies);
+  }
   return `${JSON.stringify(document, undefined, 2)}\n`;
 };
 

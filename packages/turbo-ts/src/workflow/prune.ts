@@ -112,17 +112,21 @@ const selectedPackages = (
   production: boolean,
 ): ReadonlyArray<RepositoryPackage> => {
   const selected = new Map<string, RepositoryPackage>();
-  const pending = scopes.map((scope) => {
-    const packageModel = repository.packages.find(
-      (candidate) => candidate.name === scope || candidate.identity === scope,
+  const pending = scopes.flatMap((scope) => {
+    const identityMatch = repository.packages.find(
+      (candidate) => candidate.identity === scope,
     );
-    if (packageModel === undefined) {
+    const matches =
+      identityMatch === undefined
+        ? repository.packages.filter((candidate) => candidate.name === scope)
+        : [identityMatch];
+    if (matches.length === 0) {
       throw new ConfigurationError({
         path: "<arguments>",
         message: `package not found: ${scope}`,
       });
     }
-    return packageModel;
+    return matches;
   });
   const dependenciesOf = (packageModel: RepositoryPackage) =>
     production
