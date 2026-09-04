@@ -957,91 +957,97 @@ const executeGraphql = (
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const processService = yield* ProcessService;
-    let externalDependenciesPromise:
-      | Promise<ReadonlyArray<LockfilePackage>>
-      | undefined;
-    const loadExternalDependencies = () => {
-      externalDependenciesPromise ??= Effect.runPromise(
-        Effect.gen(function* () {
-          if (repository.lockfile === undefined) return [];
-          const lockfileContents = yield* fileSystem
-            .readBytes(repository.lockfile)
-            .pipe(
-              Effect.mapError(
-                (error) =>
+    return yield* Effect.tryPromise({
+      try: (signal) => {
+        const runResolverEffect = <A, E>(effect: Effect.Effect<A, E, never>) =>
+          Effect.runPromise(effect, { signal });
+        let externalDependenciesPromise:
+          | Promise<ReadonlyArray<LockfilePackage>>
+          | undefined;
+        const loadExternalDependencies = () => {
+          externalDependenciesPromise ??= runResolverEffect(
+            Effect.gen(function* () {
+              if (repository.lockfile === undefined) return [];
+              const lockfileContents = yield* fileSystem
+                .readBytes(repository.lockfile)
+                .pipe(
+                  Effect.mapError(
+                    (error) =>
+                      new ConfigurationError({
+                        path: repository.lockfile!,
+                        message: error.message,
+                      }),
+                  ),
+                );
+              const models = repositoryModels(repository);
+              return yield* Effect.try({
+                try: () => {
+                  const dependencies = new Map<string, LockfilePackage>();
+                  for (const model of models) {
+                    const internalNames = new Set([
+                      model.name,
+                      ...model.internalDependencies.flatMap((identity) => {
+                        const dependency =
+                          repository.packagesByIdentity.get(identity);
+                        return dependency === undefined
+                          ? []
+                          : [dependency.name];
+                      }),
+                    ]);
+                    const manifestReferences = new Map(
+                      [
+                        model.manifest.dependencies,
+                        model.manifest.devDependencies,
+                        model.manifest.optionalDependencies,
+                        model.manifest.peerDependencies,
+                      ].flatMap((entries) => Object.entries(entries ?? {})),
+                    );
+                    const directDependencies = model.dependencyNames
+                      .filter((name) => !internalNames.has(name))
+                      .map(
+                        (name) => [name, manifestReferences.get(name)] as const,
+                      );
+                    for (const dependency of resolveLockfilePackageClosure(
+                      repository.lockfile!,
+                      lockfileContents,
+                      {
+                        workspacePath: model.relativeDirectory,
+                        packageName: model.name,
+                        packageVersion: model.manifest.version,
+                        directDependencies,
+                      },
+                    )) {
+                      if (!internalNames.has(dependency.name)) {
+                        dependencies.set(
+                          `${dependency.name}@${dependency.version}`,
+                          dependency,
+                        );
+                      }
+                    }
+                  }
+                  return [...dependencies.values()].sort((left, right) =>
+                    `${left.name}@${left.version}`.localeCompare(
+                      `${right.name}@${right.version}`,
+                    ),
+                  );
+                },
+                catch: (cause) =>
                   new ConfigurationError({
                     path: repository.lockfile!,
-                    message: error.message,
+                    message: String(cause),
                   }),
-              ),
-            );
-          const models = repositoryModels(repository);
-          return yield* Effect.try({
-            try: () => {
-              const dependencies = new Map<string, LockfilePackage>();
-              for (const model of models) {
-                const internalNames = new Set([
-                  model.name,
-                  ...model.internalDependencies.flatMap((identity) => {
-                    const dependency =
-                      repository.packagesByIdentity.get(identity);
-                    return dependency === undefined ? [] : [dependency.name];
-                  }),
-                ]);
-                const manifestReferences = new Map(
-                  [
-                    model.manifest.dependencies,
-                    model.manifest.devDependencies,
-                    model.manifest.optionalDependencies,
-                    model.manifest.peerDependencies,
-                  ].flatMap((entries) => Object.entries(entries ?? {})),
-                );
-                const directDependencies = model.dependencyNames
-                  .filter((name) => !internalNames.has(name))
-                  .map((name) => [name, manifestReferences.get(name)] as const);
-                for (const dependency of resolveLockfilePackageClosure(
-                  repository.lockfile!,
-                  lockfileContents,
-                  {
-                    workspacePath: model.relativeDirectory,
-                    packageName: model.name,
-                    packageVersion: model.manifest.version,
-                    directDependencies,
-                  },
-                )) {
-                  if (!internalNames.has(dependency.name)) {
-                    dependencies.set(
-                      `${dependency.name}@${dependency.version}`,
-                      dependency,
-                    );
-                  }
-                }
-              }
-              return [...dependencies.values()].sort((left, right) =>
-                `${left.name}@${left.version}`.localeCompare(
-                  `${right.name}@${right.version}`,
-                ),
-              );
-            },
-            catch: (cause) =>
-              new ConfigurationError({
-                path: repository.lockfile!,
-                message: String(cause),
-              }),
-          });
-        }),
-      );
-      return externalDependenciesPromise;
-    };
-    return yield* Effect.tryPromise({
-      try: () =>
-        graphql({
+              });
+            }),
+          );
+          return externalDependenciesPromise;
+        };
+        return graphql({
           schema: repositoryQuerySchema,
           source,
           rootValue: repositoryQueryRoot(
             repository,
             (path) =>
-              Effect.runPromise(
+              runResolverEffect(
                 fileSystem.realPath(path).pipe(
                   Effect.mapError(
                     (error) =>
@@ -1073,14 +1079,15 @@ const executeGraphql = (
               ),
             loadExternalDependencies,
             (base, head) =>
-              Effect.runPromise(
+              runResolverEffect(
                 calculateAffectedRepository(repository, base, head).pipe(
                   Effect.provideService(ProcessService, processService),
                 ),
               ),
           ),
           variableValues: variables,
-        }),
+        });
+      },
       catch: (cause) =>
         new ConfigurationError({ path: "<query>", message: String(cause) }),
     });
@@ -1322,7 +1329,7 @@ export const executeQueryAffected = (
         return { __typename: "TaskFileChanged" };
       }
       const changedDependency = packageModel.internalDependencies.some(
-        (dependency) => directlyAffected.has(dependency),
+        (dependency) => affected.has(dependency),
       );
       return {
         __typename:

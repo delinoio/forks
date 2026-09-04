@@ -521,7 +521,9 @@ instead of displacing an older request.
 Package discovery reloads the repository model for each request so workspace
 additions, removals, and renames are visible without a daemon restart.
 Output-change registration/query calls return their protocol data rather than
-empty acknowledgments. Start-lock ownership is
+empty acknowledgments. Changed-output snapshots are consumed only after their
+response is written successfully, so a failed response remains retryable.
+Start-lock ownership is
 preserved across overlapping starts, stale locks are validated before removal,
 and a Hello response carrying an error is not healthy. Start, stop, restart,
 status, logs, and clean are race-safe; `info` reports the live daemon state.
@@ -553,9 +555,10 @@ come from the resolved task graph. GraphQL affected collections calculate the
 requested base/head range, include dependent packages, and apply package and
 task filters. The `query affected --tasks` shortcut uses the same resolved task
 graph for explicitly requested names, including configured commandless tasks,
-while its unfiltered form retains script-backed task enumeration. Boundary
-diagnostics evaluate root, package, and tag dependency and dependent permissions
-against manifest and configured implicit package dependencies. Package-graph
+and propagates dependency-task reasons through transitive affected package
+chains, while its unfiltered form retains script-backed task enumeration.
+Boundary diagnostics evaluate root, package, and tag dependency and dependent
+permissions against manifest and configured implicit package dependencies. Package-graph
 center selection retains the named package and its
 direct dependencies, package predicates narrow the returned nodes, and graph
 edges retain the selected nodes' dependency context. Graph filtering uses
@@ -565,7 +568,10 @@ when it depends on an affected workspace without allowing the root path to
 claim workspace-owned files. `query affected`, `query
 ls`, and `ls` share repository discovery and stable ordering. The server limits
 request bodies and closes HTTP handles in Scope; oversized requests receive
-HTTP 413 without resetting the connection. Top-level package predicates are
+HTTP 413 without resetting the connection. Client resets and request errors
+during body upload are isolated before handler execution, and disconnects or
+server shutdown interrupt in-flight resolver effects and their subprocesses.
+Top-level package predicates are
 applied, external dependencies come from manifest references resolved against
 the parsed lockfile, including npm v2/v3 package locations whose entries omit
 the package name, and Yarn Berry entries report their installed `version`
@@ -640,6 +646,8 @@ invalidate a cache key after hashing. Task summaries record the
 resolved transitive external-dependency closure hash for graph-bearing npm,
 pnpm, Yarn, Cargo, uv, Bun, Aube, and Nub lockfiles and the actual encoded log
 path, including collision-qualified identifiers and alternate execution scopes.
+Global summary inputs record the corresponding root-manifest external-dependency
+closure hash instead of the empty-closure hash when root dependencies resolve.
 Graph-bearing closures retain the declaring manifest reference or resolved
 workspace entry so multiple locked versions of one name do not broaden a task's
 external dependency hash.

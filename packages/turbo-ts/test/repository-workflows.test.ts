@@ -40,6 +40,7 @@ import {
   FileSystemService,
   FileWatcherService,
   ProcessService,
+  TerminalService,
 } from "../src/effect/services.js";
 import { pruneLockfile } from "../src/repository/lockfiles.js";
 import {
@@ -56,7 +57,7 @@ import {
 import { executeList } from "../src/workflow/list.js";
 import { isWindowsSubsystemForLinux } from "../src/workflow/misc.js";
 import { executePrune, parsePruneArguments } from "../src/workflow/prune.js";
-import { repositoryQuerySchema } from "../src/workflow/query.js";
+import { executeQuery, repositoryQuerySchema } from "../src/workflow/query.js";
 import {
   isInternalRepositoryPath,
   repositoryPackageManagerLabel,
@@ -113,7 +114,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 importers:
-  .: {}
+  .:
+    dependencies:
+      root-external:
+        specifier: 4.0.0
+        version: 4.0.0
   packages/app:
     dependencies:
       synthetic-library:
@@ -134,12 +139,15 @@ packages:
     resolution: {integrity: sha512-YmFy}
   baz@3.0.0:
     resolution: {integrity: sha512-YmF6}
+  root-external@4.0.0:
+    resolution: {integrity: sha512-cm9vdA==}
 snapshots:
   foo@1.0.0:
     dependencies:
       baz: 3.0.0
   bar@2.0.0: {}
   baz@3.0.0: {}
+  root-external@4.0.0: {}
 `;
 
 const prepareFixture = async (directory: string): Promise<void> => {
@@ -865,6 +873,15 @@ describe("repository workflow gate", () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-summary-paths-"));
     try {
       await prepareFixture(directory);
+      const rootManifestPath = join(directory, "package.json");
+      const rootManifest = JSON.parse(
+        await readFile(rootManifestPath, "utf8"),
+      ) as { dependencies?: Record<string, string> };
+      rootManifest.dependencies = { "root-external": "4.0.0" };
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, undefined, 2)}\n`,
+      );
       for (const [packageName, dependencies] of [
         ["app", { "synthetic-library": "workspace:*", foo: "1.0.0" }],
         ["library", { bar: "2.0.0" }],
@@ -907,6 +924,9 @@ describe("repository workflow gate", () => {
         directory,
       ]);
       const drySummary = JSON.parse(dryResult.stdout) as {
+        readonly globalCacheInputs: {
+          readonly hashOfExternalDependencies: string;
+        };
         readonly tasks: ReadonlyArray<{
           readonly taskId: string;
           readonly hashOfExternalDependencies: string;
@@ -920,14 +940,18 @@ describe("repository workflow gate", () => {
         "--cwd",
         directory,
       ]);
-      const officialHashes = (
-        JSON.parse(officialDryResult.stdout) as {
-          readonly tasks: ReadonlyArray<{
-            readonly hashOfExternalDependencies: string;
-          }>;
-        }
-      ).tasks.map((task) => task.hashOfExternalDependencies);
+      const officialSummary = JSON.parse(officialDryResult.stdout) as {
+        readonly tasks: ReadonlyArray<{
+          readonly hashOfExternalDependencies: string;
+        }>;
+      };
+      const officialHashes = officialSummary.tasks.map(
+        (task) => task.hashOfExternalDependencies,
+      );
       expect(new Set(officialHashes).size).toBe(2);
+      expect(drySummary.globalCacheInputs.hashOfExternalDependencies).not.toBe(
+        "459c029558afe716",
+      );
 
       const hashes = drySummary.tasks.map(
         (task) => task.hashOfExternalDependencies,
@@ -954,6 +978,9 @@ describe("repository workflow gate", () => {
         completedResult.stdout.trim().split("\n").at(-1)!,
       ) as typeof drySummary;
       expect(
+        completedSummary.globalCacheInputs.hashOfExternalDependencies,
+      ).toBe(drySummary.globalCacheInputs.hashOfExternalDependencies);
+      expect(
         completedSummary.tasks.map((task) => ({
           taskId: task.taskId,
           hash: task.hashOfExternalDependencies,
@@ -971,6 +998,30 @@ describe("repository workflow gate", () => {
           (await readFile(join(directory, task.logFile))).byteLength,
         ).toBeGreaterThan(0);
       }
+      rootManifest.dependencies = { "root-external": "4.0.1" };
+      await writeFile(
+        rootManifestPath,
+        `${JSON.stringify(rootManifest, undefined, 2)}\n`,
+      );
+      await writeFile(
+        join(directory, "pnpm-lock.yaml"),
+        dependencyWorkflowLockfile.replaceAll("4.0.0", "4.0.1"),
+      );
+      const changedRootSummary = JSON.parse(
+        (
+          await execFilePromise(process.execPath, [
+            candidate,
+            "run",
+            "lint:types",
+            "--dry=json",
+            "--cwd",
+            directory,
+          ])
+        ).stdout,
+      ) as typeof drySummary;
+      expect(
+        changedRootSummary.globalCacheInputs.hashOfExternalDependencies,
+      ).not.toBe(drySummary.globalCacheInputs.hashOfExternalDependencies);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1378,6 +1429,113 @@ describe("repository workflow gate", () => {
           ),
         ),
       ).rejects.toThrow(/synthetic repository watcher failure/);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("retains changed daemon outputs until a response succeeds", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-retry-"));
+    try {
+      await prepareFixture(directory);
+      const responses = new Map<string, unknown>();
+      const responseFailure = new BoundaryError({
+        boundary: "daemon",
+        message: "synthetic response failure",
+        retryable: true,
+      });
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const daemon = yield* DaemonService;
+          const connection = (
+            request: {
+              readonly id: string;
+              readonly method: (typeof DaemonMethod)[keyof typeof DaemonMethod];
+              readonly params?: unknown;
+            },
+            delay = 0,
+          ) => ({
+            requests: Stream.fromEffect(
+              Effect.sleep(delay).pipe(Effect.as(request)),
+            ),
+            respond: (response: { readonly id: string }) =>
+              request.id === "get-failed"
+                ? Effect.fail(responseFailure)
+                : Effect.sync(() => {
+                    responses.set(request.id, response);
+                  }),
+          });
+          return yield* executeDaemon({
+            command: "serve",
+            cwd: directory,
+            idleMilliseconds: 30_000,
+            json: false,
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(DaemonService, {
+                  ...daemon,
+                  serve: () =>
+                    Stream.fromIterable([
+                      connection({
+                        id: "notify",
+                        method: DaemonMethod.notifyOutputsWritten,
+                        params: {
+                          hash: "synthetic-hash",
+                          outputGlobs: ["packages/app/build/**"],
+                        },
+                      }),
+                      connection(
+                        {
+                          id: "get-failed",
+                          method: DaemonMethod.getChangedOutputs,
+                          params: { hashes: ["synthetic-hash"] },
+                        },
+                        30,
+                      ),
+                      connection({
+                        id: "get-retry",
+                        method: DaemonMethod.getChangedOutputs,
+                        params: { hashes: ["synthetic-hash"] },
+                      }),
+                      connection({
+                        id: "get-empty",
+                        method: DaemonMethod.getChangedOutputs,
+                        params: { hashes: ["synthetic-hash"] },
+                      }),
+                    ]),
+                }),
+                Layer.succeed(FileWatcherService, {
+                  watch: (root) =>
+                    Stream.fromEffect(
+                      Effect.sleep("10 millis").pipe(
+                        Effect.as({
+                          path: join(root, "packages/app/build/output.txt"),
+                          kind: "modify" as const,
+                        }),
+                      ),
+                    ),
+                }),
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(responses.get("get-retry")).toMatchObject({
+        result: {
+          changedOutputs: [
+            {
+              hash: "synthetic-hash",
+              changedOutputGlobs: ["packages/app/build/**"],
+            },
+          ],
+        },
+      });
+      expect(responses.get("get-empty")).toMatchObject({
+        result: {
+          changedOutputs: [{ hash: "synthetic-hash", changedOutputGlobs: [] }],
+        },
+      });
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2353,6 +2511,90 @@ snapshots:
       await rm(outside, { force: true, recursive: true });
     }
   }, 30_000);
+
+  it("interrupts affected GraphQL work when its HTTP request closes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-query-cancel-"));
+    const git = (...arguments_: ReadonlyArray<string>) =>
+      execFilePromise("/usr/bin/git", [
+        "-C",
+        directory,
+        "-c",
+        "user.email=synthetic@example.test",
+        "-c",
+        "user.name=Synthetic Fixture",
+        ...arguments_,
+      ]);
+    try {
+      await prepareFixture(directory);
+      await git("init", "--quiet");
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "base");
+      await writeFile(join(directory, "packages/app/source.txt"), "changed\n");
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "changed");
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            const terminal = yield* TerminalService;
+            const gitStarted = yield* Deferred.make<void>();
+            const gitFinalized = yield* Deferred.make<void>();
+            let stdout = "";
+            const overrides = Layer.mergeAll(
+              Layer.succeed(ProcessService, {
+                ...processService,
+                runBytes: (request) =>
+                  request.command === "git" && request.args[0] === "diff"
+                    ? Effect.acquireRelease(
+                        Deferred.succeed(gitStarted, undefined),
+                        () => Deferred.succeed(gitFinalized, undefined),
+                      ).pipe(Effect.zipRight(Effect.never))
+                    : processService.runBytes(request),
+              }),
+              Layer.succeed(TerminalService, {
+                ...terminal,
+                writeStdout: (text) =>
+                  Effect.sync(() => {
+                    stdout += text;
+                  }),
+              }),
+            );
+            const serverFiber = yield* Effect.forkScoped(
+              executeQuery({
+                cwd: directory,
+                schema: false,
+                port: 0,
+              }).pipe(Effect.provide(overrides)),
+            );
+            while (!stdout.includes("GraphQL endpoint:")) {
+              yield* Effect.sleep("10 millis");
+            }
+            const port = /GraphQL endpoint: http:\/\/localhost:(\d+)/.exec(
+              stdout,
+            )?.[1];
+            expect(port).toBeDefined();
+            const controller = new AbortController();
+            const request = fetch(`http://127.0.0.1:${port}`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                query:
+                  '{ affectedPackages(base: "HEAD~1", head: "HEAD") { length } }',
+              }),
+              signal: controller.signal,
+            }).catch(() => undefined);
+            yield* Deferred.await(gitStarted);
+            controller.abort();
+            yield* Deferred.await(gitFinalized);
+            yield* Effect.promise(() => request);
+            yield* Fiber.interrupt(serverFiber);
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
 
   it("matches the reference prune output and generated tree", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-"));
@@ -3461,6 +3703,128 @@ importers:
       await rm(directory, { force: true, recursive: true });
     }
   });
+
+  it("propagates dependency-task reasons through affected package chains", async () => {
+    const fixtureParent = join(repositoryRoot, ".turbo");
+    await mkdir(fixtureParent, { recursive: true });
+    const directory = await mkdtemp(
+      join(fixtureParent, "turbo-ts-query-reasons-"),
+    );
+    const git = (...arguments_: ReadonlyArray<string>) =>
+      execFilePromise("/usr/bin/git", [
+        "-C",
+        directory,
+        "-c",
+        "user.email=synthetic@example.test",
+        "-c",
+        "user.name=Synthetic Fixture",
+        ...arguments_,
+      ]);
+    try {
+      await prepareFixture(directory);
+      const libraryManifestPath = join(
+        directory,
+        "packages/library/package.json",
+      );
+      const libraryManifest = JSON.parse(
+        await readFile(libraryManifestPath, "utf8"),
+      ) as { dependencies?: Record<string, string> };
+      libraryManifest.dependencies = { "synthetic-core": "workspace:*" };
+      await writeFile(
+        libraryManifestPath,
+        `${JSON.stringify(libraryManifest, undefined, 2)}\n`,
+      );
+      await mkdir(join(directory, "packages/core"), { recursive: true });
+      await writeFile(
+        join(directory, "packages/core/package.json"),
+        `${JSON.stringify({
+          name: "synthetic-core",
+          version: "1.0.0",
+          private: true,
+          scripts: { build: "node -e \"console.log('core build')\"" },
+        })}\n`,
+      );
+      await writeFile(join(directory, "packages/core/source.txt"), "base\n");
+      await writeFile(
+        join(directory, "pnpm-lock.yaml"),
+        workflowLockfile.replace(
+          "  packages/library: {}",
+          `  packages/library:
+    dependencies:
+      synthetic-core:
+        specifier: workspace:*
+        version: link:../core
+  packages/core: {}`,
+        ),
+      );
+      await git("init", "--quiet");
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "base");
+      await writeFile(join(directory, "packages/core/source.txt"), "changed\n");
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "changed");
+
+      const shortcut = await execFilePromise(process.execPath, [
+        candidate,
+        "query",
+        "affected",
+        "--tasks",
+        "build",
+        "--base=HEAD~1",
+        "--head=HEAD",
+        "--cwd",
+        directory,
+      ]);
+      const graphqlResult = await execFilePromise(process.execPath, [
+        candidate,
+        "query",
+        '{ affectedTasks(base: "HEAD~1", head: "HEAD", tasks: ["build"]) { items { fullName reason } } }',
+        "--cwd",
+        directory,
+      ]);
+      const shortcutItems = (
+        JSON.parse(shortcut.stdout) as {
+          data: {
+            affectedTasks: {
+              items: ReadonlyArray<{
+                fullName: string;
+                reason: { __typename: string };
+              }>;
+            };
+          };
+        }
+      ).data.affectedTasks.items;
+      const graphqlItems = (
+        JSON.parse(graphqlResult.stdout) as {
+          data: {
+            affectedTasks: {
+              items: ReadonlyArray<{
+                fullName: string;
+                reason: { __typename: string };
+              }>;
+            };
+          };
+        }
+      ).data.affectedTasks.items;
+      const taskReasons = (
+        items: ReadonlyArray<{
+          fullName: string;
+          reason: { __typename: string };
+        }>,
+      ) =>
+        Object.fromEntries(
+          items.map((item) => [item.fullName, item.reason.__typename]),
+        );
+      expect(taskReasons(shortcutItems)).toEqual(taskReasons(graphqlItems));
+      expect(taskReasons(shortcutItems)).toEqual({
+        "synthetic-app#build": "TaskDependencyTaskChanged",
+        "synthetic-core#build": "TaskFileChanged",
+        "synthetic-library#build": "TaskDependencyTaskChanged",
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
 
   it(evidenceId.repositorySecurity, async () => {
     const source = new TextEncoder().encode(`lockfileVersion: '9.0'

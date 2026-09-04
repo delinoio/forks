@@ -1,6 +1,7 @@
 import { fstatSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -467,6 +468,55 @@ describe("Effect foundation", () => {
       }),
     ]);
     expect(await request).toBe("closed");
+  });
+
+  it("isolates loopback client resets before request bodies finish", async () => {
+    let publishPort: ((port: number) => void) | undefined;
+    const port = new Promise<number>((resolve) => {
+      publishPort = resolve;
+    });
+    let handledRequests = 0;
+    const serverFiber = Effect.runFork(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const http = yield* LoopbackHttpService;
+          const server = yield* http.serve(0, () =>
+            Effect.sync(() => {
+              handledRequests += 1;
+              return { status: 200, body: "ok" };
+            }),
+          );
+          publishPort?.(server.port);
+          yield* Effect.never;
+        }),
+      ).pipe(Effect.provide(nodeFoundationLayer)),
+    );
+    const serverPort = await port;
+    try {
+      await new Promise<void>((resolve) => {
+        const socket = createConnection(
+          { host: "127.0.0.1", port: serverPort },
+          () => {
+            socket.write(
+              "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\npartial",
+              () => socket.resetAndDestroy(),
+            );
+          },
+        );
+        socket.once("error", () => undefined);
+        socket.once("close", () => resolve());
+      });
+      await delay(25);
+      const response = await fetch(`http://127.0.0.1:${serverPort}`, {
+        method: "POST",
+        body: "complete",
+      });
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("ok");
+      expect(handledRequests).toBe(1);
+    } finally {
+      await Effect.runPromise(Fiber.interrupt(serverFiber));
+    }
   });
 
   it("removes undefined environment overrides before spawning", async () => {

@@ -733,6 +733,10 @@ const serveDaemon = (
                   `${new Date(yield* clock.now).toISOString()} rpc=${request.method}\n`,
                 )
                 .pipe(Effect.ignore);
+              const changedOutputAcknowledgements = new Map<
+                Set<string>,
+                ReadonlyArray<string>
+              >();
               const result = yield* (() => {
                 if (request.method === DaemonMethod.status) {
                   return Effect.gen(function* () {
@@ -810,7 +814,10 @@ const serveDaemon = (
                     const changedOutputGlobs = [
                       ...registration.changedOutputGlobs,
                     ].sort();
-                    registration.changedOutputGlobs.clear();
+                    changedOutputAcknowledgements.set(
+                      registration.changedOutputGlobs,
+                      changedOutputGlobs,
+                    );
                     return [{ hash, changedOutputGlobs }];
                   });
                   return Effect.succeed({ changedOutputs });
@@ -826,10 +833,30 @@ const serveDaemon = (
                       : String(result.left),
                 });
               } else {
-                yield* connection.respond({
+                const response = connection.respond({
                   id: request.id,
                   result: result.right,
                 });
+                if (request.method === DaemonMethod.getChangedOutputs) {
+                  const responseResult = yield* response.pipe(Effect.either);
+                  if (responseResult._tag === "Left") {
+                    yield* fileSystem
+                      .appendText(
+                        paths.log,
+                        `${new Date(yield* clock.now).toISOString()} rpc=${request.method} response_error=${responseResult.left.message}\n`,
+                      )
+                      .pipe(Effect.ignore);
+                    return;
+                  }
+                } else {
+                  yield* response;
+                }
+                for (const [
+                  registration,
+                  acknowledged,
+                ] of changedOutputAcknowledgements) {
+                  for (const glob of acknowledged) registration.delete(glob);
+                }
               }
               if (request.method === DaemonMethod.shutdown) {
                 yield* Deferred.succeed(shutdown, undefined);

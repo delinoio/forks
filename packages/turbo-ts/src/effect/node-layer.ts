@@ -2261,8 +2261,21 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
             const chunks: Array<Buffer> = [];
             let size = 0;
             let oversized = false;
+            let connectionClosed = false;
+            let handlerFiber:
+              | Fiber.RuntimeFiber<LoopbackHttpResponse, BoundaryError>
+              | undefined;
+            const interruptHandler = (): void => {
+              connectionClosed = true;
+              if (handlerFiber !== undefined) {
+                Effect.runFork(Fiber.interrupt(handlerFiber));
+              }
+            };
+            request.once("aborted", interruptHandler);
+            request.once("error", interruptHandler);
+            response.once("close", interruptHandler);
             request.on("data", (chunk: Buffer) => {
-              if (oversized) return;
+              if (oversized || connectionClosed) return;
               size += chunk.length;
               if (size > 1024 * 1024) {
                 oversized = true;
@@ -2274,7 +2287,7 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
               chunks.push(chunk);
             });
             request.on("end", () => {
-              if (oversized) return;
+              if (oversized || connectionClosed) return;
               const headers = Object.fromEntries(
                 Object.entries(request.headers).flatMap(([key, value]) =>
                   value === undefined
@@ -2282,18 +2295,6 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
                     : [[key, Array.isArray(value) ? value.join(", ") : value]],
                 ),
               );
-              let connectionClosed = false;
-              let handlerFiber:
-                | Fiber.RuntimeFiber<LoopbackHttpResponse, BoundaryError>
-                | undefined;
-              const interruptHandler = (): void => {
-                connectionClosed = true;
-                if (handlerFiber !== undefined) {
-                  Effect.runFork(Fiber.interrupt(handlerFiber));
-                }
-              };
-              request.once("aborted", interruptHandler);
-              response.once("close", interruptHandler);
               const requestEffect = handler({
                 method: request.method ?? "GET",
                 path: request.url ?? "/",
@@ -2313,6 +2314,7 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
               );
               Effect.runPromiseExit(requestEffect).then((exit) => {
                 request.off("aborted", interruptHandler);
+                request.off("error", interruptHandler);
                 response.off("close", interruptHandler);
                 if (
                   connectionClosed ||

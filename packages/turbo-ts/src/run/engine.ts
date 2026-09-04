@@ -1786,12 +1786,12 @@ const taskLogPath = (
 
 const emptyExternalDependenciesHash = "459c029558afe716";
 
-const taskExternalDependenciesHash = (
+const packageExternalDependenciesHash = (
   repository: RepositoryModel,
-  node: TaskNode,
+  packageModel: RepositoryPackage,
+  lockfile: string | undefined,
 ): Effect.Effect<string, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
-    const lockfile = yield* owningLockfile(repository, node);
     if (lockfile === undefined) return emptyExternalDependenciesHash;
     const fileSystem = yield* FileSystemService;
     const contents = yield* fileSystem
@@ -1803,29 +1803,29 @@ const taskExternalDependenciesHash = (
         ),
       );
     const internalNames = new Set([
-      node.package.name,
-      ...node.package.internalDependencies.flatMap((identity) => {
+      packageModel.name,
+      ...packageModel.internalDependencies.flatMap((identity) => {
         const dependency = repository.packagesByIdentity.get(identity);
         return dependency === undefined ? [] : [dependency.name];
       }),
     ]);
     const manifestDependencyReferences = new Map(
       [
-        node.package.manifest.dependencies,
-        node.package.manifest.devDependencies,
-        node.package.manifest.optionalDependencies,
-        node.package.manifest.peerDependencies,
+        packageModel.manifest.dependencies,
+        packageModel.manifest.devDependencies,
+        packageModel.manifest.optionalDependencies,
+        packageModel.manifest.peerDependencies,
       ].flatMap((dependencies) => Object.entries(dependencies ?? {})),
     );
-    const directExternalDependencies = node.package.dependencyNames
+    const directExternalDependencies = packageModel.dependencyNames
       .filter((name) => !internalNames.has(name))
       .map((name) => [name, manifestDependencyReferences.get(name)] as const);
     const dependencies = yield* Effect.try({
       try: () =>
         resolveLockfilePackageClosure(lockfile, contents, {
-          workspacePath: node.package.relativeDirectory,
-          packageName: node.package.name,
-          packageVersion: node.package.manifest.version,
+          workspacePath: packageModel.relativeDirectory,
+          packageName: packageModel.name,
+          packageVersion: packageModel.manifest.version,
           directDependencies: directExternalDependencies,
         }),
       catch: (cause) =>
@@ -1844,6 +1844,16 @@ const taskExternalDependenciesHash = (
       ? emptyExternalDependenciesHash
       : xxhash64Hex(JSON.stringify(identities));
   });
+
+const taskExternalDependenciesHash = (
+  repository: RepositoryModel,
+  node: TaskNode,
+): Effect.Effect<string, RepositoryError, FileSystemService> =>
+  owningLockfile(repository, node).pipe(
+    Effect.flatMap((lockfile) =>
+      packageExternalDependenciesHash(repository, node.package, lockfile),
+    ),
+  );
 
 const taskLogIdentifiers = (
   repository: RepositoryModel,
@@ -3562,11 +3572,13 @@ export const executeRun = (
       }
       return 0;
     }
-    const externalDependencyHashes = new Map(
+    const summariesNeedDependencyHashes =
       parsed.dryRun === "json" ||
-        parsed.summarize ||
-        parsed.json ||
-        parsed.logFile !== undefined
+      parsed.summarize ||
+      parsed.json ||
+      parsed.logFile !== undefined;
+    const externalDependencyHashes = new Map(
+      summariesNeedDependencyHashes
         ? yield* Effect.forEach(
             orderedNodes,
             (node) =>
@@ -3577,6 +3589,13 @@ export const executeRun = (
           )
         : [],
     );
+    const globalExternalDependenciesHash = summariesNeedDependencyHashes
+      ? yield* packageExternalDependenciesHash(
+          repository,
+          repository.rootPackage,
+          repository.lockfile,
+        )
+      : emptyExternalDependenciesHash;
     if (parsed.dryRun !== undefined) {
       const terminal = yield* TerminalService;
       if (parsed.dryRun === "json") {
@@ -3594,7 +3613,7 @@ export const executeRun = (
               globalCacheInputs: {
                 rootKey: "I can’t see ya, but I know you’re here",
                 files: globalInputFileHashes,
-                hashOfExternalDependencies: emptyExternalDependenciesHash,
+                hashOfExternalDependencies: globalExternalDependenciesHash,
                 hashOfInternalDependencies: "",
                 environmentVariables: {
                   specified: { env: [], passThroughEnv: null },
@@ -4239,7 +4258,7 @@ export const executeRun = (
       globalCacheInputs: {
         rootKey: "I can’t see ya, but I know you’re here",
         files: globalInputFileHashes,
-        hashOfExternalDependencies: "459c029558afe716",
+        hashOfExternalDependencies: globalExternalDependenciesHash,
         hashOfInternalDependencies: "",
         environmentVariables: {
           specified: { env: [], passThroughEnv: null },
