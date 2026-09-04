@@ -195,8 +195,10 @@ Environment-name selection follows Windows case-insensitive semantics for run
 options, affected-range controls, hashing, and strict task execution.
 Repository discovery records the resolved root lockfile path. Gate 3 validates
 all modeled lockfile formats before prune, rewrites pnpm importer/package/
-snapshot closure and npm workspace package indexes, and preserves validated
-formats that do not expose a safely rewritable public workspace index. pnpm
+snapshot closure, npm workspace package indexes, Yarn Classic and Berry entry
+closures, and text Bun workspace/package indexes. Binary Bun, Yarn PnP, and
+other validated formats without a safely rewritable public workspace index are
+preserved. pnpm
 aliases derive their target identity from importer specifiers and
 target-qualified resolutions, peer-qualified snapshots retain
 both the base package and qualified snapshot, and npm pruning retains only the
@@ -527,7 +529,8 @@ introspection, and a loopback GraphQL server. Task relationship collections
 come from the resolved task graph. GraphQL affected collections calculate the
 requested base/head range, include dependent packages, and apply package and
 task filters. Boundary diagnostics evaluate root, package, and tag dependency
-and dependent permissions against the resolved package graph. Package-graph
+and dependent permissions against manifest and configured implicit package
+dependencies. Package-graph
 center selection retains the named package and its
 direct dependencies, package predicates narrow the returned nodes, and graph
 edges retain the selected nodes' dependency context. `query affected`, `query
@@ -542,6 +545,10 @@ only pnpm's compatibility family uses the versioned `pnpm9` label. File queries
 enforce repository containment
 after resolving symlinks. The startup message describes the static page as a
 GraphQL endpoint rather than an IDE.
+
+Affected package listing disables Git rename detection so moves between
+workspaces select both the source and destination owners before dependent
+closure is applied.
 
 `prune` selects the transitive internal package closure of both requested
 packages and workspace dependencies retained by the copied root manifest,
@@ -562,8 +569,9 @@ installation root. Root Yarn installation controls, including `.yarnrc.yml`,
 executable, are retained at their repository-relative locations in applicable
 ordinary and Docker layouts. Copying honors repository and
 nested Git-ignore files unless disabled; ordinary pnpm pruning retains
-development dependency closure, while production npm and pnpm pruning removes
-development dependency edges and their package closure.
+development dependency closure. Production npm, pnpm, Yarn, and text Bun
+pruning removes development dependency edges and their package closure,
+including development-marked trees in legacy npm v1 lockfiles.
 
 Run workflows support text and JSON dry-runs; DOT, Mermaid, JSON, and HTML task
 graphs; JSON run summaries and live newline-delimited structured log files;
@@ -576,7 +584,9 @@ falls back to stream mode when either terminal side is non-interactive. JSON
 mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
 completed task's full log replay. Structured log files append typed task events
 as work runs and end with a typed run summary. CLI `--global-deps` patterns are
-merged into task hash inputs. Dry runs do not perform local cache eviction, and
+merged into task hash inputs, and their repository-relative Git blob hashes are
+reported in summary `globalCacheInputs.files`. Dry runs do not perform local
+cache eviction, and
 `info` derives WSL status from the Linux kernel release. Log-prefix selection
 applies to live and cached output. Summaries record
 the actual local or remote cache source and saved duration, and summaries and

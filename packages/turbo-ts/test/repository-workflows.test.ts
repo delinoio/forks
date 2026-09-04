@@ -503,15 +503,25 @@ describe("repository workflow gate", () => {
           "--cwd",
           directory,
         ]);
-        return (
-          JSON.parse(result.stdout) as {
-            tasks: ReadonlyArray<{ hash: string }>;
-          }
-        ).tasks.map((task) => task.hash);
+        return JSON.parse(result.stdout) as {
+          readonly globalCacheInputs: {
+            readonly files: Readonly<Record<string, string>>;
+          };
+          readonly tasks: ReadonlyArray<{ readonly hash: string }>;
+        };
       };
-      const firstGlobalHashes = await hashWithGlobalInput();
+      const firstGlobalSummary = await hashWithGlobalInput();
+      expect(
+        firstGlobalSummary.globalCacheInputs.files["global-input.txt"],
+      ).toMatch(/^[0-9a-f]{40}$/);
       await writeFile(join(directory, "global-input.txt"), "two\n");
-      expect(await hashWithGlobalInput()).not.toEqual(firstGlobalHashes);
+      const secondGlobalSummary = await hashWithGlobalInput();
+      expect(secondGlobalSummary.tasks.map((task) => task.hash)).not.toEqual(
+        firstGlobalSummary.tasks.map((task) => task.hash),
+      );
+      expect(secondGlobalSummary.globalCacheInputs.files).not.toEqual(
+        firstGlobalSummary.globalCacheInputs.files,
+      );
 
       const structured = await execFilePromise(process.execPath, [
         candidate,
@@ -520,6 +530,7 @@ describe("repository workflow gate", () => {
         "--no-cache",
         "--summarize",
         "--json",
+        "--global-deps=global-input.txt",
         "--heap=run.heapsnapshot",
         "--trace=trace.json",
         "--profile=profile.json",
@@ -546,6 +557,9 @@ describe("repository workflow gate", () => {
       const runSummary = structuredRecords.at(-1) as {
         readonly id: string;
         readonly type: string;
+        readonly globalCacheInputs: {
+          readonly files: Readonly<Record<string, string>>;
+        };
         readonly tasks: ReadonlyArray<{
           readonly taskId: string;
           readonly execution: {
@@ -557,6 +571,9 @@ describe("repository workflow gate", () => {
       expect(runSummary.type).toBe("run_summary");
       expect(runSummary.id).toMatch(
         /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+      expect(runSummary.globalCacheInputs.files).toEqual(
+        secondGlobalSummary.globalCacheInputs.files,
       );
       const logRecords = (await readFile(join(directory, "run.ndjson"), "utf8"))
         .trim()
@@ -987,6 +1004,50 @@ describe("repository workflow gate", () => {
         }),
       );
       expect((await queryBoundaries()).data.boundaries.errors).toEqual([
+        {
+          message:
+            "Package `synthetic-library` found with tag listed in denylist for `synthetic-app`: `library`",
+          reason: "library",
+          path: "packages/library/turbo.json",
+          import: "synthetic-library",
+        },
+      ]);
+
+      const appManifestPath = join(directory, "packages/app/package.json");
+      const appManifest = JSON.parse(
+        await readFile(appManifestPath, "utf8"),
+      ) as { dependencies?: Record<string, string> };
+      delete appManifest.dependencies;
+      await writeFile(appManifestPath, JSON.stringify(appManifest));
+      await writeFile(
+        join(directory, "packages/app/turbo.json"),
+        JSON.stringify({
+          extends: ["//"],
+          tags: ["app"],
+          boundaries: {
+            implicitDependencies: ["synthetic-library"],
+            dependencies: { deny: ["library"] },
+          },
+          tasks: {},
+        }),
+      );
+      await writeFile(
+        join(directory, "packages/library/turbo.json"),
+        JSON.stringify({
+          extends: ["//"],
+          tags: ["library"],
+          boundaries: { dependents: { deny: ["app"] } },
+          tasks: {},
+        }),
+      );
+      expect((await queryBoundaries()).data.boundaries.errors).toEqual([
+        {
+          message:
+            "Package `synthetic-app` found with tag listed in denylist for `synthetic-library`: `app`",
+          reason: "app",
+          path: "packages/app/turbo.json",
+          import: "synthetic-app",
+        },
         {
           message:
             "Package `synthetic-library` found with tag listed in denylist for `synthetic-app`: `library`",
@@ -2130,6 +2191,32 @@ importers:
           affectedTasks: { length: 0 },
         },
       });
+      await rename(
+        join(directory, "packages/library/source.txt"),
+        join(directory, "packages/app/moved-source.txt"),
+      );
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "move source between workspaces");
+      const renameAffected = await execFilePromise(
+        process.execPath,
+        [candidate, "ls", "--affected", "--output=json", "--cwd", directory],
+        {
+          env: {
+            ...differentialEnvironment,
+            TURBO_SCM_BASE: "HEAD~1",
+            TURBO_SCM_HEAD: "HEAD",
+          },
+        },
+      );
+      expect(JSON.parse(renameAffected.stdout)).toMatchObject({
+        packages: {
+          count: 2,
+          items: [
+            { name: "synthetic-app", path: "packages/app" },
+            { name: "synthetic-library", path: "packages/library" },
+          ],
+        },
+      });
       if (process.platform !== "win32") {
         await writeFile(
           join(directory, "real/linked/source.txt"),
@@ -2304,6 +2391,49 @@ snapshots:
     expect(
       npmProduction.packages["packages/app"]?.devDependencies,
     ).toBeUndefined();
+    const npmV1Source = new TextEncoder().encode(
+      JSON.stringify({
+        name: "legacy-root",
+        lockfileVersion: 1,
+        requires: true,
+        dependencies: {
+          runtime: {
+            version: "1.0.0",
+            dependencies: {
+              transitive: { version: "1.1.0" },
+              "nested-dev": { version: "2.0.0", dev: true },
+            },
+          },
+          "build-tool": {
+            version: "3.0.0",
+            dev: true,
+            dependencies: { "build-leaf": { version: "3.1.0", dev: true } },
+          },
+        },
+      }),
+    );
+    const npmV1Development = JSON.parse(
+      new TextDecoder().decode(
+        pruneLockfile("/repo/package-lock.json", npmV1Source, new Set()),
+      ),
+    ) as { dependencies: Record<string, unknown> };
+    expect(npmV1Development.dependencies["build-tool"]).toBeDefined();
+    const npmV1Production = JSON.parse(
+      new TextDecoder().decode(
+        pruneLockfile("/repo/package-lock.json", npmV1Source, new Set(), {
+          production: true,
+        }),
+      ),
+    ) as {
+      dependencies: Record<
+        string,
+        { readonly dependencies?: Readonly<Record<string, unknown>> }
+      >;
+    };
+    expect(Object.keys(npmV1Production.dependencies)).toEqual(["runtime"]);
+    expect(
+      Object.keys(npmV1Production.dependencies.runtime!.dependencies!),
+    ).toEqual(["transitive"]);
     const developmentSource = new TextEncoder().encode(`lockfileVersion: '9.0'
 importers:
   packages/app:
@@ -2334,6 +2464,162 @@ snapshots:
         ),
       ),
     ).not.toContain("build-tool");
+    const pruneManifests = [
+      {
+        dependencies: { a: "^1.0.0" },
+        devDependencies: { "build-tool": "^5.0.0" },
+      },
+    ];
+    const yarnClassicSource =
+      new TextEncoder().encode(`# synthetic Yarn lockfile
+
+a@^1.0.0:
+  version "1.0.0"
+  dependencies:
+    b "^2.0.0"
+b@^2.0.0:
+  version "2.0.0"
+build-tool@^5.0.0:
+  version "5.0.0"
+unused@^4.0.0:
+  version "4.0.0"
+`);
+    const yarnClassic = new TextDecoder().decode(
+      pruneLockfile("/repo/yarn.lock", yarnClassicSource, new Set(), {
+        manifests: pruneManifests,
+      }),
+    );
+    expect(yarnClassic).toContain("a@^1.0.0:");
+    expect(yarnClassic).toContain("b@^2.0.0:");
+    expect(yarnClassic).toContain("build-tool@^5.0.0:");
+    expect(yarnClassic).not.toContain("unused@^4.0.0:");
+    expect(
+      new TextDecoder().decode(
+        pruneLockfile("/repo/yarn.lock", yarnClassicSource, new Set(), {
+          manifests: pruneManifests,
+          production: true,
+        }),
+      ),
+    ).not.toContain("build-tool@^5.0.0:");
+    const yarnBerrySource = new TextEncoder().encode(`__metadata:
+  version: 8
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+"app@workspace:packages/app":
+  version: 0.0.0-use.local
+  resolution: "app@workspace:packages/app"
+  dependencies:
+    a: "npm:^1.0.0"
+  devDependencies:
+    build-tool: "npm:^5.0.0"
+"unused-workspace@workspace:packages/unused":
+  version: 0.0.0-use.local
+  resolution: "unused-workspace@workspace:packages/unused"
+  dependencies:
+    unused: "npm:^4.0.0"
+"a@npm:^1.0.0":
+  version: 1.0.0
+  resolution: "a@npm:1.0.0"
+  dependencies:
+    b: "npm:^2.0.0"
+"b@npm:^2.0.0":
+  version: 2.0.0
+  resolution: "b@npm:2.0.0"
+"build-tool@npm:^5.0.0":
+  version: 5.0.0
+  resolution: "build-tool@npm:5.0.0"
+"unused@npm:^4.0.0":
+  version: 4.0.0
+  resolution: "unused@npm:4.0.0"
+`);
+    const yarnBerry = new TextDecoder().decode(
+      pruneLockfile(
+        "/repo/yarn.lock",
+        yarnBerrySource,
+        new Set(["packages/app"]),
+        { manifests: pruneManifests },
+      ),
+    );
+    expect(yarnBerry).toContain("app@workspace:packages/app");
+    expect(yarnBerry).toContain("a@npm:^1.0.0");
+    expect(yarnBerry).toContain("b@npm:^2.0.0");
+    expect(yarnBerry).not.toContain("unused-workspace");
+    expect(yarnBerry).not.toContain("unused@npm:^4.0.0");
+    const yarnBerryProduction = new TextDecoder().decode(
+      pruneLockfile(
+        "/repo/yarn.lock",
+        yarnBerrySource,
+        new Set(["packages/app"]),
+        { manifests: pruneManifests, production: true },
+      ),
+    );
+    expect(yarnBerryProduction).not.toContain("devDependencies");
+    expect(yarnBerryProduction).not.toContain("build-tool@npm:^5.0.0");
+    const bunSource = new TextEncoder().encode(
+      JSON.stringify({
+        lockfileVersion: 1,
+        workspaces: {
+          "": { name: "root" },
+          "packages/app": {
+            name: "app",
+            dependencies: { a: "a@1.0.0" },
+            devDependencies: { "build-tool": "build-tool@5.0.0" },
+          },
+          "packages/unused": {
+            name: "unused-workspace",
+            dependencies: { unused: "unused@4.0.0" },
+          },
+        },
+        packages: {
+          root: ["root@workspace:.", ""],
+          app: ["app@workspace:packages/app", ""],
+          "unused-workspace": [
+            "unused-workspace@workspace:packages/unused",
+            "",
+          ],
+          "a@1.0.0": ["a@1.0.0", "", { dependencies: { b: "b@2.0.0" } }, ""],
+          "b@2.0.0": ["b@2.0.0", "", {}, ""],
+          "build-tool@5.0.0": ["build-tool@5.0.0", "", {}, ""],
+          "unused@4.0.0": ["unused@4.0.0", "", {}, ""],
+        },
+      }),
+    );
+    const bunPruned = JSON.parse(
+      new TextDecoder().decode(
+        pruneLockfile("/repo/bun.lock", bunSource, new Set(["packages/app"]), {
+          manifests: pruneManifests,
+        }),
+      ),
+    ) as {
+      readonly workspaces: Readonly<Record<string, unknown>>;
+      readonly packages: Readonly<Record<string, unknown>>;
+    };
+    expect(Object.keys(bunPruned.workspaces)).toEqual(["", "packages/app"]);
+    expect(Object.keys(bunPruned.packages)).toEqual([
+      "root",
+      "app",
+      "a@1.0.0",
+      "b@2.0.0",
+      "build-tool@5.0.0",
+    ]);
+    const bunProduction = JSON.parse(
+      new TextDecoder().decode(
+        pruneLockfile("/repo/bun.lock", bunSource, new Set(["packages/app"]), {
+          manifests: pruneManifests,
+          production: true,
+        }),
+      ),
+    ) as {
+      readonly workspaces: Readonly<
+        Record<string, { readonly devDependencies?: unknown }>
+      >;
+      readonly packages: Readonly<Record<string, unknown>>;
+    };
+    expect(
+      bunProduction.workspaces["packages/app"]?.devDependencies,
+    ).toBeUndefined();
+    expect(bunProduction.packages["build-tool@5.0.0"]).toBeUndefined();
     expect(() =>
       pruneLockfile(
         "/repo/pnpm-lock.yaml",

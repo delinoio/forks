@@ -3397,6 +3397,10 @@ export const executeRun = (
     const orderedNodes = [...graph.nodes.values()].sort((left, right) =>
       left.id.localeCompare(right.id),
     );
+    const globalInputFileHashes =
+      orderedNodes[0] === undefined
+        ? {}
+        : hashes.get(orderedNodes[0].id)!.globalInputFileHashes;
     const isMonorepo = !parsed.singlePackage && repository.packages.length > 0;
     if (parsed.graph !== undefined) {
       const edges = orderedNodes.flatMap((node) =>
@@ -3514,7 +3518,7 @@ export const executeRun = (
               monorepo: isMonorepo,
               globalCacheInputs: {
                 rootKey: "I can’t see ya, but I know you’re here",
-                files: {},
+                files: globalInputFileHashes,
                 hashOfExternalDependencies: emptyExternalDependenciesHash,
                 hashOfInternalDependencies: "",
                 environmentVariables: {
@@ -4175,7 +4179,7 @@ export const executeRun = (
       monorepo: isMonorepo,
       globalCacheInputs: {
         rootKey: "I can’t see ya, but I know you’re here",
-        files: {},
+        files: globalInputFileHashes,
         hashOfExternalDependencies: "459c029558afe716",
         hashOfInternalDependencies: "",
         environmentVariables: {

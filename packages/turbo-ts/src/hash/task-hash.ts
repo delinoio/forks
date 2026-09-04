@@ -605,6 +605,7 @@ export interface TaskHashResult {
   readonly environment: Readonly<Record<string, string>>;
   readonly inputFiles: ReadonlyArray<string>;
   readonly inputFileHashes: Readonly<Record<string, string>>;
+  readonly globalInputFileHashes: Readonly<Record<string, string>>;
 }
 
 const discoverFiles = (
@@ -1063,6 +1064,9 @@ export const hashTask = (
         ),
         ...reportedConfigurationHashes,
       ]),
+      globalInputFileHashes: Object.fromEntries(
+        globalFileHashes.map(([path, , fileHash]) => [path, fileHash]),
+      ),
     };
   });
 

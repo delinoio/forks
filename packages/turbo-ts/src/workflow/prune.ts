@@ -580,7 +580,13 @@ export const executePrune = (
       repository.lockfile,
       lockfileContents,
       new Set(packages.map((packageModel) => packageModel.relativeDirectory)),
-      { production: options.production },
+      {
+        production: options.production,
+        manifests: [
+          repository.rootManifest,
+          ...packages.map((packageModel) => packageModel.manifest),
+        ],
+      },
     );
     const lockfileName = repository.lockfile.slice(
       repository.lockfile.lastIndexOf("/") + 1,

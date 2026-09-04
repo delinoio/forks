@@ -95,7 +95,13 @@ export const executeList = (
       const git = yield* Effect.scoped(
         processService.runBytes({
           command: "git",
-          args: ["diff", "--name-only", "-z", `${base}...${head}`],
+          args: [
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            `${base}...${head}`,
+          ],
           cwd: repository.root,
           inheritEnvironment: true,
         }),

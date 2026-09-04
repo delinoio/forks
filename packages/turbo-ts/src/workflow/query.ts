@@ -531,9 +531,25 @@ const boundaryDiagnostics = (
     model: RepositoryPackage,
   ): BoundariesConfig | null | undefined =>
     model === repository.rootPackage ? rootBoundaries : model.boundaries;
+  const implicitDependenciesFor = (
+    model: RepositoryPackage,
+  ): ReadonlyArray<RepositoryPackage> =>
+    (configurationFor(model)?.implicitDependencies ?? []).flatMap(
+      (reference) => {
+        const exact = byIdentity.get(reference);
+        if (exact !== undefined) return [exact];
+        return models.filter((candidate) => candidate.name === reference);
+      },
+    );
   for (const source of models) {
     const sourceTags = source.tags ?? [];
-    for (const dependencyIdentity of source.internalDependencies) {
+    const dependencyIdentities = new Set([
+      ...source.internalDependencies,
+      ...implicitDependenciesFor(source)
+        .filter((target) => target !== source)
+        .map((target) => target.identity),
+    ]);
+    for (const dependencyIdentity of dependencyIdentities) {
       const target = byIdentity.get(dependencyIdentity);
       if (target === undefined) continue;
       const targetTags = target.tags ?? [];

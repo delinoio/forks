@@ -287,7 +287,13 @@ interface LockfileGraphEntry {
   readonly dependencies: ReadonlyArray<
     readonly [name: string, reference: string | undefined]
   >;
+  readonly sourceKey?: string;
 }
+
+type LockfileDependencyReference = readonly [
+  name: string,
+  reference: string | undefined,
+];
 
 const lockfilePackageIdentity = (value: LockfilePackage): string =>
   `${value.name}@${value.version}`;
@@ -320,11 +326,11 @@ const dependencyObjectEntries = (
   });
 };
 
-const resolveGraphPackageClosure = (
+const resolveGraphEntryClosure = (
   entries: ReadonlyArray<LockfileGraphEntry>,
-  directDependencyNames: ReadonlySet<string>,
-  directReferences: ReadonlyMap<string, string | undefined> = new Map(),
-): ReadonlyArray<LockfilePackage> => {
+  directDependencies: ReadonlyArray<LockfileDependencyReference>,
+  initialEntries: ReadonlyArray<LockfileGraphEntry> = [],
+): ReadonlySet<LockfileGraphEntry> => {
   if (entries.length > maximumNodes) {
     throw new TypeError("lockfile structure exceeds the node safety limit");
   }
@@ -354,29 +360,49 @@ const resolveGraphPackageClosure = (
       const exact = new Set([
         ...(aliases.get(reference) ?? []),
         ...(aliases.get(`${name}@${reference}`) ?? []),
+        ...(aliases.get(`${name}@npm:${reference}`) ?? []),
       ]);
       if (exact.size > 0) return exact;
     }
     return names.get(name) ?? new Set();
   };
-  const pending: Array<number> = [];
-  for (const name of directDependencyNames) {
-    pending.push(...matchesForReference(name, directReferences.get(name)));
+  const pending = initialEntries.flatMap((entry) => {
+    const index = entries.indexOf(entry);
+    return index === -1 ? [] : [index];
+  });
+  for (const [name, reference] of directDependencies) {
+    pending.push(...matchesForReference(name, reference));
   }
   const visited = new Set<number>();
-  const packages = new Map<string, LockfilePackage>();
   while (pending.length > 0) {
     const entryIndex = pending.pop()!;
     if (visited.has(entryIndex)) continue;
     visited.add(entryIndex);
     const entry = entries[entryIndex]!;
-    for (const package_ of entry.packages) {
-      packages.set(lockfilePackageIdentity(package_), package_);
-    }
     for (const [name, reference] of entry.dependencies) {
       for (const dependencyIndex of matchesForReference(name, reference)) {
         if (!visited.has(dependencyIndex)) pending.push(dependencyIndex);
       }
+    }
+  }
+  return new Set([...visited].map((index) => entries[index]!));
+};
+
+const resolveGraphPackageClosure = (
+  entries: ReadonlyArray<LockfileGraphEntry>,
+  directDependencyNames: ReadonlySet<string>,
+  directReferences: ReadonlyMap<string, string | undefined> = new Map(),
+): ReadonlyArray<LockfilePackage> => {
+  const packages = new Map<string, LockfilePackage>();
+  const closure = resolveGraphEntryClosure(
+    entries,
+    [...directDependencyNames].map(
+      (name) => [name, directReferences.get(name)] as const,
+    ),
+  );
+  for (const entry of closure) {
+    for (const package_ of entry.packages) {
+      packages.set(lockfilePackageIdentity(package_), package_);
     }
   }
   return [...packages.values()].sort((left, right) =>
@@ -448,6 +474,7 @@ const parseYarnClassicGraph = (
 
 const parseYarnBerryGraph = (
   source: string,
+  includeDevelopmentDependencies = false,
 ): ReadonlyArray<LockfileGraphEntry> => {
   const document = objectValue(parseYamlDocument(source));
   if (document === undefined) {
@@ -483,7 +510,11 @@ const parseYarnBerryGraph = (
           ...selectorList,
           ...(resolution === undefined ? [] : [resolution]),
         ],
-        dependencies: dependencyObjectEntries(entry, false),
+        dependencies: dependencyObjectEntries(
+          entry,
+          includeDevelopmentDependencies,
+        ),
+        sourceKey: descriptors,
       },
     ];
   });
@@ -555,6 +586,22 @@ const parseUvGraph = (source: string): ReadonlyArray<LockfileGraphEntry> => {
   });
 };
 
+const normalizeWorkspacePath = (path: string): string => {
+  const normalized = path.replace(/^\.\//, "").replace(/\/$/, "");
+  return normalized === "" ? "." : normalized;
+};
+
+const workspaceReferencePath = (reference: string): string | undefined => {
+  const marker = "@workspace:";
+  const separator = reference.lastIndexOf(marker);
+  if (separator !== -1) {
+    return normalizeWorkspacePath(reference.slice(separator + marker.length));
+  }
+  return reference.startsWith("workspace:")
+    ? normalizeWorkspacePath(reference.slice("workspace:".length))
+    : undefined;
+};
+
 const bunPackageReference = (
   reference: string,
 ): LockfilePackage | undefined => {
@@ -575,6 +622,7 @@ const bunPackageReference = (
 
 const parseBunGraph = (
   source: string,
+  includeDevelopmentDependencies = false,
 ): {
   readonly entries: ReadonlyArray<LockfileGraphEntry>;
   readonly workspaces: Readonly<Record<string, unknown>>;
@@ -587,15 +635,24 @@ const parseBunGraph = (
       if (!Array.isArray(value) || typeof value[0] !== "string") return [];
       const package_ =
         bunPackageReference(value[0]) ?? bunPackageReference(key);
-      if (package_ === undefined) return [];
+      if (
+        package_ === undefined &&
+        workspaceReferencePath(value[0]) === undefined
+      ) {
+        return [];
+      }
       const information = value.find(
         (entry) => objectValue(entry) !== undefined,
       );
       return [
         {
-          packages: [package_],
+          packages: package_ === undefined ? [] : [package_],
           aliases: [key, value[0]],
-          dependencies: dependencyObjectEntries(information, false),
+          dependencies: dependencyObjectEntries(
+            information,
+            includeDevelopmentDependencies,
+          ),
+          sourceKey: key,
         },
       ];
     },
@@ -790,8 +847,33 @@ const pruneNpmLockfile = (
   if (document === undefined)
     throw new TypeError("npm lockfile is not an object");
   const packages = objectValue(document.packages);
-  if (packages === undefined)
+  if (packages === undefined) {
+    if (production && document.dependencies !== undefined) {
+      const pruneLegacyDependencies = (
+        value: unknown,
+      ): Readonly<Record<string, unknown>> =>
+        Object.fromEntries(
+          Object.entries(objectValue(value) ?? {}).flatMap(
+            ([name, rawEntry]) => {
+              const entry = objectValue(rawEntry);
+              if (entry?.dev === true) return [];
+              if (entry?.dependencies === undefined) return [[name, rawEntry]];
+              return [
+                [
+                  name,
+                  {
+                    ...entry,
+                    dependencies: pruneLegacyDependencies(entry.dependencies),
+                  },
+                ],
+              ];
+            },
+          ),
+        );
+      document.dependencies = pruneLegacyDependencies(document.dependencies);
+    }
     return `${JSON.stringify(document, undefined, 2)}\n`;
+  }
   const selectedWorkspaces = new Set(
     [...workspacePaths].map((path) => path.replace(/^\.\//, "")),
   );
@@ -866,6 +948,192 @@ const pruneNpmLockfile = (
   return `${JSON.stringify(document, undefined, 2)}\n`;
 };
 
+export interface LockfilePruneManifest {
+  readonly dependencies?: Readonly<Record<string, string>>;
+  readonly devDependencies?: Readonly<Record<string, string>>;
+  readonly optionalDependencies?: Readonly<Record<string, string>>;
+  readonly peerDependencies?: Readonly<Record<string, string>>;
+}
+
+export interface LockfilePruneOptions {
+  readonly production?: boolean;
+  readonly manifests?: ReadonlyArray<LockfilePruneManifest>;
+}
+
+const withoutDevelopmentDependencies = (value: unknown): unknown => {
+  const object = objectValue(value);
+  if (object === undefined || object.devDependencies === undefined)
+    return value;
+  const { devDependencies: _devDependencies, ...productionValue } = object;
+  return productionValue;
+};
+
+const selectedWorkspacePaths = (
+  workspacePaths: ReadonlySet<string>,
+): ReadonlySet<string> =>
+  new Set([".", ...[...workspacePaths].map(normalizeWorkspacePath)]);
+
+const pruneDependencySeeds = (
+  options: LockfilePruneOptions,
+): ReadonlyArray<LockfileDependencyReference> =>
+  (options.manifests ?? []).flatMap((manifest) =>
+    dependencyObjectEntries(manifest, options.production !== true),
+  );
+
+const yarnClassicBlocks = (
+  source: string,
+): {
+  readonly preamble: string;
+  readonly entries: ReadonlyArray<{
+    readonly source: string;
+    readonly aliases: ReadonlyArray<string>;
+  }>;
+} => {
+  const lines = source.match(/[^\n]*(?:\n|$)/g)?.filter(Boolean) ?? [];
+  let preamble = "";
+  const entries: Array<{ source: string; aliases: ReadonlyArray<string> }> = [];
+  for (const line of lines) {
+    const content = line.replace(/\r?\n$/, "");
+    if (content !== "" && !content.startsWith(" ") && content.endsWith(":")) {
+      entries.push({
+        source: line,
+        aliases: content
+          .slice(0, -1)
+          .split(",")
+          .map((entry) => entry.trim().replace(/^"|"$/g, "")),
+      });
+      continue;
+    }
+    const current = entries.at(-1);
+    if (current === undefined) {
+      preamble += line;
+    } else {
+      entries[entries.length - 1] = {
+        ...current,
+        source: current.source + line,
+      };
+    }
+  }
+  return { preamble, entries };
+};
+
+const pruneYarnClassicLockfile = (
+  source: string,
+  dependencies: ReadonlyArray<LockfileDependencyReference>,
+): string => {
+  const closure = resolveGraphEntryClosure(
+    parseYarnClassicGraph(source),
+    dependencies,
+  );
+  const retainedAliases = new Set(
+    [...closure].flatMap((entry) => entry.aliases),
+  );
+  const document = yarnClassicBlocks(source);
+  return (
+    document.preamble +
+    document.entries
+      .filter((entry) =>
+        entry.aliases.some((alias) => retainedAliases.has(alias)),
+      )
+      .map((entry) => entry.source)
+      .join("")
+  );
+};
+
+const pruneYarnBerryLockfile = (
+  source: string,
+  workspacePaths: ReadonlySet<string>,
+  dependencies: ReadonlyArray<LockfileDependencyReference>,
+  production: boolean,
+): string => {
+  const document = objectValue(parseYamlDocument(source));
+  if (document === undefined)
+    throw new TypeError("Yarn Berry lockfile is not an object");
+  const selectedPaths = selectedWorkspacePaths(workspacePaths);
+  const graph = parseYarnBerryGraph(source, !production);
+  const workspaceEntries = graph.filter((entry) =>
+    entry.aliases.some((alias) => {
+      const path = workspaceReferencePath(alias);
+      return path !== undefined && selectedPaths.has(path);
+    }),
+  );
+  const closure = resolveGraphEntryClosure(
+    graph,
+    dependencies,
+    workspaceEntries,
+  );
+  const retainedKeys = new Set(
+    [...closure].flatMap((entry) =>
+      entry.sourceKey === undefined ? [] : [entry.sourceKey],
+    ),
+  );
+  return stringifyYaml(
+    Object.fromEntries(
+      Object.entries(document).flatMap(([key, value]) =>
+        key === "__metadata" || retainedKeys.has(key)
+          ? [[key, production ? withoutDevelopmentDependencies(value) : value]]
+          : [],
+      ),
+    ),
+    { lineWidth: 0, singleQuote: true },
+  );
+};
+
+const pruneBunLockfile = (
+  source: string,
+  workspacePaths: ReadonlySet<string>,
+  dependencies: ReadonlyArray<LockfileDependencyReference>,
+  production: boolean,
+): string => {
+  const document = objectValue(parseYamlDocument(source));
+  if (document === undefined)
+    throw new TypeError("Bun lockfile is not an object");
+  const selectedPaths = selectedWorkspacePaths(workspacePaths);
+  const workspaces = objectValue(document.workspaces) ?? {};
+  const retainedWorkspaces = Object.fromEntries(
+    Object.entries(workspaces)
+      .filter(([path]) => selectedPaths.has(normalizeWorkspacePath(path)))
+      .map(([path, value]) => [
+        path,
+        production ? withoutDevelopmentDependencies(value) : value,
+      ]),
+  );
+  const graph = parseBunGraph(source, !production).entries;
+  const workspaceEntries = graph.filter((entry) =>
+    entry.aliases.some((alias) => {
+      const path = workspaceReferencePath(alias);
+      return path !== undefined && selectedPaths.has(path);
+    }),
+  );
+  const workspaceDependencies = Object.values(retainedWorkspaces).flatMap(
+    (workspace) => dependencyObjectEntries(workspace, !production),
+  );
+  const closure = resolveGraphEntryClosure(
+    graph,
+    [...dependencies, ...workspaceDependencies],
+    workspaceEntries,
+  );
+  const retainedPackageKeys = new Set(
+    [...closure].flatMap((entry) =>
+      entry.sourceKey === undefined ? [] : [entry.sourceKey],
+    ),
+  );
+  const packages = objectValue(document.packages) ?? {};
+  return `${JSON.stringify(
+    {
+      ...document,
+      workspaces: retainedWorkspaces,
+      packages: Object.fromEntries(
+        Object.entries(packages).filter(([key]) =>
+          retainedPackageKeys.has(key),
+        ),
+      ),
+    },
+    undefined,
+    2,
+  )}\n`;
+};
+
 /**
  * Prunes independently parsed lockfile formats without consulting a package
  * manager implementation. Formats whose public artifact does not expose a
@@ -875,19 +1143,36 @@ export const pruneLockfile = (
   path: string,
   contents: Uint8Array,
   workspacePaths: ReadonlySet<string>,
-  options: { readonly production?: boolean } = {},
+  options: LockfilePruneOptions = {},
 ): Uint8Array => {
   const parsed = parseLockfile(path, contents);
   if (parsed.format === "bun-binary" || parsed.format === "yarn-pnp") {
     return contents;
   }
   const source = validateSource(contents);
+  const dependencies = pruneDependencySeeds(options);
   const output =
     parsed.format === "pnpm"
       ? prunePnpmLockfile(source, workspacePaths, options.production === true)
       : parsed.format === "npm"
         ? pruneNpmLockfile(source, workspacePaths, options.production === true)
-        : source;
+        : parsed.format === "yarn-classic"
+          ? pruneYarnClassicLockfile(source, dependencies)
+          : parsed.format === "yarn-berry"
+            ? pruneYarnBerryLockfile(
+                source,
+                workspacePaths,
+                dependencies,
+                options.production === true,
+              )
+            : parsed.format === "bun-text"
+              ? pruneBunLockfile(
+                  source,
+                  workspacePaths,
+                  dependencies,
+                  options.production === true,
+                )
+              : source;
   return new TextEncoder().encode(output);
 };
 
