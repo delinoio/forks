@@ -26,6 +26,7 @@ import {
   CompressionService,
   FileSystemService,
   HttpService,
+  LoopbackHttpService,
   ProcessService,
   RandomnessService,
   TerminalService,
@@ -418,6 +419,54 @@ describe("Effect foundation", () => {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  it("interrupts loopback handlers with their server scope", async () => {
+    let publishPort: ((port: number) => void) | undefined;
+    const port = new Promise<number>((resolve) => {
+      publishPort = resolve;
+    });
+    let markHandlerStarted: (() => void) | undefined;
+    const handlerStarted = new Promise<void>((resolve) => {
+      markHandlerStarted = resolve;
+    });
+    let markHandlerFinalized: (() => void) | undefined;
+    const handlerFinalized = new Promise<void>((resolve) => {
+      markHandlerFinalized = resolve;
+    });
+    const serverFiber = Effect.runFork(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const http = yield* LoopbackHttpService;
+          const server = yield* http.serve(0, () =>
+            Effect.scoped(
+              Effect.acquireRelease(
+                Effect.sync(() => markHandlerStarted?.()),
+                () => Effect.sync(() => markHandlerFinalized?.()),
+              ).pipe(Effect.zipRight(Effect.never)),
+            ),
+          );
+          publishPort?.(server.port);
+          yield* Effect.never;
+        }),
+      ).pipe(Effect.provide(nodeFoundationLayer)),
+    );
+    const request = fetch(`http://127.0.0.1:${await port}`, {
+      method: "POST",
+      body: "request",
+    }).then(
+      () => "response" as const,
+      () => "closed" as const,
+    );
+    await handlerStarted;
+    await Effect.runPromise(Fiber.interrupt(serverFiber));
+    await Promise.race([
+      handlerFinalized,
+      delay(1_000).then(() => {
+        throw new Error("loopback handler remained active after shutdown");
+      }),
+    ]);
+    expect(await request).toBe("closed");
   });
 
   it("removes undefined environment overrides before spawning", async () => {

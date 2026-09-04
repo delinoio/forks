@@ -22,14 +22,20 @@ import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "@rstest/core";
-import { Effect, Layer, Stream } from "effect";
+import { Deferred, Effect, Fiber, Layer, Stream } from "effect";
 import { graphql } from "graphql";
 import { commandIndex } from "../src/cli/program.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { normalizeOutput } from "../src/compatibility/normalizers.js";
 import { BoundaryError } from "../src/effect/errors.js";
 import { nodeFoundationLayer } from "../src/effect/node-layer.js";
-import { FileWatcherService } from "../src/effect/services.js";
+import {
+  DaemonMethod,
+  DaemonService,
+  FileSystemService,
+  FileWatcherService,
+  ProcessService,
+} from "../src/effect/services.js";
 import { pruneLockfile } from "../src/repository/lockfiles.js";
 import {
   renderRunTui,
@@ -1209,6 +1215,93 @@ describe("repository workflow gate", () => {
     }
   });
 
+  it("coordinates daemon stop with an in-progress serve startup", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-stop-"));
+    try {
+      await prepareFixture(directory);
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const daemon = yield* DaemonService;
+            const fileSystem = yield* FileSystemService;
+            const processService = yield* ProcessService;
+            const allowServe = yield* Deferred.make<void>();
+            const pidCreated = yield* Deferred.make<void>();
+            let daemonAlive = true;
+            let stopCompleted = false;
+            const overrides = Layer.mergeAll(
+              Layer.succeed(DaemonService, {
+                ...daemon,
+                serve: (endpoint) =>
+                  Stream.fromEffect(Deferred.await(allowServe)).pipe(
+                    Stream.flatMap(() => daemon.serve(endpoint)),
+                  ),
+                request: (endpoint, request, timeoutMilliseconds) =>
+                  daemon.request(endpoint, request, timeoutMilliseconds).pipe(
+                    Effect.tap(() =>
+                      request.method === DaemonMethod.shutdown
+                        ? Effect.sync(() => {
+                            daemonAlive = false;
+                          })
+                        : Effect.void,
+                    ),
+                  ),
+              }),
+              Layer.succeed(FileSystemService, {
+                ...fileSystem,
+                createExclusiveFile: (path, contents) =>
+                  fileSystem
+                    .createExclusiveFile(path, contents)
+                    .pipe(
+                      Effect.tap((created) =>
+                        created && path.endsWith("turbod.pid")
+                          ? Deferred.succeed(pidCreated, undefined).pipe(
+                              Effect.ignore,
+                            )
+                          : Effect.void,
+                      ),
+                    ),
+              }),
+              Layer.succeed(ProcessService, {
+                ...processService,
+                isProcessAlive: (pid) =>
+                  pid === process.pid
+                    ? Effect.succeed(daemonAlive)
+                    : (processService.isProcessAlive?.(pid) ??
+                      Effect.succeed(false)),
+              }),
+            );
+            const runDaemon = (command: "serve" | "stop") =>
+              executeDaemon({
+                command,
+                cwd: directory,
+                idleMilliseconds: 30_000,
+                json: false,
+              }).pipe(Effect.provide(overrides));
+            const serveFiber = yield* Effect.forkScoped(runDaemon("serve"));
+            yield* Deferred.await(pidCreated);
+            const stopFiber = yield* Effect.forkScoped(
+              runDaemon("stop").pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    stopCompleted = true;
+                  }),
+                ),
+              ),
+            );
+            yield* Effect.sleep("100 millis");
+            expect(stopCompleted).toBe(false);
+            yield* Deferred.succeed(allowServe, undefined);
+            expect(yield* Fiber.join(stopFiber)).toBe(0);
+            expect(yield* Fiber.join(serveFiber)).toBe(0);
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("resets the daemon idle deadline after client activity", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-idle-"));
     const runCandidate = (...arguments_: ReadonlyArray<string>) =>
@@ -1371,7 +1464,7 @@ describe("repository workflow gate", () => {
       scripts: Record<string, string>;
     };
     appManifest.scripts.build =
-      "node -e \"const fs=require('node:fs');const output=JSON.parse(fs.readFileSync('turbo.json','utf8')).tasks.build.outputs[0].split('/')[0];fs.mkdirSync(output,{recursive:true});fs.writeFileSync(output+'/generated.txt','generated');fs.writeFileSync(output+'/package.json','{}');console.log('app build')\"";
+      "node -e \"const fs=require('node:fs');const output=JSON.parse(fs.readFileSync('turbo.json','utf8')).tasks.build.outputs[0].split('/')[0];fs.mkdirSync(output,{recursive:true});fs.writeFileSync(output+'/generated.txt','generated');fs.writeFileSync(output+'/package.json','{}');fs.writeFileSync(output+'/.gitignore','generated');console.log('app build')\"";
     await writeFile(
       appManifestPath,
       `${JSON.stringify(appManifest, undefined, 2)}\n`,
@@ -1550,8 +1643,10 @@ importers:
   packages/library: {}
 packages:
   external-package@1.2.3: {}
+  external-package@9.9.9: {}
 snapshots:
   external-package@1.2.3: {}
+  external-package@9.9.9: {}
 `,
     );
     await writeFile(join(outside, "secret.txt"), "outside\n");
@@ -1827,6 +1922,39 @@ snapshots:
           ),
         ).toBe("module.exports = { hooks: {} };\n");
       }
+      const applicationManifestPath = join(
+        directory,
+        "packages/app/package.json",
+      );
+      const applicationManifest = JSON.parse(
+        await readFile(applicationManifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      applicationManifest.devDependencies = {
+        "synthetic-development-only": "workspace:*",
+      };
+      await writeFile(
+        applicationManifestPath,
+        `${JSON.stringify(applicationManifest, undefined, 2)}\n`,
+      );
+      const developmentOnlyDirectory = join(
+        directory,
+        "packages/development-only",
+      );
+      await mkdir(developmentOnlyDirectory);
+      await writeFile(
+        join(developmentOnlyDirectory, "package.json"),
+        `${JSON.stringify({
+          name: "synthetic-development-only",
+          version: "1.0.0",
+          private: true,
+        })}\n`,
+      );
+      await writeFile(
+        join(directory, "pnpm-lock.yaml"),
+        `${workflowLockfile.trimEnd()}
+  packages/development-only: {}
+`,
+      );
       await executeDifferentialCommand(process.execPath, [
         candidate,
         "--cwd",
@@ -1846,6 +1974,21 @@ snapshots:
           (await stat(join(directory, "production-result", path))).mode & 0o777,
         ).toBe(0o644);
       }
+      expect(
+        await readFile(
+          join(
+            directory,
+            "production-result/packages/development-only/package.json",
+          ),
+          "utf8",
+        ).catch(() => undefined),
+      ).toBeUndefined();
+      expect(
+        await readFile(
+          join(directory, "production-result/pnpm-lock.yaml"),
+          "utf8",
+        ),
+      ).not.toContain("packages/development-only");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

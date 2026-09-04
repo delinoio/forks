@@ -84,6 +84,7 @@ export interface RepositoryPackage {
   readonly scripts: Readonly<Record<string, string>>;
   readonly dependencyNames: ReadonlyArray<string>;
   readonly internalDependencies: ReadonlyArray<string>;
+  readonly productionInternalDependencies: ReadonlyArray<string>;
   readonly excludedTasks: ReadonlySet<string>;
   readonly tasks: Readonly<Record<string, Pipeline>>;
   readonly manifest: PackageManifest;
@@ -526,11 +527,21 @@ const workspacePatterns = (
 
 const dependencyEntries = (
   manifest: PackageManifest,
-): ReadonlyArray<readonly [string, string]> => [
-  ...Object.entries(manifest.dependencies ?? {}),
-  ...Object.entries(manifest.devDependencies ?? {}),
-  ...Object.entries(manifest.optionalDependencies ?? {}),
-  ...Object.entries(manifest.peerDependencies ?? {}),
+): ReadonlyArray<
+  readonly [name: string, specification: string, production: boolean]
+> => [
+  ...Object.entries(manifest.dependencies ?? {}).map(
+    ([name, specification]) => [name, specification, true] as const,
+  ),
+  ...Object.entries(manifest.devDependencies ?? {}).map(
+    ([name, specification]) => [name, specification, false] as const,
+  ),
+  ...Object.entries(manifest.optionalDependencies ?? {}).map(
+    ([name, specification]) => [name, specification, true] as const,
+  ),
+  ...Object.entries(manifest.peerDependencies ?? {}).map(
+    ([name, specification]) => [name, specification, true] as const,
+  ),
 ];
 
 const dependencyNames = (manifest: PackageManifest): ReadonlyArray<string> =>
@@ -675,6 +686,7 @@ const javascriptInternalDependencies = (
 ): Effect.Effect<
   {
     readonly internalDependencies: ReadonlyArray<string>;
+    readonly productionInternalDependencies: ReadonlyArray<string>;
     readonly cacheInputsComplete: boolean;
   },
   never,
@@ -705,7 +717,7 @@ const javascriptInternalDependencies = (
         : packagesByFilesystemIdentity.get(declaringFilesystemIdentity);
     const references = yield* Effect.forEach(
       dependencyEntries(manifest),
-      ([name, specification]) => {
+      ([name, specification, production]) => {
         const localPath = localPathSpecification(
           declaringDirectory,
           specification,
@@ -720,6 +732,7 @@ const javascriptInternalDependencies = (
                   : packagesByFilesystemIdentity.get(identity);
               return {
                 internalDependency,
+                production,
                 cacheInputsComplete: internalDependency !== undefined,
               };
             }),
@@ -733,6 +746,7 @@ const javascriptInternalDependencies = (
         return target === undefined
           ? Effect.succeed({
               internalDependency: undefined,
+              production,
               cacheInputsComplete: true,
             })
           : referencesWorkspacePackage(
@@ -742,6 +756,7 @@ const javascriptInternalDependencies = (
             ).pipe(
               Effect.map((matches) => ({
                 internalDependency: matches ? target.identity : undefined,
+                production,
                 cacheInputsComplete: true,
               })),
             );
@@ -752,6 +767,17 @@ const javascriptInternalDependencies = (
       internalDependencies: [
         ...new Set(
           references
+            .map(({ internalDependency }) => internalDependency)
+            .filter(
+              (name): name is string =>
+                name !== undefined && name !== declaringPackageIdentity,
+            ),
+        ),
+      ].sort(),
+      productionInternalDependencies: [
+        ...new Set(
+          references
+            .filter(({ production }) => production)
             .map(({ internalDependency }) => internalDependency)
             .filter(
               (name): name is string =>
@@ -811,7 +837,10 @@ interface CargoDependencyMetadata {
 }
 
 interface RepositoryPackageDraft
-  extends Omit<RepositoryPackage, "identity" | "internalDependencies"> {
+  extends Omit<
+    RepositoryPackage,
+    "identity" | "internalDependencies" | "productionInternalDependencies"
+  > {
   readonly cargoDependencies: ReadonlyArray<CargoDependencyMetadata>;
   readonly uvDependencySources?: ReadonlyMap<
     string,
@@ -2832,6 +2861,9 @@ export const discoverRepository = (
             internalDependencies: resolvedDependencies.flatMap(({ target }) =>
               target === undefined ? [] : [target.identity],
             ),
+            productionInternalDependencies: resolvedDependencies.flatMap(
+              ({ target }) => (target === undefined ? [] : [target.identity]),
+            ),
           };
         }
         if (packageDraft.manager === "uv") {
@@ -2844,6 +2876,8 @@ export const discoverRepository = (
               packageDraft.cacheInputsComplete &&
               (resolution?.cacheInputsComplete ?? true),
             internalDependencies: resolution?.internalDependencies ?? [],
+            productionInternalDependencies:
+              resolution?.internalDependencies ?? [],
           };
         }
         const resolution = javascriptDependencyResolutionByDirectory.get(
@@ -2855,6 +2889,8 @@ export const discoverRepository = (
             packageDraft.cacheInputsComplete &&
             (resolution?.cacheInputsComplete ?? true),
           internalDependencies: resolution?.internalDependencies ?? [],
+          productionInternalDependencies:
+            resolution?.productionInternalDependencies ?? [],
         };
       })
       .sort((left, right) => left.identity.localeCompare(right.identity));
@@ -2895,6 +2931,8 @@ export const discoverRepository = (
       dependencyNames: dependencyNames(rootManifest),
       internalDependencies:
         rootDependencyResolution?.internalDependencies ?? [],
+      productionInternalDependencies:
+        rootDependencyResolution?.productionInternalDependencies ?? [],
       excludedTasks: new Set<string>(),
       tasks: rootTasks,
       manifest: rootManifest,

@@ -109,6 +109,7 @@ export const parsePruneArguments = (
 const selectedPackages = (
   repository: RepositoryModel,
   scopes: ReadonlyArray<string>,
+  production: boolean,
 ): ReadonlyArray<RepositoryPackage> => {
   const selected = new Map<string, RepositoryPackage>();
   const pending = scopes.map((scope) => {
@@ -123,7 +124,11 @@ const selectedPackages = (
     }
     return packageModel;
   });
-  for (const dependency of repository.rootPackage.internalDependencies) {
+  const dependenciesOf = (packageModel: RepositoryPackage) =>
+    production
+      ? packageModel.productionInternalDependencies
+      : packageModel.internalDependencies;
+  for (const dependency of dependenciesOf(repository.rootPackage)) {
     const dependencyPackage = repository.packagesByIdentity.get(dependency);
     if (dependencyPackage !== undefined) pending.push(dependencyPackage);
   }
@@ -131,7 +136,7 @@ const selectedPackages = (
     const packageModel = pending.pop()!;
     if (selected.has(packageModel.identity)) continue;
     selected.set(packageModel.identity, packageModel);
-    for (const dependency of packageModel.internalDependencies) {
+    for (const dependency of dependenciesOf(packageModel)) {
       const dependencyPackage = repository.packagesByIdentity.get(dependency);
       if (dependencyPackage !== undefined) pending.push(dependencyPackage);
     }
@@ -395,7 +400,11 @@ export const executePrune = (
     const fileSystem = yield* FileSystemService;
     const terminal = yield* TerminalService;
     const repository = yield* loadWorkflowRepository(options);
-    const packages = selectedPackages(repository, options.scopes);
+    const packages = selectedPackages(
+      repository,
+      options.scopes,
+      options.production,
+    );
     for (const packageModel of packages) {
       const metadata = yield* fileSystem.metadata(packageModel.directory);
       if (

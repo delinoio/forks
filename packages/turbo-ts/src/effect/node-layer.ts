@@ -56,7 +56,7 @@ import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import { writeHeapSnapshot } from "node:v8";
 import { createZstdDecompress, zstdCompress, zstdDecompress } from "node:zlib";
-import { Cause, Effect, Exit, Layer, Option, Ref, Stream } from "effect";
+import { Cause, Effect, Exit, Fiber, Layer, Option, Ref, Stream } from "effect";
 import { createXxhash64 } from "../hash/xxhash64.js";
 import { BoundaryError, ProcessExecutionError } from "./errors.js";
 import {
@@ -81,6 +81,7 @@ import {
   FileWatcherService,
   GitService,
   HttpService,
+  type LoopbackHttpResponse,
   LoopbackHttpService,
   ObservabilityService,
   type OutputChunkHandler,
@@ -2190,106 +2191,140 @@ const daemonLayer = Layer.succeed(DaemonService, {
 
 const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
   serve: (requestedPort, handler) =>
-    Effect.acquireRelease(
-      Effect.async<
-        {
-          readonly server: ReturnType<typeof createHttpServer>;
-          readonly port: number;
-        },
-        BoundaryError
-      >((resume) => {
-        const server = createHttpServer((request, response) => {
-          const chunks: Array<Buffer> = [];
-          let size = 0;
-          let oversized = false;
-          request.on("data", (chunk: Buffer) => {
-            if (oversized) return;
-            size += chunk.length;
-            if (size > 1024 * 1024) {
-              oversized = true;
-              chunks.length = 0;
-              response.writeHead(413);
-              response.end();
-              return;
-            }
-            chunks.push(chunk);
-          });
-          request.on("end", () => {
-            if (oversized) return;
-            const headers = Object.fromEntries(
-              Object.entries(request.headers).flatMap(([key, value]) =>
-                value === undefined
-                  ? []
-                  : [[key, Array.isArray(value) ? value.join(", ") : value]],
-              ),
-            );
-            Effect.runPromise(
-              handler({
+    Effect.gen(function* () {
+      const scope = yield* Effect.scope;
+      return yield* Effect.acquireRelease(
+        Effect.async<
+          {
+            readonly server: ReturnType<typeof createHttpServer>;
+            readonly port: number;
+          },
+          BoundaryError
+        >((resume) => {
+          const server = createHttpServer((request, response) => {
+            const chunks: Array<Buffer> = [];
+            let size = 0;
+            let oversized = false;
+            request.on("data", (chunk: Buffer) => {
+              if (oversized) return;
+              size += chunk.length;
+              if (size > 1024 * 1024) {
+                oversized = true;
+                chunks.length = 0;
+                response.writeHead(413);
+                response.end();
+                return;
+              }
+              chunks.push(chunk);
+            });
+            request.on("end", () => {
+              if (oversized) return;
+              const headers = Object.fromEntries(
+                Object.entries(request.headers).flatMap(([key, value]) =>
+                  value === undefined
+                    ? []
+                    : [[key, Array.isArray(value) ? value.join(", ") : value]],
+                ),
+              );
+              let connectionClosed = false;
+              let handlerFiber:
+                | Fiber.RuntimeFiber<LoopbackHttpResponse, BoundaryError>
+                | undefined;
+              const interruptHandler = (): void => {
+                connectionClosed = true;
+                if (handlerFiber !== undefined) {
+                  Effect.runFork(Fiber.interrupt(handlerFiber));
+                }
+              };
+              request.once("aborted", interruptHandler);
+              response.once("close", interruptHandler);
+              const requestEffect = handler({
                 method: request.method ?? "GET",
                 path: request.url ?? "/",
                 headers,
                 body: new Uint8Array(Buffer.concat(chunks)),
-              }),
-            ).then(
-              (result) => {
-                response.writeHead(result.status, result.headers);
-                response.end(result.body);
-              },
-              (cause) => {
+              }).pipe(
+                Effect.forkIn(scope),
+                Effect.tap((fiber) =>
+                  Effect.sync(() => {
+                    handlerFiber = fiber;
+                    if (connectionClosed) {
+                      Effect.runFork(Fiber.interrupt(fiber));
+                    }
+                  }),
+                ),
+                Effect.flatMap(Fiber.join),
+              );
+              Effect.runPromiseExit(requestEffect).then((exit) => {
+                request.off("aborted", interruptHandler);
+                response.off("close", interruptHandler);
+                if (
+                  connectionClosed ||
+                  response.destroyed ||
+                  response.writableEnded
+                ) {
+                  return;
+                }
+                if (Exit.isSuccess(exit)) {
+                  response.writeHead(exit.value.status, exit.value.headers);
+                  response.end(exit.value.body);
+                  return;
+                }
+                if (Cause.isInterruptedOnly(exit.cause)) return;
                 response.writeHead(500, {
                   "content-type": "text/plain; charset=utf-8",
                 });
-                response.end(String(cause));
-              },
-            );
+                response.end(Cause.pretty(exit.cause));
+              });
+            });
           });
-        });
-        server.once("error", (cause) =>
-          resume(
-            Effect.fail(
-              new BoundaryError({
-                boundary: "http-server",
-                message: String(cause),
-                retryable: false,
-              }),
-            ),
-          ),
-        );
-        server.listen(requestedPort, "127.0.0.1", () => {
-          const address = server.address();
-          if (address === null || typeof address === "string") {
+          server.once("error", (cause) =>
             resume(
               Effect.fail(
                 new BoundaryError({
                   boundary: "http-server",
-                  message: "loopback server has no TCP address",
+                  message: String(cause),
                   retryable: false,
                 }),
               ),
-            );
-            return;
-          }
-          resume(
-            Effect.succeed({
-              server,
-              port: address.port,
-            }),
+            ),
           );
-        });
-      }),
-      ({ server }) =>
-        Effect.promise(async () => {
-          server.closeAllConnections();
-          await new Promise<void>((resolve) => server.close(() => resolve()));
+          server.listen(requestedPort, "127.0.0.1", () => {
+            const address = server.address();
+            if (address === null || typeof address === "string") {
+              resume(
+                Effect.fail(
+                  new BoundaryError({
+                    boundary: "http-server",
+                    message: "loopback server has no TCP address",
+                    retryable: false,
+                  }),
+                ),
+              );
+              return;
+            }
+            resume(
+              Effect.succeed({
+                server,
+                port: address.port,
+              }),
+            );
+          });
         }),
-    ).pipe(
-      Effect.map(({ server, port }) => ({
-        port,
-        closed: Effect.async<void, BoundaryError>((resume) => {
-          server.once("close", () => resume(Effect.void));
-        }),
-      })),
-    ),
+        ({ server }) =>
+          Effect.promise(async () => {
+            server.closeAllConnections();
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+          }),
+      ).pipe(
+        Effect.map(({ server, port }) => ({
+          port,
+          closed: Effect.async<void, BoundaryError>((resume) => {
+            server.once("close", () => resume(Effect.void));
+          }),
+        })),
+      );
+    }),
 });
 
 const runtimeProfileLayer = Layer.succeed(RuntimeProfileService, {

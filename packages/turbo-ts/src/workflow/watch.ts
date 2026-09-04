@@ -136,13 +136,6 @@ export const executeWatch = (
           if (isInternalRepositoryPath(repository.root, change.path)) {
             return false;
           }
-          if (isGitIgnorePath(change.path)) {
-            yield* Ref.set(
-              ignoreMatcher,
-              yield* loadGitIgnoreMatcher(repository.root),
-            );
-            return true;
-          }
           const currentRepository = yield* Ref.get(repositoryRef);
           const ignored = (yield* Ref.get(ignoreMatcher)).ignores(
             change.path,
@@ -150,6 +143,13 @@ export const executeWatch = (
           );
           if (ignored || configuredOutputPath(currentRepository, change.path)) {
             return false;
+          }
+          if (isGitIgnorePath(change.path)) {
+            yield* Ref.set(
+              ignoreMatcher,
+              yield* loadGitIgnoreMatcher(repository.root),
+            );
+            return true;
           }
           if (
             isWorkspaceDiscoveryPath(repository.root, change.path) ||

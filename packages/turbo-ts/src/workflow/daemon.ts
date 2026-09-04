@@ -283,6 +283,8 @@ export const daemonIsRunning = (
   );
 
 const staleStartLockMilliseconds = 30_000;
+const daemonStartupAttempts = 100;
+const daemonStartupPollMilliseconds = 50;
 
 const acquireStartLock = (
   paths: DaemonPaths,
@@ -335,6 +337,57 @@ const releaseStartLock = (
     if (current._tag === "Right" && current.right === contents) {
       yield* fileSystem.remove(paths.lock).pipe(Effect.ignore);
     }
+  });
+
+const acquireDaemonOperationLock = (
+  paths: DaemonPaths,
+): Effect.Effect<string, BoundaryError, ClockService | FileSystemService> =>
+  Effect.gen(function* () {
+    let failure: BoundaryError | undefined;
+    for (let attempt = 0; attempt < daemonStartupAttempts; attempt += 1) {
+      const result = yield* acquireStartLock(paths).pipe(Effect.either);
+      if (result._tag === "Right") return result.right;
+      failure = result.left;
+      yield* Effect.sleep(`${daemonStartupPollMilliseconds} millis`);
+    }
+    return yield* Effect.fail(
+      failure ??
+        new BoundaryError({
+          boundary: "daemon",
+          message: "daemon lifecycle lock is unavailable",
+          retryable: true,
+        }),
+    );
+  });
+
+const waitForDaemonHealthy = (
+  paths: DaemonPaths,
+  expectedPid: number,
+): Effect.Effect<
+  boolean,
+  never,
+  ClockService | DaemonService | FileSystemService | ProcessService
+> =>
+  Effect.gen(function* () {
+    for (let attempt = 0; attempt < daemonStartupAttempts; attempt += 1) {
+      const currentPid = yield* readPid(paths.pid);
+      if (currentPid !== undefined && currentPid !== expectedPid) return false;
+      if (currentPid === expectedPid) {
+        if (!(yield* isAlive(currentPid))) return false;
+        if (yield* daemonHealthy(paths)) return true;
+      }
+      yield* Effect.sleep(`${daemonStartupPollMilliseconds} millis`);
+    }
+    return false;
+  });
+
+const cleanStaleStateIfOwned = (
+  paths: DaemonPaths,
+  expectedPid: number | undefined,
+): Effect.Effect<void, never, FileSystemService> =>
+  Effect.gen(function* () {
+    if ((yield* readPid(paths.pid)) !== expectedPid) return;
+    yield* cleanStaleState(paths);
   });
 
 const startDaemon = (
@@ -406,14 +459,7 @@ const startDaemon = (
             cwd: root,
             inheritEnvironment: true,
           });
-          let ready = false;
-          for (let attempt = 0; attempt < 100; attempt += 1) {
-            yield* Effect.sleep("50 millis");
-            if (yield* daemonHealthy(paths)) {
-              ready = true;
-              break;
-            }
-          }
+          const ready = yield* waitForDaemonHealthy(paths, childPid);
           if (!ready) {
             if (processService.terminateProcess !== undefined) {
               yield* processService
@@ -439,7 +485,28 @@ const stopDaemon = (
   paths: DaemonPaths,
 ): Effect.Effect<
   void,
-  never,
+  BoundaryError,
+  | ClockService
+  | DaemonService
+  | FileSystemService
+  | ProcessService
+  | TerminalService
+> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    yield* fileSystem.makeDirectory(paths.stateDirectory);
+    yield* Effect.acquireUseRelease(
+      acquireDaemonOperationLock(paths),
+      () => stopDaemonWithLock(paths),
+      (contents) => releaseStartLock(paths, contents),
+    );
+  });
+
+const stopDaemonWithLock = (
+  paths: DaemonPaths,
+): Effect.Effect<
+  void,
+  BoundaryError,
   | ClockService
   | DaemonService
   | FileSystemService
@@ -451,12 +518,34 @@ const stopDaemon = (
     const terminal = yield* TerminalService;
     const pid = yield* readPid(paths.pid);
     if (!(yield* isAlive(pid))) {
-      yield* cleanStaleState(paths);
+      yield* cleanStaleStateIfOwned(paths, pid);
       yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);
       return;
     }
-    if (!(yield* daemonHealthy(paths))) {
-      yield* cleanStaleState(paths);
+    if (
+      !(yield* daemonHealthy(paths)) &&
+      !(yield* waitForDaemonHealthy(paths, pid!))
+    ) {
+      const currentPid = yield* readPid(paths.pid);
+      if (currentPid !== pid) {
+        return yield* Effect.fail(
+          new BoundaryError({
+            boundary: "daemon",
+            message: "daemon lifecycle state changed while stopping",
+            retryable: true,
+          }),
+        );
+      }
+      if (yield* isAlive(currentPid)) {
+        return yield* Effect.fail(
+          new BoundaryError({
+            boundary: "daemon",
+            message: "daemon is still starting",
+            retryable: true,
+          }),
+        );
+      }
+      yield* cleanStaleStateIfOwned(paths, pid);
       yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);
       return;
     }
@@ -464,7 +553,7 @@ const stopDaemon = (
       Effect.either,
     );
     if (shutdown._tag === "Left" || shutdown.right.error !== undefined) {
-      yield* cleanStaleState(paths);
+      yield* cleanStaleStateIfOwned(paths, pid);
       yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);
       return;
     }
@@ -480,7 +569,7 @@ const stopDaemon = (
     ) {
       yield* processService.terminateProcess(pid, true).pipe(Effect.ignore);
     }
-    yield* cleanStaleState(paths);
+    yield* cleanStaleStateIfOwned(paths, pid);
     yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);
   });
 
