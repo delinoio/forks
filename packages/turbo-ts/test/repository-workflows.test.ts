@@ -1313,7 +1313,7 @@ describe("repository workflow gate", () => {
     }
   }, 15_000);
 
-  it("preserves live daemon state when shutdown RPC fails", async () => {
+  it("preserves live daemon state when lifecycle RPCs fail", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-failure-"));
     try {
       await prepareFixture(directory);
@@ -1325,16 +1325,39 @@ describe("repository workflow gate", () => {
             const processService = yield* ProcessService;
             const pidCreated = yield* Deferred.make<void>();
             let shutdownFailure: "response" | "transport" | undefined;
+            let statusFailure: "response" | "transport" | undefined;
+            let pidPath: string | undefined;
+            let socketPath: string | undefined;
             let terminationAttempts = 0;
-            const transportFailure = new BoundaryError({
+            const shutdownTransportFailure = new BoundaryError({
               boundary: "daemon",
               message: "synthetic shutdown transport failure",
+              retryable: true,
+            });
+            const statusTransportFailure = new BoundaryError({
+              boundary: "daemon",
+              message: "synthetic status transport failure",
               retryable: true,
             });
             const overrides = Layer.mergeAll(
               Layer.succeed(DaemonService, {
                 ...daemon,
+                serve: (endpoint) => {
+                  socketPath = endpoint;
+                  return daemon.serve(endpoint);
+                },
                 request: (endpoint, request, timeoutMilliseconds) => {
+                  if (
+                    request.method === DaemonMethod.status &&
+                    statusFailure !== undefined
+                  ) {
+                    return statusFailure === "transport"
+                      ? Effect.fail(statusTransportFailure)
+                      : Effect.succeed({
+                          id: request.id,
+                          error: "synthetic status response failure",
+                        });
+                  }
                   if (
                     request.method !== DaemonMethod.shutdown ||
                     shutdownFailure === undefined
@@ -1346,7 +1369,7 @@ describe("repository workflow gate", () => {
                     );
                   }
                   return shutdownFailure === "transport"
-                    ? Effect.fail(transportFailure)
+                    ? Effect.fail(shutdownTransportFailure)
                     : Effect.succeed({
                         id: request.id,
                         error: "synthetic shutdown response failure",
@@ -1356,17 +1379,17 @@ describe("repository workflow gate", () => {
               Layer.succeed(FileSystemService, {
                 ...fileSystem,
                 createExclusiveFile: (path, contents) =>
-                  fileSystem
-                    .createExclusiveFile(path, contents)
-                    .pipe(
-                      Effect.tap((created) =>
-                        created && path.endsWith("turbod.pid")
-                          ? Deferred.succeed(pidCreated, undefined).pipe(
-                              Effect.ignore,
-                            )
-                          : Effect.void,
-                      ),
-                    ),
+                  fileSystem.createExclusiveFile(path, contents).pipe(
+                    Effect.tap((created) => {
+                      if (!created || !path.endsWith("turbod.pid")) {
+                        return Effect.void;
+                      }
+                      pidPath = path;
+                      return Deferred.succeed(pidCreated, undefined).pipe(
+                        Effect.ignore,
+                      );
+                    }),
+                  ),
               }),
               Layer.succeed(ProcessService, {
                 ...processService,
@@ -1376,7 +1399,7 @@ describe("repository workflow gate", () => {
                   }),
               }),
             );
-            const runDaemon = (command: "serve" | "status" | "stop") =>
+            const runDaemon = (command: "logs" | "serve" | "status" | "stop") =>
               executeDaemon({
                 command,
                 cwd: directory,
@@ -1402,6 +1425,33 @@ describe("repository workflow gate", () => {
               expect(terminationAttempts).toBe(0);
             }
             shutdownFailure = undefined;
+            for (const command of ["status", "logs"] as const) {
+              for (const [failure, message] of [
+                ["transport", "synthetic status transport failure"],
+                [
+                  "response",
+                  "daemon status failed: synthetic status response failure",
+                ],
+              ] as const) {
+                statusFailure = failure;
+                const result = yield* runDaemon(command).pipe(Effect.either);
+                expect(result).toMatchObject({
+                  _tag: "Left",
+                  left: { boundary: "daemon", message },
+                });
+                expect(pidPath).toBeDefined();
+                expect(socketPath).toBeDefined();
+                expect(yield* fileSystem.exists(pidPath!)).toBe(true);
+                expect(yield* fileSystem.exists(socketPath!)).toBe(true);
+                expect(
+                  yield* fileSystem.exists(
+                    join(dirname(pidPath!), "turbod.log-path"),
+                  ),
+                ).toBe(true);
+                statusFailure = undefined;
+                expect(yield* runDaemon("status")).toBe(0);
+              }
+            }
             expect(yield* runDaemon("stop")).toBe(0);
             expect(yield* Fiber.join(serveFiber)).toBe(0);
           }),
@@ -1693,7 +1743,11 @@ describe("repository workflow gate", () => {
       strictTaskEntrypointSelection: true,
     };
     configuration.tasks = {
-      alpha: { cache: false, inputs: ["alpha.txt", "generated"] },
+      alpha: {
+        cache: false,
+        inputs: ["alpha.txt", "generated", "dist/config.json"],
+        outputs: ["dist/**", "!dist/config.json"],
+      },
       beta: { cache: false, inputs: ["beta.txt"] },
     };
     await writeFile(
@@ -1757,6 +1811,52 @@ describe("repository workflow gate", () => {
           .length,
         stdout,
       ).toBe(1);
+
+      await mkdir(join(applicationDirectory, "dist"));
+      await writeFile(
+        join(applicationDirectory, "dist/config.json"),
+        "excluded output input\n",
+      );
+      await waitUntil(
+        () =>
+          (stdout.match(/synthetic-app:alpha: cache miss, executing/g) ?? [])
+            .length >= 3,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(
+        (stdout.match(/synthetic-app:beta: cache miss, executing/g) ?? [])
+          .length,
+        stdout,
+      ).toBe(1);
+
+      const alphaRuns = (
+        stdout.match(/synthetic-app:alpha: cache miss, executing/g) ?? []
+      ).length;
+      const betaRuns = (
+        stdout.match(/synthetic-app:beta: cache miss, executing/g) ?? []
+      ).length;
+      await Promise.all([
+        writeFile(join(applicationDirectory, "alpha.txt"), "alpha change\n"),
+        writeFile(join(applicationDirectory, "beta.txt"), "beta change\n"),
+      ]);
+      await waitUntil(
+        () =>
+          (stdout.match(/synthetic-app:alpha: cache miss, executing/g) ?? [])
+            .length > alphaRuns &&
+          (stdout.match(/synthetic-app:beta: cache miss, executing/g) ?? [])
+            .length > betaRuns,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(
+        (stdout.match(/synthetic-app:alpha: cache miss, executing/g) ?? [])
+          .length,
+        stdout,
+      ).toBe(alphaRuns + 1);
+      expect(
+        (stdout.match(/synthetic-app:beta: cache miss, executing/g) ?? [])
+          .length,
+        stdout,
+      ).toBe(betaRuns + 1);
     } finally {
       child.kill();
       await Promise.race([
@@ -2806,6 +2906,15 @@ importers:
       ]);
     try {
       await prepareFixture(directory);
+      const rootConfigurationPath = join(directory, "turbo.json");
+      const rootConfiguration = JSON.parse(
+        await readFile(rootConfigurationPath, "utf8"),
+      ) as { tasks: Record<string, Record<string, unknown>> };
+      rootConfiguration.tasks.aggregate = {};
+      await writeFile(
+        rootConfigurationPath,
+        `${JSON.stringify(rootConfiguration, undefined, 2)}\n`,
+      );
       if (process.platform !== "win32") {
         await mkdir(join(directory, "real/linked"), { recursive: true });
         await writeFile(
@@ -2853,6 +2962,34 @@ importers:
           reference.stderr,
         );
       }
+      const commandlessAffected = await execFilePromise(process.execPath, [
+        candidate,
+        "query",
+        "affected",
+        "--tasks",
+        "aggregate",
+        "--base=HEAD~1",
+        "--head=HEAD",
+        "--cwd",
+        directory,
+      ]);
+      expect(JSON.parse(commandlessAffected.stdout)).toMatchObject({
+        data: {
+          affectedTasks: {
+            length: 2,
+            items: [
+              {
+                name: "aggregate",
+                fullName: "synthetic-app#aggregate",
+              },
+              {
+                name: "aggregate",
+                fullName: "synthetic-library#aggregate",
+              },
+            ],
+          },
+        },
+      });
       const rootManifestPath = join(directory, "package.json");
       const rootManifest = JSON.parse(
         await readFile(rootManifestPath, "utf8"),

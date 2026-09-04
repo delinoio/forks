@@ -250,6 +250,21 @@ const daemonRequest = (
     });
   });
 
+const daemonStatus = (paths: DaemonPaths) =>
+  daemonRequest(paths, DaemonMethod.status).pipe(
+    Effect.flatMap((response) =>
+      response.error === undefined
+        ? Effect.succeed(response)
+        : Effect.fail(
+            new BoundaryError({
+              boundary: "daemon",
+              message: `daemon status failed: ${response.error}`,
+              retryable: true,
+            }),
+          ),
+    ),
+  );
+
 const daemonHealthy = (
   paths: DaemonPaths,
 ): Effect.Effect<
@@ -874,16 +889,7 @@ export const executeDaemon = (
         );
         return 1;
       }
-      const status = yield* daemonRequest(paths, DaemonMethod.status).pipe(
-        Effect.either,
-      );
-      if (status._tag === "Left" || status.right.error !== undefined) {
-        yield* cleanStaleState(paths);
-        yield* terminal.writeStderr(
-          "x daemon is not running, run `turbo daemon start` to start it\n",
-        );
-        return 1;
-      }
+      yield* daemonStatus(paths);
       const logPath = (yield* readActiveLogPath(paths)) ?? paths.log;
       return yield* Effect.scoped(
         Effect.gen(function* () {
@@ -918,17 +924,8 @@ export const executeDaemon = (
       );
       return 1;
     }
-    const status = yield* daemonRequest(paths, DaemonMethod.status).pipe(
-      Effect.either,
-    );
-    if (status._tag === "Left" || status.right.error !== undefined) {
-      yield* cleanStaleState(paths);
-      yield* terminal.writeStderr(
-        "x daemon is not running, run `turbo daemon start` to start it\n",
-      );
-      return 1;
-    }
-    const result = status.right.result as {
+    const status = yield* daemonStatus(paths);
+    const result = status.result as {
       readonly logFile?: unknown;
       readonly uptimeMilliseconds?: unknown;
     };

@@ -1368,6 +1368,52 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
+  it("keeps restored cache hits when duration metadata is malformed", async () => {
+    const directory = await makeFixture();
+    try {
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+        "--json",
+      ];
+      const cold = await run(process.execPath, args, repositoryRoot);
+      expect(cold.exitCode, cold.stderr).toBe(0);
+      expect(cold.stdout).toContain("cache miss");
+
+      const cacheDirectory = join(directory, ".turbo/cache");
+      const metadataName = (await readdir(cacheDirectory)).find((name) =>
+        name.endsWith("-meta.json"),
+      );
+      expect(metadataName).toBeDefined();
+      await writeFile(join(cacheDirectory, metadataName!), '{"duration":');
+
+      const warm = await run(process.execPath, args, repositoryRoot);
+      expect(warm.exitCode, warm.stderr).toBe(0);
+      const summary = JSON.parse(warm.stdout.trim().split("\n").at(-1)!) as {
+        readonly tasks: ReadonlyArray<{
+          readonly cache: {
+            readonly status: string;
+            readonly timeSaved: number;
+          };
+        }>;
+      };
+      expect(summary.tasks).toHaveLength(1);
+      expect(summary.tasks[0]?.cache).toEqual({
+        local: true,
+        remote: false,
+        status: "HIT",
+        timeSaved: 0,
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("preserves cache hits when restored task logs cannot be replayed", async () => {
     const directory = await makeFixture();
     const executionPath = `${directory}/packages/library/.turbo/executions.txt`;

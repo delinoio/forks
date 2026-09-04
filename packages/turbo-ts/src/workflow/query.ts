@@ -299,6 +299,26 @@ const repositoryModels = (
   ),
 ];
 
+const repositoryTaskGraph = (
+  repository: RepositoryModel,
+  requestedTaskNames?: ReadonlyArray<string>,
+) => {
+  const models = repositoryModels(repository);
+  const taskNames =
+    requestedTaskNames ??
+    [
+      ...new Set(
+        models.flatMap((model) => [
+          ...Object.keys(model.scripts),
+          ...Object.keys(model.tasks).map((name) =>
+            name.slice(name.lastIndexOf("#") + 1),
+          ),
+        ]),
+      ),
+    ].sort();
+  return buildTaskGraph(repository, models, taskNames, false);
+};
+
 const calculateAffectedRepository = (
   repository: RepositoryModel,
   base: string,
@@ -687,17 +707,7 @@ const repositoryQueryRoot = (
       tasks: list<TaskView>([]),
     });
   }
-  const taskNames = [
-    ...new Set(
-      models.flatMap((model) => [
-        ...Object.keys(model.scripts),
-        ...Object.keys(model.tasks).map((name) =>
-          name.slice(name.lastIndexOf("#") + 1),
-        ),
-      ]),
-    ),
-  ].sort();
-  const taskGraph = buildTaskGraph(repository, models, taskNames, false);
+  const taskGraph = repositoryTaskGraph(repository);
   const taskDependents = new Map<string, Array<string>>();
   for (const node of taskGraph.nodes.values()) {
     for (const dependency of node.dependencies) {
@@ -1296,11 +1306,14 @@ export const executeQueryAffected = (
             : "DependencyChanged",
         },
       }));
-    const taskReason = (packageModel: RepositoryPackage, name: string) => {
+    const taskReason = (
+      packageModel: RepositoryPackage,
+      name: string,
+      dependsOn: ReadonlyArray<string>,
+    ) => {
       if (directlyAffected.has(packageModel.identity)) {
         return { __typename: "TaskFileChanged" };
       }
-      const dependsOn = packageModel.tasks[name]?.dependsOn ?? [];
       const changedDependency = packageModel.internalDependencies.some(
         (dependency) => directlyAffected.has(dependency),
       );
@@ -1311,18 +1324,43 @@ export const executeQueryAffected = (
             : "TaskAllChanged",
       };
     };
-    const taskItems = [...affected.values()]
-      .flatMap((packageModel) =>
-        Object.keys(packageModel.scripts)
-          .filter((name) => requested.size === 0 || requested.has(name))
-          .map((name) => ({
-            name,
-            fullName: `${packageModel.name}#${name}`,
-            package: { name: packageModel.name },
-            reason: taskReason(packageModel, name),
-          })),
-      )
-      .sort((left, right) => left.fullName.localeCompare(right.fullName));
+    const taskItem = (
+      packageModel: RepositoryPackage,
+      name: string,
+      dependsOn: ReadonlyArray<string>,
+    ) => ({
+      name,
+      fullName: `${packageModel.name}#${name}`,
+      package: { name: packageModel.name },
+      reason: taskReason(packageModel, name, dependsOn),
+    });
+    const taskItems = (
+      options.packages
+        ? []
+        : requested.size === 0
+          ? [...affected.values()].flatMap((packageModel) =>
+              Object.keys(packageModel.scripts).map((name) =>
+                taskItem(
+                  packageModel,
+                  name,
+                  packageModel.tasks[name]?.dependsOn ?? [],
+                ),
+              ),
+            )
+          : [...repositoryTaskGraph(repository, [...requested]).nodes.values()]
+              .filter(
+                (node) =>
+                  affected.has(node.package.identity) &&
+                  requested.has(node.task),
+              )
+              .map((node) =>
+                taskItem(
+                  node.package,
+                  node.task,
+                  node.definition.dependsOn ?? [],
+                ),
+              )
+    ).sort((left, right) => left.fullName.localeCompare(right.fullName));
     const items = options.packages ? packageItems : taskItems;
     const key = options.packages ? "affectedPackages" : "affectedTasks";
     yield* terminal.writeStdout(

@@ -261,6 +261,8 @@ failures warn without changing a successful task outcome, and a local failure
 does not suppress a configured remote upload. Local and remote cache restoration
 is limited to 256 MiB compressed and 1 GiB after decompression; preflight and
 upload response bodies have an independent 64 KiB limit.
+Missing or malformed local cache duration metadata reports zero saved time
+without invalidating an otherwise successful restoration.
 Restored task logs replay through scoped, bounded text chunks with terminal
 backpressure instead of loading the complete log into another string. A task-log
 replay I/O failure warns without changing the successful cache-hit outcome.
@@ -483,17 +485,19 @@ validation until their dependency graph and output-hash semantics are
 implemented; they are never treated as ordinary local globs.
 
 Gate 3 adds repository workflows with automated ledger evidence. `watch`
-debounces filesystem storms and uses switching Effect streams so a later file
-event interrupts an in-flight run before recovery. Watchers, child processes,
-fibers, signals, and task resources remain scope-owned. Watch mode reads cache
+debounces filesystem storms, retains every distinct changed path in each
+settled debounce batch, and uses switching Effect streams so a later batch
+interrupts an in-flight run before recovery. Watchers, child processes, fibers,
+signals, and task resources remain scope-owned. Watch mode reads cache
 by default and enables cache publication only with
 `--experimental-write-cache`; supplied write-capable cache policies are reduced
 to their read-only capabilities until that flag is present. Repository and
-nested Git-ignore rules and every configured task-output pattern suppress
-generated-file triggers. Ignore and output filtering occurs before manifest or
-configuration refresh classification, so generated manifests cannot cause a
-watch loop. Changes to an ignore file reload the matcher and remain
-user-visible triggers, while root, custom, and workspace Turbo
+nested Git-ignore rules and configured task-output patterns suppress generated
+files except where an output exclusion denies the changed file. Partial output
+matching is limited to directory events. Ignore and output filtering occurs
+before manifest or configuration refresh classification, so generated
+manifests cannot cause a watch loop. Changes to an ignore file reload the
+matcher and remain user-visible triggers, while root, custom, and workspace Turbo
 configuration changes and active JavaScript, Cargo, or uv workspace manifest
 changes refresh package discovery and output patterns before the next run.
 Internal-directory exclusions are matched relative to the watched repository,
@@ -501,7 +505,7 @@ so reserved names in ancestor directories do not suppress repository events.
 Run arguments after `--` remain task pass-through arguments, including text
 equal to the watch-only cache-publication flag.
 When `futureFlags.watchUsingTaskInputs` is enabled, file-triggered runs retain
-only requested task entrypoints whose effective inputs match the changed path,
+only requested task entrypoints whose effective inputs match the changed paths,
 plus their dependency and `with` closure. Root configuration and `.gitignore`
 changes retain the all-task fallback. Watcher entry types distinguish regular
 file renames from directories when applying directory-only ignore rules.
@@ -519,8 +523,11 @@ empty acknowledgments. Start-lock ownership is
 preserved across overlapping starts, stale locks are validated before removal,
 and a Hello response carrying an error is not healthy. Start, stop, restart,
 status, logs, and clean are race-safe; `info` reports the live daemon state.
-Status failures clean stale PID and socket state even when the recorded PID has
-been reused by an unrelated live process.
+Failed health checks clean stale PID and socket state even when the recorded
+PID has been reused by an unrelated live process.
+After a successful health handshake, a subsequent status transport or response
+failure preserves the live daemon's PID, socket, and active-log state and is
+reported to the caller for both status and logs commands.
 Log clients follow the exact dated log reported by the running daemon until
 interrupted. Stop escalates only after a successful RPC identifies the process
 as the expected daemon; reused live PIDs without a healthy daemon RPC are
@@ -540,9 +547,11 @@ package and task collections, affected collections, variables, schema
 introspection, and a loopback GraphQL server. Task relationship collections
 come from the resolved task graph. GraphQL affected collections calculate the
 requested base/head range, include dependent packages, and apply package and
-task filters. Boundary diagnostics evaluate root, package, and tag dependency
-and dependent permissions against manifest and configured implicit package
-dependencies. Package-graph
+task filters. The `query affected --tasks` shortcut uses the same resolved task
+graph for explicitly requested names, including configured commandless tasks,
+while its unfiltered form retains script-backed task enumeration. Boundary
+diagnostics evaluate root, package, and tag dependency and dependent permissions
+against manifest and configured implicit package dependencies. Package-graph
 center selection retains the named package and its
 direct dependencies, package predicates narrow the returned nodes, and graph
 edges retain the selected nodes' dependency context. Graph filtering uses

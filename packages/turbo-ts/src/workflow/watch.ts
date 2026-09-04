@@ -74,6 +74,7 @@ export const parseWatchArguments = (
 const configuredOutputPath = (
   repository: RepositoryModel,
   path: string,
+  entryKind: "directory" | "file" | "symlink" | "other" | undefined,
 ): boolean =>
   [repository.rootPackage, ...repository.packages].some((packageModel) => {
     if (!isPathContained(packageModel.directory, path)) return false;
@@ -82,13 +83,25 @@ const configuredOutputPath = (
       const outputs = task.outputs ?? [];
       return (
         matchesGlobsWithExclusions([relative], outputs) ||
-        outputs.some(
-          (output) =>
-            !output.startsWith("!") && canMatchGlobDescendant(relative, output),
-        )
+        (entryKind === "directory" &&
+          outputs.some(
+            (output) =>
+              !output.startsWith("!") &&
+              canMatchGlobDescendant(relative, output),
+          ))
       );
     });
   });
+
+interface PendingWatchChange {
+  readonly sequence: number;
+  readonly path: string;
+}
+
+interface PendingWatchChanges {
+  readonly nextSequence: number;
+  readonly changes: ReadonlyArray<PendingWatchChange>;
+}
 
 const isGitIgnorePath = (path: string): boolean =>
   normalizePath(path).split("/").at(-1) === ".gitignore";
@@ -130,6 +143,10 @@ export const executeWatch = (
     const ignoreMatcher = yield* Ref.make<GitIgnoreMatcher>(
       yield* loadGitIgnoreMatcher(repository.root),
     );
+    const pendingChanges = yield* Ref.make<PendingWatchChanges>({
+      nextSequence: 0,
+      changes: [],
+    });
     const changes = watcher.watch(repository.root).pipe(
       Stream.filterEffect((change) =>
         Effect.gen(function* () {
@@ -141,7 +158,14 @@ export const executeWatch = (
             change.path,
             change.entryKind === "directory",
           );
-          if (ignored || configuredOutputPath(currentRepository, change.path)) {
+          if (
+            ignored ||
+            configuredOutputPath(
+              currentRepository,
+              change.path,
+              change.entryKind,
+            )
+          ) {
             return false;
           }
           if (isGitIgnorePath(change.path)) {
@@ -173,24 +197,53 @@ export const executeWatch = (
           return true;
         }),
       ),
+      Stream.mapEffect((change) =>
+        Ref.modify(pendingChanges, (pending) => {
+          const sequence = pending.nextSequence;
+          return [
+            sequence,
+            {
+              nextSequence: sequence + 1,
+              changes: [...pending.changes, { sequence, path: change.path }],
+            },
+          ] as const;
+        }),
+      ),
       Stream.debounce("100 millis"),
-      Stream.map((change) => change.path),
+      Stream.mapEffect((sequence) =>
+        Ref.modify(pendingChanges, (pending) => {
+          const included = pending.changes.filter(
+            (change) => change.sequence <= sequence,
+          );
+          return [
+            [...new Set(included.map((change) => change.path))],
+            {
+              ...pending,
+              changes: pending.changes.filter(
+                (change) => change.sequence > sequence,
+              ),
+            },
+          ] as const;
+        }),
+      ),
     );
     const triggers = Stream.concat(
-      Stream.succeed<string | undefined>(undefined),
+      Stream.succeed<ReadonlyArray<string>>([]),
       changes,
     );
     yield* triggers.pipe(
       Stream.flatMap(
-        (path) =>
+        (paths) =>
           Stream.fromEffect(
             Effect.gen(function* () {
-              if (path !== undefined) {
-                yield* terminal.writeStdout(`\n• change detected: ${path}\n`);
+              if (paths.length > 0) {
+                yield* terminal.writeStdout(
+                  `\n• change detected: ${paths.join(", ")}\n`,
+                );
               }
               return yield* executeRun(
                 options.run,
-                path === undefined ? {} : { changedPaths: [path] },
+                paths.length === 0 ? {} : { changedPaths: paths },
               ).pipe(
                 Effect.catchAll((cause) =>
                   terminal

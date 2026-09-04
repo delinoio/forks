@@ -34,6 +34,24 @@ const effectFromExit = <A, E>(exit: Exit.Exit<A, E>): Effect.Effect<A, E> =>
     ? Effect.succeed(exit.value)
     : Effect.failCause(exit.cause);
 
+const parseCacheDuration = (contents: string): number => {
+  try {
+    const parsed: unknown = JSON.parse(contents);
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      !("duration" in parsed) ||
+      typeof parsed.duration !== "number" ||
+      !Number.isFinite(parsed.duration)
+    ) {
+      return 0;
+    }
+    return Math.max(0, parsed.duration);
+  } catch {
+    return 0;
+  }
+};
+
 const cachePaths = (directory: string, hash: string) => ({
   archive: joinPath(directory, `${hash}.tar.zst`),
   manifest: joinPath(directory, `${hash}-manifest.json`),
@@ -300,19 +318,7 @@ export const restoreLocalCache = (
           return yield* Effect.fail(outcome.left);
         }
         const duration = yield* fileSystem.readText(paths.metadata).pipe(
-          Effect.map((contents) => {
-            const parsed: unknown = JSON.parse(contents);
-            if (
-              typeof parsed !== "object" ||
-              parsed === null ||
-              !("duration" in parsed) ||
-              typeof parsed.duration !== "number" ||
-              !Number.isFinite(parsed.duration)
-            ) {
-              return 0;
-            }
-            return Math.max(0, parsed.duration);
-          }),
+          Effect.map(parseCacheDuration),
           Effect.catchAll(() => Effect.succeed(0)),
         );
         yield* Effect.sync(() => onHit?.(duration));
