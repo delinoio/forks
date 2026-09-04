@@ -139,7 +139,7 @@ export const executeWatch = (
           const currentRepository = yield* Ref.get(repositoryRef);
           const ignored = (yield* Ref.get(ignoreMatcher)).ignores(
             change.path,
-            change.kind !== "modify",
+            change.entryKind === "directory",
           );
           if (ignored || configuredOutputPath(currentRepository, change.path)) {
             return false;
@@ -188,7 +188,10 @@ export const executeWatch = (
               if (path !== undefined) {
                 yield* terminal.writeStdout(`\n• change detected: ${path}\n`);
               }
-              return yield* executeRun(options.run).pipe(
+              return yield* executeRun(
+                options.run,
+                path === undefined ? {} : { changedPaths: [path] },
+              ).pipe(
                 Effect.catchAll((cause) =>
                   terminal
                     .writeStderr(

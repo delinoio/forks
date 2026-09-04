@@ -500,6 +500,11 @@ Internal-directory exclusions are matched relative to the watched repository,
 so reserved names in ancestor directories do not suppress repository events.
 Run arguments after `--` remain task pass-through arguments, including text
 equal to the watch-only cache-publication flag.
+When `futureFlags.watchUsingTaskInputs` is enabled, file-triggered runs retain
+only requested task entrypoints whose effective inputs match the changed path,
+plus their dependency and `with` closure. Root configuration and `.gitignore`
+changes retain the all-task fallback. Watcher entry types distinguish regular
+file renames from directories when applying directory-only ignore rules.
 
 The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
 identity, per-user temporary state directory, atomic PID and start lock files,
@@ -584,6 +589,14 @@ nested Git-ignore files unless disabled; ordinary pnpm pruning retains
 development dependency closure. Production npm, pnpm, Yarn, and text Bun
 pruning removes development dependency edges and their package closure,
 including development-marked trees in legacy npm v1 lockfiles.
+Production pruning also removes `devDependencies` from selected JavaScript
+workspace manifests in the ordinary or Docker full tree. Docker JSON subsets
+contain manifests only for selected JavaScript packages; selected Cargo and uv
+package manifests remain in the full tree. When
+`futureFlags.pruneIncludesGlobalFiles` is enabled, ordered
+`globalDependencies` or `global.inputs` globs copy their safe, non-ignored
+matches into the ordinary output or Docker full tree before generated controls
+and manifests are rewritten.
 
 Run workflows support text and JSON dry-runs; DOT, Mermaid, JSON, and HTML task
 graphs; JSON run summaries and live newline-delimited structured log files;

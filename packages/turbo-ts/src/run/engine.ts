@@ -616,6 +616,10 @@ interface AffectedPackages {
   readonly rootChanged: boolean;
 }
 
+interface RunExecutionContext {
+  readonly changedPaths?: ReadonlyArray<string>;
+}
+
 const packageRelativeChangedFile = (
   packageModel: RepositoryPackage,
   repositoryRelativeFile: string,
@@ -647,6 +651,60 @@ const parseGitRange = (selector: string): GitRange => {
     });
   }
   return { source: selector, base, head };
+};
+
+const affectedPackagesFromChangedFiles = (
+  repository: RepositoryModel,
+  changedFiles: ReadonlyArray<string>,
+  globalInputsAreTaskAware: boolean,
+  windowsPathSeparators: boolean,
+): AffectedPackages => {
+  const globalDependencyPatterns =
+    repository.rootConfiguration.value.futureFlags?.globalConfiguration === true
+      ? globalInputsAreTaskAware
+        ? []
+        : (repository.rootConfiguration.value.global?.inputs ?? [])
+      : (repository.rootConfiguration.value.globalDependencies ?? []);
+  const globalDependencyChanged =
+    selectByGlobs(changedFiles, globalDependencyPatterns, windowsPathSeparators)
+      .length > 0;
+  const ordinaryRootChanged = changedFiles.some(
+    (path) =>
+      !repository.packages.some(
+        (packageModel) =>
+          packageModel.relativeDirectory !== "." &&
+          packageRelativeChangedFile(packageModel, path) !== undefined,
+      ),
+  );
+  const rootConfigurationChanged = changedFiles.includes(
+    relativePath(repository.root, repository.rootConfiguration.path),
+  );
+  const gitIgnoreChanged = changedFiles.some(
+    (path) => path === ".gitignore" || path.endsWith("/.gitignore"),
+  );
+  const rootChanged =
+    globalDependencyChanged ||
+    rootConfigurationChanged ||
+    gitIgnoreChanged ||
+    (!globalInputsAreTaskAware && ordinaryRootChanged);
+  return {
+    packages: rootChanged
+      ? new Set(
+          repository.packages.map((packageModel) => packageModel.identity),
+        )
+      : new Set(
+          repository.packages
+            .filter((packageModel) =>
+              changedFiles.some(
+                (path) =>
+                  packageRelativeChangedFile(packageModel, path) !== undefined,
+              ),
+            )
+            .map((packageModel) => packageModel.identity),
+        ),
+    changedFiles,
+    rootChanged,
+  };
 };
 
 const gitRangeSelector = (rawFilter: string): string | undefined => {
@@ -753,57 +811,12 @@ const findAffectedPackages = (
             cause instanceof RepositoryError ? cause.message : String(cause),
         }),
     });
-    const globalDependencyPatterns =
-      repository.rootConfiguration.value.futureFlags?.globalConfiguration ===
-      true
-        ? globalInputsAreTaskAware
-          ? []
-          : (repository.rootConfiguration.value.global?.inputs ?? [])
-        : (repository.rootConfiguration.value.globalDependencies ?? []);
-    const globalDependencyChanged =
-      selectByGlobs(
-        changedFiles,
-        globalDependencyPatterns,
-        windowsPathSeparators,
-      ).length > 0;
-    const ordinaryRootChanged = changedFiles.some(
-      (path) =>
-        !repository.packages.some(
-          (packageModel) =>
-            packageModel.relativeDirectory !== "." &&
-            packageRelativeChangedFile(packageModel, path) !== undefined,
-        ),
-    );
-    const rootConfigurationChanged = changedFiles.includes(
-      relativePath(repository.root, repository.rootConfiguration.path),
-    );
-    const gitIgnoreChanged = changedFiles.some(
-      (path) => path === ".gitignore" || path.endsWith("/.gitignore"),
-    );
-    const rootChanged =
-      globalDependencyChanged ||
-      rootConfigurationChanged ||
-      gitIgnoreChanged ||
-      (!globalInputsAreTaskAware && ordinaryRootChanged);
-    return {
-      packages: rootChanged
-        ? new Set(
-            repository.packages.map((packageModel) => packageModel.identity),
-          )
-        : new Set(
-            repository.packages
-              .filter((packageModel) =>
-                changedFiles.some(
-                  (path) =>
-                    packageRelativeChangedFile(packageModel, path) !==
-                    undefined,
-                ),
-              )
-              .map((packageModel) => packageModel.identity),
-          ),
+    return affectedPackagesFromChangedFiles(
+      repository,
       changedFiles,
-      rootChanged,
-    };
+      globalInputsAreTaskAware,
+      windowsPathSeparators,
+    );
   });
 
 const defaultAffectedSelector = "$TURBO_DEFAULT_AFFECTED$";
@@ -3090,6 +3103,7 @@ const canonicalContainmentPath = (
 
 export const executeRun = (
   parsed: ParsedRunOptions,
+  context: RunExecutionContext = {},
 ): Effect.Effect<number, unknown, RunRequirements> =>
   Effect.gen(function* () {
     const environmentService = yield* EnvironmentService;
@@ -3259,6 +3273,17 @@ export const executeRun = (
       platform === "win32",
     );
     const flags = repository.rootConfiguration.value.futureFlags;
+    const watchChanges =
+      flags?.watchUsingTaskInputs === true && context.changedPaths !== undefined
+        ? affectedPackagesFromChangedFiles(
+            repository,
+            context.changedPaths.map((path) =>
+              relativePath(repository.root, path),
+            ),
+            true,
+            platform === "win32",
+          )
+        : undefined;
     const useTaskInputs =
       (options.affected && flags?.affectedUsingTaskInputs === true) ||
       (affected.hasGitRangeFilter && flags?.filterUsingTasks === true);
@@ -3339,7 +3364,7 @@ export const executeRun = (
       options.only,
       flags?.strictTaskEntrypointSelection === true,
     );
-    const selectedGraph = useTaskInputs
+    const affectedGraph = useTaskInputs
       ? selectAffectedTasks(
           repository,
           unfilteredGraph,
@@ -3352,6 +3377,24 @@ export const executeRun = (
           platform === "win32",
         )
       : unfilteredGraph;
+    const selectedGraph =
+      watchChanges === undefined
+        ? affectedGraph
+        : retainTaskEntrypoints(
+            affectedGraph,
+            affectedTaskEntrypoints(
+              repository,
+              affectedGraph,
+              watchChanges.changedFiles,
+              watchChanges.rootChanged,
+              "",
+              undefined,
+              environment,
+              options.environmentMode,
+              options.frameworkInference,
+              platform === "win32",
+            ),
+          );
     const cargoWorkspacePlan = planCargoWorkspaceTasks(
       repository,
       selectedGraph,

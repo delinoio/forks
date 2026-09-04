@@ -215,6 +215,7 @@ export class PackageManagerService extends Context.Tag(
 export interface FileChange {
   readonly path: string;
   readonly kind: "create" | "modify" | "remove" | "rename" | "unknown";
+  readonly entryKind?: FileMetadata["kind"];
 }
 
 export interface FileWatcherOperations {

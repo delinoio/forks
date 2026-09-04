@@ -43,7 +43,11 @@ import {
   resolveRunUiMode,
 } from "../src/run/engine.js";
 import { parseRunArguments } from "../src/run/options.js";
-import { executeDaemon, parseDaemonArguments } from "../src/workflow/daemon.js";
+import {
+  executeDaemon,
+  parseDaemonArguments,
+  watcherPathsMatch,
+} from "../src/workflow/daemon.js";
 import { isWindowsSubsystemForLinux } from "../src/workflow/misc.js";
 import { executePrune, parsePruneArguments } from "../src/workflow/prune.js";
 import { repositoryQuerySchema } from "../src/workflow/query.js";
@@ -328,6 +332,13 @@ describe("repository workflow gate", () => {
     expect(isWindowsSubsystemForLinux("linux", "4.4.0-19041-Microsoft")).toBe(
       true,
     );
+    expect(
+      watcherPathsMatch(
+        "C:\\repo\\.turbo\\daemon\\turbo.log",
+        "C:/repo/.turbo/daemon/turbo.log",
+        true,
+      ),
+    ).toBe(true);
     expect(isWindowsSubsystemForLinux("linux", "6.8.0-generic")).toBe(false);
     expect(isWindowsSubsystemForLinux("win32", "10.0.26100-Microsoft")).toBe(
       false,
@@ -1670,6 +1681,96 @@ describe("repository workflow gate", () => {
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
   }, 40_000);
 
+  it("uses task inputs and file entry types for watch changes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-inputs-"));
+    await prepareFixture(directory);
+    const configurationPath = join(directory, "turbo.json");
+    const configuration = JSON.parse(
+      await readFile(configurationPath, "utf8"),
+    ) as Record<string, unknown>;
+    configuration.futureFlags = {
+      watchUsingTaskInputs: true,
+      strictTaskEntrypointSelection: true,
+    };
+    configuration.tasks = {
+      alpha: { cache: false, inputs: ["alpha.txt", "generated"] },
+      beta: { cache: false, inputs: ["beta.txt"] },
+    };
+    await writeFile(
+      configurationPath,
+      `${JSON.stringify(configuration, undefined, 2)}\n`,
+    );
+    const applicationDirectory = join(directory, "packages/app");
+    const applicationManifestPath = join(applicationDirectory, "package.json");
+    const applicationManifest = JSON.parse(
+      await readFile(applicationManifestPath, "utf8"),
+    ) as { scripts: Record<string, string> };
+    applicationManifest.scripts.alpha = "node -e \"console.log('alpha run')\"";
+    applicationManifest.scripts.beta = "node -e \"console.log('beta run')\"";
+    await writeFile(
+      applicationManifestPath,
+      `${JSON.stringify(applicationManifest, undefined, 2)}\n`,
+    );
+    const ignoredSource = join(applicationDirectory, "ignored-source");
+    await mkdir(ignoredSource);
+    await writeFile(join(ignoredSource, "input.txt"), "input\n");
+    await writeFile(
+      join(applicationDirectory, ".gitignore"),
+      "ignored-source/\ngenerated/\n",
+    );
+    const child = spawn(
+      process.execPath,
+      [
+        candidate,
+        "watch",
+        "alpha",
+        "beta",
+        "--filter=synthetic-app",
+        "--cwd",
+        directory,
+        "--no-cache",
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    const closed = new Promise<void>((resolve) => child.once("close", resolve));
+    try {
+      await waitUntil(
+        () => stdout.includes("alpha run") && stdout.includes("beta run"),
+      );
+      await rename(
+        join(ignoredSource, "input.txt"),
+        join(applicationDirectory, "generated"),
+      );
+      await waitUntil(
+        () =>
+          (stdout.match(/synthetic-app:alpha: cache miss, executing/g) ?? [])
+            .length >= 2,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(
+        (stdout.match(/synthetic-app:beta: cache miss, executing/g) ?? [])
+          .length,
+        stdout,
+      ).toBe(1);
+    } finally {
+      child.kill();
+      await Promise.race([
+        closed,
+        new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await closed;
+      }
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("recovers a watch task after a failed run", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-recovery-"));
     await prepareFixture(directory);
@@ -2088,6 +2189,80 @@ snapshots:
           "utf8",
         ),
       ).not.toContain("packages/development-only");
+      expect(
+        JSON.parse(
+          await readFile(
+            join(directory, "production-result/packages/app/package.json"),
+            "utf8",
+          ),
+        ),
+      ).not.toHaveProperty("devDependencies");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("copies opted-in global dependency files into prune source trees", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-global-"));
+    try {
+      await prepareFixture(directory);
+      const configurationPath = join(directory, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.globalDependencies = [
+        "tooling/*.json",
+        "!tooling/excluded.json",
+      ];
+      configuration.futureFlags = { pruneIncludesGlobalFiles: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      await mkdir(join(directory, "tooling"));
+      await writeFile(join(directory, "tooling/included.json"), "{}\n");
+      await writeFile(join(directory, "tooling/excluded.json"), "{}\n");
+      await writeFile(join(directory, "tooling/ignored.json"), "{}\n");
+      await writeFile(join(directory, ".gitignore"), "tooling/ignored.json\n");
+      await executeDifferentialCommand(process.execPath, [
+        candidate,
+        "--cwd",
+        directory,
+        "prune",
+        "synthetic-app",
+        "--out-dir=result",
+      ]);
+      expect(
+        await readFile(join(directory, "result/tooling/included.json"), "utf8"),
+      ).toBe("{}\n");
+      for (const name of ["excluded.json", "ignored.json"]) {
+        expect(
+          await readFile(join(directory, "result/tooling", name), "utf8").catch(
+            () => undefined,
+          ),
+        ).toBeUndefined();
+      }
+      await executeDifferentialCommand(process.execPath, [
+        candidate,
+        "--cwd",
+        directory,
+        "prune",
+        "synthetic-app",
+        "--docker",
+        "--out-dir=docker-result",
+      ]);
+      expect(
+        await readFile(
+          join(directory, "docker-result/full/tooling/included.json"),
+          "utf8",
+        ),
+      ).toBe("{}\n");
+      expect(
+        await readFile(
+          join(directory, "docker-result/json/tooling/included.json"),
+          "utf8",
+        ).catch(() => undefined),
+      ).toBeUndefined();
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2325,6 +2500,7 @@ importers:
       const runPrune = (
         scopes: ReadonlyArray<string>,
         outputDirectory: string,
+        docker = false,
       ) =>
         Effect.runPromise(
           Effect.gen(function* () {
@@ -2333,7 +2509,7 @@ importers:
               scopes,
               cwd: directory,
               outputDirectory,
-              docker: false,
+              docker,
               production: false,
               useGitignore: false,
             }).pipe(
@@ -2403,6 +2579,28 @@ importers:
       ]) {
         expect(await readFile(join(plainOutput, path), "utf8")).not.toBe("");
       }
+      const dockerOutput = join(directory, "docker-result");
+      expect(await runPrune([packageName], dockerOutput, true)).toBe(0);
+      for (const path of [
+        "rust/polyglot/Cargo.toml",
+        "rust/leaf/Cargo.toml",
+        "python/polyglot/pyproject.toml",
+      ]) {
+        expect(
+          await readFile(join(dockerOutput, "full", path), "utf8"),
+        ).not.toBe("");
+        expect(
+          await readFile(join(dockerOutput, "json", path), "utf8").catch(
+            () => undefined,
+          ),
+        ).toBeUndefined();
+      }
+      expect(
+        await readFile(
+          join(dockerOutput, "json/packages/polyglot/package.json"),
+          "utf8",
+        ),
+      ).toContain(packageName);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

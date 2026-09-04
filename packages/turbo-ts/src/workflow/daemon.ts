@@ -286,6 +286,14 @@ const staleStartLockMilliseconds = 30_000;
 const daemonStartupAttempts = 100;
 const daemonStartupPollMilliseconds = 50;
 
+export const watcherPathsMatch = (
+  left: string,
+  right: string,
+  windowsPathSeparators?: boolean,
+): boolean =>
+  normalizePath(left, windowsPathSeparators) ===
+  normalizePath(right, windowsPathSeparators);
+
 const acquireStartLock = (
   paths: DaemonPaths,
 ): Effect.Effect<string, BoundaryError, ClockService | FileSystemService> =>
@@ -884,7 +892,7 @@ export const executeDaemon = (
             .pipe(Effect.orElseSucceed(() => ""));
           yield* terminal.writeStdout(contents);
           const follow = watcher.watch(parentPath(logPath)).pipe(
-            Stream.filter((change) => change.path === logPath),
+            Stream.filter((change) => watcherPathsMatch(change.path, logPath)),
             Stream.mapEffect(() =>
               fileSystem.readText(logPath).pipe(Effect.orElseSucceed(() => "")),
             ),

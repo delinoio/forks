@@ -1,6 +1,7 @@
 import { Effect } from "effect";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { parseJsonConfiguration } from "../config/runtime.js";
+import { canMatchGlobDescendant, selectByGlobs } from "../core/glob.js";
 import {
   baseName,
   isAbsolutePath,
@@ -22,9 +23,10 @@ import {
   loadGitIgnoreMatcher,
 } from "../repository/git-ignore.js";
 import { pruneLockfile } from "../repository/lockfiles.js";
-import type {
-  RepositoryModel,
-  RepositoryPackage,
+import {
+  listRepositoryFiles,
+  type RepositoryModel,
+  type RepositoryPackage,
 } from "../repository/model.js";
 import { loadWorkflowRepository } from "./repository.js";
 
@@ -331,6 +333,51 @@ const copyIfPresent = (
     );
   });
 
+const copyGlobalDependencyFiles = (
+  repository: RepositoryModel,
+  destinationRoot: string,
+  excludedRoot: string,
+  ignoreMatcher?: GitIgnoreMatcher,
+): Effect.Effect<void, unknown, FileSystemService> =>
+  Effect.gen(function* () {
+    if (
+      repository.rootConfiguration.value.futureFlags
+        ?.pruneIncludesGlobalFiles !== true
+    ) {
+      return;
+    }
+    const patterns =
+      repository.rootConfiguration.value.futureFlags?.globalConfiguration ===
+      true
+        ? (repository.rootConfiguration.value.global?.inputs ?? [])
+        : (repository.rootConfiguration.value.globalDependencies ?? []);
+    const positivePatterns = patterns.filter(
+      (pattern) => !pattern.startsWith("!"),
+    );
+    if (positivePatterns.length === 0) return;
+    const paths = yield* listRepositoryFiles(repository.root, {
+      shouldTraverseDirectory: (relativeDirectory) =>
+        positivePatterns.some((pattern) =>
+          canMatchGlobDescendant(relativeDirectory, pattern),
+        ),
+    });
+    const selected = selectByGlobs(
+      paths.map((path) => relativePath(repository.root, path)),
+      patterns,
+    );
+    for (const relative of selected) {
+      const source = joinPath(repository.root, relative);
+      if (ignoreMatcher?.ignores(source)) continue;
+      yield* copyIfPresent(
+        source,
+        joinPath(destinationRoot, relative),
+        repository.root,
+        excludedRoot,
+        destinationRoot,
+      );
+    }
+  });
+
 const writeManifest = (
   source: string,
   destination: string,
@@ -474,6 +521,12 @@ export const executePrune = (
     yield* terminal.writeStdout(
       `Generating pruned monorepo for ${options.scopes.join(", ")} in ${outputRoot}\n`,
     );
+    yield* copyGlobalDependencyFiles(
+      repository,
+      fullRoot,
+      canonicalOutputRoot,
+      ignoreMatcher,
+    );
     const rootFiles = [
       ".gitignore",
       ".npmrc",
@@ -582,14 +635,27 @@ export const executePrune = (
         selectedPackageRoots,
         ignoreMatcher,
       );
+      yield* terminal.writeStdout(` - Added ${packageModel.name}\n`);
+    }
+    for (const packageModel of packages) {
+      if (packageModel.manager === "cargo" || packageModel.manager === "uv") {
+        continue;
+      }
+      const sourceManifest = joinPath(packageModel.directory, "package.json");
+      if (options.production) {
+        yield* writeManifest(
+          sourceManifest,
+          joinPath(fullRoot, packageModel.relativeDirectory, "package.json"),
+          true,
+        );
+      }
       if (options.docker) {
         yield* writeManifest(
-          joinPath(packageModel.directory, "package.json"),
+          sourceManifest,
           joinPath(jsonRoot, packageModel.relativeDirectory, "package.json"),
           options.production,
         );
       }
-      yield* terminal.writeStdout(` - Added ${packageModel.name}\n`);
     }
     const lockfileContents = yield* fileSystem.readBytes(repository.lockfile);
     const prunedLockfile = pruneLockfile(

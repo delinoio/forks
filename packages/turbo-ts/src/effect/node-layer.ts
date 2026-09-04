@@ -1587,6 +1587,7 @@ const fileWatcherLayer = Layer.succeed(FileWatcherService, {
       {
         readonly path: string;
         readonly kind: "modify" | "rename" | "remove" | "unknown";
+        readonly entryKind?: "directory" | "file" | "symlink" | "other";
       },
       BoundaryError
     >(
@@ -1608,7 +1609,12 @@ const fileWatcherLayer = Layer.succeed(FileWatcherService, {
                     return;
                   }
                   lstat(path).then(
-                    () => emit.single({ path, kind: "rename" }),
+                    (metadata) =>
+                      emit.single({
+                        path,
+                        kind: "rename",
+                        entryKind: metadataKind(metadata),
+                      }),
                     (cause) =>
                       isMissingFileError(cause)
                         ? emit.single({ path, kind: "remove" })
