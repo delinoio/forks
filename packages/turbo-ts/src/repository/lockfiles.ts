@@ -287,6 +287,11 @@ const dependencyVersion = (value: unknown): string | undefined => {
   return typeof object?.version === "string" ? object.version : undefined;
 };
 
+const dependencySpecifier = (value: unknown): string | undefined => {
+  const object = objectValue(value);
+  return typeof object?.specifier === "string" ? object.specifier : undefined;
+};
+
 interface PnpmDependencyKeys {
   readonly packageKey?: string;
   readonly snapshotKey?: string;
@@ -307,6 +312,7 @@ const packageKeysForDependency = (
   snapshots: Readonly<Record<string, unknown>>,
   name: string,
   rawVersion: string,
+  specifier: string | undefined,
 ): PnpmDependencyKeys => {
   if (
     rawVersion.startsWith("link:") ||
@@ -315,9 +321,15 @@ const packageKeysForDependency = (
   ) {
     return {};
   }
-  const alias = /^npm:((?:@[^/]+\/)?[^@]+)@(.+)$/.exec(rawVersion);
-  const targetName = alias?.[1] ?? name;
-  const targetVersion = alias?.[2] ?? rawVersion;
+  const aliasPattern = /^npm:((?:@[^/]+\/)?[^@]+)@(.+)$/;
+  const specifierAlias =
+    specifier === undefined ? null : aliasPattern.exec(specifier);
+  const versionAlias = aliasPattern.exec(rawVersion);
+  const targetName = specifierAlias?.[1] ?? versionAlias?.[1] ?? name;
+  const resolvedVersion = versionAlias?.[2] ?? rawVersion;
+  const targetVersion = resolvedVersion.startsWith(`${targetName}@`)
+    ? resolvedVersion.slice(targetName.length + 1)
+    : resolvedVersion;
   const peerQualifier = targetVersion.indexOf("(");
   const baseVersion =
     peerQualifier === -1
@@ -336,7 +348,7 @@ const packageKeysForDependency = (
 const dependencyEntries = (
   value: unknown,
   includeDevelopmentDependencies: boolean,
-): ReadonlyArray<readonly [string, string]> => {
+): ReadonlyArray<readonly [string, string, string | undefined]> => {
   const object = objectValue(value);
   if (object === undefined) return [];
   return [
@@ -349,7 +361,9 @@ const dependencyEntries = (
     if (dependencies === undefined) return [];
     return Object.entries(dependencies).flatMap(([name, descriptor]) => {
       const version = dependencyVersion(descriptor);
-      return version === undefined ? [] : [[name, version] as const];
+      return version === undefined
+        ? []
+        : [[name, version, dependencySpecifier(descriptor)] as const];
     });
   });
 };
@@ -381,8 +395,17 @@ const prunePnpmLockfile = (
   const retainedSnapshots = new Set<string>();
   const pending: Array<PnpmDependencyKeys> = [];
   const enqueueDependencies = (value: unknown): void => {
-    for (const [name, version] of dependencyEntries(value, !production)) {
-      const keys = packageKeysForDependency(packages, snapshots, name, version);
+    for (const [name, version, specifier] of dependencyEntries(
+      value,
+      !production,
+    )) {
+      const keys = packageKeysForDependency(
+        packages,
+        snapshots,
+        name,
+        version,
+        specifier,
+      );
       if (
         (keys.packageKey !== undefined &&
           !retainedPackages.has(keys.packageKey)) ||

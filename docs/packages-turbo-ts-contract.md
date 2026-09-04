@@ -197,7 +197,8 @@ Repository discovery records the resolved root lockfile path. Gate 3 validates
 all modeled lockfile formats before prune, rewrites pnpm importer/package/
 snapshot closure and npm workspace package indexes, and preserves validated
 formats that do not expose a safely rewritable public workspace index. pnpm
-aliases retain their target package identity, peer-qualified snapshots retain
+aliases derive their target identity from importer specifiers and
+target-qualified resolutions, peer-qualified snapshots retain
 both the base package and qualified snapshot, and npm pruning retains only the
 selected workspace dependency closure and its valid workspace links. Without
 Git, explicit task
@@ -498,8 +499,10 @@ identity, per-user temporary state directory, atomic PID and start lock files,
 official `turbodprotocol.Turbod` gRPC service over HTTP/2. Hello, status, and
 shutdown calls interoperate in both directions with the 2.10.12 executable;
 package and watch calls share the same bounded framing and scoped sessions.
-Package discovery and output-change registration/query calls return their
-protocol data rather than empty acknowledgments. Start-lock ownership is
+Package discovery reloads the repository model for each request so workspace
+additions, removals, and renames are visible without a daemon restart.
+Output-change registration/query calls return their protocol data rather than
+empty acknowledgments. Start-lock ownership is
 preserved across overlapping starts, stale locks are validated before removal,
 and a Hello response carrying an error is not healthy. Start, stop, restart,
 status, logs, and clean are race-safe; `info` reports the live daemon state.
@@ -518,7 +521,9 @@ package and task collections, affected collections, variables, schema
 introspection, and a loopback GraphQL server. Task relationship collections
 come from the resolved task graph. GraphQL affected collections calculate the
 requested base/head range, include dependent packages, and apply package and
-task filters. Package-graph center selection retains the named package and its
+task filters. Boundary diagnostics evaluate root, package, and tag dependency
+and dependent permissions against the resolved package graph. Package-graph
+center selection retains the named package and its
 direct dependencies, package predicates narrow the returned nodes, and graph
 edges retain the selected nodes' dependency context. `query affected`, `query
 ls`, and `ls` share repository discovery and stable ordering. The server limits
@@ -533,8 +538,10 @@ enforce repository containment
 after resolving symlinks. The startup message describes the static page as a
 GraphQL endpoint rather than an IDE.
 
-`prune` selects the transitive internal package closure, emits ordinary and
-Docker layouts, creates reduced lockfiles with reference-compatible canonical
+`prune` selects the transitive internal package closure of both requested
+packages and workspace dependencies retained by the copied root manifest,
+emits ordinary and Docker layouts, creates reduced lockfiles with
+reference-compatible canonical
 configuration formatting, supports production manifests, and
 rejects output roots that could contain the source repository. It never
 follows workspace symlinks into a prune output. Output safety and traversal

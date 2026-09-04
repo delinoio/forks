@@ -2,7 +2,10 @@ import { Effect } from "effect";
 import { satisfies } from "semver";
 import { parse as parseToml } from "smol-toml";
 import { parse as parseYaml } from "yaml";
-import type { LoadedRootConfiguration } from "../config/runtime.js";
+import type {
+  LoadedPackageConfiguration,
+  LoadedRootConfiguration,
+} from "../config/runtime.js";
 import { loadPackageConfiguration, mergePipeline } from "../config/runtime.js";
 import { canMatchGlobDescendant, selectByGlobs } from "../core/glob.js";
 import {
@@ -16,7 +19,7 @@ import {
 } from "../core/path.js";
 import { RepositoryError } from "../effect/errors.js";
 import { FileSystemService, ProcessService } from "../effect/services.js";
-import type { Pipeline } from "../generated/configuration.js";
+import type { BoundariesConfig, Pipeline } from "../generated/configuration.js";
 
 export const packageManagerNames = [
   "npm",
@@ -74,6 +77,9 @@ export interface RepositoryPackage {
   readonly cargoCompilerIdentity?: string;
   readonly cargoHostTarget?: string;
   readonly workspaceDirectory?: string;
+  readonly configurationPath?: string;
+  readonly tags?: ReadonlyArray<string> | null;
+  readonly boundaries?: BoundariesConfig | null;
   readonly manager: PackageManagerName;
   readonly scripts: Readonly<Record<string, string>>;
   readonly dependencyNames: ReadonlyArray<string>;
@@ -2173,6 +2179,9 @@ export const discoverRepository = (
               ? {}
               : { cacheControlInputPaths }),
             manager: managerIdentity.name,
+            configurationPath: packageConfiguration.path,
+            tags: packageConfiguration.tags,
+            boundaries: packageConfiguration.boundaries,
             scripts: manifest.scripts ?? {},
             cargoDependencies:
               [] satisfies ReadonlyArray<CargoDependencyMetadata>,
@@ -2430,7 +2439,7 @@ export const discoverRepository = (
             };
             const configuredBuildTarget =
               yield* cargoBuildTargetConfigured(directory);
-            const packageConfiguration =
+            const packageConfiguration: LoadedPackageConfiguration =
               directory === root
                 ? {
                     excludedTasks: new Set<string>(),
@@ -2476,6 +2485,9 @@ export const discoverRepository = (
                     cargoHostTarget: compilerIdentity.hostTarget,
                   }),
               workspaceDirectory: metadata.workspaceDirectory,
+              configurationPath: packageConfiguration.path,
+              tags: packageConfiguration.tags,
+              boundaries: packageConfiguration.boundaries,
               manager: "cargo" as const,
               scripts: polyglotScripts("cargo", metadata.entrypointNames),
               cargoDependencies: metadata.dependencies,
@@ -2539,7 +2551,7 @@ export const discoverRepository = (
           if (metadata.name === undefined) {
             return undefined;
           }
-          const packageConfiguration =
+          const packageConfiguration: LoadedPackageConfiguration =
             directory === root
               ? {
                   excludedTasks: new Set<string>(),
@@ -2567,6 +2579,9 @@ export const discoverRepository = (
             cachePathRestorable: yield* cachePathIsRestorable(root, directory),
             cacheInputsComplete: metadata.cacheInputsComplete,
             workspaceDirectory: root,
+            configurationPath: packageConfiguration.path,
+            tags: packageConfiguration.tags,
+            boundaries: packageConfiguration.boundaries,
             manager: "uv" as const,
             scripts: polyglotScripts("uv", []),
             cargoDependencies:

@@ -6,6 +6,7 @@ import {
   readdir,
   readFile,
   readlink,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -633,6 +634,98 @@ describe("repository workflow gate", () => {
     }
   }, 20_000);
 
+  it("evaluates package and tag boundary rules in repository queries", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-boundaries-"));
+    const queryBoundaries = async () => {
+      const result = await executeDifferentialCommand(process.execPath, [
+        candidate,
+        "query",
+        "{ boundaries { errors warnings } }",
+        "--cwd",
+        directory,
+      ]);
+      return JSON.parse(result.stdout) as {
+        readonly data: {
+          readonly boundaries: {
+            readonly errors: ReadonlyArray<Record<string, unknown>>;
+            readonly warnings: ReadonlyArray<Record<string, unknown>>;
+          };
+        };
+      };
+    };
+    try {
+      await prepareFixture(directory);
+      await writeFile(
+        join(directory, "turbo.json"),
+        JSON.stringify({
+          boundaries: {
+            tags: {
+              app: { dependencies: { deny: ["library"] } },
+            },
+          },
+          tasks: {},
+        }),
+      );
+      await writeFile(
+        join(directory, "packages/app/turbo.json"),
+        JSON.stringify({ extends: ["//"], tags: ["app"], tasks: {} }),
+      );
+      await writeFile(
+        join(directory, "packages/library/turbo.json"),
+        JSON.stringify({
+          extends: ["//"],
+          tags: ["library"],
+          boundaries: { dependents: { allow: ["service"] } },
+          tasks: {},
+        }),
+      );
+      expect((await queryBoundaries()).data.boundaries).toEqual({
+        errors: [
+          {
+            message:
+              "Package `synthetic-app` found without any tag listed in allowlist for `synthetic-library`",
+            reason: null,
+            path: "packages/app/turbo.json",
+            import: "synthetic-app",
+          },
+          {
+            message:
+              "Package `synthetic-library` found with tag listed in denylist for `synthetic-app`: `library`",
+            reason: "library",
+            path: "packages/library/turbo.json",
+            import: "synthetic-library",
+          },
+        ],
+        warnings: [],
+      });
+
+      await writeFile(
+        join(directory, "turbo.json"),
+        JSON.stringify({ tasks: {} }),
+      );
+      await writeFile(
+        join(directory, "packages/app/turbo.json"),
+        JSON.stringify({
+          extends: ["//"],
+          tags: ["app", "service"],
+          boundaries: { dependencies: { deny: ["library"] } },
+          tasks: {},
+        }),
+      );
+      expect((await queryBoundaries()).data.boundaries.errors).toEqual([
+        {
+          message:
+            "Package `synthetic-library` found with tag listed in denylist for `synthetic-app`: `library`",
+          reason: "library",
+          path: "packages/library/turbo.json",
+          import: "synthetic-library",
+        },
+      ]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
   it(evidenceId.repositoryProtocol, async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-"));
     const runCandidate = (...arguments_: ReadonlyArray<string>) =>
@@ -667,6 +760,37 @@ describe("repository workflow gate", () => {
       );
       expect(discovered.toString("utf8")).toContain("synthetic-app");
       expect(discovered.toString("utf8")).toContain("synthetic-library");
+      const addedDirectory = join(directory, "packages/added");
+      const renamedDirectory = join(directory, "packages/renamed");
+      await mkdir(addedDirectory, { recursive: true });
+      await writeFile(
+        join(addedDirectory, "package.json"),
+        JSON.stringify({ name: "synthetic-added", private: true }),
+      );
+      const added = await sendDaemonRequest(
+        officialState.sock_file,
+        "DiscoverPackages",
+      );
+      expect(added.toString("utf8")).toContain("synthetic-added");
+      expect(added.toString("utf8")).toContain("packages/added");
+      await rename(addedDirectory, renamedDirectory);
+      await writeFile(
+        join(renamedDirectory, "package.json"),
+        JSON.stringify({ name: "synthetic-renamed", private: true }),
+      );
+      const renamed = await sendDaemonRequest(
+        officialState.sock_file,
+        "DiscoverPackages",
+      );
+      expect(renamed.toString("utf8")).not.toContain("synthetic-added");
+      expect(renamed.toString("utf8")).toContain("synthetic-renamed");
+      expect(renamed.toString("utf8")).toContain("packages/renamed");
+      await rm(renamedDirectory, { force: true, recursive: true });
+      const removed = await sendDaemonRequest(
+        officialState.sock_file,
+        "DiscoverPackages",
+      );
+      expect(removed.toString("utf8")).not.toContain("synthetic-renamed");
       await sendDaemonRequest(
         officialState.sock_file,
         "NotifyOutputsWritten",
@@ -1302,6 +1426,90 @@ snapshots:
     }
   }, 30_000);
 
+  it("includes root workspace dependencies in the prune closure", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-root-"));
+    const output = join(directory, "result");
+    try {
+      await prepareFixture(directory);
+      const rootManifest = JSON.parse(
+        await readFile(join(directory, "package.json"), "utf8"),
+      ) as Record<string, unknown>;
+      rootManifest.dependencies = { "synthetic-root-only": "workspace:*" };
+      await writeFile(
+        join(directory, "package.json"),
+        `${JSON.stringify(rootManifest, undefined, 2)}\n`,
+      );
+      for (const [path, manifest] of [
+        [
+          "root-only",
+          {
+            name: "synthetic-root-only",
+            private: true,
+            dependencies: { "synthetic-root-leaf": "workspace:*" },
+          },
+        ],
+        ["root-leaf", { name: "synthetic-root-leaf", private: true }],
+        ["unused", { name: "synthetic-unused", private: true }],
+      ] as const) {
+        await mkdir(join(directory, `packages/${path}`), { recursive: true });
+        await writeFile(
+          join(directory, `packages/${path}/package.json`),
+          `${JSON.stringify(manifest, undefined, 2)}\n`,
+        );
+      }
+      await writeFile(
+        join(directory, "pnpm-lock.yaml"),
+        `lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      synthetic-root-only:
+        specifier: workspace:*
+        version: link:packages/root-only
+  packages/app:
+    dependencies:
+      synthetic-library:
+        specifier: workspace:*
+        version: link:../library
+  packages/library: {}
+  packages/root-only:
+    dependencies:
+      synthetic-root-leaf:
+        specifier: workspace:*
+        version: link:../root-leaf
+  packages/root-leaf: {}
+  packages/unused: {}
+`,
+      );
+      await executeDifferentialCommand(process.execPath, [
+        candidate,
+        "--cwd",
+        directory,
+        "prune",
+        "synthetic-app",
+        "--out-dir=result",
+      ]);
+      expect(
+        await readFile(join(output, "packages/root-only/package.json"), "utf8"),
+      ).toContain("synthetic-root-only");
+      expect(
+        await readFile(join(output, "packages/root-leaf/package.json"), "utf8"),
+      ).toContain("synthetic-root-leaf");
+      expect(
+        await readFile(
+          join(output, "packages/unused/package.json"),
+          "utf8",
+        ).catch(() => undefined),
+      ).toBeUndefined();
+      const lockfile = await readFile(join(output, "pnpm-lock.yaml"), "utf8");
+      expect(lockfile).toContain("packages/root-only:");
+      expect(lockfile).toContain("packages/root-leaf:");
+      expect(lockfile).not.toContain("packages/unused:");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("rejects unsafe prune output aliases and escaping package symlinks", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-safety-"));
     const outside = await mkdtemp(join(tmpdir(), "turbo-ts-prune-control-"));
@@ -1600,7 +1808,8 @@ importers:
   packages/app:
     dependencies:
       alias-name:
-        version: npm:actual-name@1.0.0
+        specifier: npm:actual-name@^1
+        version: actual-name@1.0.0
       peer-qualified:
         version: 2.0.0(peer-name@3.0.0)
 packages:

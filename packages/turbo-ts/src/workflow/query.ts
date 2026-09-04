@@ -10,6 +10,7 @@ import {
   isPathContained,
   joinPath,
   normalizePath,
+  relativePath,
 } from "../core/path.js";
 import { ConfigurationError } from "../effect/errors.js";
 import {
@@ -20,6 +21,10 @@ import {
   SignalService,
   TerminalService,
 } from "../effect/services.js";
+import type {
+  BoundariesConfig,
+  Permissions,
+} from "../generated/configuration.js";
 import { buildTaskGraph } from "../graph/task-graph.js";
 import { decodeNullDelimitedGitOutput } from "../hash/task-hash.js";
 import {
@@ -453,6 +458,124 @@ const packageMatchesPredicate = (
   );
 };
 
+interface BoundaryDiagnostic {
+  readonly message: string;
+  readonly reason: string | null;
+  readonly path: string;
+  readonly import: string;
+}
+
+const activePermissions = (
+  permissions: Permissions | null | undefined,
+): permissions is Permissions =>
+  permissions !== null && permissions !== undefined;
+
+const boundaryRuleDiagnostics = (
+  repository: RepositoryModel,
+  ruleOwner: RepositoryPackage,
+  subject: RepositoryPackage,
+  subjectTags: ReadonlyArray<string>,
+  permissions: Permissions,
+): ReadonlyArray<BoundaryDiagnostic> => {
+  const path = relativePath(
+    repository.root,
+    subject === repository.rootPackage
+      ? repository.rootConfiguration.path
+      : (subject.configurationPath ??
+          joinPath(subject.directory, "package.json")),
+  );
+  const deniedTags = subjectTags.filter((tag) =>
+    permissions.deny?.includes(tag),
+  );
+  if (deniedTags.length > 0) {
+    return deniedTags.map((tag) => ({
+      message: `Package \`${subject.name}\` found with tag listed in denylist for \`${ruleOwner.name}\`: \`${tag}\``,
+      reason: tag,
+      path,
+      import: subject.name,
+    }));
+  }
+  if (
+    permissions.allow !== null &&
+    permissions.allow !== undefined &&
+    !subjectTags.some((tag) => permissions.allow?.includes(tag))
+  ) {
+    return [
+      {
+        message: `Package \`${subject.name}\` found without any tag listed in allowlist for \`${ruleOwner.name}\``,
+        reason: null,
+        path,
+        import: subject.name,
+      },
+    ];
+  }
+  return [];
+};
+
+const boundaryDiagnostics = (
+  repository: RepositoryModel,
+): ReadonlyArray<BoundaryDiagnostic> => {
+  const models = [repository.rootPackage, ...repository.packages];
+  const byIdentity = new Map(models.map((model) => [model.identity, model]));
+  const rootBoundaries = repository.rootConfiguration.value.boundaries;
+  const diagnostics = new Map<string, BoundaryDiagnostic>();
+  const record = (entries: ReadonlyArray<BoundaryDiagnostic>): void => {
+    for (const entry of entries) {
+      diagnostics.set(
+        `${entry.path}\0${entry.import}\0${entry.message}`,
+        entry,
+      );
+    }
+  };
+  const configurationFor = (
+    model: RepositoryPackage,
+  ): BoundariesConfig | null | undefined =>
+    model === repository.rootPackage ? rootBoundaries : model.boundaries;
+  for (const source of models) {
+    const sourceTags = source.tags ?? [];
+    for (const dependencyIdentity of source.internalDependencies) {
+      const target = byIdentity.get(dependencyIdentity);
+      if (target === undefined) continue;
+      const targetTags = target.tags ?? [];
+      const dependencyRules = [
+        configurationFor(source)?.dependencies,
+        ...sourceTags.map((tag) => rootBoundaries?.tags?.[tag]?.dependencies),
+      ].filter(activePermissions);
+      for (const permissions of dependencyRules) {
+        record(
+          boundaryRuleDiagnostics(
+            repository,
+            source,
+            target,
+            targetTags,
+            permissions,
+          ),
+        );
+      }
+      const dependentRules = [
+        configurationFor(target)?.dependents,
+        ...targetTags.map((tag) => rootBoundaries?.tags?.[tag]?.dependents),
+      ].filter(activePermissions);
+      for (const permissions of dependentRules) {
+        record(
+          boundaryRuleDiagnostics(
+            repository,
+            target,
+            source,
+            sourceTags,
+            permissions,
+          ),
+        );
+      }
+    }
+  }
+  return [...diagnostics.values()].sort((left, right) =>
+    `${left.path}\0${left.import}\0${left.message}`.localeCompare(
+      `${right.path}\0${right.import}\0${right.message}`,
+    ),
+  );
+};
+
 const repositoryQueryRoot = (
   repository: RepositoryModel,
   readFile: (path: string) => Promise<string>,
@@ -741,7 +864,10 @@ const repositoryQueryRoot = (
         }),
       );
     },
-    boundaries: () => ({ errors: [], warnings: [] }),
+    boundaries: () => ({
+      errors: boundaryDiagnostics(repository),
+      warnings: [],
+    }),
     externalDependencies: () => list(externalDependencies),
     file: async ({ path }: { readonly path: string }) => {
       const normalized = normalizePath(path);

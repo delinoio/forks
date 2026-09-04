@@ -122,6 +122,10 @@ const selectedPackages = (
     }
     return packageModel;
   });
+  for (const dependency of repository.rootPackage.internalDependencies) {
+    const dependencyPackage = repository.packagesByIdentity.get(dependency);
+    if (dependencyPackage !== undefined) pending.push(dependencyPackage);
+  }
   while (pending.length > 0) {
     const packageModel = pending.pop()!;
     if (selected.has(packageModel.identity)) continue;

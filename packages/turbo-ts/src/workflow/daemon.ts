@@ -492,8 +492,10 @@ const serveDaemon = (
   unknown,
   | ClockService
   | DaemonService
+  | EnvironmentService
   | FileSystemService
   | FileWatcherService
+  | ProcessService
   | SystemService
 > =>
   Effect.scoped(
@@ -595,17 +597,22 @@ const serveDaemon = (
                   });
                 }
                 if (request.method === DaemonMethod.discoverPackages) {
-                  return Effect.succeed({
-                    packages: repository.packages
-                      .map((packageModel) => ({
-                        name: packageModel.name,
-                        path: packageModel.relativeDirectory,
-                      }))
-                      .sort((left, right) =>
-                        left.name.localeCompare(right.name),
-                      ),
-                    packageManager: repositoryPackageManagerLabel(repository),
-                  });
+                  return loadWorkflowRepository({
+                    cwd: repository.root,
+                  }).pipe(
+                    Effect.map((currentRepository) => ({
+                      packages: currentRepository.packages
+                        .map((packageModel) => ({
+                          name: packageModel.name,
+                          path: packageModel.relativeDirectory,
+                        }))
+                        .sort((left, right) =>
+                          left.name.localeCompare(right.name),
+                        ),
+                      packageManager:
+                        repositoryPackageManagerLabel(currentRepository),
+                    })),
+                  );
                 }
                 if (request.method === DaemonMethod.notifyOutputsWritten) {
                   const params = request.params as {
