@@ -9,9 +9,15 @@ import {
   isPathContained,
   joinPath,
   normalizePath,
+  parentPath,
   relativePath,
 } from "../core/path.js";
-import { FileWatcherService, TerminalService } from "../effect/services.js";
+import {
+  ConcurrencyService,
+  EnvironmentService,
+  FileWatcherService,
+  TerminalService,
+} from "../effect/services.js";
 import {
   type GitIgnoreMatcher,
   loadGitIgnoreMatcher,
@@ -21,6 +27,7 @@ import {
   executeRun,
   parseCacheSpecification,
   type RunRequirements,
+  resolveOptions,
 } from "../run/engine.js";
 import { type ParsedRunOptions, parseRunArguments } from "../run/options.js";
 import {
@@ -93,6 +100,80 @@ const configuredOutputPath = (
     });
   });
 
+const runOwnedPath = (
+  repository: RepositoryModel,
+  options: ParsedRunOptions,
+  path: string,
+  environment: Readonly<Record<string, string | undefined>>,
+  availableParallelism: number,
+  windowsPathSeparators: boolean,
+): boolean => {
+  const resolved = resolveOptions(
+    options,
+    repository.root,
+    environment,
+    repository.rootConfiguration,
+    availableParallelism,
+    windowsPathSeparators,
+  );
+  const ordinaryRun =
+    options.graph === undefined && options.dryRun === undefined;
+  const resolveArtifactPath = (requested: string | undefined) =>
+    requested === undefined || requested === ""
+      ? undefined
+      : normalizePath(
+          isAbsolutePath(requested, windowsPathSeparators)
+            ? requested
+            : joinPath(repository.root, requested),
+          windowsPathSeparators,
+        );
+  const exactPaths = [
+    options.graph === undefined || options.graph === ""
+      ? undefined
+      : resolveArtifactPath(options.graph),
+    ordinaryRun ? resolveArtifactPath(options.logFile) : undefined,
+    ordinaryRun ? resolveArtifactPath(options.profile) : undefined,
+    ordinaryRun ? resolveArtifactPath(options.anonymousProfile) : undefined,
+    ordinaryRun ? resolveArtifactPath(options.heap) : undefined,
+    ordinaryRun ? resolveArtifactPath(options.trace) : undefined,
+  ].filter((candidate): candidate is string => candidate !== undefined);
+  const normalizedPath = normalizePath(path, windowsPathSeparators);
+  if (
+    exactPaths.some(
+      (exactPath) =>
+        exactPath === normalizedPath ||
+        (normalizePath(parentPath(exactPath, windowsPathSeparators)) ===
+          normalizePath(parentPath(normalizedPath, windowsPathSeparators)) &&
+          baseName(normalizedPath, windowsPathSeparators).startsWith(
+            `${baseName(exactPath, windowsPathSeparators)}.`,
+          ) &&
+          baseName(normalizedPath, windowsPathSeparators).endsWith(".tmp")),
+    )
+  ) {
+    return true;
+  }
+  const writesDefaultProfile =
+    ordinaryRun &&
+    [options.profile, options.anonymousProfile, options.trace].includes("");
+  if (
+    writesDefaultProfile &&
+    normalizePath(parentPath(normalizedPath, windowsPathSeparators)) ===
+      normalizePath(repository.root, windowsPathSeparators) &&
+    baseName(normalizedPath, windowsPathSeparators).startsWith("profile.")
+  ) {
+    return true;
+  }
+  return (
+    ordinaryRun &&
+    resolved.cachePolicy.localWrite &&
+    isPathContained(
+      normalizePath(resolved.cacheDirectory, windowsPathSeparators),
+      normalizedPath,
+      windowsPathSeparators,
+    )
+  );
+};
+
 interface PendingWatchChange {
   readonly sequence: number;
   readonly path: string;
@@ -136,9 +217,16 @@ export const executeWatch = (
   Effect.gen(function* () {
     const watcher = yield* FileWatcherService;
     const terminal = yield* TerminalService;
+    const environmentService = yield* EnvironmentService;
+    const concurrencyService = yield* ConcurrencyService;
+    const environment = yield* environmentService.entries;
+    const platform = yield* environmentService.platform;
+    const availableParallelism = yield* concurrencyService.availableParallelism;
+    const windowsPathSeparators = platform === "win32";
     const repository = yield* loadWorkflowRepository({
       cwd: options.run.cwd,
       rootTurboJson: options.run.rootTurboJson,
+      singlePackage: options.run.singlePackage,
     });
     const repositoryRef = yield* Ref.make(repository);
     const ignoreMatcher = yield* Ref.make<GitIgnoreMatcher>(
@@ -148,6 +236,7 @@ export const executeWatch = (
       nextSequence: 0,
       changes: [],
     });
+    const activeRuns = yield* Ref.make(0);
     const changes = watcher.watch(repository.root).pipe(
       Stream.filterEffect((change) =>
         Effect.gen(function* () {
@@ -159,6 +248,7 @@ export const executeWatch = (
               loadWorkflowRepository({
                 cwd: options.run.cwd,
                 rootTurboJson: options.run.rootTurboJson,
+                singlePackage: options.run.singlePackage,
               }),
             );
             if (refreshed._tag === "Right") {
@@ -171,26 +261,36 @@ export const executeWatch = (
             return true;
           }
           const currentRepository = yield* Ref.get(repositoryRef);
-          const ignored = (yield* Ref.get(ignoreMatcher)).ignores(
+          const isRunOwnedPath = runOwnedPath(
+            currentRepository,
+            options.run,
             change.path,
-            change.entryKind === "directory",
+            environment,
+            availableParallelism,
+            windowsPathSeparators,
           );
-          if (
-            ignored ||
-            configuredOutputPath(
-              currentRepository,
-              change.path,
-              change.entryKind,
-            )
-          ) {
-            return false;
-          }
+          const isConfiguredOutputPath = configuredOutputPath(
+            currentRepository,
+            change.path,
+            change.entryKind,
+          );
           if (isGitIgnorePath(change.path)) {
             yield* Ref.set(
               ignoreMatcher,
               yield* loadGitIgnoreMatcher(repository.root),
             );
-            return true;
+            return (
+              !isRunOwnedPath &&
+              (!isConfiguredOutputPath || (yield* Ref.get(activeRuns)) === 0)
+            );
+          }
+          if (isRunOwnedPath) return false;
+          const ignored = (yield* Ref.get(ignoreMatcher)).ignores(
+            change.path,
+            change.entryKind === "directory",
+          );
+          if (ignored || isConfiguredOutputPath) {
+            return false;
           }
           if (
             isWorkspaceDiscoveryPath(repository.root, change.path) ||
@@ -204,6 +304,7 @@ export const executeWatch = (
               loadWorkflowRepository({
                 cwd: options.run.cwd,
                 rootTurboJson: options.run.rootTurboJson,
+                singlePackage: options.run.singlePackage,
               }),
             );
             if (refreshed._tag === "Right") {
@@ -275,19 +376,24 @@ export const executeWatch = (
                   `\n• change detected: ${paths.join(", ")}\n`,
                 );
               }
-              return yield* executeRun(
-                options.run,
-                paths.length === 0 || invalidateAll
-                  ? {}
-                  : { changedPaths: paths },
-              ).pipe(
-                Effect.catchAll((cause) =>
-                  terminal
-                    .writeStderr(
-                      `turbo-ts: watch run failed: ${String(cause)}\n`,
-                    )
-                    .pipe(Effect.as(1)),
-                ),
+              return yield* Effect.acquireUseRelease(
+                Ref.update(activeRuns, (count) => count + 1),
+                () =>
+                  executeRun(
+                    options.run,
+                    paths.length === 0 || invalidateAll
+                      ? {}
+                      : { changedPaths: paths },
+                  ).pipe(
+                    Effect.catchAll((cause) =>
+                      terminal
+                        .writeStderr(
+                          `turbo-ts: watch run failed: ${String(cause)}\n`,
+                        )
+                        .pipe(Effect.as(1)),
+                    ),
+                  ),
+                () => Ref.update(activeRuns, (count) => Math.max(0, count - 1)),
               );
             }),
           ),

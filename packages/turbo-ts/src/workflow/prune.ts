@@ -165,10 +165,12 @@ const copyTree = (
   excludedRoot: string,
   allowedSymlinkRoots: ReadonlyArray<string>,
   ignoreMatcher?: GitIgnoreMatcher,
+  excludedSourceRoots: ReadonlySet<string> = new Set(),
 ): Effect.Effect<void, unknown, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     if (isPathContained(excludedRoot, source)) return;
+    if (excludedSourceRoots.has(normalizePath(source))) return;
     const sourceMetadata = yield* fileSystem.metadata(source);
     if (sourceMetadata.kind !== "directory") {
       return yield* Effect.fail(
@@ -186,6 +188,7 @@ const copyTree = (
       }
       const sourcePath = joinPath(source, entry.name);
       const destinationPath = joinPath(destination, entry.name);
+      if (excludedSourceRoots.has(normalizePath(sourcePath))) continue;
       if (ignoreMatcher?.ignores(sourcePath, entry.kind === "directory")) {
         continue;
       }
@@ -196,6 +199,7 @@ const copyTree = (
           excludedRoot,
           allowedSymlinkRoots,
           ignoreMatcher,
+          excludedSourceRoots,
         );
       } else if (entry.kind === "file") {
         yield* fileSystem.copyFile(sourcePath, destinationPath);
@@ -499,6 +503,30 @@ export const executePrune = (
         }),
       );
     }
+    const protectedWorkspaceRoots = yield* Effect.forEach(
+      [
+        ...new Set(
+          packages.flatMap((packageModel) => [
+            packageModel.directory,
+            packageModel.workspaceDirectory ?? packageModel.directory,
+          ]),
+        ),
+      ],
+      canonicalOutputPath,
+    );
+    if (
+      protectedWorkspaceRoots.some((sourceRoot) =>
+        isPathContained(canonicalOutputRoot, sourceRoot),
+      )
+    ) {
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: outputRoot,
+          message:
+            "prune output must not contain a selected package or workspace control directory",
+        }),
+      );
+    }
     if (yield* fileSystem.exists(outputRoot)) {
       const outputMetadata = yield* fileSystem.metadata(outputRoot);
       if (outputMetadata.kind === "symlink") {
@@ -660,6 +688,24 @@ export const executePrune = (
     const selectedPackageRoots = packages.map(
       (packageModel) => packageModel.directory,
     );
+    const selectedCanonicalPackageRoots = new Set(
+      packages.map((packageModel) =>
+        normalizePath(
+          joinPath(repository.root, packageModel.canonicalRelativeDirectory),
+        ),
+      ),
+    );
+    const excludedPackageRoots = new Set(
+      repository.packages.flatMap((packageModel) => {
+        const logicalRoot = normalizePath(packageModel.directory);
+        const canonicalRoot = normalizePath(
+          joinPath(repository.root, packageModel.canonicalRelativeDirectory),
+        );
+        return selectedCanonicalPackageRoots.has(canonicalRoot)
+          ? []
+          : [logicalRoot, canonicalRoot];
+      }),
+    );
     for (const packageModel of packages) {
       yield* copyTree(
         packageModel.directory,
@@ -667,6 +713,7 @@ export const executePrune = (
         canonicalOutputRoot,
         selectedPackageRoots,
         ignoreMatcher,
+        excludedPackageRoots,
       );
       yield* terminal.writeStdout(` - Added ${packageModel.name}\n`);
     }

@@ -497,9 +497,15 @@ files except where an output exclusion denies the changed file. Partial output
 matching is limited to directory events. Ignore and output filtering occurs
 before manifest or configuration refresh classification, so generated
 manifests cannot cause a watch loop. Changes to an ignore file reload the
-matcher and remain user-visible triggers, while root, custom, and workspace Turbo
-configuration changes and active JavaScript, Cargo, or uv workspace manifest
-changes refresh package discovery and output patterns before the next run.
+matcher before stale ignore rules are applied and remain user-visible triggers.
+Declared-output ignore files written by an active run remain suppressed to
+prevent generated-output loops. Root, custom, and workspace Turbo configuration
+changes and active JavaScript, Cargo, or uv workspace manifest changes refresh
+package discovery and output patterns before the next run. Explicit graph,
+structured-log, profile, trace, and heap artifacts, default profile artifacts,
+and write-enabled local cache directories are treated as run-owned paths and
+never trigger another watch run. Watch-time discovery honors `--single-package`
+for both initial and refreshed repository models.
 Internal-directory exclusions are matched relative to the watched repository,
 so reserved names in ancestor directories do not suppress repository events.
 Windows-originated `.git`, `.turbo`, and `node_modules` components are matched
@@ -598,8 +604,11 @@ packages and workspace dependencies retained by the copied root manifest,
 emits ordinary and Docker layouts, creates reduced lockfiles with
 reference-compatible canonical
 configuration formatting, supports production manifests, and
-rejects output roots that could contain the source repository. Generated
-installation manifests and configuration files use readable `0644` modes. It
+rejects output roots that could contain the source repository, a selected
+package, or a selected Cargo or uv workspace-control directory. Selected
+package copies stop at nested workspace roots outside the selected closure.
+Generated installation manifests and configuration files use readable `0644`
+modes. It
 never follows workspace symlinks into a prune output. Output safety and traversal
 exclusions use canonical locations. Contained relative file symlinks are
 recreated without dereferencing; copied root controls include their contained

@@ -12,6 +12,7 @@ import {
   ClockService,
   DaemonMethod,
   type DaemonMethod as DaemonMethodType,
+  type DaemonResponse,
   DaemonService,
   DigestService,
   EnvironmentService,
@@ -424,6 +425,44 @@ const cleanStaleStateIfOwned = (
   Effect.gen(function* () {
     if ((yield* readPid(paths.pid)) !== expectedPid) return;
     yield* cleanStaleState(paths);
+  });
+
+const daemonStatusWhenReady = (
+  paths: DaemonPaths,
+): Effect.Effect<
+  | {
+      readonly response: DaemonResponse;
+      readonly logPath: string;
+    }
+  | undefined,
+  unknown,
+  ClockService | DaemonService | FileSystemService | ProcessService
+> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    yield* fileSystem.makeDirectory(paths.stateDirectory);
+    return yield* Effect.acquireUseRelease(
+      acquireDaemonOperationLock(paths),
+      () =>
+        Effect.gen(function* () {
+          const pid = yield* readPid(paths.pid);
+          if (pid === undefined || !(yield* isAlive(pid))) {
+            yield* cleanStaleStateIfOwned(paths, pid);
+            return undefined;
+          }
+          if (
+            !(yield* daemonHealthy(paths)) &&
+            !(yield* waitForDaemonHealthy(paths, pid))
+          ) {
+            yield* cleanStaleStateIfOwned(paths, pid);
+            return undefined;
+          }
+          const response = yield* daemonStatus(paths);
+          const logPath = (yield* readActiveLogPath(paths)) ?? paths.log;
+          return { response, logPath };
+        }),
+      (contents) => releaseStartLock(paths, contents),
+    );
   });
 
 const startDaemon = (
@@ -940,15 +979,14 @@ export const executeDaemon = (
     if (options.command === "logs") {
       const watcher = yield* FileWatcherService;
       const signals = yield* SignalService;
-      if (!(yield* daemonHealthy(paths))) {
-        yield* cleanStaleState(paths);
+      const state = yield* daemonStatusWhenReady(paths);
+      if (state === undefined) {
         yield* terminal.writeStderr(
           "x daemon is not running, run `turbo daemon start` to start it\n",
         );
         return 1;
       }
-      yield* daemonStatus(paths);
-      const logPath = (yield* readActiveLogPath(paths)) ?? paths.log;
+      const logPath = state.logPath;
       return yield* Effect.scoped(
         Effect.gen(function* () {
           let contents = yield* fileSystem
@@ -975,15 +1013,14 @@ export const executeDaemon = (
         }),
       );
     }
-    if (!(yield* daemonHealthy(paths))) {
-      yield* cleanStaleState(paths);
+    const state = yield* daemonStatusWhenReady(paths);
+    if (state === undefined) {
       yield* terminal.writeStderr(
         "x daemon is not running, run `turbo daemon start` to start it\n",
       );
       return 1;
     }
-    const status = yield* daemonStatus(paths);
-    const result = status.result as {
+    const result = state.response.result as {
       readonly logFile?: unknown;
       readonly uptimeMilliseconds?: unknown;
     };
@@ -991,7 +1028,7 @@ export const executeDaemon = (
       typeof result.uptimeMilliseconds === "number"
         ? result.uptimeMilliseconds
         : 0;
-    const logPath = (yield* readActiveLogPath(paths)) ?? paths.log;
+    const logPath = state.logPath;
     if (options.json) {
       yield* terminal.writeStdout(
         `${JSON.stringify(

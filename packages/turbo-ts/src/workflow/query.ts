@@ -1324,6 +1324,7 @@ export const executeQueryAffected = (
       packageModel: RepositoryPackage,
       name: string,
       dependsOn: ReadonlyArray<string>,
+      dependencyPackageIdentities?: ReadonlyArray<string>,
     ) => {
       if (directlyAffected.has(packageModel.identity)) {
         return { __typename: "TaskFileChanged" };
@@ -1331,23 +1332,38 @@ export const executeQueryAffected = (
       const changedDependency = packageModel.internalDependencies.some(
         (dependency) => affected.has(dependency),
       );
+      const changedDependencyTask =
+        dependencyPackageIdentities === undefined
+          ? changedDependency && dependsOn.includes(`^${name}`)
+          : dependencyPackageIdentities.some((identity) =>
+              affected.has(identity),
+            );
       return {
-        __typename:
-          changedDependency && dependsOn.includes(`^${name}`)
-            ? "TaskDependencyTaskChanged"
-            : "TaskAllChanged",
+        __typename: changedDependencyTask
+          ? "TaskDependencyTaskChanged"
+          : "TaskAllChanged",
       };
     };
     const taskItem = (
       packageModel: RepositoryPackage,
       name: string,
       dependsOn: ReadonlyArray<string>,
+      dependencyPackageIdentities?: ReadonlyArray<string>,
     ) => ({
       name,
       fullName: `${packageModel.name}#${name}`,
       package: { name: packageModel.name },
-      reason: taskReason(packageModel, name, dependsOn),
+      reason: taskReason(
+        packageModel,
+        name,
+        dependsOn,
+        dependencyPackageIdentities,
+      ),
     });
+    const requestedTaskGraph =
+      requested.size === 0
+        ? undefined
+        : repositoryTaskGraph(repository, [...requested]);
     const taskItems = (
       options.packages
         ? []
@@ -1361,7 +1377,7 @@ export const executeQueryAffected = (
                 ),
               ),
             )
-          : [...repositoryTaskGraph(repository, [...requested]).nodes.values()]
+          : [...requestedTaskGraph!.nodes.values()]
               .filter(
                 (node) =>
                   affected.has(node.package.identity) &&
@@ -1372,6 +1388,13 @@ export const executeQueryAffected = (
                   node.package,
                   node.task,
                   node.definition.dependsOn ?? [],
+                  node.dependencies.flatMap((dependency) => {
+                    const dependencyNode =
+                      requestedTaskGraph!.nodes.get(dependency);
+                    return dependencyNode === undefined
+                      ? []
+                      : [dependencyNode.package.identity];
+                  }),
                 ),
               )
     ).sort((left, right) => left.fullName.localeCompare(right.fullName));

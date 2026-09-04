@@ -21,6 +21,7 @@ import { discoverRepositoryRoot } from "../run/engine.js";
 export interface WorkflowRepositoryOptions {
   readonly cwd?: string;
   readonly rootTurboJson?: string;
+  readonly singlePackage?: boolean;
 }
 
 export const loadWorkflowRepository = (
@@ -89,7 +90,9 @@ export const loadWorkflowRepository = (
           ? options.rootTurboJson
           : joinPath(root, options.rootTurboJson),
     );
-    return yield* discoverRepository(root, configuration);
+    return yield* discoverRepository(root, configuration, {
+      singlePackage: options.singlePackage,
+    });
   });
 
 export const repositoryPackageManagerLabel = (

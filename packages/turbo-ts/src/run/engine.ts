@@ -3536,7 +3536,13 @@ export const executeRun = (
       orderedNodes[0] === undefined
         ? {}
         : hashes.get(orderedNodes[0].id)!.globalInputFileHashes;
-    const isMonorepo = !parsed.singlePackage && repository.packages.length > 0;
+    const isMonorepo =
+      !parsed.singlePackage &&
+      repository.packages.some(
+        (packageModel) =>
+          normalizePath(packageModel.directory, platform === "win32") !==
+          normalizePath(repository.root, platform === "win32"),
+      );
     if (parsed.graph !== undefined) {
       const edges = orderedNodes.flatMap((node) =>
         node.dependencies.length === 0

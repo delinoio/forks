@@ -956,6 +956,77 @@ describe("repository workflow gate", () => {
     }
   }, 30_000);
 
+  it("does not treat a root-scoped Cargo package as a child workspace", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-root-cargo-"));
+    try {
+      await writeFile(
+        join(directory, "package.json"),
+        `${JSON.stringify({
+          name: "synthetic-root-cargo",
+          private: true,
+          packageManager: "pnpm@10.34.5",
+        })}\n`,
+      );
+      await writeFile(
+        join(directory, "pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\nimporters:\n  .: {}\n",
+      );
+      await writeFile(
+        join(directory, "turbo.json"),
+        `${JSON.stringify({
+          futureFlags: { experimentalCargoWorkspaces: true },
+          tasks: { build: { cache: false } },
+        })}\n`,
+      );
+      await writeFile(
+        join(directory, "Cargo.toml"),
+        '[package]\nname = "synthetic-root-cargo"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(
+        join(directory, "Cargo.lock"),
+        'version = 4\n\n[[package]]\nname = "synthetic-root-cargo"\nversion = "0.1.0"\n',
+      );
+      await writeFile(
+        join(directory, "rust-toolchain.toml"),
+        '[toolchain]\nchannel = "nightly-2026-03-28"\nprofile = "minimal"\n',
+      );
+      await mkdir(join(directory, "src"));
+      await writeFile(
+        join(directory, "src/lib.rs"),
+        "pub fn value() -> u8 { 1 }\n",
+      );
+      const dryRun = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--dry=json",
+        "--cwd",
+        directory,
+      ]);
+      expect(
+        (JSON.parse(dryRun.stdout) as { readonly monorepo: boolean }).monorepo,
+      ).toBe(false);
+      const completedRun = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--no-cache",
+        "--json",
+        "--cwd",
+        directory,
+      ]);
+      expect(
+        (
+          JSON.parse(completedRun.stdout.trim().split("\n").at(-1)!) as {
+            readonly monorepo: boolean;
+          }
+        ).monorepo,
+      ).toBe(false);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("reports resolved dependency hashes and actual encoded task-log paths", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-summary-paths-"));
     try {
@@ -1748,6 +1819,121 @@ describe("repository workflow gate", () => {
     }
   }, 15_000);
 
+  it("preserves daemon state while status and logs wait for startup", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-ready-"));
+    try {
+      await prepareFixture(directory);
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const daemon = yield* DaemonService;
+            const fileSystem = yield* FileSystemService;
+            const processService = yield* ProcessService;
+            const terminal = yield* TerminalService;
+            const allowServe = yield* Deferred.make<void>();
+            const pidCreated = yield* Deferred.make<void>();
+            let pidPath: string | undefined;
+            let stdout = "";
+            let statusCompleted = false;
+            let logsCompleted = false;
+            const overrides = Layer.mergeAll(
+              Layer.succeed(DaemonService, {
+                ...daemon,
+                serve: (endpoint) =>
+                  Stream.fromEffect(Deferred.await(allowServe)).pipe(
+                    Stream.flatMap(() => daemon.serve(endpoint)),
+                  ),
+              }),
+              Layer.succeed(FileSystemService, {
+                ...fileSystem,
+                createExclusiveFile: (path, contents) =>
+                  fileSystem.createExclusiveFile(path, contents).pipe(
+                    Effect.tap((created) => {
+                      if (!created || !path.endsWith("turbod.pid")) {
+                        return Effect.void;
+                      }
+                      pidPath = path;
+                      return Deferred.succeed(pidCreated, undefined).pipe(
+                        Effect.ignore,
+                      );
+                    }),
+                  ),
+              }),
+              Layer.succeed(ProcessService, {
+                ...processService,
+                isProcessAlive: (pid) =>
+                  pid === process.pid
+                    ? Effect.succeed(true)
+                    : (processService.isProcessAlive?.(pid) ??
+                      Effect.succeed(false)),
+              }),
+              Layer.succeed(TerminalService, {
+                ...terminal,
+                writeStdout: (text) =>
+                  Effect.sync(() => {
+                    stdout += text;
+                  }),
+              }),
+            );
+            const runDaemon = (command: "logs" | "serve" | "status" | "stop") =>
+              executeDaemon({
+                command,
+                cwd: directory,
+                idleMilliseconds: 30_000,
+                json: command === "status",
+              }).pipe(Effect.provide(overrides));
+            const serveFiber = yield* Effect.forkScoped(runDaemon("serve"));
+            yield* Deferred.await(pidCreated);
+            const statusFiber = yield* Effect.forkScoped(
+              runDaemon("status").pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    statusCompleted = true;
+                  }),
+                ),
+              ),
+            );
+            const logsFiber = yield* Effect.forkScoped(
+              runDaemon("logs").pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    logsCompleted = true;
+                  }),
+                ),
+              ),
+            );
+            yield* Effect.sleep("100 millis");
+            expect(statusCompleted).toBe(false);
+            expect(logsCompleted).toBe(false);
+            expect(pidPath).toBeDefined();
+            expect(yield* fileSystem.exists(pidPath!)).toBe(true);
+            expect(
+              yield* fileSystem.exists(
+                join(dirname(pidPath!), "turbod.log-path"),
+              ),
+            ).toBe(true);
+            yield* Deferred.succeed(allowServe, undefined);
+            expect(yield* Fiber.join(statusFiber)).toBe(0);
+            for (
+              let attempt = 0;
+              attempt < 100 && !stdout.includes("daemon started");
+              attempt += 1
+            ) {
+              yield* Effect.sleep("10 millis");
+            }
+            expect(stdout).toContain("daemon started");
+            expect(logsCompleted).toBe(false);
+            yield* Fiber.interrupt(logsFiber);
+            expect(yield* runDaemon("stop")).toBe(0);
+            expect(yield* Fiber.join(serveFiber)).toBe(0);
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("preserves live daemon state when lifecycle RPCs fail", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-failure-"));
     try {
@@ -2233,6 +2419,172 @@ describe("repository workflow gate", () => {
     }
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
   }, 40_000);
+
+  it("uses single-package discovery when filtering watch changes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-single-"));
+    await prepareFixture(directory);
+    await mkdir(join(directory, "packages/app/build"), { recursive: true });
+    const child = spawn(
+      process.execPath,
+      [
+        candidate,
+        "watch",
+        "build",
+        "--single-package",
+        "--cwd",
+        directory,
+        "--no-cache",
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    const closed = new Promise<void>((resolve) => child.once("close", resolve));
+    try {
+      await waitUntil(() => stdout.includes("root build"));
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const initialRuns = (stdout.match(/root build/g) ?? []).length;
+      await writeFile(
+        join(directory, "packages/app/build/source.txt"),
+        "root input\n",
+      );
+      await waitUntil(
+        () => (stdout.match(/root build/g) ?? []).length > initialRuns,
+      );
+      expect(stdout).not.toContain("app build");
+    } finally {
+      child.kill();
+      await Promise.race([
+        closed,
+        new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await closed;
+      }
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("reloads ignored control files before watch output filtering", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-ignore-"));
+    await prepareFixture(directory);
+    await writeFile(join(directory, ".gitignore"), ".gitignore\nignored.txt\n");
+    const nestedIgnorePath = join(directory, "packages/app/build/.gitignore");
+    await mkdir(dirname(nestedIgnorePath), { recursive: true });
+    await writeFile(nestedIgnorePath, ".gitignore\n");
+    const child = spawn(
+      process.execPath,
+      [
+        candidate,
+        "watch",
+        "build",
+        "--filter=synthetic-app",
+        "--cwd",
+        directory,
+        "--no-cache",
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    const closed = new Promise<void>((resolve) => child.once("close", resolve));
+    try {
+      await waitUntil(() => stdout.includes("app build"));
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      let runs = (stdout.match(/app build/g) ?? []).length;
+      await writeFile(join(directory, ".gitignore"), ".gitignore\n");
+      await waitUntil(() => (stdout.match(/app build/g) ?? []).length > runs);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      runs = (stdout.match(/app build/g) ?? []).length;
+      await writeFile(join(directory, "ignored.txt"), "now visible\n");
+      await waitUntil(() => (stdout.match(/app build/g) ?? []).length > runs);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      runs = (stdout.match(/app build/g) ?? []).length;
+      await writeFile(nestedIgnorePath, ".gitignore\nchanged.txt\n");
+      await waitUntil(() => (stdout.match(/app build/g) ?? []).length > runs);
+    } finally {
+      child.kill();
+      await Promise.race([
+        closed,
+        new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await closed;
+      }
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 40_000);
+
+  it("suppresses artifacts written by watched runs", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-watch-artifacts-"),
+    );
+    await prepareFixture(directory);
+    const child = spawn(
+      process.execPath,
+      [
+        candidate,
+        "watch",
+        "build",
+        "--filter=synthetic-app",
+        "--experimental-write-cache",
+        "--cache=local:rw",
+        "--cache-dir=packages/app/custom-cache",
+        "--log-file=packages/app/run.ndjson",
+        "--profile=packages/app/profile.json",
+        "--trace=packages/app/trace.json",
+        "--heap=packages/app/run.heapsnapshot",
+        "--cwd",
+        directory,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    const closed = new Promise<void>((resolve) => child.once("close", resolve));
+    try {
+      await waitUntil(
+        () =>
+          stdout.includes("app build") &&
+          [
+            "custom-cache",
+            "run.ndjson",
+            "profile.json",
+            "trace.json",
+            "run.heapsnapshot",
+          ].every((path) => existsSync(join(directory, "packages/app", path))),
+        30_000,
+      );
+      const appBuildOutputCount = (stdout.match(/app build/g) ?? []).length;
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect((stdout.match(/app build/g) ?? []).length, stdout).toBe(
+        appBuildOutputCount,
+      );
+      expect(stdout, stdout).not.toContain("change detected");
+    } finally {
+      child.kill();
+      await Promise.race([
+        closed,
+        new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await closed;
+      }
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 45_000);
 
   it("uses task inputs and file entry types for watch changes", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-inputs-"));
@@ -3131,6 +3483,59 @@ importers:
     }
   }, 30_000);
 
+  it("omits unselected workspaces nested below selected prune roots", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-nested-"));
+    try {
+      await prepareFixture(directory);
+      const parentDirectory = join(directory, "packages/parent");
+      const nestedDirectory = join(parentDirectory, "nested");
+      await mkdir(nestedDirectory, { recursive: true });
+      await writeFile(
+        join(parentDirectory, "package.json"),
+        `${JSON.stringify({ name: "synthetic-parent", private: true })}\n`,
+      );
+      await writeFile(join(parentDirectory, "source.txt"), "parent\n");
+      await writeFile(
+        join(nestedDirectory, "package.json"),
+        `${JSON.stringify({ name: "synthetic-nested", private: true })}\n`,
+      );
+      await writeFile(join(nestedDirectory, "source.txt"), "nested\n");
+      await writeFile(
+        join(directory, "pnpm-workspace.yaml"),
+        'packages:\n  - "packages/*"\n  - "packages/parent/nested"\n',
+      );
+      await writeFile(
+        join(directory, "pnpm-lock.yaml"),
+        `${workflowLockfile.trimEnd()}\n  packages/parent: {}\n  packages/parent/nested: {}\n`,
+      );
+      await execFilePromise(process.execPath, [
+        candidate,
+        "prune",
+        "synthetic-parent",
+        "--out-dir=result",
+        "--cwd",
+        directory,
+      ]);
+      expect(
+        await readFile(
+          join(directory, "result/packages/parent/source.txt"),
+          "utf8",
+        ),
+      ).toBe("parent\n");
+      expect(
+        await readFile(
+          join(directory, "result/packages/parent/nested/package.json"),
+          "utf8",
+        ).catch(() => undefined),
+      ).toBeUndefined();
+      expect(
+        await readFile(join(directory, "result/pnpm-lock.yaml"), "utf8"),
+      ).not.toContain("packages/parent/nested");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("selects every cross-ecosystem package matching a plain prune scope", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-scopes-"));
     const packageName = "synthetic-polyglot";
@@ -3268,6 +3673,12 @@ importers:
             );
           }).pipe(Effect.provide(nodeFoundationLayer)),
         );
+      await expect(
+        runPrune([`cargo:${packageName}`], cargoWorkspaceDirectory),
+      ).rejects.toThrow(/selected package or workspace control directory/);
+      expect(
+        await readFile(join(cargoWorkspaceDirectory, "Cargo.toml"), "utf8"),
+      ).toContain("[workspace]");
       const qualifiedOutput = join(directory, "qualified-result");
       expect(await runPrune([`cargo:${packageName}`], qualifiedOutput)).toBe(0);
       expect(
@@ -3348,6 +3759,36 @@ importers:
     const outside = await mkdtemp(join(tmpdir(), "turbo-ts-prune-control-"));
     try {
       await prepareFixture(directory);
+      for (const outputDirectory of ["packages", "packages/app"]) {
+        await expect(
+          execFilePromise(process.execPath, [
+            candidate,
+            "prune",
+            "synthetic-app",
+            `--out-dir=${outputDirectory}`,
+            "--cwd",
+            directory,
+          ]),
+        ).rejects.toThrow(/selected package or workspace control directory/);
+        expect(
+          await readFile(join(directory, "packages/app/package.json"), "utf8"),
+        ).toContain("synthetic-app");
+      }
+      await symlink(".", join(directory, "source-alias"));
+      await expect(
+        execFilePromise(process.execPath, [
+          candidate,
+          "prune",
+          "synthetic-app",
+          "--out-dir=source-alias/packages",
+          "--cwd",
+          directory,
+        ]),
+      ).rejects.toThrow(/selected package or workspace control directory/);
+      expect(
+        await readFile(join(directory, "packages/app/package.json"), "utf8"),
+      ).toContain("synthetic-app");
+      await rm(join(directory, "source-alias"));
       await mkdir(join(directory, "config"));
       await writeFile(join(directory, "config/npmrc"), "safe-control\n");
       await symlink("config/npmrc", join(directory, ".npmrc"));
@@ -3883,14 +4324,35 @@ importers:
       ]);
     try {
       await prepareFixture(directory);
+      const applicationConfigurationPath = join(
+        directory,
+        "packages/app/turbo.json",
+      );
+      const applicationConfiguration = JSON.parse(
+        await readFile(applicationConfigurationPath, "utf8"),
+      ) as {
+        tasks: { build: { dependsOn?: Array<string> } };
+      };
+      applicationConfiguration.tasks.build.dependsOn = [
+        "synthetic-library#compile",
+      ];
+      await writeFile(
+        applicationConfigurationPath,
+        `${JSON.stringify(applicationConfiguration, undefined, 2)}\n`,
+      );
       const libraryManifestPath = join(
         directory,
         "packages/library/package.json",
       );
       const libraryManifest = JSON.parse(
         await readFile(libraryManifestPath, "utf8"),
-      ) as { dependencies?: Record<string, string> };
+      ) as {
+        dependencies?: Record<string, string>;
+        scripts: Record<string, string>;
+      };
       libraryManifest.dependencies = { "synthetic-core": "workspace:*" };
+      libraryManifest.scripts.compile =
+        "node -e \"console.log('library compile')\"";
       await writeFile(
         libraryManifestPath,
         `${JSON.stringify(libraryManifest, undefined, 2)}\n`,
