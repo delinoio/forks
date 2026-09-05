@@ -26,7 +26,15 @@ import { delimiter, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "@rstest/core";
-import { Deferred, Effect, Fiber, Layer, Stream } from "effect";
+import {
+  Deferred,
+  Effect,
+  Fiber,
+  HashMap,
+  Layer,
+  Option,
+  Stream,
+} from "effect";
 import { graphql } from "graphql";
 import { parse as parseToml } from "smol-toml";
 import { commandIndex } from "../src/cli/program.js";
@@ -82,9 +90,12 @@ import {
   repositoryPackageManagerLabel,
 } from "../src/workflow/repository.js";
 import {
+  appendPendingWatchChange,
   executeWatch,
+  initialPendingWatchChanges,
   parseWatchArguments,
   resolvedWatchRunOptions,
+  takePendingWatchChanges,
 } from "../src/workflow/watch.js";
 
 const execFilePromise = promisify(execFile);
@@ -313,6 +324,53 @@ describe("repository workflow gate", () => {
         "linux",
       ),
     ).toBe("/tmp/turbod-user/repository/turbod.sock");
+  });
+
+  it("bounds pending watch events by distinct path", () => {
+    const repeatedPath = "/repository/packages/app/source.ts";
+    let pending = initialPendingWatchChanges();
+    let repeatedSequence = 0;
+    for (let index = 0; index < 10_000; index += 1) {
+      [repeatedSequence, pending] = appendPendingWatchChange(
+        pending,
+        repeatedPath,
+        index === 100,
+      );
+    }
+    expect(HashMap.size(pending.changesByPath)).toBe(1);
+    expect(
+      Option.getOrUndefined(HashMap.get(pending.changesByPath, repeatedPath))
+        ?.sequence,
+    ).toBe(repeatedSequence);
+
+    const distinctPath = "/repository/packages/library/source.ts";
+    const firstBatchBoundary = repeatedSequence;
+    const [distinctSequence, withDistinctPath] = appendPendingWatchChange(
+      pending,
+      distinctPath,
+      true,
+    );
+
+    const [firstBatch, remaining] = takePendingWatchChanges(
+      withDistinctPath,
+      firstBatchBoundary,
+    );
+    expect(firstBatch).toEqual({
+      paths: [repeatedPath],
+      invalidateAll: true,
+    });
+    expect(HashMap.size(remaining.changesByPath)).toBe(1);
+
+    const [secondBatch, empty] = takePendingWatchChanges(
+      remaining,
+      distinctSequence,
+    );
+    expect(secondBatch).toEqual({
+      paths: [distinctPath],
+      invalidateAll: true,
+    });
+    expect(HashMap.size(empty.changesByPath)).toBe(0);
+    expect(empty.invalidation).toBeUndefined();
   });
 
   it(evidenceId.repositoryWorkflows, async () => {
@@ -3541,7 +3599,7 @@ describe("repository workflow gate", () => {
       await writeFile(running.sock_file, "stale socket\n");
       await writeFile(
         join(dirname(running.pid_file), "turbod.lock"),
-        "stale lock\n",
+        `${Date.now() + 24 * 60 * 60 * 1_000}\n`,
       );
       await runCandidate("daemon", "start", "--idle-time=30s");
       expect(
@@ -6155,6 +6213,139 @@ importers:
     } finally {
       await rm(directory, { force: true, recursive: true });
       await rm(outside, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("rewrites validated symlinked generated root controls during prune", async () => {
+    for (const configurationName of ["turbo.json", "turbo.jsonc"] as const) {
+      const directory = await mkdtemp(
+        join(tmpdir(), `turbo-ts-prune-${configurationName}-link-`),
+      );
+      try {
+        await prepareFixture(directory);
+        if (configurationName === "turbo.jsonc") {
+          await rename(
+            join(directory, "turbo.json"),
+            join(directory, configurationName),
+          );
+        }
+        const configurationDirectory = join(directory, "config");
+        await mkdir(configurationDirectory);
+        const configurationPath = join(directory, configurationName);
+        const configurationTarget = join(
+          configurationDirectory,
+          `root-${configurationName}`,
+        );
+        const configurationLink = `config/root-${configurationName}`;
+        await rename(configurationPath, configurationTarget);
+        await symlink(configurationLink, configurationPath);
+
+        const workspacePath = join(directory, "pnpm-workspace.yaml");
+        const workspaceTarget = join(
+          configurationDirectory,
+          "root-pnpm-workspace.yaml",
+        );
+        const workspaceLink = "config/root-pnpm-workspace.yaml";
+        const workspaceSource = 'packages: ["packages/*"]\n';
+        await writeFile(workspacePath, workspaceSource);
+        await rename(workspacePath, workspaceTarget);
+        await symlink(workspaceLink, workspacePath);
+
+        await execFilePromise(process.execPath, [
+          candidate,
+          "prune",
+          "synthetic-app",
+          "--docker",
+          "--out-dir=linked-control-result",
+          "--cwd",
+          directory,
+        ]);
+
+        const fullRoot = join(directory, "linked-control-result/full");
+        expect(await readlink(join(fullRoot, configurationName))).toBe(
+          configurationLink,
+        );
+        const generatedConfiguration = await readFile(
+          join(fullRoot, configurationLink),
+          "utf8",
+        );
+        expect(await readFile(join(fullRoot, configurationName), "utf8")).toBe(
+          generatedConfiguration,
+        );
+        expect(JSON.parse(generatedConfiguration)).toHaveProperty(
+          "tasks.build",
+        );
+        expect(generatedConfiguration.endsWith("\n")).toBe(false);
+
+        for (const root of ["full", "json"]) {
+          const outputRoot = join(directory, "linked-control-result", root);
+          expect(await readlink(join(outputRoot, "pnpm-workspace.yaml"))).toBe(
+            workspaceLink,
+          );
+          const generatedWorkspace = await readFile(
+            join(outputRoot, workspaceLink),
+            "utf8",
+          );
+          expect(
+            await readFile(join(outputRoot, "pnpm-workspace.yaml"), "utf8"),
+          ).toBe(generatedWorkspace);
+          expect(generatedWorkspace).not.toBe(workspaceSource);
+          expect(generatedWorkspace).toContain("packages/*");
+        }
+      } finally {
+        await rm(directory, { force: true, recursive: true });
+      }
+    }
+  }, 30_000);
+
+  it("rejects symlinked generated root controls outside the repository", async () => {
+    for (const controlName of [
+      "turbo.json",
+      "turbo.jsonc",
+      "pnpm-workspace.yaml",
+    ] as const) {
+      const directory = await mkdtemp(
+        join(tmpdir(), `turbo-ts-prune-${controlName}-escape-`),
+      );
+      const outside = await mkdtemp(
+        join(tmpdir(), `turbo-ts-prune-${controlName}-outside-`),
+      );
+      try {
+        await prepareFixture(directory);
+        if (controlName === "turbo.jsonc") {
+          await rename(
+            join(directory, "turbo.json"),
+            join(directory, controlName),
+          );
+        }
+        const controlPath = join(directory, controlName);
+        const outsideControl = join(outside, controlName);
+        await writeFile(outsideControl, await readFile(controlPath));
+        await rm(controlPath);
+        await symlink(relative(directory, outsideControl), controlPath);
+
+        await expect(
+          execFilePromise(process.execPath, [
+            candidate,
+            "prune",
+            "synthetic-app",
+            "--out-dir=escaping-control-result",
+            "--cwd",
+            directory,
+          ]),
+        ).rejects.toThrow(
+          /prune root control symlink must use a relative target inside the repository/,
+        );
+        expect(
+          await readFile(
+            join(directory, "escaping-control-result", controlName),
+            "utf8",
+          ).catch(() => undefined),
+        ).toBeUndefined();
+      } finally {
+        await rm(directory, { force: true, recursive: true });
+        await rm(outside, { force: true, recursive: true });
+      }
     }
   }, 30_000);
 

@@ -706,11 +706,32 @@ export const executePrune = (
           );
         }
       } else if (name === "turbo.json" || name === "turbo.jsonc") {
-        yield* writeRootConfiguration(source, joinPath(fullRoot, name));
+        yield* copyIfPresent(
+          source,
+          joinPath(fullRoot, name),
+          repository.root,
+          canonicalOutputRoot,
+          fullRoot,
+          writeRootConfiguration,
+        );
       } else if (name === "pnpm-workspace.yaml") {
-        yield* writeWorkspaceConfiguration(source, joinPath(fullRoot, name));
+        yield* copyIfPresent(
+          source,
+          joinPath(fullRoot, name),
+          repository.root,
+          canonicalOutputRoot,
+          fullRoot,
+          writeWorkspaceConfiguration,
+        );
         if (options.docker) {
-          yield* writeWorkspaceConfiguration(source, joinPath(jsonRoot, name));
+          yield* copyIfPresent(
+            source,
+            joinPath(jsonRoot, name),
+            repository.root,
+            canonicalOutputRoot,
+            jsonRoot,
+            writeWorkspaceConfiguration,
+          );
         }
       } else {
         yield* copyIfPresent(

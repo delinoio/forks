@@ -1,4 +1,4 @@
-import { Effect, Ref, Stream } from "effect";
+import { Effect, HashMap, Ref, Stream } from "effect";
 import {
   canMatchGlobsDescendantWithExclusions,
   matchesGlobsWithExclusions,
@@ -205,13 +205,84 @@ const runOwnedPath = (
 interface PendingWatchChange {
   readonly sequence: number;
   readonly path: string;
-  readonly invalidateAll: boolean;
 }
 
-interface PendingWatchChanges {
-  readonly nextSequence: number;
-  readonly changes: ReadonlyArray<PendingWatchChange>;
+interface PendingWatchInvalidation {
+  readonly earliestSequence: number;
+  readonly latestSequence: number;
 }
+
+export interface PendingWatchChanges {
+  readonly nextSequence: number;
+  readonly changesByPath: HashMap.HashMap<string, PendingWatchChange>;
+  readonly invalidation?: PendingWatchInvalidation;
+}
+
+export const initialPendingWatchChanges = (): PendingWatchChanges => ({
+  nextSequence: 0,
+  changesByPath: HashMap.empty(),
+});
+
+export const appendPendingWatchChange = (
+  pending: PendingWatchChanges,
+  path: string,
+  invalidateAll: boolean,
+): readonly [number, PendingWatchChanges] => {
+  const sequence = pending.nextSequence;
+  return [
+    sequence,
+    {
+      nextSequence: sequence + 1,
+      changesByPath: HashMap.set(pending.changesByPath, path, {
+        sequence,
+        path,
+      }),
+      invalidation: invalidateAll
+        ? {
+            earliestSequence:
+              pending.invalidation?.earliestSequence ?? sequence,
+            latestSequence: sequence,
+          }
+        : pending.invalidation,
+    },
+  ];
+};
+
+export const takePendingWatchChanges = (
+  pending: PendingWatchChanges,
+  throughSequence: number,
+): readonly [
+  { readonly paths: ReadonlyArray<string>; readonly invalidateAll: boolean },
+  PendingWatchChanges,
+] => {
+  const included: Array<PendingWatchChange> = [];
+  let changesByPath = HashMap.empty<string, PendingWatchChange>();
+  for (const change of HashMap.values(pending.changesByPath)) {
+    if (change.sequence <= throughSequence) {
+      included.push(change);
+    } else {
+      changesByPath = HashMap.set(changesByPath, change.path, change);
+    }
+  }
+  included.sort((left, right) => left.sequence - right.sequence);
+  const invalidateAll =
+    pending.invalidation !== undefined &&
+    pending.invalidation.earliestSequence <= throughSequence;
+  const invalidation =
+    pending.invalidation === undefined ||
+    pending.invalidation.latestSequence <= throughSequence
+      ? undefined
+      : pending.invalidation.earliestSequence > throughSequence
+        ? pending.invalidation
+        : {
+            earliestSequence: pending.invalidation.latestSequence,
+            latestSequence: pending.invalidation.latestSequence,
+          };
+  return [
+    { paths: included.map((change) => change.path), invalidateAll },
+    { ...pending, changesByPath, invalidation },
+  ];
+};
 
 const isGitIgnorePath = (path: string): boolean =>
   normalizePath(path).split("/").at(-1) === ".gitignore";
@@ -260,10 +331,7 @@ export const executeWatch = (
     const ignoreMatcher = yield* Ref.make<GitIgnoreMatcher>(
       yield* loadGitIgnoreMatcher(repository.root),
     );
-    const pendingChanges = yield* Ref.make<PendingWatchChanges>({
-      nextSequence: 0,
-      changes: [],
-    });
+    const pendingChanges = yield* Ref.make(initialPendingWatchChanges());
     const activeRuns = yield* Ref.make(0);
     const absoluteRootTurboJson =
       options.run.rootTurboJson === undefined
@@ -384,43 +452,19 @@ export const executeWatch = (
         }),
       ),
       Stream.mapEffect((change) =>
-        Ref.modify(pendingChanges, (pending) => {
-          const sequence = pending.nextSequence;
-          return [
-            sequence,
-            {
-              nextSequence: sequence + 1,
-              changes: [
-                ...pending.changes,
-                {
-                  sequence,
-                  path: change.path,
-                  invalidateAll: change.kind === "unknown",
-                },
-              ],
-            },
-          ] as const;
-        }),
+        Ref.modify(pendingChanges, (pending) =>
+          appendPendingWatchChange(
+            pending,
+            change.path,
+            change.kind === "unknown",
+          ),
+        ),
       ),
       Stream.debounce("100 millis"),
       Stream.mapEffect((sequence) =>
-        Ref.modify(pendingChanges, (pending) => {
-          const included = pending.changes.filter(
-            (change) => change.sequence <= sequence,
-          );
-          return [
-            {
-              paths: [...new Set(included.map((change) => change.path))],
-              invalidateAll: included.some((change) => change.invalidateAll),
-            },
-            {
-              ...pending,
-              changes: pending.changes.filter(
-                (change) => change.sequence > sequence,
-              ),
-            },
-          ] as const;
-        }),
+        Ref.modify(pendingChanges, (pending) =>
+          takePendingWatchChanges(pending, sequence),
+        ),
       ),
     );
     const triggers = Stream.concat(

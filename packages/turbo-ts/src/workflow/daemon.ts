@@ -393,6 +393,7 @@ const acquireStartLock = (
       const timestamp = Number(observed.right.trim());
       if (
         Number.isFinite(timestamp) &&
+        timestamp <= now &&
         now - timestamp < staleStartLockMilliseconds
       ) {
         break;

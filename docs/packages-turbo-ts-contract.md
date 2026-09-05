@@ -487,10 +487,11 @@ validation until their dependency graph and output-hash semantics are
 implemented; they are never treated as ordinary local globs.
 
 Gate 3 adds repository workflows with automated ledger evidence. `watch`
-debounces filesystem storms, retains every distinct changed path in each
-settled debounce batch, and uses switching Effect streams so a later batch
-interrupts an in-flight run before recovery. Watchers, child processes, fibers,
-signals, and task resources remain scope-owned. Watch mode resolves cache
+debounces filesystem storms, coalesces repeated pending events by path before
+the debounce settles, retains every distinct changed path in each settled
+batch, and uses switching Effect streams so a later batch interrupts an
+in-flight run before recovery. Watchers, child processes, fibers, signals, and
+task resources remain scope-owned. Watch mode resolves cache
 policy from CLI and environment configuration, reads cache by default, and
 enables cache publication only with `--experimental-write-cache`; the effective
 policy is reduced to its readable capabilities until that flag is present, and
@@ -560,8 +561,9 @@ response remains retryable, and changes recorded while a response is being
 written remain pending for the next query.
 Start-lock ownership is
 preserved across overlapping starts, stale locks are validated before removal,
-and a Hello response carrying an error is not healthy. Start, stop, restart,
-status, logs, and clean are race-safe; `info` reports the live daemon state.
+and future-dated lock timestamps are stale rather than live. A Hello response
+carrying an error is not healthy. Start, stop, restart, status, logs, and clean
+are race-safe; `info` reports the live daemon state.
 Failed health checks clean stale PID and socket state even when the recorded
 PID has been reused by an unrelated live process.
 After a successful health handshake, a subsequent status transport or response
@@ -662,9 +664,10 @@ recreated without dereferencing unless their resolved target enters an
 unselected nested workspace; copied root controls include their contained
 regular-file targets at the corresponding installation paths. Absolute,
 escaping, or output-targeting root-control links are rejected, and an exact
-symlinked output root is rejected before replacement. Generated root manifest
-transformations, including production dependency removal, are applied to
-validated symlink targets before the links are recreated. The root pnpm
+symlinked output root is rejected before replacement. Generated root manifest,
+Turbo configuration, and pnpm workspace configuration transformations are
+applied to validated symlink targets before the links are recreated; this
+includes production dependency removal from root manifests. The root pnpm
 hook `.pnpmfile.cjs` is retained in every
 installation root. Root Bun `bunfig.toml` configuration is retained in the
 ordinary output and both Docker installation roots. Root Yarn installation controls, including `.yarnrc.yml`,
