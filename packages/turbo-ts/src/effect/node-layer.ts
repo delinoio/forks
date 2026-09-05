@@ -1784,6 +1784,9 @@ const protocolString = (field: number, value: string): Buffer =>
 const protocolInteger = (field: number, value: number): Buffer =>
   Buffer.concat([protocolVarint(field * 8), protocolVarint(value)]);
 
+const maximumDaemonPayloadBytes = 1024 * 1024;
+const maximumDaemonFrameBytes = maximumDaemonPayloadBytes + 5;
+
 const grpcFrame = (payload: Uint8Array): Buffer => {
   const header = Buffer.alloc(5);
   header.writeUInt32BE(payload.length, 1);
@@ -1795,7 +1798,7 @@ const grpcPayload = (contents: Uint8Array): Buffer => {
     throw new TypeError("malformed gRPC daemon frame");
   }
   const length = Buffer.from(contents).readUInt32BE(1);
-  if (length > 1024 * 1024 || length + 5 > contents.length) {
+  if (length > maximumDaemonPayloadBytes || length + 5 > contents.length) {
     throw new TypeError("daemon frame exceeds its declared size");
   }
   return Buffer.from(contents.subarray(5, length + 5));
@@ -1833,7 +1836,10 @@ const protocolFields = (
     } else if (wire === 2) {
       const [length, afterLength] = readProtocolVarint(bytes, offset);
       offset = afterLength;
-      if (length > 1024 * 1024 || offset + length > bytes.length) {
+      if (
+        length > maximumDaemonPayloadBytes ||
+        offset + length > bytes.length
+      ) {
         throw new TypeError("malformed protobuf length");
       }
       value = Buffer.from(bytes.subarray(offset, offset + length));
@@ -2218,7 +2224,7 @@ export const makeDaemonServe = (setup: Partial<DaemonEndpointSetup> = {}) => {
                 let length = 0;
                 stream.on("data", (chunk: Buffer) => {
                   length += chunk.length;
-                  if (length > 1024 * 1024 + 5) {
+                  if (length > maximumDaemonFrameBytes) {
                     stream.close(http2Constants.NGHTTP2_CANCEL);
                     return;
                   }
@@ -2365,6 +2371,7 @@ const daemonLayer = Layer.succeed(DaemonService, {
         te: "trailers",
       });
       const chunks: Array<Buffer> = [];
+      let responseLength = 0;
       let responseError: string | undefined;
       stream.on("response", (headers) => {
         if (
@@ -2386,7 +2393,23 @@ const daemonLayer = Layer.succeed(DaemonService, {
           );
         }
       });
-      stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+      stream.on("data", (chunk: Buffer) => {
+        if (settled) return;
+        responseLength += chunk.length;
+        if (responseLength > maximumDaemonFrameBytes) {
+          chunks.length = 0;
+          stream.close(http2Constants.NGHTTP2_CANCEL);
+          complete(
+            Effect.fail(
+              daemonProtocolError(
+                new TypeError("daemon frame exceeds its declared size"),
+              ),
+            ),
+          );
+          return;
+        }
+        chunks.push(chunk);
+      });
       stream.on("end", () => {
         try {
           const payload = grpcPayload(Buffer.concat(chunks));

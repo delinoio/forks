@@ -1,6 +1,6 @@
 import { Deferred, Effect, Queue, Ref, Stream } from "effect";
 import {
-  canMatchGlobDescendant,
+  canMatchGlobsDescendantWithExclusions,
   matchesGlobsWithExclusions,
 } from "../core/glob.js";
 import {
@@ -86,6 +86,31 @@ interface OutputRegistration {
   readonly changedOutputGenerations: Map<string, number>;
   nextChangeGeneration: number;
 }
+
+const maximumOutputRegistrations = 1_024;
+
+const retainOutputRegistration = (
+  registrations: Map<string, OutputRegistration>,
+  hash: string,
+  registration: OutputRegistration,
+): void => {
+  registrations.delete(hash);
+  registrations.set(hash, registration);
+  if (registrations.size <= maximumOutputRegistrations) return;
+  const oldestHash = registrations.keys().next().value;
+  if (oldestHash !== undefined) registrations.delete(oldestHash);
+};
+
+const recentOutputRegistration = (
+  registrations: Map<string, OutputRegistration>,
+  hash: string,
+): OutputRegistration | undefined => {
+  const registration = registrations.get(hash);
+  if (registration === undefined) return undefined;
+  registrations.delete(hash);
+  registrations.set(hash, registration);
+  return registration;
+};
 
 const markOutputChanged = (
   registration: OutputRegistration,
@@ -913,11 +938,11 @@ const serveDaemon = (
                     (excluded) => `!${excluded}`,
                   ),
                 ];
-                if (
-                  matchesGlobsWithExclusions([relative], patterns) ||
-                  (change.entryKind === "directory" &&
-                    canMatchGlobDescendant(relative, glob))
-                ) {
+                const changed =
+                  change.entryKind === "directory"
+                    ? canMatchGlobsDescendantWithExclusions(relative, patterns)
+                    : matchesGlobsWithExclusions([relative], patterns);
+                if (changed) {
                   markOutputChanged(registration, glob);
                 }
               }
@@ -997,24 +1022,28 @@ const serveDaemon = (
                           }),
                         );
                       }
-                      outputRegistrations.set(params.hash, {
-                        outputGlobs: Array.isArray(params.outputGlobs)
-                          ? params.outputGlobs.filter(
-                              (value): value is string =>
-                                typeof value === "string",
-                            )
-                          : [],
-                        outputExclusionGlobs: Array.isArray(
-                          params.outputExclusionGlobs,
-                        )
-                          ? params.outputExclusionGlobs.filter(
-                              (value): value is string =>
-                                typeof value === "string",
-                            )
-                          : [],
-                        changedOutputGenerations: new Map(),
-                        nextChangeGeneration: 0,
-                      });
+                      retainOutputRegistration(
+                        outputRegistrations,
+                        params.hash,
+                        {
+                          outputGlobs: Array.isArray(params.outputGlobs)
+                            ? params.outputGlobs.filter(
+                                (value): value is string =>
+                                  typeof value === "string",
+                              )
+                            : [],
+                          outputExclusionGlobs: Array.isArray(
+                            params.outputExclusionGlobs,
+                          )
+                            ? params.outputExclusionGlobs.filter(
+                                (value): value is string =>
+                                  typeof value === "string",
+                              )
+                            : [],
+                          changedOutputGenerations: new Map(),
+                          nextChangeGeneration: 0,
+                        },
+                      );
                       return Effect.succeed({});
                     }
                     if (request.method === DaemonMethod.getChangedOutputs) {
@@ -1028,7 +1057,10 @@ const serveDaemon = (
                           )
                         : [];
                       const changedOutputs = hashes.flatMap((hash) => {
-                        const registration = outputRegistrations.get(hash);
+                        const registration = recentOutputRegistration(
+                          outputRegistrations,
+                          hash,
+                        );
                         if (registration === undefined) return [];
                         const acknowledgement = new Map(
                           registration.changedOutputGenerations,

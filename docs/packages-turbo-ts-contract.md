@@ -543,7 +543,8 @@ stale-state cleanup. Named pipes skip Unix filesystem ownership and permission
 operations. Its public transport is the official `turbodprotocol.Turbod` gRPC
 service over HTTP/2. Hello, status, and shutdown calls interoperate in both
 directions with the 2.10.12 executable; package and watch calls share the same
-bounded framing and scoped sessions.
+bounded framing and scoped sessions. Clients terminate a response as soon as
+its accumulated frame exceeds the 1 MiB payload limit plus framing bytes.
 Requests that exceed the transport queue receive an immediate protocol error
 instead of displacing an older request. Unsupported-method and queue-capacity
 responses run in the server Scope so endpoint teardown interrupts pending
@@ -555,13 +556,15 @@ forwarded to detached servers, and reused for request-time package discovery.
 Registered outputs beneath `.turbo` outside the resolved cache directory and
 beneath `node_modules` remain observable. Directory events conservatively mark
 positive output globs when descendants can match, even when an exclusion can
-match only part of that subtree. Git metadata, the resolved cache directory,
-and daemon-owned logs remain excluded.
+match only part of that subtree; an event rooted in a fully excluded subtree is
+ignored. Git metadata, the resolved cache directory, and daemon-owned logs
+remain excluded.
 Output-change registration/query calls return their protocol data rather than
 empty acknowledgments. Changed-output snapshots consume only the exact glob
 generations reported after their response is written successfully. A failed
 response remains retryable, and changes recorded while a response is being
-written remain pending for the next query.
+written remain pending for the next query. The daemon retains at most 1,024
+output registrations and evicts the least recently registered or queried hash.
 Start-lock ownership is
 preserved across overlapping starts, stale locks are validated before removal,
 and future-dated lock timestamps are stale rather than live. A Hello response
@@ -688,14 +691,16 @@ pruning retains development dependency closure. Production npm, pnpm, Yarn,
 and text Bun pruning removes development dependency edges and their package
 closure, including development-marked trees in legacy npm v1 lockfiles.
 Production pruning also removes `devDependencies` from selected JavaScript
-workspace manifests in the ordinary or Docker full tree. Docker JSON subsets
-contain manifests only for selected JavaScript packages; selected Cargo and uv
-package manifests remain in the full tree. Selected Cargo and uv packages also
-retain their owning workspace manifest and lockfile in the ordinary or Docker
-full tree. Retained Cargo workspace manifests list exactly the selected Cargo
-members, narrow `default-members` to that set, and omit `default-members`
-when none remain. Their exclusion lists are removed after the selected member
-set is made explicit. When
+workspace manifests in the ordinary or Docker full tree. A contained relative
+workspace-manifest symlink remains a symlink in ordinary, Docker full, and
+Docker JSON layouts, and manifest transformations update its copied target.
+Docker JSON subsets contain manifests only for selected JavaScript packages;
+selected Cargo and uv package manifests remain in the full tree. Selected Cargo
+and uv packages also retain their owning workspace manifest and lockfile in the
+ordinary or Docker full tree. Retained Cargo workspace manifests list exactly
+the selected Cargo members, narrow `default-members` to that set, and omit
+`default-members` when none remain. Their exclusion lists are removed after the
+selected member set is made explicit. When
 `futureFlags.pruneIncludesGlobalFiles` is enabled, ordered
 `globalDependencies` or `global.inputs` globs copy their safe, non-ignored
 matches into the ordinary output or Docker full tree before generated controls
@@ -718,8 +723,9 @@ from task and global file hashes. Root-level generated
 `profile.<timestamp>` artifacts, their anonymous variant, and atomic temporary
 files are likewise excluded whenever a bare profile option selects the default
 path; other `profile.*` files remain inputs. Simultaneous bare named and
-anonymous profiles use distinct generated destinations. A structured-log
-artifact may not replace a mandatory task control input or match a declared task
+anonymous profiles use distinct generated destinations. A bare structured-log
+option resolves its generated destination before validation. No structured-log
+artifact may replace a mandatory task control input or match a declared task
 output or resolved task-log path. Every active structured-log, named-profile,
 anonymous-profile, heap-snapshot, and trace destination must also resolve to a
 distinct path; collisions fail before an artifact is written or a task starts.

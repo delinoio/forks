@@ -3514,15 +3514,6 @@ export const executeRun = (
       cargoWorkspacePlan.scopes,
       platform === "win32",
     );
-    const configuredStructuredLogPath =
-      parsed.graph === undefined &&
-      parsed.dryRun === undefined &&
-      parsed.logFile !== undefined &&
-      parsed.logFile !== ""
-        ? isAbsolutePath(parsed.logFile)
-          ? parsed.logFile
-          : joinPath(options.root, parsed.logFile)
-        : undefined;
     const resolveExplicitRunArtifactPath = (
       requestedPath: string | undefined,
     ): string | undefined =>
@@ -3531,13 +3522,23 @@ export const executeRun = (
         : isAbsolutePath(requestedPath)
           ? requestedPath
           : joinPath(options.root, requestedPath);
+    const clock = yield* ClockService;
+    const runStartedAt = yield* clock.now;
+    const ordinaryRun =
+      parsed.graph === undefined && parsed.dryRun === undefined;
+    const structuredLogPath =
+      !ordinaryRun || parsed.logFile === undefined
+        ? undefined
+        : parsed.logFile === ""
+          ? joinPath(options.root, ".turbo", "logs", `${runStartedAt}.json`)
+          : resolveExplicitRunArtifactPath(parsed.logFile);
     const comparableInputPath = (path: string): string => {
       const normalized = normalizePath(path, platform === "win32");
       return platform === "win32" ? normalized.toLowerCase() : normalized;
     };
-    if (configuredStructuredLogPath !== undefined) {
+    if (structuredLogPath !== undefined) {
       const canonicalStructuredLogPath = yield* canonicalExistingAncestorPath(
-        configuredStructuredLogPath,
+        structuredLogPath,
         "run artifact",
       );
       const structuredLogIdentity = comparableInputPath(
@@ -3567,7 +3568,7 @@ export const executeRun = (
       if (controlCollision) {
         return yield* Effect.fail(
           new ConfigurationError({
-            path: configuredStructuredLogPath,
+            path: structuredLogPath,
             message:
               "structured log path must not replace a task control input",
           }),
@@ -3595,7 +3596,7 @@ export const executeRun = (
       if (outputCollision) {
         return yield* Effect.fail(
           new ConfigurationError({
-            path: configuredStructuredLogPath,
+            path: structuredLogPath,
             message:
               "structured log path must not match a declared task output",
           }),
@@ -3623,14 +3624,14 @@ export const executeRun = (
       if (taskLogCollision) {
         return yield* Effect.fail(
           new ConfigurationError({
-            path: configuredStructuredLogPath,
+            path: structuredLogPath,
             message: "structured log path must not replace a task log",
           }),
         );
       }
     }
     const excludedInputPaths = [
-      configuredStructuredLogPath,
+      structuredLogPath,
       ...(parsed.graph === undefined && parsed.dryRun === undefined
         ? [parsed.profile, parsed.anonymousProfile, parsed.trace].map(
             resolveExplicitRunArtifactPath,
@@ -3656,16 +3657,6 @@ export const executeRun = (
         { concurrency: 8 },
       ),
     );
-    const clock = yield* ClockService;
-    const runStartedAt = yield* clock.now;
-    const ordinaryRun =
-      parsed.graph === undefined && parsed.dryRun === undefined;
-    const structuredLogPath =
-      !ordinaryRun || parsed.logFile === undefined
-        ? undefined
-        : parsed.logFile === ""
-          ? joinPath(options.root, ".turbo", "logs", `${runStartedAt}.json`)
-          : configuredStructuredLogPath;
     const defaultProfilePath = joinPath(
       options.root,
       defaultProfileArtifactName(runStartedAt, false),

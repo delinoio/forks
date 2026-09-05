@@ -312,6 +312,7 @@ const copyIfPresent = (
     source: string,
     destination: string,
   ) => Effect.Effect<void, unknown, FileSystemService>,
+  symlinkDescription = "root control",
 ): Effect.Effect<void, unknown, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -332,7 +333,7 @@ const copyIfPresent = (
           (error) =>
             new ConfigurationError({
               path: source,
-              message: `cannot resolve prune root control symlink: ${error.message}`,
+              message: `cannot resolve prune ${symlinkDescription} symlink: ${error.message}`,
             }),
         ),
       );
@@ -344,8 +345,7 @@ const copyIfPresent = (
         return yield* Effect.fail(
           new ConfigurationError({
             path: source,
-            message:
-              "prune root control symlink must use a relative target inside the repository",
+            message: `prune ${symlinkDescription} symlink must use a relative target inside the repository`,
           }),
         );
       }
@@ -354,7 +354,7 @@ const copyIfPresent = (
         return yield* Effect.fail(
           new ConfigurationError({
             path: source,
-            message: "prune root control symlink must target a regular file",
+            message: `prune ${symlinkDescription} symlink must target a regular file`,
           }),
         );
       }
@@ -363,6 +363,7 @@ const copyIfPresent = (
         relativePath(repositoryRoot, resolved),
       );
       yield* write(resolved, destinationTarget);
+      yield* fileSystem.remove(destination);
       yield* fileSystem.createSymlink(
         relativePath(parentPath(destination), destinationTarget),
         destination,
@@ -372,7 +373,7 @@ const copyIfPresent = (
     return yield* Effect.fail(
       new ConfigurationError({
         path: source,
-        message: "prune root control must be a regular file or symlink",
+        message: `prune ${symlinkDescription} must be a regular file or symlink`,
       }),
     );
   });
@@ -896,16 +897,34 @@ export const executePrune = (
         continue;
       }
       const sourceManifest = joinPath(packageModel.directory, "package.json");
-      yield* writeManifest(
+      yield* copyIfPresent(
         sourceManifest,
         joinPath(fullRoot, packageModel.relativeDirectory, "package.json"),
-        options.production,
+        repository.root,
+        canonicalOutputRoot,
+        fullRoot,
+        (manifestSource, manifestDestination) =>
+          writeManifest(
+            manifestSource,
+            manifestDestination,
+            options.production,
+          ),
+        "workspace manifest",
       );
       if (options.docker) {
-        yield* writeManifest(
+        yield* copyIfPresent(
           sourceManifest,
           joinPath(jsonRoot, packageModel.relativeDirectory, "package.json"),
-          options.production,
+          repository.root,
+          canonicalOutputRoot,
+          jsonRoot,
+          (manifestSource, manifestDestination) =>
+            writeManifest(
+              manifestSource,
+              manifestDestination,
+              options.production,
+            ),
+          "workspace manifest",
         );
       }
     }
