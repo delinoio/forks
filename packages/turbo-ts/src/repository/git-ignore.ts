@@ -17,6 +17,7 @@ interface IgnoreRules {
 
 export interface GitIgnoreMatcher {
   readonly ignores: (path: string, directory?: boolean) => boolean;
+  readonly wasDirectory: (path: string) => boolean;
 }
 
 const traversalIgnoredDirectories = new Set([
@@ -98,6 +99,7 @@ export const loadGitIgnoreMatcher = (
         }
       }
     }
+    const knownDirectories = new Set(trackedDirectories);
     const rules: Array<IgnoreRules> = [];
     const pending = [normalizedRoot];
     while (pending.length > 0) {
@@ -132,13 +134,10 @@ export const loadGitIgnoreMatcher = (
           ),
         );
       for (const entry of entries) {
-        if (
-          entry.kind !== "directory" ||
-          traversalIgnoredDirectories.has(entry.name)
-        ) {
-          continue;
-        }
+        if (entry.kind !== "directory") continue;
         const path = joinPath(directory, entry.name);
+        knownDirectories.add(comparablePath(path));
+        if (traversalIgnoredDirectories.has(entry.name)) continue;
         if (!matchesRules(normalizedRoot, rules, path, true))
           pending.push(path);
       }
@@ -154,5 +153,6 @@ export const loadGitIgnoreMatcher = (
         }
         return matchesRules(normalizedRoot, rules, path, directory);
       },
+      wasDirectory: (path) => knownDirectories.has(comparablePath(path)),
     };
   });

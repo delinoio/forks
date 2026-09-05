@@ -516,8 +516,10 @@ changes and active JavaScript, Cargo, or uv workspace manifest changes refresh
 package discovery and output patterns before the next run. Explicit graph,
 structured-log, profile, trace, and heap artifacts, default profile artifacts,
 and write-enabled local cache directories are treated as run-owned paths and
-never trigger another watch run. Default profile matching is limited to the
-generated `profile.<timestamp>` names, their anonymous variant, and atomic
+never trigger another watch run. Write-enabled cache directories are resolved
+through existing ancestor symlinks before event filtering. Default profile
+matching is limited to the generated `profile.<timestamp>` names, their
+anonymous variant, and atomic
 temporary files; other root-level `profile.*` files remain ordinary watch
 inputs. Watch-time discovery honors `--single-package` for both initial and
 refreshed repository models.
@@ -534,7 +536,8 @@ only requested task entrypoints whose effective inputs match the changed paths,
 plus their dependency and `with` closure. Root configuration, `.gitignore`, and
 CLI `--global-deps` matches retain the all-task fallback. Watcher entry types
 distinguish regular file renames from directories when applying directory-only
-ignore rules.
+ignore rules. Removal events without type metadata reuse directory kinds from
+the loaded ignore snapshot or later watcher observations.
 
 The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
 identity, per-user temporary state directory, atomic PID and start lock files,
@@ -600,10 +603,13 @@ setup failure closes the server and all sessions. Repository watcher failure
 terminates the daemon rather than leaving an apparently healthy RPC server.
 Windows deliberately uses Node's forceful
 process termination because Node has no supported graceful Win32 Ctrl+C bridge.
+Daemon log followers treat watcher overflow invalidations as incremental read
+prompts so a dropped file-specific event cannot strand available log bytes.
 
 `query` provides the compatible repository GraphQL root, package graph,
 package and task collections, affected collections, variables, schema
-introspection, and a loopback GraphQL server. Task relationship collections
+introspection, and a GraphQL server that binds and advertises IPv4 loopback.
+Task relationship collections
 come from the resolved task graph. GraphQL affected collections calculate the
 requested base/head range, include dependent packages, and apply package and
 task filters. The `query affected --tasks` shortcut uses the same resolved task
@@ -719,7 +725,8 @@ mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
 completed task's full log replay. Structured log files append typed task events
 as work runs and end with a typed run summary. An explicit structured-log
 artifact and explicit named, anonymous, or trace profile artifacts are excluded
-from task and global file hashes. Root-level generated
+from task and global file hashes by their canonical filesystem identities.
+Root-level generated
 `profile.<timestamp>` artifacts, their anonymous variant, and atomic temporary
 files are likewise excluded whenever a bare profile option selects the default
 path; other `profile.*` files remain inputs. Simultaneous bare named and

@@ -1242,7 +1242,7 @@ export const executeQuery = (
           );
         });
         yield* terminal.writeStdout(
-          `GraphQL endpoint: http://localhost:${server.port}\n`,
+          `GraphQL endpoint: http://127.0.0.1:${server.port}\n`,
         );
         yield* Stream.runHead(signals.signals);
         return 0;

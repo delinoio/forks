@@ -1198,10 +1198,20 @@ describe("repository workflow gate", () => {
           "PACKAGES/APP/SNAPSHOT.HEAPSNAPSHOT.1234.0123456789ABCDEF.TMP",
         ),
       ]) {
-        expect(runOwnedPath(repository, options, path, {}, 8, true)).toBe(true);
-        expect(runOwnedPath(repository, options, path, {}, 8, false)).toBe(
-          false,
-        );
+        expect(
+          await Effect.runPromise(
+            runOwnedPath(repository, options, path, {}, 8, true).pipe(
+              Effect.provide(nodeFoundationLayer),
+            ),
+          ),
+        ).toBe(true);
+        expect(
+          await Effect.runPromise(
+            runOwnedPath(repository, options, path, {}, 8, false).pipe(
+              Effect.provide(nodeFoundationLayer),
+            ),
+          ),
+        ).toBe(false);
       }
     } finally {
       await rm(directory, { force: true, recursive: true });
@@ -1212,7 +1222,16 @@ describe("repository workflow gate", () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-log-hash-"));
     try {
       await prepareFixture(directory);
-      const logPath = "packages/app/run.ndjson";
+      const artifactTarget = join(directory, "packages/app/artifact-target");
+      const artifactLink = join(directory, "packages/app/artifact-link");
+      await mkdir(artifactTarget);
+      await symlink(
+        process.platform === "win32" ? artifactTarget : "artifact-target",
+        artifactLink,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      const logPath = "packages/app/artifact-link/run.ndjson";
+      const canonicalLogPath = "packages/app/artifact-target/run.ndjson";
       const execute = async () => {
         const result = await execFilePromise(process.execPath, [
           candidate,
@@ -1222,7 +1241,7 @@ describe("repository workflow gate", () => {
           "--no-cache",
           "--summarize",
           "--json",
-          `--global-deps=${logPath}`,
+          `--global-deps=${canonicalLogPath}`,
           `--log-file=${logPath}`,
           "--cwd",
           directory,
@@ -1243,11 +1262,13 @@ describe("repository workflow gate", () => {
       expect(
         second.tasks.map(({ taskId, hash }) => ({ taskId, hash })),
       ).toEqual(first.tasks.map(({ taskId, hash }) => ({ taskId, hash })));
-      expect(first.globalCacheInputs.files).not.toHaveProperty(logPath);
+      expect(first.globalCacheInputs.files).not.toHaveProperty(
+        canonicalLogPath,
+      );
       expect(
         first.tasks.find((task) => task.taskId === "synthetic-app#build")
           ?.inputs,
-      ).not.toHaveProperty("run.ndjson");
+      ).not.toHaveProperty("artifact-target/run.ndjson");
 
       const manifestPath = join(directory, "packages/app/package.json");
       const manifest = await readFile(manifestPath, "utf8");
@@ -1484,6 +1505,14 @@ describe("repository workflow gate", () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-profile-hash-"));
     try {
       await prepareFixture(directory);
+      const artifactTarget = join(directory, "packages/app/artifact-target");
+      const artifactLink = join(directory, "packages/app/artifact-link");
+      await mkdir(artifactTarget);
+      await symlink(
+        process.platform === "win32" ? artifactTarget : "artifact-target",
+        artifactLink,
+        process.platform === "win32" ? "junction" : "dir",
+      );
       const runProfiled = async () => {
         const result = await execFilePromise(process.execPath, [
           candidate,
@@ -1491,9 +1520,9 @@ describe("repository workflow gate", () => {
           "build",
           "--filter=synthetic-app",
           "--no-cache",
-          "--profile=packages/app/profile.json",
-          "--anon-profile=packages/app/anonymous.json",
-          `--trace=${join(directory, "packages/app/trace.json")}`,
+          "--profile=packages/app/artifact-link/profile.json",
+          "--anon-profile=packages/app/artifact-link/anonymous.json",
+          `--trace=${join(directory, "packages/app/artifact-link/trace.json")}`,
           "--json",
           "--cwd",
           directory,
@@ -1515,9 +1544,15 @@ describe("repository workflow gate", () => {
         (task) => task.taskId === "synthetic-app#build",
       )!;
       expect(secondTask.hash).toBe(firstTask.hash);
-      expect(Object.keys(secondTask.inputs)).not.toContain("profile.json");
-      expect(Object.keys(secondTask.inputs)).not.toContain("anonymous.json");
-      expect(Object.keys(secondTask.inputs)).not.toContain("trace.json");
+      expect(Object.keys(secondTask.inputs)).not.toContain(
+        "artifact-target/profile.json",
+      );
+      expect(Object.keys(secondTask.inputs)).not.toContain(
+        "artifact-target/anonymous.json",
+      );
+      expect(Object.keys(secondTask.inputs)).not.toContain(
+        "artifact-target/trace.json",
+      );
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -4092,9 +4127,8 @@ describe("repository workflow gate", () => {
                       Effect.promise(async () => {
                         await appendFile(logPath, appended);
                         return {
-                          path: logPath,
-                          kind: "modify" as const,
-                          entryKind: "file" as const,
+                          path: directory,
+                          kind: "unknown" as const,
                         };
                       }),
                     ),
@@ -4591,6 +4625,14 @@ describe("repository workflow gate", () => {
       join(tmpdir(), "turbo-ts-watch-artifacts-"),
     );
     await prepareFixture(directory);
+    const cacheTarget = join(directory, "packages/app/custom-cache-target");
+    const cacheLink = join(directory, "packages/app/custom-cache");
+    await mkdir(cacheTarget);
+    await symlink(
+      process.platform === "win32" ? cacheTarget : "custom-cache-target",
+      cacheLink,
+      process.platform === "win32" ? "junction" : "dir",
+    );
     const child = spawn(
       process.execPath,
       [
@@ -4792,6 +4834,96 @@ describe("repository workflow gate", () => {
         await closed;
       }
       await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("retains directory kinds when removals omit watcher metadata", async () => {
+    for (const tracked of [false, true]) {
+      const directory = await mkdtemp(
+        join(tmpdir(), "turbo-ts-watch-remove-kind-"),
+      );
+      try {
+        await prepareFixture(directory);
+        const applicationDirectory = join(directory, "packages/app");
+        const applicationManifestPath = join(
+          applicationDirectory,
+          "package.json",
+        );
+        const applicationManifest = JSON.parse(
+          await readFile(applicationManifestPath, "utf8"),
+        ) as { scripts: Record<string, string> };
+        applicationManifest.scripts.build =
+          "node -e \"require('node:fs').appendFileSync('.watch-runs','run\\n')\"";
+        await writeFile(
+          applicationManifestPath,
+          `${JSON.stringify(applicationManifest, undefined, 2)}\n`,
+        );
+        await writeFile(join(applicationDirectory, ".gitignore"), "removed/\n");
+        const removedDirectory = join(applicationDirectory, "removed");
+        await mkdir(removedDirectory);
+        await writeFile(join(removedDirectory, "value.txt"), "value\n");
+        await Effect.runPromise(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            return yield* executeWatch(
+              parseWatchArguments([
+                "build",
+                "--filter=synthetic-app",
+                "--cwd",
+                directory,
+                "--no-cache",
+              ]),
+            ).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  Layer.succeed(FileWatcherService, {
+                    watch: () =>
+                      Stream.concat(
+                        Stream.fromEffect(
+                          Effect.promise(async () => {
+                            await rm(removedDirectory, {
+                              force: true,
+                              recursive: true,
+                            });
+                            return {
+                              path: removedDirectory,
+                              kind: "remove" as const,
+                            };
+                          }),
+                        ),
+                        Stream.fromEffect(Effect.sleep("250 millis")).pipe(
+                          Stream.drain,
+                        ),
+                      ),
+                  }),
+                  Layer.succeed(ProcessService, {
+                    ...processService,
+                    runBytes: (request) =>
+                      request.command === "git" &&
+                      request.args.join("\0") ===
+                        ["ls-files", "--cached", "-z", "--"].join("\0")
+                        ? Effect.succeed({
+                            exitCode: 0,
+                            stdout: new TextEncoder().encode(
+                              tracked ? "packages/app/removed/value.txt\0" : "",
+                            ),
+                            stderr: new Uint8Array(),
+                          })
+                        : processService.runBytes(request),
+                  }),
+                ),
+              ),
+            );
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+        expect(
+          (await readFile(join(applicationDirectory, ".watch-runs"), "utf8"))
+            .trim()
+            .split("\n"),
+        ).toHaveLength(tracked ? 2 : 1);
+      } finally {
+        await rm(directory, { force: true, recursive: true });
+      }
     }
   }, 30_000);
 
@@ -5064,9 +5196,9 @@ snapshots:
     const closed = new Promise<void>((resolve) => child.once("close", resolve));
     try {
       await waitUntil(() =>
-        /GraphQL endpoint: http:\/\/localhost:\d+/.test(stdout),
+        /GraphQL endpoint: http:\/\/127\.0\.0\.1:\d+/.test(stdout),
       );
-      const port = /GraphQL endpoint: http:\/\/localhost:(\d+)/.exec(
+      const port = /GraphQL endpoint: http:\/\/127\.0\.0\.1:(\d+)/.exec(
         stdout,
       )?.[1];
       expect(port).toBeDefined();
@@ -5481,11 +5613,11 @@ dependencies = ["external-package 2.0.0"]
       try {
         await Promise.race([
           waitUntil(() =>
-            /GraphQL endpoint: http:\/\/localhost:\d+/.test(stdout),
+            /GraphQL endpoint: http:\/\/127\.0\.0\.1:\d+/.test(stdout),
           ),
           closed,
         ]);
-        const port = /GraphQL endpoint: http:\/\/localhost:(\d+)/.exec(
+        const port = /GraphQL endpoint: http:\/\/127\.0\.0\.1:(\d+)/.exec(
           stdout,
         )?.[1];
         expect(port, stderr).toBeDefined();
@@ -5578,7 +5710,7 @@ dependencies = ["external-package 2.0.0"]
             while (!stdout.includes("GraphQL endpoint:")) {
               yield* Effect.sleep("10 millis");
             }
-            const port = /GraphQL endpoint: http:\/\/localhost:(\d+)/.exec(
+            const port = /GraphQL endpoint: http:\/\/127\.0\.0\.1:(\d+)/.exec(
               stdout,
             )?.[1];
             expect(port).toBeDefined();

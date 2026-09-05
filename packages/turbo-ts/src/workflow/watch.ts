@@ -12,9 +12,11 @@ import {
   parentPath,
   relativePath,
 } from "../core/path.js";
+import { ConfigurationError } from "../effect/errors.js";
 import {
   ConcurrencyService,
   EnvironmentService,
+  FileSystemService,
   FileWatcherService,
   TerminalService,
 } from "../effect/services.js";
@@ -24,6 +26,7 @@ import {
 } from "../repository/git-ignore.js";
 import type { RepositoryModel } from "../repository/model.js";
 import {
+  canonicalExistingAncestorPath,
   executeRun,
   type RunRequirements,
   resolveOptions,
@@ -133,82 +136,86 @@ export const runOwnedPath = (
   environment: Readonly<Record<string, string | undefined>>,
   availableParallelism: number,
   windowsPathSeparators: boolean,
-): boolean => {
-  const resolved = resolveOptions(
-    options,
-    repository.root,
-    environment,
-    repository.rootConfiguration,
-    availableParallelism,
-    windowsPathSeparators,
-  );
-  const ordinaryRun =
-    options.graph === undefined && options.dryRun === undefined;
-  const resolveArtifactPath = (requested: string | undefined) =>
-    requested === undefined || requested === ""
-      ? undefined
-      : normalizePath(
-          isAbsolutePath(requested, windowsPathSeparators)
-            ? requested
-            : joinPath(repository.root, requested),
-          windowsPathSeparators,
-        );
-  const exactPaths = [
-    options.graph === undefined || options.graph === ""
-      ? undefined
-      : resolveArtifactPath(options.graph),
-    ordinaryRun ? resolveArtifactPath(options.logFile) : undefined,
-    ordinaryRun ? resolveArtifactPath(options.profile) : undefined,
-    ordinaryRun ? resolveArtifactPath(options.anonymousProfile) : undefined,
-    ordinaryRun ? resolveArtifactPath(options.heap) : undefined,
-    ordinaryRun ? resolveArtifactPath(options.trace) : undefined,
-  ].filter((candidate): candidate is string => candidate !== undefined);
-  const normalizedPath = normalizePath(path, windowsPathSeparators);
-  const comparablePath = (candidate: string): string => {
-    const normalized = normalizePath(candidate, windowsPathSeparators);
-    return windowsPathSeparators ? normalized.toLowerCase() : normalized;
-  };
-  const comparableBaseName = (candidate: string): string => {
-    const name = baseName(candidate, windowsPathSeparators);
-    return windowsPathSeparators ? name.toLowerCase() : name;
-  };
-  const pathIdentity = comparablePath(normalizedPath);
-  if (
-    exactPaths.some((exactPath) => {
-      const exactName = comparableBaseName(exactPath);
-      const observedName = comparableBaseName(normalizedPath);
-      return (
-        comparablePath(exactPath) === pathIdentity ||
-        (comparablePath(parentPath(exactPath, windowsPathSeparators)) ===
-          comparablePath(parentPath(normalizedPath, windowsPathSeparators)) &&
-          observedName.startsWith(`${exactName}.`) &&
-          observedName.endsWith(".tmp"))
-      );
-    })
-  ) {
-    return true;
-  }
-  const writesDefaultProfile =
-    ordinaryRun &&
-    [options.profile, options.anonymousProfile, options.trace].includes("");
-  if (
-    writesDefaultProfile &&
-    comparablePath(parentPath(normalizedPath, windowsPathSeparators)) ===
-      comparablePath(repository.root) &&
-    isDefaultProfileArtifactName(comparableBaseName(normalizedPath))
-  ) {
-    return true;
-  }
-  return (
-    ordinaryRun &&
-    resolved.cachePolicy.localWrite &&
-    isPathContained(
-      normalizePath(resolved.cacheDirectory, windowsPathSeparators),
-      normalizedPath,
+): Effect.Effect<boolean, ConfigurationError, FileSystemService> =>
+  Effect.gen(function* () {
+    const resolved = resolveOptions(
+      options,
+      repository.root,
+      environment,
+      repository.rootConfiguration,
+      availableParallelism,
       windowsPathSeparators,
-    )
-  );
-};
+    );
+    const ordinaryRun =
+      options.graph === undefined && options.dryRun === undefined;
+    const resolveArtifactPath = (requested: string | undefined) =>
+      requested === undefined || requested === ""
+        ? undefined
+        : normalizePath(
+            isAbsolutePath(requested, windowsPathSeparators)
+              ? requested
+              : joinPath(repository.root, requested),
+            windowsPathSeparators,
+          );
+    const exactPaths = [
+      options.graph === undefined || options.graph === ""
+        ? undefined
+        : resolveArtifactPath(options.graph),
+      ordinaryRun ? resolveArtifactPath(options.logFile) : undefined,
+      ordinaryRun ? resolveArtifactPath(options.profile) : undefined,
+      ordinaryRun ? resolveArtifactPath(options.anonymousProfile) : undefined,
+      ordinaryRun ? resolveArtifactPath(options.heap) : undefined,
+      ordinaryRun ? resolveArtifactPath(options.trace) : undefined,
+    ].filter((candidate): candidate is string => candidate !== undefined);
+    const normalizedPath = normalizePath(path, windowsPathSeparators);
+    const comparablePath = (candidate: string): string => {
+      const normalized = normalizePath(candidate, windowsPathSeparators);
+      return windowsPathSeparators ? normalized.toLowerCase() : normalized;
+    };
+    const comparableBaseName = (candidate: string): string => {
+      const name = baseName(candidate, windowsPathSeparators);
+      return windowsPathSeparators ? name.toLowerCase() : name;
+    };
+    const pathIdentity = comparablePath(normalizedPath);
+    if (
+      exactPaths.some((exactPath) => {
+        const exactName = comparableBaseName(exactPath);
+        const observedName = comparableBaseName(normalizedPath);
+        return (
+          comparablePath(exactPath) === pathIdentity ||
+          (comparablePath(parentPath(exactPath, windowsPathSeparators)) ===
+            comparablePath(parentPath(normalizedPath, windowsPathSeparators)) &&
+            observedName.startsWith(`${exactName}.`) &&
+            observedName.endsWith(".tmp"))
+        );
+      })
+    ) {
+      return true;
+    }
+    const writesDefaultProfile =
+      ordinaryRun &&
+      [options.profile, options.anonymousProfile, options.trace].includes("");
+    if (
+      writesDefaultProfile &&
+      comparablePath(parentPath(normalizedPath, windowsPathSeparators)) ===
+        comparablePath(repository.root) &&
+      isDefaultProfileArtifactName(comparableBaseName(normalizedPath))
+    ) {
+      return true;
+    }
+    if (!ordinaryRun || !resolved.cachePolicy.localWrite) return false;
+    const canonicalCacheDirectory = yield* canonicalExistingAncestorPath(
+      resolved.cacheDirectory,
+    );
+    return [resolved.cacheDirectory, canonicalCacheDirectory].some(
+      (cacheDirectory) =>
+        isPathContained(
+          normalizePath(cacheDirectory, windowsPathSeparators),
+          normalizedPath,
+          windowsPathSeparators,
+        ),
+    );
+  });
 
 interface PendingWatchChange {
   readonly sequence: number;
@@ -341,6 +348,11 @@ export const executeWatch = (
     );
     const pendingChanges = yield* Ref.make(initialPendingWatchChanges());
     const activeRuns = yield* Ref.make(0);
+    const observedDirectories = yield* Ref.make<ReadonlySet<string>>(new Set());
+    const comparableWatchPath = (path: string): string => {
+      const normalized = normalizePath(path, windowsPathSeparators);
+      return windowsPathSeparators ? normalized.toLowerCase() : normalized;
+    };
     const absoluteRootTurboJson =
       options.run.rootTurboJson === undefined
         ? undefined
@@ -395,9 +407,33 @@ export const executeWatch = (
               ignoreMatcher,
               yield* loadGitIgnoreMatcher(repository.root),
             );
+            yield* Ref.set(observedDirectories, new Set());
             return true;
           }
           const currentRepository = yield* Ref.get(repositoryRef);
+          const currentIgnoreMatcher = yield* Ref.get(ignoreMatcher);
+          const changeIdentity = comparableWatchPath(change.path);
+          const wasObservedDirectory = (yield* Ref.get(
+            observedDirectories,
+          )).has(changeIdentity);
+          const entryIsDirectory =
+            change.entryKind === "directory" ||
+            (change.kind === "remove" &&
+              (wasObservedDirectory ||
+                currentIgnoreMatcher.wasDirectory(change.path)));
+          yield* Ref.update(observedDirectories, (current) => {
+            const updated = new Set(current);
+            if (
+              change.kind === "remove" ||
+              (change.entryKind !== undefined &&
+                change.entryKind !== "directory")
+            ) {
+              updated.delete(changeIdentity);
+            } else if (change.entryKind === "directory") {
+              updated.add(changeIdentity);
+            }
+            return updated;
+          });
           const currentRunOptions = resolvedWatchRunOptions(
             options,
             currentRepository,
@@ -405,7 +441,7 @@ export const executeWatch = (
             availableParallelism,
             windowsPathSeparators,
           );
-          const isRunOwnedPath = runOwnedPath(
+          const isRunOwnedPath = yield* runOwnedPath(
             currentRepository,
             currentRunOptions,
             change.path,
@@ -416,7 +452,7 @@ export const executeWatch = (
           const isConfiguredOutputPath = configuredOutputPath(
             currentRepository,
             change.path,
-            change.entryKind,
+            entryIsDirectory ? "directory" : change.entryKind,
           );
           if (isGitIgnorePath(change.path)) {
             yield* Ref.set(
@@ -429,9 +465,9 @@ export const executeWatch = (
             );
           }
           if (isRunOwnedPath) return false;
-          const ignored = (yield* Ref.get(ignoreMatcher)).ignores(
+          const ignored = currentIgnoreMatcher.ignores(
             change.path,
-            change.entryKind === "directory",
+            entryIsDirectory,
           );
           if (ignored || isConfiguredOutputPath) {
             return false;

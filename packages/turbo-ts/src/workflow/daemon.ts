@@ -1194,7 +1194,11 @@ export const followDaemonLog = (
       });
       yield* writeAvailable;
       const follow = watcher.watch(parentPath(logPath)).pipe(
-        Stream.filter((change) => watcherPathsMatch(change.path, logPath)),
+        Stream.filter(
+          (change) =>
+            change.kind === "unknown" ||
+            watcherPathsMatch(change.path, logPath),
+        ),
         Stream.mapEffect(() => writeAvailable),
         Stream.runDrain,
       );

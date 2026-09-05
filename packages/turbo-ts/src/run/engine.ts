@@ -3167,7 +3167,7 @@ const readyForegroundCohorts = (
   return cohorts.sort((left, right) => left[0]!.localeCompare(right[0]!));
 };
 
-const canonicalExistingAncestorPath = (
+export const canonicalExistingAncestorPath = (
   path: string,
   description = "cache directory",
 ): Effect.Effect<string, ConfigurationError, FileSystemService> =>
@@ -3536,11 +3536,24 @@ export const executeRun = (
       const normalized = normalizePath(path, platform === "win32");
       return platform === "win32" ? normalized.toLowerCase() : normalized;
     };
-    if (structuredLogPath !== undefined) {
-      const canonicalStructuredLogPath = yield* canonicalExistingAncestorPath(
-        structuredLogPath,
-        "run artifact",
+    const canonicalArtifactPaths = new Map<string, string>();
+    const canonicalRunArtifactPath = (
+      path: string,
+    ): Effect.Effect<string, ConfigurationError, FileSystemService> => {
+      const lexicalIdentity = comparableInputPath(path);
+      const cached = canonicalArtifactPaths.get(lexicalIdentity);
+      if (cached !== undefined) return Effect.succeed(cached);
+      return canonicalExistingAncestorPath(path, "run artifact").pipe(
+        Effect.tap((canonicalPath) =>
+          Effect.sync(() => {
+            canonicalArtifactPaths.set(lexicalIdentity, canonicalPath);
+          }),
+        ),
       );
+    };
+    if (structuredLogPath !== undefined) {
+      const canonicalStructuredLogPath =
+        yield* canonicalRunArtifactPath(structuredLogPath);
       const structuredLogIdentity = comparableInputPath(
         canonicalStructuredLogPath,
       );
@@ -3630,7 +3643,7 @@ export const executeRun = (
         );
       }
     }
-    const excludedInputPaths = [
+    const excludedInputPathCandidates = [
       structuredLogPath,
       ...(parsed.graph === undefined && parsed.dryRun === undefined
         ? [parsed.profile, parsed.anonymousProfile, parsed.trace].map(
@@ -3638,6 +3651,10 @@ export const executeRun = (
           )
         : []),
     ].filter((path): path is string => path !== undefined);
+    const excludedInputPaths = yield* Effect.forEach(
+      excludedInputPathCandidates,
+      canonicalRunArtifactPath,
+    );
     const excludeDefaultProfileArtifacts =
       parsed.graph === undefined &&
       parsed.dryRun === undefined &&
@@ -3696,7 +3713,7 @@ export const executeRun = (
     for (const [owner, path] of artifactDestinations) {
       if (path === undefined) continue;
       const identity = comparableInputPath(
-        yield* canonicalExistingAncestorPath(path, "run artifact"),
+        yield* canonicalRunArtifactPath(path),
       );
       const existingOwner = artifactOwners.get(identity);
       if (existingOwner !== undefined) {
