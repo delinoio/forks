@@ -12,6 +12,7 @@ import {
 import {
   createReadStream,
   createWriteStream,
+  constants as fileSystemConstants,
   watch as watchFileSystem,
 } from "node:fs";
 import {
@@ -150,6 +151,63 @@ const isMissingFileError = (cause: unknown): boolean =>
   cause !== null &&
   "code" in cause &&
   cause.code === "ENOENT";
+
+const isExistingPathError = (cause: unknown): boolean =>
+  typeof cause === "object" &&
+  cause !== null &&
+  "code" in cause &&
+  cause.code === "EEXIST";
+
+const ensurePrivateDirectoryPath = async (path: string): Promise<void> => {
+  try {
+    await mkdir(path, { mode: 0o700 });
+  } catch (cause) {
+    if (!isExistingPathError(cause)) throw cause;
+  }
+
+  if (operatingSystem() === "win32") {
+    if (!(await lstat(path)).isDirectory()) {
+      throw new TypeError("private directory path is not a real directory");
+    }
+    return;
+  }
+
+  if (typeof process.getuid !== "function") {
+    throw new TypeError("current user identity is unavailable");
+  }
+  const directory = await open(
+    path,
+    fileSystemConstants.O_RDONLY |
+      fileSystemConstants.O_DIRECTORY |
+      fileSystemConstants.O_NOFOLLOW,
+  );
+  try {
+    let metadata = await directory.stat();
+    if (!metadata.isDirectory()) {
+      throw new TypeError("private directory path is not a real directory");
+    }
+    if (metadata.uid !== process.getuid()) {
+      throw new TypeError("private directory is not owned by the current user");
+    }
+    const mode = metadata.mode & 0o777;
+    if ((mode & 0o022) !== 0) {
+      throw new TypeError("private directory is writable by another user");
+    }
+    if (mode !== 0o700) {
+      await directory.chmod(0o700);
+      metadata = await directory.stat();
+    }
+    if (
+      !metadata.isDirectory() ||
+      metadata.uid !== process.getuid() ||
+      (metadata.mode & 0o777) !== 0o700
+    ) {
+      throw new TypeError("private directory security validation failed");
+    }
+  } finally {
+    await directory.close();
+  }
+};
 
 const metadataKind = (
   metadata: Awaited<ReturnType<typeof lstat>>,
@@ -895,6 +953,11 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
       try: async () => {
         await mkdir(path, { recursive: true });
       },
+      catch: filesystemError,
+    }),
+  ensurePrivateDirectory: (path) =>
+    Effect.tryPromise({
+      try: () => ensurePrivateDirectoryPath(path),
       catch: filesystemError,
     }),
   createExclusiveFile: (path, contents) =>
@@ -2442,12 +2505,19 @@ const daemonLayer = Layer.succeed(DaemonService, {
         chunks.push(chunk);
       });
       stream.on("end", () => {
+        if (settled) return;
         try {
-          const payload = grpcPayload(Buffer.concat(chunks));
+          const payload =
+            responseLength === 0 && responseError !== undefined
+              ? undefined
+              : grpcPayload(Buffer.concat(chunks));
           complete(
             Effect.succeed({
               id: request.id,
-              result: decodedDaemonResponse(request.method, payload),
+              result:
+                payload === undefined
+                  ? undefined
+                  : decodedDaemonResponse(request.method, payload),
               error: responseError,
             }),
           );

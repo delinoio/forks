@@ -881,6 +881,26 @@ export const executePrune = (
           : [logicalRoot, canonicalRoot];
       }),
     );
+    const generatedControlSources = [
+      ...rootControlNames.map((name) => joinPath(repository.root, name)),
+      ...[...ecosystemWorkspaceControls.values()].flatMap(
+        (controls) => controls.paths,
+      ),
+    ];
+    const generatedControlCopyExclusions = new Set(
+      (yield* Effect.forEach(generatedControlSources, (source) =>
+        canonicalOutputPath(source).pipe(
+          Effect.map((canonicalSource) => [
+            normalizePath(source),
+            canonicalSource,
+          ]),
+        ),
+      )).flat(),
+    );
+    const packageCopyExclusions = new Set([
+      ...excludedPackageRoots,
+      ...generatedControlCopyExclusions,
+    ]);
     for (const packageModel of packages) {
       yield* copyTree(
         packageModel.directory,
@@ -888,7 +908,7 @@ export const executePrune = (
         canonicalOutputRoot,
         selectedPackageRoots,
         ignoreMatcher,
-        excludedPackageRoots,
+        packageCopyExclusions,
       );
       yield* terminal.writeStdout(` - Added ${packageModel.name}\n`);
     }

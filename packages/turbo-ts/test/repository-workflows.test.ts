@@ -330,6 +330,80 @@ describe("repository workflow gate", () => {
     ).toBe("/tmp/turbod-user/repository/turbod.sock");
   });
 
+  it("secures the daemon state parent before accessing repository state", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-parent-"));
+    const temporaryDirectory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-daemon-state-"),
+    );
+    const outside = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-outside-"));
+    try {
+      await prepareFixture(directory);
+      const { information, terminal } = await Effect.runPromise(
+        Effect.gen(function* () {
+          const system = yield* SystemService;
+          const terminal = yield* TerminalService;
+          return { information: yield* system.information, terminal };
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const stateParent = join(
+        temporaryDirectory,
+        `turbod-${information.userIdentifier}`,
+      );
+      const overrides = Layer.mergeAll(
+        Layer.succeed(SystemService, {
+          information: Effect.succeed({
+            ...information,
+            temporaryDirectory,
+          }),
+        }),
+        Layer.succeed(TerminalService, {
+          ...terminal,
+          writeStdout: () => Effect.void,
+          writeStderr: () => Effect.void,
+        }),
+      );
+      const runStatus = () =>
+        Effect.runPromise(
+          executeDaemon({
+            command: "status",
+            cwd: directory,
+            idleMilliseconds: 30_000,
+            json: false,
+          }).pipe(
+            Effect.provide(overrides),
+            Effect.either,
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+
+      await symlink(outside, stateParent);
+      expect(await runStatus()).toMatchObject({
+        _tag: "Left",
+        left: { boundary: "filesystem" },
+      });
+      expect(await readdir(outside)).toEqual([]);
+      await rm(stateParent);
+
+      await mkdir(stateParent, { mode: 0o777 });
+      await chmod(stateParent, 0o777);
+      expect(await runStatus()).toMatchObject({
+        _tag: "Left",
+        left: { message: expect.stringContaining("writable by another user") },
+      });
+      await rm(stateParent, { recursive: true });
+
+      await mkdir(stateParent, { mode: 0o755 });
+      await chmod(stateParent, 0o755);
+      expect(await runStatus()).toMatchObject({ _tag: "Right", right: 1 });
+      expect((await stat(stateParent)).mode & 0o777).toBe(0o700);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+      await rm(temporaryDirectory, { force: true, recursive: true });
+      await rm(outside, { force: true, recursive: true });
+    }
+  });
+
   it("bounds pending watch events by distinct path", () => {
     const repeatedPath = "/repository/packages/app/source.ts";
     let pending = initialPendingWatchChanges();
@@ -1802,6 +1876,7 @@ describe("repository workflow gate", () => {
           name: "synthetic-root-cargo",
           private: true,
           packageManager: "pnpm@10.34.5",
+          devDependencies: { "synthetic-build-tool": "1.0.0" },
         })}\n`,
       );
       await writeFile(
@@ -1817,7 +1892,7 @@ describe("repository workflow gate", () => {
       );
       await writeFile(
         join(directory, "Cargo.toml"),
-        '[package]\nname = "synthetic-root-cargo"\nversion = "0.1.0"\nedition = "2024"\n',
+        '[workspace]\nmembers = []\nexclude = ["unused"]\nresolver = "3"\n\n[package]\nname = "synthetic-root-cargo"\nversion = "0.1.0"\nedition = "2024"\n',
       );
       await writeFile(
         join(directory, "Cargo.lock"),
@@ -1859,6 +1934,29 @@ describe("repository workflow gate", () => {
           }
         ).monorepo,
       ).toBe(false);
+      await execFilePromise(process.execPath, [
+        candidate,
+        "prune",
+        "synthetic-root-cargo",
+        "--production",
+        "--out-dir=pruned",
+        "--cwd",
+        directory,
+      ]);
+      const prunedManifest = JSON.parse(
+        await readFile(join(directory, "pruned/package.json"), "utf8"),
+      ) as Record<string, unknown>;
+      expect(prunedManifest).not.toHaveProperty("devDependencies");
+      const prunedCargoManifest = parseToml(
+        await readFile(join(directory, "pruned/Cargo.toml"), "utf8"),
+      ) as unknown as {
+        readonly workspace: {
+          readonly members: ReadonlyArray<string>;
+          readonly exclude?: ReadonlyArray<string>;
+        };
+      };
+      expect(prunedCargoManifest.workspace.members).toEqual(["."]);
+      expect(prunedCargoManifest.workspace.exclude).toBeUndefined();
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -2678,7 +2776,7 @@ describe("repository workflow gate", () => {
     }
   });
 
-  it("decodes daemon errors from response headers and trailers", async () => {
+  it("decodes daemon errors from headers and trailers without DATA frames", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(
       join(tmpdir(), "turbo-ts-daemon-error-message-"),
@@ -2713,7 +2811,7 @@ describe("repository workflow gate", () => {
           "grpc-message": encodeURIComponent(message),
         });
       }
-      stream.end(Buffer.alloc(5));
+      stream.end();
     });
     try {
       await new Promise<void>((resolve, reject) => {
@@ -2740,6 +2838,8 @@ describe("repository workflow gate", () => {
       );
       expect(responses.fromHeaders.error).toBe(message);
       expect(responses.fromTrailers.error).toBe(message);
+      expect(responses.fromHeaders.result).toBeUndefined();
+      expect(responses.fromTrailers.result).toBeUndefined();
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(directory, { force: true, recursive: true });

@@ -225,11 +225,12 @@ const daemonPaths = (
 ): Effect.Effect<
   DaemonPaths,
   BoundaryError,
-  ClockService | DigestService | SystemService
+  ClockService | DigestService | FileSystemService | SystemService
 > =>
   Effect.gen(function* () {
     const clock = yield* ClockService;
     const digest = yield* DigestService;
+    const fileSystem = yield* FileSystemService;
     const system = yield* SystemService;
     const information = yield* system.information;
     if (digest.sha256 === undefined) {
@@ -245,11 +246,12 @@ const daemonPaths = (
     const userHash = (yield* digest.sha256(
       `${information.userIdentifier}\0${information.temporaryDirectory}`,
     )).slice(0, 16);
-    const stateDirectory = joinPath(
+    const stateParentDirectory = joinPath(
       information.temporaryDirectory,
       `turbod-${information.userIdentifier}`,
-      hash,
     );
+    yield* fileSystem.ensurePrivateDirectory(stateParentDirectory);
+    const stateDirectory = joinPath(stateParentDirectory, hash);
     const date = new Date(yield* clock.now).toISOString().slice(0, 10);
     return {
       hash,

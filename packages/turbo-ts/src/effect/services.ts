@@ -58,6 +58,9 @@ export interface FileSystemOperations {
     path: string,
   ) => Effect.Effect<FileMetadata, BoundaryError>;
   readonly makeDirectory: (path: string) => Effect.Effect<void, BoundaryError>;
+  readonly ensurePrivateDirectory: (
+    path: string,
+  ) => Effect.Effect<void, BoundaryError>;
   readonly createExclusiveFile: (
     path: string,
     contents: string,

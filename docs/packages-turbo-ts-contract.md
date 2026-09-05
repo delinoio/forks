@@ -545,8 +545,12 @@ The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
 identity, per-user temporary state directory, atomic PID files, and a lifecycle
 lock beside rather than inside the removable repository state directory. It
 uses 0600 Unix sockets on POSIX, per-user named-pipe endpoints on Windows, and
-stale-state cleanup. Named pipes skip Unix filesystem ownership and permission
-operations. Its public transport is the official `turbodprotocol.Turbod` gRPC
+stale-state cleanup. Before any state path is accessed, the predictable
+per-user parent is created without following existing paths and validated as a
+real current-user-owned directory. POSIX parents writable by another user are
+rejected; safe legacy modes are tightened to `0700` and revalidated. Windows
+skips Unix filesystem ownership and permission operations. Its public transport
+is the official `turbodprotocol.Turbod` gRPC
 service over HTTP/2. Hello, status, and shutdown calls interoperate in both
 directions with the 2.10.12 executable; package and watch calls share the same
 bounded framing and scoped sessions. Clients terminate a response as soon as
@@ -554,7 +558,9 @@ its accumulated frame exceeds the 1 MiB payload limit plus framing bytes.
 Oversized request streams discard retained frame data and are never dispatched
 to a daemon handler after cancellation. Nonzero `grpc-message` diagnostics in
 response headers or trailers are percent-decoded; malformed encodings fail with
-a typed protocol error.
+a typed protocol error. A nonzero status without a DATA frame returns that
+decoded diagnostic as an error-only response, while successful and data-bearing
+responses still require valid gRPC framing.
 Requests that exceed the transport queue receive an immediate protocol error
 instead of displacing an older request. Unsupported-method and queue-capacity
 responses run in the server Scope so endpoint teardown interrupts pending
@@ -692,7 +698,10 @@ escaping, or output-targeting root-control links are rejected, and an exact
 symlinked output root is rejected before replacement. Generated root manifest,
 Turbo configuration, and pnpm workspace configuration transformations are
 applied to validated symlink targets before the links are recreated; this
-includes production dependency removal from root manifests. The root pnpm
+includes production dependency removal from root manifests. Selected package
+tree copies, including packages located at a workspace or repository root, do
+not overwrite generated root controls, their validated symlink targets, or
+reduced Cargo workspace manifests. The root pnpm
 hook `.pnpmfile.cjs` is retained in every
 installation root. Root Bun `bunfig.toml` configuration is retained in the
 ordinary output and both Docker installation roots. Root Yarn installation controls, including `.yarnrc.yml`,
