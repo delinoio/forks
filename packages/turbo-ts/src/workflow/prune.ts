@@ -509,7 +509,7 @@ export const executePrune = (
     const protectedWorkspaceRoots = yield* Effect.forEach(
       [
         ...new Set(
-          packages.flatMap((packageModel) => [
+          [...repository.packages, ...packages].flatMap((packageModel) => [
             packageModel.directory,
             packageModel.workspaceDirectory ?? packageModel.directory,
           ]),
@@ -526,7 +526,7 @@ export const executePrune = (
         new ConfigurationError({
           path: outputRoot,
           message:
-            "prune output must not contain a selected package or workspace control directory",
+            "prune output must not contain a repository package or workspace control directory",
         }),
       );
     }

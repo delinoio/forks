@@ -415,9 +415,15 @@ describe("repository workflow gate", () => {
       ),
     ).toContain("running   app#build");
     expect(
-      parseDaemonArguments(["--idle-time=30s", "status", "--json"]),
+      parseDaemonArguments([
+        "--idle-time=30s",
+        "status",
+        "--json",
+        "--turbo-json-path=custom.json",
+      ]),
     ).toMatchObject({
       command: "status",
+      rootTurboJson: "custom.json",
       idleMilliseconds: 30_000,
       json: true,
     });
@@ -1508,7 +1514,32 @@ describe("repository workflow gate", () => {
       execFilePromise(official, [...arguments_, "--cwd", directory]);
     try {
       await prepareFixture(directory);
-      await runCandidate("daemon", "start", "--idle-time=30s");
+      const customConfiguration = JSON.parse(
+        await readFile(join(directory, "turbo.json"), "utf8"),
+      ) as { futureFlags?: Record<string, boolean> };
+      customConfiguration.futureFlags = {
+        ...customConfiguration.futureFlags,
+        experimentalPythonWorkspaces: true,
+      };
+      await writeFile(
+        join(directory, "custom-turbo.json"),
+        `${JSON.stringify(customConfiguration, undefined, 2)}\n`,
+      );
+      await writeFile(
+        join(directory, "pyproject.toml"),
+        '[tool.uv.workspace]\nmembers = ["python/*"]\n',
+      );
+      await mkdir(join(directory, "python/daemon"), { recursive: true });
+      await writeFile(
+        join(directory, "python/daemon/pyproject.toml"),
+        '[project]\nname = "synthetic-daemon-python"\nversion = "0.1.0"\ndependencies = []\n',
+      );
+      await runCandidate(
+        "daemon",
+        "start",
+        "--idle-time=30s",
+        "--turbo-json-path=custom-turbo.json",
+      );
       await expect(
         runCandidate("daemon", "serve", "--idle-time=30s"),
       ).rejects.toThrow(/daemon is already running/);
@@ -1532,6 +1563,7 @@ describe("repository workflow gate", () => {
       );
       expect(discovered.toString("utf8")).toContain("synthetic-app");
       expect(discovered.toString("utf8")).toContain("synthetic-library");
+      expect(discovered.toString("utf8")).toContain("synthetic-daemon-python");
       const addedDirectory = join(directory, "packages/added");
       const renamedDirectory = join(directory, "packages/renamed");
       await mkdir(addedDirectory, { recursive: true });
@@ -2657,6 +2689,76 @@ describe("repository workflow gate", () => {
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
   }, 40_000);
 
+  it("suppresses repository-root outputs written by watched child tasks", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-watch-root-output-"),
+    );
+    await prepareFixture(directory);
+    const configurationPath = join(directory, "packages/app/turbo.json");
+    const configuration = JSON.parse(
+      await readFile(configurationPath, "utf8"),
+    ) as { tasks: { build: { outputs: Array<string> } } };
+    configuration.tasks.build.outputs = ["$TURBO_ROOT$/generated/**"];
+    await writeFile(
+      configurationPath,
+      `${JSON.stringify(configuration, undefined, 2)}\n`,
+    );
+    const manifestPath = join(directory, "packages/app/package.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    manifest.scripts.build =
+      "node -e \"const fs=require('node:fs');fs.mkdirSync('../../generated',{recursive:true});fs.writeFileSync('../../generated/output.txt','generated');console.log('app root output build')\"";
+    await writeFile(
+      manifestPath,
+      `${JSON.stringify(manifest, undefined, 2)}\n`,
+    );
+    const child = spawn(
+      process.execPath,
+      [
+        candidate,
+        "watch",
+        "build",
+        "--filter=synthetic-app",
+        "--cwd",
+        directory,
+        "--no-cache",
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    const closed = new Promise<void>((resolve) => child.once("close", resolve));
+    try {
+      await waitUntil(
+        () =>
+          stdout.includes("app root output build") &&
+          existsSync(join(directory, "generated/output.txt")),
+      );
+      const completedRuns = (stdout.match(/app root output build/g) ?? [])
+        .length;
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect((stdout.match(/app root output build/g) ?? []).length).toBe(
+        completedRuns,
+      );
+      expect(stdout, stdout).not.toContain("change detected");
+    } finally {
+      child.kill();
+      await Promise.race([
+        closed,
+        new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await closed;
+      }
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("uses single-package discovery when filtering watch changes", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-single-"));
     await prepareFixture(directory);
@@ -3324,6 +3426,63 @@ snapshots:
     }
   }, 15_000);
 
+  it("excludes packages from their own cyclic relationship closures", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-query-cycle-"));
+    try {
+      await prepareFixture(directory);
+      const libraryManifestPath = join(
+        directory,
+        "packages/library/package.json",
+      );
+      const libraryManifest = JSON.parse(
+        await readFile(libraryManifestPath, "utf8"),
+      ) as { dependencies?: Record<string, string> };
+      libraryManifest.dependencies = {
+        ...libraryManifest.dependencies,
+        "synthetic-app": "workspace:*",
+      };
+      await writeFile(
+        libraryManifestPath,
+        `${JSON.stringify(libraryManifest, undefined, 2)}\n`,
+      );
+      const rootConfigurationPath = join(directory, "turbo.json");
+      const rootConfiguration = JSON.parse(
+        await readFile(rootConfigurationPath, "utf8"),
+      ) as { tasks: { build: { dependsOn?: Array<string> } } };
+      rootConfiguration.tasks.build.dependsOn = [];
+      await writeFile(
+        rootConfigurationPath,
+        `${JSON.stringify(rootConfiguration, undefined, 2)}\n`,
+      );
+
+      const result = await execFilePromise(process.execPath, [
+        candidate,
+        "query",
+        '{ package(name: "synthetic-app") { allDependencies { length items { name } } indirectDependencies { length items { name } } allDependents { length items { name } } indirectDependents { length items { name } } } }',
+        "--cwd",
+        directory,
+      ]);
+      expect(JSON.parse(result.stdout)).toEqual({
+        data: {
+          package: {
+            allDependencies: {
+              length: 1,
+              items: [{ name: "synthetic-library" }],
+            },
+            indirectDependencies: { length: 0, items: [] },
+            allDependents: {
+              length: 1,
+              items: [{ name: "synthetic-library" }],
+            },
+            indirectDependents: { length: 0, items: [] },
+          },
+        },
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("matches the reference prune output and generated tree", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-"));
     const output = join(directory, "result");
@@ -3947,7 +4106,7 @@ importers:
         );
       await expect(
         runPrune([`cargo:${packageName}`], cargoWorkspaceDirectory),
-      ).rejects.toThrow(/selected package or workspace control directory/);
+      ).rejects.toThrow(/repository package or workspace control directory/);
       expect(
         await readFile(join(cargoWorkspaceDirectory, "Cargo.toml"), "utf8"),
       ).toContain("[workspace]");
@@ -4031,6 +4190,26 @@ importers:
     const outside = await mkdtemp(join(tmpdir(), "turbo-ts-prune-control-"));
     try {
       await prepareFixture(directory);
+      const unselectedWorkspace = join(directory, "packages/other");
+      await mkdir(unselectedWorkspace);
+      await writeFile(
+        join(unselectedWorkspace, "package.json"),
+        `${JSON.stringify({ name: "synthetic-other", private: true })}\n`,
+      );
+      await writeFile(join(unselectedWorkspace, "sentinel.txt"), "preserved\n");
+      await expect(
+        execFilePromise(process.execPath, [
+          candidate,
+          "prune",
+          "synthetic-app",
+          "--out-dir=packages/other",
+          "--cwd",
+          directory,
+        ]),
+      ).rejects.toThrow(/repository package or workspace control directory/);
+      expect(
+        await readFile(join(unselectedWorkspace, "sentinel.txt"), "utf8"),
+      ).toBe("preserved\n");
       for (const outputDirectory of ["packages", "packages/app"]) {
         await expect(
           execFilePromise(process.execPath, [
@@ -4041,7 +4220,7 @@ importers:
             "--cwd",
             directory,
           ]),
-        ).rejects.toThrow(/selected package or workspace control directory/);
+        ).rejects.toThrow(/repository package or workspace control directory/);
         expect(
           await readFile(join(directory, "packages/app/package.json"), "utf8"),
         ).toContain("synthetic-app");
@@ -4056,7 +4235,7 @@ importers:
           "--cwd",
           directory,
         ]),
-      ).rejects.toThrow(/selected package or workspace control directory/);
+      ).rejects.toThrow(/repository package or workspace control directory/);
       expect(
         await readFile(join(directory, "packages/app/package.json"), "utf8"),
       ).toContain("synthetic-app");
@@ -4340,6 +4519,25 @@ importers:
           },
         },
       });
+      const qualifiedAffected = await execFilePromise(process.execPath, [
+        candidate,
+        "query",
+        "affected",
+        "--tasks",
+        "synthetic-app#build",
+        "--base=HEAD~1",
+        "--head=HEAD",
+        "--cwd",
+        directory,
+      ]);
+      expect(JSON.parse(qualifiedAffected.stdout)).toMatchObject({
+        data: {
+          affectedTasks: {
+            length: 1,
+            items: [{ fullName: "synthetic-app#build" }],
+          },
+        },
+      });
       const rootManifestPath = join(directory, "package.json");
       const rootManifest = JSON.parse(
         await readFile(rootManifestPath, "utf8"),
@@ -4376,6 +4574,25 @@ importers:
           rootPackage: { length: 1, items: [{ name: "//" }] },
           rootTask: { length: 1, items: [{ fullName: "//#build" }] },
           affectedTasks: { length: 0 },
+        },
+      });
+      const qualifiedRootAffected = await execFilePromise(process.execPath, [
+        candidate,
+        "query",
+        "affected",
+        "--tasks",
+        "//#build",
+        "--base=HEAD~1",
+        "--head=HEAD",
+        "--cwd",
+        directory,
+      ]);
+      expect(JSON.parse(qualifiedRootAffected.stdout)).toMatchObject({
+        data: {
+          affectedTasks: {
+            length: 1,
+            items: [{ fullName: "//#build" }],
+          },
         },
       });
       await rename(

@@ -650,10 +650,12 @@ const repositoryQueryRoot = (
     next: (model: RepositoryPackage) => ReadonlyArray<RepositoryPackage>,
   ): ReadonlyArray<RepositoryPackage> => {
     const result = new Map<string, RepositoryPackage>();
+    const visited = new Set([start.identity]);
     const pending = [...next(start)];
     while (pending.length > 0) {
       const model = pending.shift()!;
-      if (result.has(model.identity)) continue;
+      if (visited.has(model.identity)) continue;
+      visited.add(model.identity);
       result.set(model.identity, model);
       pending.push(...next(model));
     }
@@ -1364,6 +1366,7 @@ export const executeQueryAffected = (
       requested.size === 0
         ? undefined
         : repositoryTaskGraph(repository, [...requested]);
+    const requestedTaskIds = new Set(requestedTaskGraph?.entrypoints ?? []);
     const taskItems = (
       options.packages
         ? []
@@ -1381,7 +1384,7 @@ export const executeQueryAffected = (
               .filter(
                 (node) =>
                   affected.has(node.package.identity) &&
-                  requested.has(node.task),
+                  requestedTaskIds.has(node.id),
               )
               .map((node) =>
                 taskItem(

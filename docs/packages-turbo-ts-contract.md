@@ -494,11 +494,13 @@ enables cache publication only with `--experimental-write-cache`; the effective
 policy is reduced to its readable capabilities until that flag is present, and
 a write-only policy disables cache access. Repository and
 nested Git-ignore rules and configured task-output patterns suppress generated
-files except where an output exclusion denies the changed file. Partial output
-matching is limited to directory events. Ignore and output filtering occurs
-before manifest or configuration refresh classification, so generated
-manifests cannot cause a watch loop. Changes to an ignore file reload the
-matcher before stale ignore rules are applied and remain user-visible triggers.
+files except where an output exclusion denies the changed file. Package-relative
+outputs are matched from their package directory, while `$TURBO_ROOT$/` outputs
+and exclusions are matched from the repository root. Partial output matching is
+limited to directory events. Ignore and output filtering occurs before manifest
+or configuration refresh classification, so generated manifests cannot cause a
+watch loop. Changes to an ignore file reload the matcher before stale ignore
+rules are applied and remain user-visible triggers.
 Declared-output ignore files written by an active run remain suppressed to
 prevent generated-output loops. Root, custom, and workspace Turbo configuration
 changes and active JavaScript, Cargo, or uv workspace manifest changes refresh
@@ -532,6 +534,8 @@ Requests that exceed the transport queue receive an immediate protocol error
 instead of displacing an older request.
 Package discovery reloads the repository model for each request so workspace
 additions, removals, and renames are visible without a daemon restart.
+Custom root Turbo configuration paths are retained by lifecycle commands,
+forwarded to detached servers, and reused for request-time package discovery.
 Output-change registration/query calls return their protocol data rather than
 empty acknowledgments. Changed-output snapshots are consumed only after their
 response is written successfully, so a failed response remains retryable.
@@ -568,9 +572,11 @@ introspection, and a loopback GraphQL server. Task relationship collections
 come from the resolved task graph. GraphQL affected collections calculate the
 requested base/head range, include dependent packages, and apply package and
 task filters. The `query affected --tasks` shortcut uses the same resolved task
-graph for explicitly requested names, including configured commandless tasks,
-and propagates dependency-task reasons through transitive affected package
-chains, while its unfiltered form retains script-backed task enumeration.
+graph for explicitly requested bare and package-qualified names, including root
+tasks and configured commandless tasks, and propagates dependency-task reasons
+through transitive affected package chains, while its unfiltered form retains
+script-backed task enumeration. Cyclic package graphs never include the starting
+package in its own dependency or dependent relationship collections.
 Boundary diagnostics evaluate root, package, and tag dependency and dependent
 permissions against manifest and configured implicit package dependencies. Package-graph
 center selection retains the named package and its
@@ -608,8 +614,8 @@ packages and workspace dependencies retained by the copied root manifest,
 emits ordinary and Docker layouts, creates reduced lockfiles with
 reference-compatible canonical
 configuration formatting, supports production manifests, and
-rejects output roots that could contain the source repository, a selected
-package, or a selected Cargo or uv workspace-control directory. Selected
+rejects output roots that could contain the source repository, any discovered
+package, or any discovered Cargo or uv workspace-control directory. Selected
 package copies stop at nested workspace roots outside the selected closure.
 Generated installation manifests and configuration files use readable `0644`
 modes. It

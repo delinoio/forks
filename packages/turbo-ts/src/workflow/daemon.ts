@@ -41,6 +41,7 @@ type DaemonCommand =
 export interface DaemonOptions {
   readonly command: DaemonCommand;
   readonly cwd?: string;
+  readonly rootTurboJson?: string;
   readonly idleMilliseconds: number;
   readonly json: boolean;
 }
@@ -81,6 +82,7 @@ export const parseDaemonArguments = (
 ): DaemonOptions => {
   let command: DaemonCommand | undefined;
   let cwd: string | undefined;
+  let rootTurboJson: string | undefined;
   let idleMilliseconds = 4 * 60 * 60 * 1_000;
   let json = false;
   for (let index = 0; index < arguments_.length; index += 1) {
@@ -132,7 +134,7 @@ export const parseDaemonArguments = (
       case "--no-update-notifier":
         break;
       case "--turbo-json-path":
-        takeValue();
+        rootTurboJson = takeValue();
         break;
       default:
         throw new ConfigurationError({
@@ -147,7 +149,7 @@ export const parseDaemonArguments = (
       message: "a daemon command is required",
     });
   }
-  return { command, cwd, idleMilliseconds, json };
+  return { command, cwd, rootTurboJson, idleMilliseconds, json };
 };
 
 const daemonPaths = (
@@ -571,6 +573,9 @@ const startDaemon = (
               "--cwd",
               root,
               `--idle-time=${options.idleMilliseconds}ms`,
+              ...(options.rootTurboJson === undefined
+                ? []
+                : [`--turbo-json-path=${options.rootTurboJson}`]),
             ],
             cwd: root,
             inheritEnvironment: true,
@@ -842,6 +847,7 @@ const serveDaemon = (
                 if (request.method === DaemonMethod.discoverPackages) {
                   return loadWorkflowRepository({
                     cwd: repository.root,
+                    rootTurboJson: options.rootTurboJson,
                   }).pipe(
                     Effect.map((currentRepository) => ({
                       packages: currentRepository.packages

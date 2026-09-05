@@ -90,23 +90,44 @@ const configuredOutputPath = (
   repository: RepositoryModel,
   path: string,
   entryKind: "directory" | "file" | "symlink" | "other" | undefined,
-): boolean =>
-  [repository.rootPackage, ...repository.packages].some((packageModel) => {
-    if (!isPathContained(packageModel.directory, path)) return false;
-    const relative = relativePath(packageModel.directory, path);
-    return Object.values(packageModel.tasks).some((task) => {
+): boolean => {
+  const rootOutputPrefix = "$TURBO_ROOT$/";
+  const matchesOutput = (
+    directory: string,
+    patterns: ReadonlyArray<string>,
+  ): boolean => {
+    if (!isPathContained(directory, path)) return false;
+    const relative = relativePath(directory, path);
+    return (
+      matchesGlobsWithExclusions([relative], patterns) ||
+      (entryKind === "directory" &&
+        patterns.some(
+          (pattern) =>
+            !pattern.startsWith("!") &&
+            canMatchGlobDescendant(relative, pattern),
+        ))
+    );
+  };
+  return [repository.rootPackage, ...repository.packages].some((packageModel) =>
+    Object.values(packageModel.tasks).some((task) => {
       const outputs = task.outputs ?? [];
-      return (
-        matchesGlobsWithExclusions([relative], outputs) ||
-        (entryKind === "directory" &&
-          outputs.some(
-            (output) =>
-              !output.startsWith("!") &&
-              canMatchGlobDescendant(relative, output),
-          ))
+      const packagePatterns = outputs.filter(
+        (pattern) => !pattern.replace(/^!/, "").startsWith(rootOutputPrefix),
       );
-    });
-  });
+      const rootPatterns = outputs.flatMap((pattern) => {
+        const negative = pattern.startsWith("!");
+        const value = negative ? pattern.slice(1) : pattern;
+        return value.startsWith(rootOutputPrefix)
+          ? [`${negative ? "!" : ""}${value.slice(rootOutputPrefix.length)}`]
+          : [];
+      });
+      return (
+        matchesOutput(packageModel.directory, packagePatterns) ||
+        matchesOutput(repository.root, rootPatterns)
+      );
+    }),
+  );
+};
 
 const runOwnedPath = (
   repository: RepositoryModel,
