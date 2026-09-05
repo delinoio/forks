@@ -531,7 +531,9 @@ official `turbodprotocol.Turbod` gRPC service over HTTP/2. Hello, status, and
 shutdown calls interoperate in both directions with the 2.10.12 executable;
 package and watch calls share the same bounded framing and scoped sessions.
 Requests that exceed the transport queue receive an immediate protocol error
-instead of displacing an older request.
+instead of displacing an older request. Unsupported-method and queue-capacity
+responses run in the server Scope so endpoint teardown interrupts pending
+response work.
 Package discovery reloads the repository model for each request so workspace
 additions, removals, and renames are visible without a daemon restart.
 Custom root Turbo configuration paths are retained by lifecycle commands,
@@ -665,14 +667,17 @@ mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
 completed task's full log replay. Structured log files append typed task events
 as work runs and end with a typed run summary. An explicit structured-log
 artifact and explicit named, anonymous, or trace profile artifacts are excluded
-from task and global file hashes. A structured-log artifact may not replace a
-mandatory task control input or match a declared task output. Timestamped
+from task and global file hashes. Root-level `profile.*` artifacts are likewise
+excluded whenever a bare profile option selects the generated default path. A
+structured-log artifact may not replace a mandatory task control input or match
+a declared task output. Timestamped
 streaming applies the timestamp
 writer to a final unterminated task line. Errors-only failure replay does
 not duplicate output already recorded while the task ran and reads the complete
 task log instead of the bounded diagnostic tail. CLI `--global-deps`
 patterns are merged into task hash inputs, and their repository-relative Git
-blob hashes are reported in summary `globalCacheInputs.files`. Dry runs do not perform local
+blob hashes are reported in summary `globalCacheInputs.files`, including when a
+valid requested task is filtered to a successful no-op. Dry runs do not perform local
 cache eviction, and
 `info` derives WSL status from the Linux kernel release. Log-prefix selection
 applies to live and cached output. Summaries record
@@ -689,7 +694,9 @@ Global summary inputs record the corresponding root-manifest external-dependency
 closure hash instead of the empty-closure hash when root dependencies resolve.
 Graph-bearing closures retain the declaring manifest reference or resolved
 workspace entry so multiple locked versions of one name do not broaden a task's
-external dependency hash.
+external dependency hash. Cargo closures also retain parenthesized source
+qualifiers so identical package names and versions from distinct registries or
+Git sources remain separate graph nodes.
 Summary `monorepo` fields are true whenever ordinary discovery finds at least
 one child workspace and false in explicit single-package mode.
 Persisted, stdout, and

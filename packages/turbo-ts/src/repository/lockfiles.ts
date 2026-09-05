@@ -545,16 +545,29 @@ const parseCargoGraph = (source: string): ReadonlyArray<LockfileGraphEntry> => {
     const dependencies = Array.isArray(package_.dependencies)
       ? package_.dependencies.flatMap((dependency) => {
           if (typeof dependency !== "string") return [];
-          const match = /^(\S+)(?:\s+(\S+))?(?:\s+\(.+\))?$/.exec(dependency);
-          return match === null ? [] : [[match[1]!, match[2]] as const];
+          const match = /^(\S+)(?:\s+(\S+))?(?:\s+\((.+)\))?$/.exec(dependency);
+          if (match === null) return [];
+          const reference =
+            match[2] === undefined
+              ? undefined
+              : `${match[2]}${match[3] === undefined ? "" : ` (${match[3]})`}`;
+          return [[match[1]!, reference] as const];
         })
       : [];
+    const packageSource =
+      typeof package_.source === "string" ? package_.source : undefined;
+    const versionAlias = `${package_.name}@${package_.version}`;
     return [
       {
         packages: [{ name: package_.name, version: package_.version }],
-        aliases: [`${package_.name}@${package_.version}`],
+        aliases: [
+          versionAlias,
+          ...(packageSource === undefined
+            ? []
+            : [`${versionAlias} (${packageSource})`]),
+        ],
         dependencies,
-        localWorkspace: package_.source === undefined,
+        localWorkspace: packageSource === undefined,
       },
     ];
   });

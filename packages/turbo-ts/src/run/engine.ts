@@ -67,6 +67,7 @@ import {
 import {
   decodeNullDelimitedGitOutput,
   effectiveTaskInputs,
+  hashGlobalInputFiles,
   hashTask,
   implicitTaskInputCandidates,
   owningLockfile,
@@ -2830,6 +2831,7 @@ const computeTaskHashes = (
   caseInsensitiveEnvironmentNames: boolean,
   cacheabilityByTask: ReadonlyMap<string, TaskScopeCacheability>,
   excludedInputPaths: ReadonlyArray<string>,
+  excludeDefaultProfileArtifacts: boolean,
 ): Effect.Effect<
   ReadonlyMap<string, TaskHashResult>,
   RepositoryError,
@@ -2862,6 +2864,7 @@ const computeTaskHashes = (
         cacheabilityByTask.get(id)?.packageManagerRuntimeIdentity,
         options.globalDependencies,
         excludedInputPaths,
+        excludeDefaultProfileArtifacts,
       );
       hashes.set(id, result);
     }
@@ -3007,6 +3010,7 @@ const applyCargoWorkspaceHashes = (
   caseInsensitiveEnvironmentNames: boolean,
   cacheabilityByTask: ReadonlyMap<string, TaskScopeCacheability>,
   excludedInputPaths: ReadonlyArray<string>,
+  excludeDefaultProfileArtifacts: boolean,
 ): Effect.Effect<
   ReadonlyMap<string, TaskHashResult>,
   RepositoryError,
@@ -3064,6 +3068,7 @@ const applyCargoWorkspaceHashes = (
           cacheabilityByTask.get(id)?.packageManagerRuntimeIdentity,
           options.globalDependencies,
           excludedInputPaths,
+          excludeDefaultProfileArtifacts,
         ),
       );
       changed.add(id);
@@ -3555,6 +3560,10 @@ export const executeRun = (
           )
         : []),
     ].filter((path): path is string => path !== undefined);
+    const excludeDefaultProfileArtifacts =
+      parsed.graph === undefined &&
+      parsed.dryRun === undefined &&
+      [parsed.profile, parsed.anonymousProfile, parsed.trace].includes("");
     const cacheabilityByTask = new Map(
       yield* Effect.forEach(
         [...graph.nodes],
@@ -3601,6 +3610,7 @@ export const executeRun = (
         platform === "win32",
         cacheabilityByTask,
         excludedInputPaths,
+        excludeDefaultProfileArtifacts,
       ),
       cargoWorkspacePlan.scopes,
       options,
@@ -3608,6 +3618,7 @@ export const executeRun = (
       platform === "win32",
       cacheabilityByTask,
       excludedInputPaths,
+      excludeDefaultProfileArtifacts,
     );
     const unrestorableCacheInputs = taskIdsWithUnrestorableCacheInputs(
       graph,
@@ -3629,7 +3640,13 @@ export const executeRun = (
     );
     const globalInputFileHashes =
       orderedNodes[0] === undefined
-        ? {}
+        ? yield* hashGlobalInputFiles(
+            repository,
+            options.cacheExclusionDirectory,
+            options.globalDependencies,
+            excludedInputPaths,
+            excludeDefaultProfileArtifacts,
+          )
         : hashes.get(orderedNodes[0].id)!.globalInputFileHashes;
     const isMonorepo =
       !parsed.singlePackage &&

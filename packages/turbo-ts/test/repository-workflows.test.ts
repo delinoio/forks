@@ -1071,6 +1071,51 @@ describe("repository workflow gate", () => {
     }
   }, 15_000);
 
+  it("excludes default profile artifacts from root task hashes", async () => {
+    for (const profileOption of ["--profile", "--anon-profile"]) {
+      const directory = await mkdtemp(
+        join(tmpdir(), "turbo-ts-default-profile-hash-"),
+      );
+      try {
+        await prepareFixture(directory);
+        const runProfiled = async () => {
+          const result = await execFilePromise(process.execPath, [
+            candidate,
+            "run",
+            "build",
+            "--single-package",
+            "--no-cache",
+            profileOption,
+            "--json",
+            "--cwd",
+            directory,
+          ]);
+          return JSON.parse(result.stdout.trim().split("\n").at(-1)!) as {
+            readonly tasks: ReadonlyArray<{
+              readonly hash: string;
+              readonly inputs: Readonly<Record<string, string>>;
+            }>;
+          };
+        };
+        const first = await runProfiled();
+        const second = await runProfiled();
+        expect(second.tasks[0]?.hash).toBe(first.tasks[0]?.hash);
+        expect(
+          Object.keys(second.tasks[0]?.inputs ?? {}).some((path) =>
+            path.startsWith("profile."),
+          ),
+        ).toBe(false);
+        expect(
+          (await readdir(directory)).some((path) =>
+            path.startsWith("profile."),
+          ),
+        ).toBe(true);
+      } finally {
+        await rm(directory, { force: true, recursive: true });
+      }
+    }
+  }, 30_000);
+
   it("hashes repository-contained heap snapshots before execution", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-heap-input-"));
     try {
@@ -1775,6 +1820,64 @@ describe("repository workflow gate", () => {
       ).rejects.toThrow(/synthetic endpoint setup failure/);
       expect(existsSync(socket)).toBe(false);
     } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("interrupts rejected daemon responses with the server scope", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-scope-"));
+    const socket = join(directory, "turbod.sock");
+    let markResponseStarted: (() => void) | undefined;
+    const responseStarted = new Promise<void>((resolve) => {
+      markResponseStarted = resolve;
+    });
+    let markResponseFinalized: (() => void) | undefined;
+    const responseFinalized = new Promise<void>((resolve) => {
+      markResponseFinalized = resolve;
+    });
+    const serveFiber = Effect.runFork(
+      Stream.runDrain(
+        makeDaemonServe({
+          respond: () =>
+            Effect.sync(() => markResponseStarted?.()).pipe(
+              Effect.zipRight(Effect.never),
+              Effect.onInterrupt(() =>
+                Effect.sync(() => markResponseFinalized?.()),
+              ),
+            ),
+        })(socket),
+      ),
+    );
+    let session: ReturnType<typeof connectHttp2> | undefined;
+    try {
+      await waitUntil(() => existsSync(socket));
+      session = connectHttp2("http://localhost", {
+        createConnection: () => createNetConnection(socket),
+      });
+      session.on("error", () => undefined);
+      const stream = session.request({
+        [http2Constants.HTTP2_HEADER_METHOD]: "POST",
+        [http2Constants.HTTP2_HEADER_PATH]:
+          "/turbodprotocol.Turbod/Unsupported",
+        [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+      });
+      stream.on("error", () => undefined);
+      stream.end(Buffer.alloc(5));
+      await responseStarted;
+      await Effect.runPromise(Fiber.interrupt(serveFiber));
+      await Promise.race([
+        responseFinalized,
+        new Promise<void>((resolve, reject) =>
+          setTimeout(
+            () => reject(new Error("daemon response remained active")),
+            1_000,
+          ),
+        ),
+      ]);
+    } finally {
+      session?.destroy();
+      await Effect.runPromise(Fiber.interrupt(serveFiber));
       await rm(directory, { force: true, recursive: true });
     }
   });

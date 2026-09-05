@@ -10133,10 +10133,7 @@ dependencies = [
   }, 15_000);
 
   it("uses task inputs for affected selection when the future flag is enabled", async () => {
-    await mkdir(`${repositoryRoot}/.turbo`, { recursive: true });
-    const directory = await mkdtemp(
-      join(repositoryRoot, ".turbo/turbo-ts-affected-"),
-    );
+    const directory = await mkdtemp(join(repositoryRoot, "turbo-ts-affected-"));
     await cp(fixtureRoot, directory, { recursive: true });
     try {
       const configurationPath = `${directory}/turbo.json`;
@@ -10144,9 +10141,11 @@ dependencies = [
         await readFile(configurationPath, "utf8"),
       ) as {
         futureFlags?: Record<string, boolean>;
+        globalDependencies?: Array<string>;
         tasks: Record<string, { inputs?: Array<string> }>;
       };
       configuration.futureFlags = { affectedUsingTaskInputs: true };
+      configuration.globalDependencies = ["configured-global.txt"];
       configuration.tasks.build!.inputs = ["$TURBO_DEFAULT$", "!README.md"];
       configuration.tasks["//#root-check"] = {
         inputs: ["$TURBO_ROOT$/packages/**"],
@@ -10171,6 +10170,8 @@ dependencies = [
         `${JSON.stringify(rootManifest, null, 2)}\n`,
       );
       await writeFile(`${directory}/packages/library/README.md`, "first\n");
+      await writeFile(`${directory}/configured-global.txt`, "configured\n");
+      await writeFile(`${directory}/cli-global.txt`, "cli\n");
       await writeFile(`${directory}/.npmrc`, "script-shell=/bin/sh\n");
       await writeFile(
         `${directory}/pnpm-lock.yaml`,
@@ -10201,13 +10202,69 @@ dependencies = [
           directory,
           "--affected",
           "--no-cache",
+          "--dry=json",
+          "--global-deps=cli-global.txt",
         ],
         repositoryRoot,
         { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
       );
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).not.toContain("library build");
-      expect(result.stdout).not.toContain("app build");
+      const emptyDrySummary = JSON.parse(result.stdout) as {
+        readonly globalCacheInputs: {
+          readonly files: Readonly<Record<string, string>>;
+        };
+        readonly tasks: ReadonlyArray<unknown>;
+      };
+      expect(emptyDrySummary.tasks).toEqual([]);
+      expect(emptyDrySummary.globalCacheInputs.files).toMatchObject({
+        "cli-global.txt": expect.stringMatching(/^[0-9a-f]{40}$/),
+        "configured-global.txt": expect.stringMatching(/^[0-9a-f]{40}$/),
+      });
+      const completedResult = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          "--cwd",
+          directory,
+          "--affected",
+          "--no-cache",
+          "--json",
+          "--summarize",
+          "--log-file=no-op.ndjson",
+          "--global-deps=cli-global.txt",
+        ],
+        repositoryRoot,
+        { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+      );
+      expect(completedResult.exitCode).toBe(0);
+      const completedSummary = JSON.parse(
+        completedResult.stdout.trim().split("\n").at(-1)!,
+      ) as typeof emptyDrySummary;
+      expect(completedSummary.tasks).toEqual([]);
+      expect(completedSummary.globalCacheInputs.files).toEqual(
+        emptyDrySummary.globalCacheInputs.files,
+      );
+      const persistedSummaryFiles = await readdir(`${directory}/.turbo/runs`);
+      const persistedSummary = JSON.parse(
+        await readFile(
+          `${directory}/.turbo/runs/${persistedSummaryFiles[0]}`,
+          "utf8",
+        ),
+      ) as typeof emptyDrySummary;
+      expect(persistedSummary.globalCacheInputs.files).toEqual(
+        emptyDrySummary.globalCacheInputs.files,
+      );
+      const structuredSummary = JSON.parse(
+        (await readFile(`${directory}/no-op.ndjson`, "utf8"))
+          .trim()
+          .split("\n")
+          .at(-1)!,
+      ) as typeof emptyDrySummary;
+      expect(structuredSummary.globalCacheInputs.files).toEqual(
+        emptyDrySummary.globalCacheInputs.files,
+      );
       const rootResult = await run(
         process.execPath,
         [

@@ -682,6 +682,48 @@ source = { registry = "https://example.test/simple" }
     }
   });
 
+  it("uses Cargo sources to disambiguate identical package versions", () => {
+    const source = `version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["shared 1.0.0 (registry+https://selected.example/index)"]
+
+[[package]]
+name = "shared"
+version = "1.0.0"
+source = "registry+https://selected.example/index"
+dependencies = ["selected-leaf 1.0.0"]
+
+[[package]]
+name = "shared"
+version = "1.0.0"
+source = "git+https://unselected.example/shared"
+dependencies = ["unselected-leaf 1.0.0"]
+
+[[package]]
+name = "selected-leaf"
+version = "1.0.0"
+
+[[package]]
+name = "unselected-leaf"
+version = "1.0.0"
+`;
+    expect(
+      resolveLockfilePackageClosure(
+        "/repo/Cargo.lock",
+        encoder.encode(source),
+        {
+          workspacePath: "packages/app",
+          packageName: "app",
+          packageVersion: "0.1.0",
+          directDependencies: [],
+        },
+      ).map((dependency) => `${dependency.name}@${dependency.version}`),
+    ).toEqual(["selected-leaf@1.0.0", "shared@1.0.0"]);
+  });
+
   it("accepts the complete core package-manager version matrix", () => {
     const identities = [
       "npm@8.0.0",

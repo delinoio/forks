@@ -2057,6 +2057,7 @@ interface DaemonEndpointIdentity {
 interface DaemonEndpointSetup {
   readonly metadata: (path: string) => Promise<DaemonEndpointIdentity>;
   readonly setPermissions: (path: string, mode: number) => Promise<void>;
+  readonly respond: typeof respondGrpc;
 }
 
 const closeBoundDaemonServer = async (
@@ -2088,136 +2089,151 @@ export const makeDaemonServe = (setup: Partial<DaemonEndpointSetup> = {}) => {
       return { device: value.dev, inode: value.ino };
     });
   const setPermissions = setup.setPermissions ?? chmod;
+  const respond = setup.respond ?? respondGrpc;
   return (endpoint: string) =>
     Stream.asyncPush<DaemonConnection, BoundaryError>(
       (emit) =>
-        Effect.acquireRelease(
-          Effect.async<
-            {
-              readonly server: Http2Server;
-              readonly sessions: Set<ServerHttp2Session>;
-              readonly endpointIdentity: DaemonEndpointIdentity;
-            },
-            BoundaryError
-          >((resume) => {
-            const sessions = new Set<ServerHttp2Session>();
-            const server = createHttp2Server();
-            server.on("session", (session) => {
-              sessions.add(session);
-              session.once("close", () => sessions.delete(session));
-            });
-            server.on("stream", (stream, headers) => {
-              // Stream protocol failures are handled by closing that stream;
-              // consume its error event so Node does not promote a hostile
-              // client frame into an uncaught process-level exception.
-              stream.on("error", () => undefined);
-              const chunks: Array<Buffer> = [];
-              let length = 0;
-              stream.on("data", (chunk: Buffer) => {
-                length += chunk.length;
-                if (length > 1024 * 1024 + 5) {
-                  stream.close(http2Constants.NGHTTP2_CANCEL);
-                  return;
-                }
-                chunks.push(chunk);
+        Effect.gen(function* () {
+          const scope = yield* Effect.scope;
+          const respondRejectedRequest = (
+            stream: ServerHttp2Stream,
+            method: string,
+            response: DaemonResponse,
+          ): void => {
+            respond(stream, method, response).pipe(
+              Effect.catchAll(() => Effect.sync(() => stream.close())),
+              Effect.forkIn(scope),
+              Effect.runFork,
+            );
+          };
+          return yield* Effect.acquireRelease(
+            Effect.async<
+              {
+                readonly server: Http2Server;
+                readonly sessions: Set<ServerHttp2Session>;
+                readonly endpointIdentity: DaemonEndpointIdentity;
+              },
+              BoundaryError
+            >((resume) => {
+              const sessions = new Set<ServerHttp2Session>();
+              const server = createHttp2Server();
+              server.on("session", (session) => {
+                sessions.add(session);
+                session.once("close", () => sessions.delete(session));
               });
-              stream.on("end", () => {
-                try {
-                  const path = String(
-                    headers[http2Constants.HTTP2_HEADER_PATH] ?? "",
-                  );
-                  const method = path.slice(path.lastIndexOf("/") + 1);
-                  if (
-                    !Object.values(DaemonMethod).includes(
-                      method as DaemonMethodType,
-                    )
-                  ) {
-                    respondGrpc(stream, DaemonMethod.status, {
-                      id: String(stream.id),
-                      error: `unsupported daemon method: ${method}`,
-                    }).pipe(Effect.runFork);
+              server.on("stream", (stream, headers) => {
+                // Stream protocol failures are handled by closing that stream;
+                // consume its error event so Node does not promote a hostile
+                // client frame into an uncaught process-level exception.
+                stream.on("error", () => undefined);
+                const chunks: Array<Buffer> = [];
+                let length = 0;
+                stream.on("data", (chunk: Buffer) => {
+                  length += chunk.length;
+                  if (length > 1024 * 1024 + 5) {
+                    stream.close(http2Constants.NGHTTP2_CANCEL);
                     return;
                   }
-                  const payload = grpcPayload(Buffer.concat(chunks));
-                  const accepted = emit.single({
-                    requests: Stream.succeed({
-                      id: String(stream.id),
-                      method: method as DaemonMethodType,
-                      params: decodedDaemonRequest(
+                  chunks.push(chunk);
+                });
+                stream.on("end", () => {
+                  try {
+                    const path = String(
+                      headers[http2Constants.HTTP2_HEADER_PATH] ?? "",
+                    );
+                    const method = path.slice(path.lastIndexOf("/") + 1);
+                    if (
+                      !Object.values(DaemonMethod).includes(
                         method as DaemonMethodType,
-                        new Uint8Array(payload),
-                      ),
-                    }),
-                    respond: (response) =>
-                      respondGrpc(stream, method, response),
-                  });
-                  if (!accepted) {
-                    respondGrpc(stream, method, {
-                      id: String(stream.id),
-                      error: "daemon request queue is full",
-                    }).pipe(Effect.runFork);
+                      )
+                    ) {
+                      respondRejectedRequest(stream, DaemonMethod.status, {
+                        id: String(stream.id),
+                        error: `unsupported daemon method: ${method}`,
+                      });
+                      return;
+                    }
+                    const payload = grpcPayload(Buffer.concat(chunks));
+                    const accepted = emit.single({
+                      requests: Stream.succeed({
+                        id: String(stream.id),
+                        method: method as DaemonMethodType,
+                        params: decodedDaemonRequest(
+                          method as DaemonMethodType,
+                          new Uint8Array(payload),
+                        ),
+                      }),
+                      respond: (response) =>
+                        respondGrpc(stream, method, response),
+                    });
+                    if (!accepted) {
+                      respondRejectedRequest(stream, method, {
+                        id: String(stream.id),
+                        error: "daemon request queue is full",
+                      });
+                    }
+                  } catch {
+                    // A malformed client stream is isolated to that HTTP/2
+                    // stream. Failing the outer Stream would tear down the
+                    // shared daemon and let one corrupt frame deny service to
+                    // every healthy client.
+                    stream.close(http2Constants.NGHTTP2_PROTOCOL_ERROR);
                   }
-                } catch {
-                  // A malformed client stream is isolated to that HTTP/2
-                  // stream. Failing the outer Stream would tear down the
-                  // shared daemon and let one corrupt frame deny service to
-                  // every healthy client.
-                  stream.close(http2Constants.NGHTTP2_PROTOCOL_ERROR);
-                }
+                });
               });
-            });
-            const fail = (cause: Error) =>
-              resume(Effect.fail(daemonProtocolError(cause)));
-            server.once("error", fail);
-            mkdir(dirname(endpoint), { recursive: true, mode: 0o700 })
-              .then(() => {
-                server.listen(endpoint, () => {
-                  let endpointIdentity: DaemonEndpointIdentity | undefined;
-                  metadata(endpoint)
-                    .then((endpointMetadata) => {
-                      endpointIdentity = endpointMetadata;
-                      return setPermissions(endpoint, 0o600);
-                    })
-                    .then(() => {
-                      server.off("error", fail);
-                      server.on("error", (cause) =>
-                        emit.fail(daemonProtocolError(cause)),
-                      );
-                      resume(
-                        Effect.succeed({
+              const fail = (cause: Error) =>
+                resume(Effect.fail(daemonProtocolError(cause)));
+              server.once("error", fail);
+              mkdir(dirname(endpoint), { recursive: true, mode: 0o700 })
+                .then(() => {
+                  server.listen(endpoint, () => {
+                    let endpointIdentity: DaemonEndpointIdentity | undefined;
+                    metadata(endpoint)
+                      .then((endpointMetadata) => {
+                        endpointIdentity = endpointMetadata;
+                        return setPermissions(endpoint, 0o600);
+                      })
+                      .then(() => {
+                        server.off("error", fail);
+                        server.on("error", (cause) =>
+                          emit.fail(daemonProtocolError(cause)),
+                        );
+                        resume(
+                          Effect.succeed({
+                            server,
+                            sessions,
+                            endpointIdentity: endpointIdentity!,
+                          }),
+                        );
+                      })
+                      .catch((cause) => {
+                        server.off("error", fail);
+                        server.on("error", () => undefined);
+                        void closeBoundDaemonServer(
+                          endpoint,
                           server,
                           sessions,
-                          endpointIdentity: endpointIdentity!,
-                        }),
-                      );
-                    })
-                    .catch((cause) => {
-                      server.off("error", fail);
-                      server.on("error", () => undefined);
-                      void closeBoundDaemonServer(
-                        endpoint,
-                        server,
-                        sessions,
-                        endpointIdentity,
-                      ).then(
-                        () => fail(cause as Error),
-                        (closeCause) => fail(closeCause as Error),
-                      );
-                    });
-                });
-              })
-              .catch((cause) => fail(cause as Error));
-          }),
-          ({ server, sessions, endpointIdentity }) =>
-            Effect.promise(() =>
-              closeBoundDaemonServer(
-                endpoint,
-                server,
-                sessions,
-                endpointIdentity,
+                          endpointIdentity,
+                        ).then(
+                          () => fail(cause as Error),
+                          (closeCause) => fail(closeCause as Error),
+                        );
+                      });
+                  });
+                })
+                .catch((cause) => fail(cause as Error));
+            }),
+            ({ server, sessions, endpointIdentity }) =>
+              Effect.promise(() =>
+                closeBoundDaemonServer(
+                  endpoint,
+                  server,
+                  sessions,
+                  endpointIdentity,
+                ),
               ),
-            ),
-        ),
+          );
+        }),
       { bufferSize: 64, strategy: "dropping" },
     );
 };

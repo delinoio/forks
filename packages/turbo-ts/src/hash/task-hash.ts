@@ -1,6 +1,7 @@
 import { Effect } from "effect";
 import { matchesGlob, selectByGlobs } from "../core/glob.js";
 import {
+  baseName,
   isAbsolutePath,
   isPathContained,
   joinPath,
@@ -132,6 +133,15 @@ interface DiscoveredFile {
   readonly repositoryRelativePath: string;
   readonly gitMode: GitTrackedMode | undefined;
 }
+
+type InputFileHash =
+  | readonly [path: string, mode: GitTrackedMode, hash: string]
+  | readonly [
+      path: string,
+      mode: GitTrackedMode,
+      hash: string,
+      resolvedContentsHash: string,
+    ];
 
 const turboRootInputPrefix = "$TURBO_ROOT$/";
 
@@ -695,6 +705,126 @@ const discoverFiles = (
       }));
   });
 
+const inputExclusionPredicate = (
+  repositoryRoot: string,
+  excludedInputPaths: ReadonlyArray<string>,
+  excludeDefaultProfileArtifacts: boolean,
+  windowsPathSeparators: boolean,
+): ((path: string) => boolean) => {
+  const comparableInputPath = (path: string): string => {
+    const normalized = normalizePath(path, windowsPathSeparators);
+    return windowsPathSeparators ? normalized.toLowerCase() : normalized;
+  };
+  const excludedInputs = new Set(excludedInputPaths.map(comparableInputPath));
+  const comparableRoot = comparableInputPath(repositoryRoot);
+  return (path) => {
+    if (excludedInputs.has(comparableInputPath(path))) return true;
+    return (
+      excludeDefaultProfileArtifacts &&
+      comparableInputPath(parentPath(path, windowsPathSeparators)) ===
+        comparableRoot &&
+      baseName(path, windowsPathSeparators).startsWith("profile.")
+    );
+  };
+};
+
+const hashInputFile = (
+  repository: RepositoryModel,
+  path: string,
+  relative: string,
+  gitMode?: GitTrackedMode,
+  hashResolvedSymlinkContents = false,
+): Effect.Effect<
+  InputFileHash | undefined,
+  RepositoryError,
+  FileSystemService | DigestService | ProcessService
+> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const digest = yield* DigestService;
+    const processService = yield* ProcessService;
+    const metadata = yield* fileSystem
+      .metadata(path)
+      .pipe(
+        Effect.mapError(
+          (error) => new RepositoryError({ path, message: error.message }),
+        ),
+      );
+    if (metadata.kind === "directory") {
+      if (gitMode !== undefined && gitMode !== "160000") return undefined;
+      const result = yield* Effect.scoped(
+        processService.runBytes({
+          command: "git",
+          args: [
+            "ls-files",
+            "--stage",
+            "-z",
+            "--",
+            literalGitPathspec(relativePath(repository.root, path)),
+          ],
+          cwd: repository.root,
+          env: gitLiteralPathspecEnvironment,
+        }),
+      ).pipe(
+        Effect.mapError(
+          (error) => new RepositoryError({ path, message: error.message }),
+        ),
+      );
+      const objectId = (yield* decodeNullDelimitedGitOutputEffect(
+        result.stdout,
+        path,
+      )).flatMap((entry) => {
+        const match = /^160000 ([0-9a-fA-F]+) 0\t/.exec(entry);
+        return match?.[1] === undefined ? [] : [match[1]];
+      })[0];
+      if (result.exitCode !== 0) {
+        return yield* Effect.fail(
+          new RepositoryError({
+            path,
+            message:
+              new TextDecoder().decode(result.stderr) ||
+              "failed to inspect directory input in the Git index",
+          }),
+        );
+      }
+      return objectId === undefined
+        ? undefined
+        : ([relative, "160000", objectId] as const);
+    }
+    const mode =
+      metadata.kind === "symlink"
+        ? ("120000" as const)
+        : metadata.kind === "file" &&
+            (gitMode === "100644" || gitMode === "100755")
+          ? gitMode
+          : (metadata.mode & 0o111) !== 0
+            ? ("100755" as const)
+            : ("100644" as const);
+    const hash = yield* (
+      metadata.kind === "symlink"
+        ? fileSystem.readLink(path).pipe(
+            Effect.map((target) => new TextEncoder().encode(target)),
+            Effect.flatMap(digest.gitBlobSha1),
+          )
+        : digest.gitBlobSha1File(path)
+    ).pipe(
+      Effect.mapError(
+        (error) => new RepositoryError({ path, message: error.message }),
+      ),
+    );
+    if (metadata.kind === "symlink" && hashResolvedSymlinkContents) {
+      const resolvedContentsHash = yield* digest
+        .gitBlobSha1File(path)
+        .pipe(
+          Effect.mapError(
+            (error) => new RepositoryError({ path, message: error.message }),
+          ),
+        );
+      return [relative, mode, hash, resolvedContentsHash] as const;
+    }
+    return [relative, mode, hash] as const;
+  });
+
 export const owningLockfile = (
   repository: RepositoryModel,
   node: TaskNode,
@@ -734,6 +864,98 @@ const activeGlobalSettings = (repository: RepositoryModel) => {
   };
 };
 
+const hashGlobalInputs = (
+  repository: RepositoryModel,
+  cacheDirectory: string,
+  commandGlobalDependencies: ReadonlyArray<string>,
+  excludedInputPaths: ReadonlyArray<string>,
+  excludeDefaultProfileArtifacts: boolean,
+): Effect.Effect<
+  ReadonlyArray<InputFileHash>,
+  RepositoryError,
+  FileSystemService | EnvironmentService | DigestService | ProcessService
+> =>
+  Effect.gen(function* () {
+    const environmentService = yield* EnvironmentService;
+    const platform = yield* environmentService.platform;
+    const windowsPathSeparators = platform === "win32";
+    const globalSettings = activeGlobalSettings(repository);
+    const globalDependencyPatterns = [
+      ...(repository.rootConfiguration.value.futureFlags
+        ?.globalConfiguration === true
+        ? []
+        : (globalSettings.inputs ?? [])),
+      ...commandGlobalDependencies,
+    ];
+    const discoveredGlobalInputFiles =
+      globalDependencyPatterns.length === 0
+        ? []
+        : yield* discoverFiles(
+            repository,
+            repository.root,
+            cacheDirectory,
+            windowsPathSeparators,
+          );
+    const globalInputFilesByRelativePath = new Map(
+      discoveredGlobalInputFiles.map((file) => [
+        file.repositoryRelativePath,
+        file,
+      ]),
+    );
+    const isExcludedInput = inputExclusionPredicate(
+      repository.root,
+      excludedInputPaths,
+      excludeDefaultProfileArtifacts,
+      windowsPathSeparators,
+    );
+    const globalInputFiles = selectByGlobs(
+      [...globalInputFilesByRelativePath.keys()],
+      globalDependencyPatterns,
+      windowsPathSeparators,
+    ).filter(
+      (relative) =>
+        !isExcludedInput(
+          globalInputFilesByRelativePath.get(relative)!.absolutePath,
+        ),
+    );
+    return (yield* Effect.forEach(
+      globalInputFiles,
+      (relative) => {
+        const file = globalInputFilesByRelativePath.get(relative)!;
+        return hashInputFile(
+          repository,
+          file.absolutePath,
+          relative,
+          file.gitMode,
+        );
+      },
+      { concurrency: 8 },
+    )).filter((hash): hash is InputFileHash => hash !== undefined);
+  });
+
+export const hashGlobalInputFiles = (
+  repository: RepositoryModel,
+  cacheDirectory: string,
+  commandGlobalDependencies: ReadonlyArray<string> = [],
+  excludedInputPaths: ReadonlyArray<string> = [],
+  excludeDefaultProfileArtifacts = false,
+): Effect.Effect<
+  Readonly<Record<string, string>>,
+  RepositoryError,
+  FileSystemService | EnvironmentService | DigestService | ProcessService
+> =>
+  hashGlobalInputs(
+    repository,
+    cacheDirectory,
+    commandGlobalDependencies,
+    excludedInputPaths,
+    excludeDefaultProfileArtifacts,
+  ).pipe(
+    Effect.map((hashes) =>
+      Object.fromEntries(hashes.map(([path, , hash]) => [path, hash])),
+    ),
+  );
+
 export const hashTask = (
   repository: RepositoryModel,
   node: TaskNode,
@@ -746,6 +968,7 @@ export const hashTask = (
   packageManagerRuntimeIdentity?: PackageManagerRuntimeIdentity,
   commandGlobalDependencies: ReadonlyArray<string> = [],
   excludedInputPaths: ReadonlyArray<string> = [],
+  excludeDefaultProfileArtifacts = false,
 ): Effect.Effect<
   TaskHashResult,
   RepositoryError,
@@ -754,17 +977,15 @@ export const hashTask = (
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const digest = yield* DigestService;
-    const processService = yield* ProcessService;
     const environmentService = yield* EnvironmentService;
     const environment = yield* environmentService.entries;
     const platform = yield* environmentService.platform;
-    const comparableInputPath = (path: string): string => {
-      const normalized = normalizePath(path, platform === "win32");
-      return platform === "win32" ? normalized.toLowerCase() : normalized;
-    };
-    const excludedInputs = new Set(excludedInputPaths.map(comparableInputPath));
-    const isExcludedInput = (path: string): boolean =>
-      excludedInputs.has(comparableInputPath(path));
+    const isExcludedInput = inputExclusionPredicate(
+      repository.root,
+      excludedInputPaths,
+      excludeDefaultProfileArtifacts,
+      platform === "win32",
+    );
     const uvControls =
       node.package.manager === "uv"
         ? yield* uvControlInputs(
@@ -815,104 +1036,11 @@ export const hashTask = (
     ]
       .filter((input) => !isExcludedInput(input.absolutePath))
       .sort((left, right) => compareCodeUnits(left.hashPath, right.hashPath));
-    const gitlinkObjectId = (path: string) =>
-      Effect.gen(function* () {
-        const result = yield* Effect.scoped(
-          processService.runBytes({
-            command: "git",
-            args: [
-              "ls-files",
-              "--stage",
-              "-z",
-              "--",
-              literalGitPathspec(relativePath(repository.root, path)),
-            ],
-            cwd: repository.root,
-            env: gitLiteralPathspecEnvironment,
-          }),
-        ).pipe(
-          Effect.mapError(
-            (error) => new RepositoryError({ path, message: error.message }),
-          ),
-        );
-        const objectId = (yield* decodeNullDelimitedGitOutputEffect(
-          result.stdout,
-          path,
-        )).flatMap((entry) => {
-          const match = /^160000 ([0-9a-fA-F]+) 0\t/.exec(entry);
-          return match?.[1] === undefined ? [] : [match[1]];
-        })[0];
-        if (result.exitCode !== 0) {
-          return yield* Effect.fail(
-            new RepositoryError({
-              path,
-              message:
-                new TextDecoder().decode(result.stderr) ||
-                "failed to inspect directory input in the Git index",
-            }),
-          );
-        }
-        return objectId;
-      });
-    const hashFile = (
-      path: string,
-      relative: string,
-      gitMode?: GitTrackedMode,
-      hashResolvedSymlinkContents = false,
-    ) =>
-      Effect.gen(function* () {
-        const metadata = yield* fileSystem
-          .metadata(path)
-          .pipe(
-            Effect.mapError(
-              (error) => new RepositoryError({ path, message: error.message }),
-            ),
-          );
-        if (metadata.kind === "directory") {
-          if (gitMode !== undefined && gitMode !== "160000") return undefined;
-          const objectId = yield* gitlinkObjectId(path);
-          return objectId === undefined
-            ? undefined
-            : ([relative, "160000", objectId] as const);
-        }
-        const mode =
-          metadata.kind === "symlink"
-            ? ("120000" as const)
-            : metadata.kind === "file" &&
-                (gitMode === "100644" || gitMode === "100755")
-              ? gitMode
-              : (metadata.mode & 0o111) !== 0
-                ? ("100755" as const)
-                : ("100644" as const);
-        const hash = yield* (
-          metadata.kind === "symlink"
-            ? fileSystem.readLink(path).pipe(
-                Effect.map((target) => new TextEncoder().encode(target)),
-                Effect.flatMap(digest.gitBlobSha1),
-              )
-            : digest.gitBlobSha1File(path)
-        ).pipe(
-          Effect.mapError(
-            (error) => new RepositoryError({ path, message: error.message }),
-          ),
-        );
-        if (metadata.kind === "symlink" && hashResolvedSymlinkContents) {
-          const resolvedContentsHash = yield* digest
-            .gitBlobSha1File(path)
-            .pipe(
-              Effect.mapError(
-                (error) =>
-                  new RepositoryError({ path, message: error.message }),
-              ),
-            );
-          return [relative, mode, hash, resolvedContentsHash] as const;
-        }
-        return [relative, mode, hash] as const;
-      });
     const hashedInputFiles = (yield* Effect.forEach(
       inputFiles,
       (input) =>
-        hashFile(
+        hashInputFile(
+          repository,
           input.absolutePath,
           input.hashPath,
           input.gitMode,
@@ -957,39 +1085,13 @@ export const hashTask = (
         : (globalSettings.inputs ?? [])),
       ...commandGlobalDependencies,
     ];
-    const discoveredGlobalInputFiles =
-      globalDependencyPatterns.length === 0
-        ? []
-        : yield* discoverFiles(
-            repository,
-            repository.root,
-            cacheDirectory,
-            platform === "win32",
-          );
-    const globalInputFilesByRelativePath = new Map(
-      discoveredGlobalInputFiles.map((file) => [
-        file.repositoryRelativePath,
-        file,
-      ]),
+    const globalFileHashes = yield* hashGlobalInputs(
+      repository,
+      cacheDirectory,
+      commandGlobalDependencies,
+      excludedInputPaths,
+      excludeDefaultProfileArtifacts,
     );
-    const globalInputFiles = selectByGlobs(
-      [...globalInputFilesByRelativePath.keys()],
-      globalDependencyPatterns,
-      platform === "win32",
-    ).filter(
-      (relative) =>
-        !isExcludedInput(
-          globalInputFilesByRelativePath.get(relative)!.absolutePath,
-        ),
-    );
-    const globalFileHashes = (yield* Effect.forEach(
-      globalInputFiles,
-      (relative) => {
-        const file = globalInputFilesByRelativePath.get(relative)!;
-        return hashFile(file.absolutePath, relative, file.gitMode);
-      },
-      { concurrency: 8 },
-    )).flatMap((hash) => (hash === undefined ? [] : [hash]));
     const hash = xxhash64Hex(
       canonicalStringify({
         packageManager: `${repository.manager}@${repository.managerVersion ?? ""}`,
