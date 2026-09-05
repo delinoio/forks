@@ -1,6 +1,7 @@
 import { Effect } from "effect";
 import { ConfigurationError } from "../effect/errors.js";
 import {
+  ClockService,
   DaemonService,
   DigestService,
   EnvironmentService,
@@ -64,6 +65,7 @@ export const executeInfo = (
 ): Effect.Effect<
   number,
   unknown,
+  | ClockService
   | EnvironmentService
   | DaemonService
   | DigestService

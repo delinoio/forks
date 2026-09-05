@@ -957,17 +957,64 @@ describe("repository workflow gate", () => {
         manifestPath,
         `${JSON.stringify(manifest, undefined, 2)}\n`,
       );
-      await expect(
-        execFilePromise(process.execPath, [
-          candidate,
-          "run",
-          "build",
-          "--no-cache",
-          "--profile=profile.json",
-          "--cwd",
-          directory,
-        ]),
-      ).rejects.toThrow();
+      const failedRun = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--no-cache",
+        "--profile=profile.json",
+        "--summarize",
+        "--json",
+        "--log-file=run.ndjson",
+        "--cwd",
+        directory,
+      ]).then(
+        (result) => ({ failed: false, stdout: result.stdout }),
+        (error: { readonly stdout?: string }) => ({
+          failed: true,
+          stdout: error.stdout ?? "",
+        }),
+      );
+      expect(failedRun.failed).toBe(true);
+      const stdoutSummary = JSON.parse(
+        failedRun.stdout.trim().split("\n").at(-1)!,
+      ) as {
+        readonly id: string;
+        readonly execution: { readonly attempted: number };
+        readonly tasks: ReadonlyArray<{
+          readonly taskId: string;
+          readonly execution: {
+            readonly startTime: number;
+            readonly endTime: number;
+            readonly exitCode: number;
+          } | null;
+        }>;
+      };
+      expect(stdoutSummary.execution.attempted).toBe(1);
+      expect(
+        stdoutSummary.tasks.find(
+          (task) => task.taskId === "synthetic-library#build",
+        )?.execution,
+      ).toMatchObject({ exitCode: 7 });
+      expect(
+        stdoutSummary.tasks.find(
+          (task) => task.taskId === "synthetic-app#build",
+        )?.execution,
+      ).toBeNull();
+      const structuredSummary = JSON.parse(
+        (await readFile(join(directory, "run.ndjson"), "utf8"))
+          .trim()
+          .split("\n")
+          .at(-1)!,
+      ) as typeof stdoutSummary;
+      expect(structuredSummary.tasks).toEqual(stdoutSummary.tasks);
+      const persistedSummary = JSON.parse(
+        await readFile(
+          join(directory, ".turbo", "runs", `${stdoutSummary.id}.json`),
+          "utf8",
+        ),
+      ) as typeof stdoutSummary;
+      expect(persistedSummary.tasks).toEqual(stdoutSummary.tasks);
       const profile = JSON.parse(
         await readFile(join(directory, "profile.json"), "utf8"),
       ) as {
@@ -976,6 +1023,49 @@ describe("repository workflow gate", () => {
       expect(profile.traceEvents.map((event) => event.name)).toEqual([
         "synthetic-library#build",
       ]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("excludes explicit profile artifacts from task input hashes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-profile-hash-"));
+    try {
+      await prepareFixture(directory);
+      const runProfiled = async () => {
+        const result = await execFilePromise(process.execPath, [
+          candidate,
+          "run",
+          "build",
+          "--filter=synthetic-app",
+          "--no-cache",
+          "--profile=packages/app/profile.json",
+          "--anon-profile=packages/app/anonymous.json",
+          `--trace=${join(directory, "packages/app/trace.json")}`,
+          "--json",
+          "--cwd",
+          directory,
+        ]);
+        return JSON.parse(result.stdout.trim().split("\n").at(-1)!) as {
+          readonly tasks: ReadonlyArray<{
+            readonly taskId: string;
+            readonly hash: string;
+            readonly inputs: Readonly<Record<string, string>>;
+          }>;
+        };
+      };
+      const first = await runProfiled();
+      const second = await runProfiled();
+      const firstTask = first.tasks.find(
+        (task) => task.taskId === "synthetic-app#build",
+      )!;
+      const secondTask = second.tasks.find(
+        (task) => task.taskId === "synthetic-app#build",
+      )!;
+      expect(secondTask.hash).toBe(firstTask.hash);
+      expect(Object.keys(secondTask.inputs)).not.toContain("profile.json");
+      expect(Object.keys(secondTask.inputs)).not.toContain("anonymous.json");
+      expect(Object.keys(secondTask.inputs)).not.toContain("trace.json");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1761,6 +1851,92 @@ describe("repository workflow gate", () => {
           ),
         ),
       ).rejects.toThrow(/synthetic repository watcher failure/);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("keeps active RPCs alive and isolates response transport failures", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-daemon-response-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const responses = new Map<string, unknown>();
+      let failedResponseCompleted = false;
+      const responseFailure = new BoundaryError({
+        boundary: "daemon",
+        message: "synthetic response failure",
+        retryable: true,
+      });
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const clock = yield* ClockService;
+          const daemon = yield* DaemonService;
+          const system = yield* SystemService;
+          const information = yield* system.information;
+          const connection = (id: string) => ({
+            requests: Stream.succeed({ id, method: DaemonMethod.status }),
+            respond: (response: { readonly id: string }) =>
+              id === "failed"
+                ? Effect.sleep("50 millis").pipe(
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        failedResponseCompleted = true;
+                      }),
+                    ),
+                    Effect.zipRight(Effect.fail(responseFailure)),
+                  )
+                : Effect.sync(() => {
+                    responses.set(id, response);
+                  }),
+          });
+          return yield* executeDaemon({
+            command: "serve",
+            cwd: directory,
+            idleMilliseconds: 10,
+            json: false,
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(ClockService, {
+                  ...clock,
+                  now: Effect.succeed(Date.UTC(2026, 0, 2, 3, 4, 5)),
+                }),
+                Layer.succeed(DaemonService, {
+                  ...daemon,
+                  serve: () =>
+                    Stream.fromIterable([
+                      connection("failed"),
+                      connection("succeeded"),
+                    ]),
+                }),
+                Layer.succeed(FileWatcherService, {
+                  watch: () => Stream.never,
+                }),
+                Layer.succeed(SystemService, {
+                  information: Effect.succeed({
+                    ...information,
+                    temporaryDirectory: directory,
+                  }),
+                }),
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(failedResponseCompleted).toBe(true);
+      expect(responses.get("succeeded")).toMatchObject({
+        id: "succeeded",
+        result: { uptimeMilliseconds: 0 },
+      });
+      const logDirectory = join(directory, ".turbo", "daemon");
+      const logs = await readdir(logDirectory);
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toMatch(/-turbo\.log\.2026-01-02$/);
+      expect(await readFile(join(logDirectory, logs[0]!), "utf8")).toContain(
+        "rpc=Status response_error=synthetic response failure",
+      );
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

@@ -2736,7 +2736,7 @@ const executeTask = (
       replayCompletedOutput &&
       options.ui !== "tui"
     ) {
-      if (options.logOrder === "grouped" && streamsCapturedOutput) {
+      if (streamsCapturedOutput) {
         yield* withOutputPermit(replayTaskLog(false));
       } else {
         yield* writeTaskEvent(
@@ -3493,6 +3493,14 @@ export const executeRun = (
           ? parsed.logFile
           : joinPath(options.root, parsed.logFile)
         : undefined;
+    const resolveExplicitRunArtifactPath = (
+      requestedPath: string | undefined,
+    ): string | undefined =>
+      requestedPath === undefined || requestedPath === ""
+        ? undefined
+        : isAbsolutePath(requestedPath)
+          ? requestedPath
+          : joinPath(options.root, requestedPath);
     const comparableInputPath = (path: string): string => {
       const normalized = normalizePath(path, platform === "win32");
       return platform === "win32" ? normalized.toLowerCase() : normalized;
@@ -3539,10 +3547,14 @@ export const executeRun = (
         );
       }
     }
-    const excludedInputPaths =
-      configuredStructuredLogPath === undefined
-        ? []
-        : [configuredStructuredLogPath];
+    const excludedInputPaths = [
+      configuredStructuredLogPath,
+      ...(parsed.graph === undefined && parsed.dryRun === undefined
+        ? [parsed.profile, parsed.anonymousProfile, parsed.trace].map(
+            resolveExplicitRunArtifactPath,
+          )
+        : []),
+    ].filter((path): path is string => path !== undefined);
     const cacheabilityByTask = new Map(
       yield* Effect.forEach(
         [...graph.nodes],
@@ -4377,11 +4389,14 @@ export const executeRun = (
           inferred: [],
           passthrough: null,
         },
-        execution: {
-          startTime: outcome?.startTime ?? runStartedAt,
-          endTime: outcome?.endTime ?? runFinishedAt,
-          exitCode: outcome?.exitCode ?? 1,
-        },
+        execution:
+          outcome === undefined
+            ? null
+            : {
+                startTime: outcome.startTime,
+                endTime: outcome.endTime,
+                exitCode: outcome.exitCode,
+              },
       };
     });
     const summaryIsEmitted =
@@ -4466,11 +4481,8 @@ export const executeRun = (
         );
       }
       const resolvedPath =
-        requestedPath === ""
-          ? joinPath(options.root, `profile.${runStartedAt}`)
-          : isAbsolutePath(requestedPath)
-            ? requestedPath
-            : joinPath(options.root, requestedPath);
+        resolveExplicitRunArtifactPath(requestedPath) ??
+        joinPath(options.root, `profile.${runStartedAt}`);
       yield* profileService.value.writeTrace(resolvedPath, traceEvents);
     }
     const summaryRecord = { type: "run_summary", ...summary } as const;

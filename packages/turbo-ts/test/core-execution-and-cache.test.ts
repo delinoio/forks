@@ -316,7 +316,7 @@ describe("core CLI execution", () => {
         scripts: Record<string, string>;
       };
       manifest.scripts["large-output"] =
-        "node -e \"process.stdout.write('x'.repeat(96 * 1024) + Buffer.from('RU5ELU1BUktFUg==', 'base64').toString() + '\\n'); process.exit(7)\"";
+        "node -e \"process.stdout.write(Buffer.from('QkVHSU4tTUFSS0VS', 'base64').toString() + 'x'.repeat(96 * 1024) + Buffer.from('RU5ELU1BUktFUg==', 'base64').toString() + '\\n'); process.exit(7)\"";
       await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
       const result = await run(
         process.execPath,
@@ -334,8 +334,9 @@ describe("core CLI execution", () => {
         repositoryRoot,
       );
       expect(result.exitCode).not.toBe(0);
+      expect(result.stdout).toContain("BEGIN-MARKER");
       expect(result.stdout).toContain("END-MARKER");
-      expect(result.stdout.length).toBeLessThan(80 * 1024);
+      expect(result.stdout.length).toBeGreaterThan(96 * 1024);
       const log = await readFile(
         `${packageDirectory}/.turbo/turbo-large-output.log`,
         "utf8",
@@ -350,6 +351,7 @@ describe("core CLI execution", () => {
         .map((line) => JSON.parse(line) as { readonly text?: string })
         .flatMap((record) => record.text ?? [])
         .join("");
+      expect(structuredOutput.match(/BEGIN-MARKER/g)).toHaveLength(1);
       expect(structuredOutput.match(/END-MARKER/g)).toHaveLength(1);
     } finally {
       await rm(directory, { force: true, recursive: true });

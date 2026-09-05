@@ -1,4 +1,4 @@
-import { Deferred, Effect, Queue, Stream } from "effect";
+import { Deferred, Effect, Queue, Ref, Stream } from "effect";
 import {
   canMatchGlobsDescendantWithExclusions,
   matchesGlobsWithExclusions,
@@ -175,8 +175,13 @@ export const parseDaemonArguments = (
 
 const daemonPaths = (
   root: string,
-): Effect.Effect<DaemonPaths, BoundaryError, DigestService | SystemService> =>
+): Effect.Effect<
+  DaemonPaths,
+  BoundaryError,
+  ClockService | DigestService | SystemService
+> =>
   Effect.gen(function* () {
+    const clock = yield* ClockService;
     const digest = yield* DigestService;
     const system = yield* SystemService;
     const information = yield* system.information;
@@ -195,7 +200,7 @@ const daemonPaths = (
       `turbod-${information.userIdentifier}`,
       hash,
     );
-    const date = new Date().toISOString().slice(0, 10);
+    const date = new Date(yield* clock.now).toISOString().slice(0, 10);
     return {
       hash,
       stateDirectory,
@@ -310,6 +315,7 @@ export const daemonIsRunning = (
 ): Effect.Effect<
   boolean,
   never,
+  | ClockService
   | DaemonService
   | DigestService
   | FileSystemService
@@ -752,6 +758,20 @@ const serveDaemon = (
       const information = yield* system.information;
       const shutdown = yield* Deferred.make<void>();
       const activity = yield* Queue.sliding<void>(1);
+      const activityState = yield* Ref.make({
+        activeRequests: 0,
+        generation: 0,
+      });
+      const recordActivity = (requestDelta = 0) =>
+        Ref.update(activityState, (state) => ({
+          activeRequests: Math.max(0, state.activeRequests + requestDelta),
+          generation: state.generation + 1,
+        })).pipe(
+          Effect.zipRight(Queue.offer(activity, undefined)),
+          Effect.asVoid,
+        );
+      const beginRequest = recordActivity(1);
+      const finishRequest = recordActivity(-1);
       const outputRegistrations = new Map<string, OutputRegistration>();
       const startedAt = yield* clock.now;
       yield* fileSystem.makeDirectory(paths.stateDirectory);
@@ -807,7 +827,7 @@ const serveDaemon = (
                   markOutputChanged(registration, glob);
                 }
               }
-              yield* Queue.offer(activity, undefined);
+              yield* recordActivity();
               return;
             }
             const relative = relativePath(repository.root, change.path);
@@ -828,7 +848,7 @@ const serveDaemon = (
                 }
               }
             }
-            yield* Queue.offer(activity, undefined);
+            yield* recordActivity();
           }),
         ),
         Effect.zipRight(Effect.never),
@@ -837,125 +857,134 @@ const serveDaemon = (
         daemon.serve(paths.socket),
         (connection) =>
           Stream.runForEach(connection.requests, (request) =>
-            Effect.gen(function* () {
-              yield* Queue.offer(activity, undefined);
-              yield* fileSystem
-                .appendText(
-                  paths.log,
-                  `${new Date(yield* clock.now).toISOString()} rpc=${request.method}\n`,
-                )
-                .pipe(Effect.ignore);
-              const changedOutputAcknowledgements = new Map<
-                Map<string, number>,
-                ReadonlyMap<string, number>
-              >();
-              const result = yield* (() => {
-                if (request.method === DaemonMethod.status) {
-                  return Effect.gen(function* () {
-                    return {
-                      logFile: paths.log.replace(/\.\d{4}-\d{2}-\d{2}$/, ""),
-                      uptimeMilliseconds: Math.max(
-                        0,
-                        (yield* clock.now) - startedAt,
-                      ),
-                    };
-                  });
-                }
-                if (request.method === DaemonMethod.discoverPackages) {
-                  return loadWorkflowRepository({
-                    cwd: repository.root,
-                    rootTurboJson: options.rootTurboJson,
-                  }).pipe(
-                    Effect.map((currentRepository) => ({
-                      packages: currentRepository.packages
-                        .map((packageModel) => ({
-                          name: packageModel.name,
-                          path: packageModel.relativeDirectory,
-                        }))
-                        .sort((left, right) =>
-                          left.name.localeCompare(right.name),
-                        ),
-                      packageManager:
-                        repositoryPackageManagerLabel(currentRepository),
-                    })),
-                  );
-                }
-                if (request.method === DaemonMethod.notifyOutputsWritten) {
-                  const params = request.params as {
-                    readonly hash?: unknown;
-                    readonly outputGlobs?: unknown;
-                    readonly outputExclusionGlobs?: unknown;
-                  };
-                  if (typeof params.hash !== "string" || params.hash === "") {
-                    return Effect.fail(
-                      new BoundaryError({
-                        boundary: "daemon",
-                        message: "NotifyOutputsWritten requires a hash",
-                        retryable: false,
-                      }),
-                    );
-                  }
-                  outputRegistrations.set(params.hash, {
-                    outputGlobs: Array.isArray(params.outputGlobs)
-                      ? params.outputGlobs.filter(
-                          (value): value is string => typeof value === "string",
-                        )
-                      : [],
-                    outputExclusionGlobs: Array.isArray(
-                      params.outputExclusionGlobs,
+            Effect.acquireUseRelease(
+              beginRequest,
+              () =>
+                Effect.gen(function* () {
+                  yield* fileSystem
+                    .appendText(
+                      paths.log,
+                      `${new Date(yield* clock.now).toISOString()} rpc=${request.method}\n`,
                     )
-                      ? params.outputExclusionGlobs.filter(
-                          (value): value is string => typeof value === "string",
+                    .pipe(Effect.ignore);
+                  const changedOutputAcknowledgements = new Map<
+                    Map<string, number>,
+                    ReadonlyMap<string, number>
+                  >();
+                  const result = yield* (() => {
+                    if (request.method === DaemonMethod.status) {
+                      return Effect.gen(function* () {
+                        return {
+                          logFile: paths.log.replace(
+                            /\.\d{4}-\d{2}-\d{2}$/,
+                            "",
+                          ),
+                          uptimeMilliseconds: Math.max(
+                            0,
+                            (yield* clock.now) - startedAt,
+                          ),
+                        };
+                      });
+                    }
+                    if (request.method === DaemonMethod.discoverPackages) {
+                      return loadWorkflowRepository({
+                        cwd: repository.root,
+                        rootTurboJson: options.rootTurboJson,
+                      }).pipe(
+                        Effect.map((currentRepository) => ({
+                          packages: currentRepository.packages
+                            .map((packageModel) => ({
+                              name: packageModel.name,
+                              path: packageModel.relativeDirectory,
+                            }))
+                            .sort((left, right) =>
+                              left.name.localeCompare(right.name),
+                            ),
+                          packageManager:
+                            repositoryPackageManagerLabel(currentRepository),
+                        })),
+                      );
+                    }
+                    if (request.method === DaemonMethod.notifyOutputsWritten) {
+                      const params = request.params as {
+                        readonly hash?: unknown;
+                        readonly outputGlobs?: unknown;
+                        readonly outputExclusionGlobs?: unknown;
+                      };
+                      if (
+                        typeof params.hash !== "string" ||
+                        params.hash === ""
+                      ) {
+                        return Effect.fail(
+                          new BoundaryError({
+                            boundary: "daemon",
+                            message: "NotifyOutputsWritten requires a hash",
+                            retryable: false,
+                          }),
+                        );
+                      }
+                      outputRegistrations.set(params.hash, {
+                        outputGlobs: Array.isArray(params.outputGlobs)
+                          ? params.outputGlobs.filter(
+                              (value): value is string =>
+                                typeof value === "string",
+                            )
+                          : [],
+                        outputExclusionGlobs: Array.isArray(
+                          params.outputExclusionGlobs,
                         )
-                      : [],
-                    changedOutputGenerations: new Map(),
-                    nextChangeGeneration: 0,
-                  });
-                  return Effect.succeed({});
-                }
-                if (request.method === DaemonMethod.getChangedOutputs) {
-                  const params = request.params as {
-                    readonly hashes?: unknown;
-                  };
-                  const hashes = Array.isArray(params.hashes)
-                    ? params.hashes.filter(
-                        (value): value is string => typeof value === "string",
-                      )
-                    : [];
-                  const changedOutputs = hashes.flatMap((hash) => {
-                    const registration = outputRegistrations.get(hash);
-                    if (registration === undefined) return [];
-                    const acknowledgement = new Map(
-                      registration.changedOutputGenerations,
-                    );
-                    const changedOutputGlobs = [
-                      ...acknowledgement.keys(),
-                    ].sort();
-                    changedOutputAcknowledgements.set(
-                      registration.changedOutputGenerations,
-                      acknowledgement,
-                    );
-                    return [{ hash, changedOutputGlobs }];
-                  });
-                  return Effect.succeed({ changedOutputs });
-                }
-                return Effect.succeed({});
-              })().pipe(Effect.either);
-              if (result._tag === "Left") {
-                yield* connection.respond({
-                  id: request.id,
-                  error:
-                    result.left instanceof Error
-                      ? result.left.message
-                      : String(result.left),
-                });
-              } else {
-                const response = connection.respond({
-                  id: request.id,
-                  result: result.right,
-                });
-                if (request.method === DaemonMethod.getChangedOutputs) {
-                  const responseResult = yield* response.pipe(Effect.either);
+                          ? params.outputExclusionGlobs.filter(
+                              (value): value is string =>
+                                typeof value === "string",
+                            )
+                          : [],
+                        changedOutputGenerations: new Map(),
+                        nextChangeGeneration: 0,
+                      });
+                      return Effect.succeed({});
+                    }
+                    if (request.method === DaemonMethod.getChangedOutputs) {
+                      const params = request.params as {
+                        readonly hashes?: unknown;
+                      };
+                      const hashes = Array.isArray(params.hashes)
+                        ? params.hashes.filter(
+                            (value): value is string =>
+                              typeof value === "string",
+                          )
+                        : [];
+                      const changedOutputs = hashes.flatMap((hash) => {
+                        const registration = outputRegistrations.get(hash);
+                        if (registration === undefined) return [];
+                        const acknowledgement = new Map(
+                          registration.changedOutputGenerations,
+                        );
+                        const changedOutputGlobs = [
+                          ...acknowledgement.keys(),
+                        ].sort();
+                        changedOutputAcknowledgements.set(
+                          registration.changedOutputGenerations,
+                          acknowledgement,
+                        );
+                        return [{ hash, changedOutputGlobs }];
+                      });
+                      return Effect.succeed({ changedOutputs });
+                    }
+                    return Effect.succeed({});
+                  })().pipe(Effect.either);
+                  const responseResult = yield* connection
+                    .respond(
+                      result._tag === "Left"
+                        ? {
+                            id: request.id,
+                            error:
+                              result.left instanceof Error
+                                ? result.left.message
+                                : String(result.left),
+                          }
+                        : { id: request.id, result: result.right },
+                    )
+                    .pipe(Effect.either);
                   if (responseResult._tag === "Left") {
                     yield* fileSystem
                       .appendText(
@@ -965,35 +994,42 @@ const serveDaemon = (
                       .pipe(Effect.ignore);
                     return;
                   }
-                } else {
-                  yield* response;
-                }
-                for (const [
-                  generations,
-                  acknowledged,
-                ] of changedOutputAcknowledgements) {
-                  for (const [glob, generation] of acknowledged) {
-                    if (generations.get(glob) === generation) {
-                      generations.delete(glob);
+                  for (const [
+                    generations,
+                    acknowledged,
+                  ] of changedOutputAcknowledgements) {
+                    for (const [glob, generation] of acknowledged) {
+                      if (generations.get(glob) === generation) {
+                        generations.delete(glob);
+                      }
                     }
                   }
-                }
-              }
-              if (request.method === DaemonMethod.shutdown) {
-                yield* Deferred.succeed(shutdown, undefined);
-              }
-            }),
+                  if (request.method === DaemonMethod.shutdown) {
+                    yield* Deferred.succeed(shutdown, undefined);
+                  }
+                }),
+              () => finishRequest,
+            ),
           ),
       );
       const waitForIdle = Effect.gen(function* () {
         while (true) {
+          const observedGeneration = (yield* Ref.get(activityState)).generation;
           const outcome = yield* Effect.race(
             Queue.take(activity).pipe(Effect.as("activity" as const)),
             clock
               .sleep(options.idleMilliseconds)
               .pipe(Effect.as("idle" as const)),
           );
-          if (outcome === "idle") return;
+          if (outcome === "idle") {
+            const current = yield* Ref.get(activityState);
+            if (
+              current.activeRequests === 0 &&
+              current.generation === observedGeneration
+            ) {
+              return;
+            }
+          }
         }
       });
       yield* Effect.raceFirst(

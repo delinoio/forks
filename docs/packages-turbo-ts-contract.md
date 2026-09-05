@@ -559,8 +559,10 @@ the operation can be retried. Forced termination must be available, succeed,
 and be confirmed before the same state is removed. A timed-out daemon start
 applies the same termination and state-retention rules to its spawned process.
 Malformed streams remain
-isolated, and an idle server resets its deadline after RPC or repository
-activity before releasing its state. Serve startup acquires exclusive PID
+isolated, response transport failures are logged and isolated to their request,
+and an idle server resets its deadline after RPC or repository activity without
+expiring while an RPC is in flight. Dated daemon log paths derive their time
+from the configured clock service. Serve startup acquires exclusive PID
 ownership, a competing server cannot unlink a live daemon endpoint, endpoint
 cleanup is limited to the owning server instance, and a post-bind endpoint
 setup failure closes the server and all sessions. Repository watcher failure
@@ -662,11 +664,13 @@ falls back to stream mode when either terminal side is non-interactive. JSON
 mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
 completed task's full log replay. Structured log files append typed task events
 as work runs and end with a typed run summary. An explicit structured-log
-artifact is excluded from task and global file hashes, and it may not replace a
+artifact and explicit named, anonymous, or trace profile artifacts are excluded
+from task and global file hashes. A structured-log artifact may not replace a
 mandatory task control input or match a declared task output. Timestamped
 streaming applies the timestamp
 writer to a final unterminated task line. Errors-only failure replay does
-not duplicate output already recorded while the task ran. CLI `--global-deps`
+not duplicate output already recorded while the task ran and reads the complete
+task log instead of the bounded diagnostic tail. CLI `--global-deps`
 patterns are merged into task hash inputs, and their repository-relative Git
 blob hashes are reported in summary `globalCacheInputs.files`. Dry runs do not perform local
 cache eviction, and
@@ -674,7 +678,8 @@ cache eviction, and
 applies to live and cached output. Summaries record
 the actual local or remote cache source and saved duration, and summaries and
 profiles use each task's scheduling timestamps. Generated profiles omit tasks
-that were never scheduled, and requested heap snapshots are written
+that were never scheduled, while summary task entries represent them with a
+null `execution` value. Requested heap snapshots are written
 before task input hashes are computed so repository-contained snapshots cannot
 invalidate a cache key after hashing. Task summaries record the
 resolved transitive external-dependency closure hash for graph-bearing npm,
