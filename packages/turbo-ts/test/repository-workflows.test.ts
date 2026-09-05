@@ -16,6 +16,7 @@ import {
 import {
   connect as connectHttp2,
   constants as http2Constants,
+  type ServerHttp2Stream,
 } from "node:http2";
 import { createConnection as createNetConnection } from "node:net";
 import { tmpdir } from "node:os";
@@ -32,6 +33,7 @@ import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import {
   makeDaemonServe,
   nodeFoundationLayer,
+  respondGrpc,
 } from "../src/effect/node-layer.js";
 import {
   ClockService,
@@ -63,7 +65,11 @@ import {
   isWindowsSubsystemForLinux,
 } from "../src/workflow/misc.js";
 import { executePrune, parsePruneArguments } from "../src/workflow/prune.js";
-import { executeQuery, repositoryQuerySchema } from "../src/workflow/query.js";
+import {
+  executeQuery,
+  executeQueryAffected,
+  repositoryQuerySchema,
+} from "../src/workflow/query.js";
 import {
   isInternalRepositoryPath,
   loadWorkflowRepository,
@@ -1148,6 +1154,8 @@ describe("repository workflow gate", () => {
       );
       try {
         await prepareFixture(directory);
+        const sourceProfilePath = join(directory, "profile.settings.json");
+        await writeFile(sourceProfilePath, '{"setting":"first"}\n');
         const runProfiled = async () => {
           const result = await execFilePromise(process.execPath, [
             candidate,
@@ -1170,16 +1178,22 @@ describe("repository workflow gate", () => {
         const first = await runProfiled();
         const second = await runProfiled();
         expect(second.tasks[0]?.hash).toBe(first.tasks[0]?.hash);
+        expect(Object.keys(second.tasks[0]?.inputs ?? {})).toContain(
+          "profile.settings.json",
+        );
         expect(
           Object.keys(second.tasks[0]?.inputs ?? {}).some((path) =>
-            path.startsWith("profile."),
+            /^profile\.[0-9]+(?:\.anonymous)?$/.test(path),
           ),
         ).toBe(false);
         expect(
           (await readdir(directory)).some((path) =>
-            path.startsWith("profile."),
+            /^profile\.[0-9]+(?:\.anonymous)?$/.test(path),
           ),
         ).toBe(true);
+        await writeFile(sourceProfilePath, '{"setting":"second"}\n');
+        const changed = await runProfiled();
+        expect(changed.tasks[0]?.hash).not.toBe(second.tasks[0]?.hash);
       } finally {
         await rm(directory, { force: true, recursive: true });
       }
@@ -1938,6 +1952,25 @@ describe("repository workflow gate", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
+  });
+
+  it("propagates asynchronous daemon response write failures", async () => {
+    const failure = new Error("synthetic asynchronous response failure");
+    const stream = {
+      respond: () => undefined,
+      end: (_payload: Uint8Array, callback: (cause?: Error | null) => void) => {
+        setImmediate(() => callback(failure));
+      },
+      close: () => undefined,
+    } as unknown as ServerHttp2Stream;
+    await expect(
+      Effect.runPromise(
+        respondGrpc(stream, DaemonMethod.getChangedOutputs, {
+          id: "synthetic-response",
+          result: { changedOutputs: [] },
+        }),
+      ),
+    ).rejects.toThrow(/synthetic asynchronous response failure/);
   });
 
   it("interrupts rejected daemon responses with the server scope", async () => {
@@ -3602,6 +3635,72 @@ describe("repository workflow gate", () => {
     }
   }, 45_000);
 
+  it("watches profile-prefixed inputs with a default profile", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-watch-default-profile-"),
+    );
+    await prepareFixture(directory);
+    const sourceProfilePath = join(directory, "profile.config.json");
+    await writeFile(sourceProfilePath, '{"setting":"first"}\n');
+    const child = spawn(
+      process.execPath,
+      [
+        candidate,
+        "watch",
+        "build",
+        "--filter=synthetic-app",
+        "--global-deps=profile.config.json",
+        "--profile",
+        "--no-cache",
+        "--cwd",
+        directory,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    const closed = new Promise<void>((resolve) => child.once("close", resolve));
+    try {
+      await waitUntil(() => stdout.includes("app build"));
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const initialRuns = (stdout.match(/app build/g) ?? []).length;
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect((stdout.match(/app build/g) ?? []).length, stdout).toBe(
+        initialRuns,
+      );
+      expect(
+        (await readdir(directory)).some((path) =>
+          /^profile\.[0-9]+$/.test(path),
+        ),
+      ).toBe(true);
+      await writeFile(sourceProfilePath, '{"setting":"second"}\n');
+      await waitUntil(
+        () => (stdout.match(/app build/g) ?? []).length > initialRuns,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const changedRuns = (stdout.match(/app build/g) ?? []).length;
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect((stdout.match(/app build/g) ?? []).length, stdout).toBe(
+        changedRuns,
+      );
+      expect(stdout).toContain(`change detected: ${sourceProfilePath}`);
+    } finally {
+      child.kill();
+      await Promise.race([
+        closed,
+        new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await closed;
+      }
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 45_000);
+
   it("uses task inputs and file entry types for watch changes", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-inputs-"));
     await prepareFixture(directory);
@@ -4668,8 +4767,12 @@ importers:
     }
   }, 15_000);
 
-  it("selects every cross-ecosystem package matching a plain prune scope", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-scopes-"));
+  it("selects plain and qualified cross-ecosystem package scopes", async () => {
+    const fixtureParent = join(repositoryRoot, ".turbo");
+    await mkdir(fixtureParent, { recursive: true });
+    const directory = await mkdtemp(
+      join(fixtureParent, "turbo-ts-prune-scopes-"),
+    );
     const packageName = "synthetic-polyglot";
     const javascriptDirectory = join(directory, "packages/polyglot");
     const cargoWorkspaceDirectory = join(directory, "rust");
@@ -4805,6 +4908,112 @@ importers:
             );
           }).pipe(Effect.provide(nodeFoundationLayer)),
         );
+      const runAffected = (scope: string) =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            const terminal = yield* TerminalService;
+            let stdout = "";
+            const exitCode = yield* executeQueryAffected([
+              "--packages",
+              scope,
+              "--base=HEAD~1",
+              "--head=HEAD",
+              "--cwd",
+              directory,
+            ]).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  Layer.succeed(ProcessService, {
+                    ...processService,
+                    run: (request) =>
+                      request.command === "cargo" &&
+                      request.args[0] === "metadata"
+                        ? Effect.succeed({
+                            exitCode: 0,
+                            stdout: cargoMetadata,
+                            stderr: "",
+                            combinedOutput: cargoMetadata,
+                          })
+                        : processService.run(request),
+                  }),
+                  Layer.succeed(TerminalService, {
+                    ...terminal,
+                    writeStdout: (text) =>
+                      Effect.sync(() => {
+                        stdout += text;
+                      }),
+                  }),
+                ),
+              ),
+            );
+            return {
+              exitCode,
+              output: JSON.parse(stdout) as {
+                readonly data: {
+                  readonly affectedPackages: {
+                    readonly items: ReadonlyArray<{
+                      readonly name: string;
+                      readonly path: string;
+                    }>;
+                  };
+                };
+              },
+            };
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      const git = (...arguments_: ReadonlyArray<string>) =>
+        execFilePromise("/usr/bin/git", [
+          "-C",
+          directory,
+          "-c",
+          "user.email=synthetic@example.test",
+          "-c",
+          "user.name=Synthetic Fixture",
+          ...arguments_,
+        ]);
+      await git("init", "--quiet");
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "base");
+      await git("branch", "-M", "main");
+      await writeFile(
+        join(javascriptDirectory, "package.json"),
+        `${JSON.stringify(
+          { name: packageName, private: true, version: "1.0.0" },
+          undefined,
+          2,
+        )}\n`,
+      );
+      await writeFile(
+        join(cargoDirectory, "Cargo.toml"),
+        `[package]\nname = "${packageName}"\nversion = "0.1.0"\nedition = "2024"\n# changed\n`,
+      );
+      await writeFile(
+        join(uvDirectory, "pyproject.toml"),
+        `[project]\nname = "${packageName}"\nversion = "0.1.0"\ndependencies = []\n# changed\n`,
+      );
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "change package manifests");
+      const plainAffected = await runAffected(packageName);
+      expect(plainAffected.exitCode, JSON.stringify(plainAffected.output)).toBe(
+        0,
+      );
+      expect(
+        plainAffected.output.data.affectedPackages.items
+          .map((item) => item.path)
+          .sort(),
+      ).toEqual(["packages/polyglot", "python/polyglot", "rust/polyglot"]);
+      const qualifiedAffected = await runAffected(`cargo:${packageName}`);
+      expect(qualifiedAffected.exitCode).toBe(0);
+      expect(qualifiedAffected.output.data.affectedPackages.items).toEqual([
+        {
+          name: packageName,
+          path: "rust/polyglot",
+          reason: {
+            __typename: "FileChanged",
+          },
+        },
+      ]);
       await expect(
         runPrune([`cargo:${packageName}`], cargoWorkspaceDirectory),
       ).rejects.toThrow(/repository package or workspace control directory/);

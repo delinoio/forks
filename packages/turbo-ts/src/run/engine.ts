@@ -98,6 +98,7 @@ import {
   yarnUserConfigurationPresent,
 } from "../repository/model.js";
 import { type ParsedRunOptions, parseConcurrency } from "./options.js";
+import { defaultProfileArtifactName } from "./profile.js";
 
 interface CachePolicy {
   readonly localRead: boolean;
@@ -4242,13 +4243,13 @@ export const executeRun = (
               return members.map((id) =>
                 id === completion.outcome.id
                   ? completion.outcome
-                  : {
+                  : (groupOutcomes.get(id) ?? {
                       id,
                       exitCode: 1,
                       skipped: true,
                       startTime: taskStartedAt.get(id) ?? endTime,
                       endTime,
-                    },
+                    }),
               );
             }
             for (const outcome of completion.outcomes) {
@@ -4504,11 +4505,11 @@ export const executeRun = (
     const anonymousProfileEvents = profileEvents(true);
     const defaultProfilePath = joinPath(
       options.root,
-      `profile.${runStartedAt}`,
+      defaultProfileArtifactName(runStartedAt, false),
     );
     const defaultAnonymousProfilePath =
       parsed.profile === "" && parsed.anonymousProfile === ""
-        ? `${defaultProfilePath}.anonymous`
+        ? joinPath(options.root, defaultProfileArtifactName(runStartedAt, true))
         : defaultProfilePath;
     for (const [requestedPath, traceEvents, defaultPath] of [
       [parsed.profile, namedProfileEvents, defaultProfilePath],

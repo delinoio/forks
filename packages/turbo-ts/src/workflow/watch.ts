@@ -29,6 +29,7 @@ import {
   resolveOptions,
 } from "../run/engine.js";
 import { type ParsedRunOptions, parseRunArguments } from "../run/options.js";
+import { isDefaultProfileArtifactName } from "../run/profile.js";
 import {
   isInternalRepositoryPath,
   loadWorkflowRepository,
@@ -184,7 +185,9 @@ const runOwnedPath = (
     writesDefaultProfile &&
     normalizePath(parentPath(normalizedPath, windowsPathSeparators)) ===
       normalizePath(repository.root, windowsPathSeparators) &&
-    baseName(normalizedPath, windowsPathSeparators).startsWith("profile.")
+    isDefaultProfileArtifactName(
+      baseName(normalizedPath, windowsPathSeparators),
+    )
   ) {
     return true;
   }

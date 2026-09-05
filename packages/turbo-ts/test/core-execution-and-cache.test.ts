@@ -7676,6 +7676,83 @@ dependencies = [
     }
   }, 10_000);
 
+  it("preserves completed owners when a persistent companion exits", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.check = {
+        cache: false,
+        with: ["synthetic-library#serve"],
+      };
+      configuration.tasks.serve = { cache: false, persistent: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      for (const packageName of ["app", "library"]) {
+        const manifestPath = `${directory}/packages/${packageName}/package.json`;
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          scripts: Record<string, string>;
+        };
+        manifest.scripts.check =
+          packageName === "app"
+            ? "node -e \"require('node:fs').writeFileSync('app.done','1'); console.log('app check complete')\""
+            : "node -e \"const fs=require('node:fs'); fs.writeFileSync('library.started','1'); setTimeout(()=>fs.writeFileSync('library.finished','1'),2000)\"";
+        if (packageName === "library") {
+          manifest.scripts.serve =
+            "node -e \"const fs=require('node:fs'); const timer=setInterval(()=>{if(fs.existsSync('../app/app.done')&&fs.existsSync('library.started')){clearInterval(timer);process.exit(8)}},10)\"";
+        }
+        await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      }
+      const result = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "check",
+          "--cwd",
+          directory,
+          "--concurrency=1",
+          "--no-cache",
+          "--json",
+        ],
+        repositoryRoot,
+      );
+      expect(result.exitCode).not.toBe(0);
+      const summary = JSON.parse(result.stdout.trim().split("\n").at(-1)!) as {
+        readonly execution: {
+          readonly success: number;
+          readonly failed: number;
+          readonly attempted: number;
+        };
+        readonly tasks: ReadonlyArray<{
+          readonly taskId: string;
+          readonly hash: string;
+          readonly execution: { readonly exitCode: number } | null;
+        }>;
+      };
+      expect(summary.execution).toMatchObject({
+        success: 1,
+        failed: 1,
+        attempted: 3,
+      });
+      expect(
+        summary.tasks.find((task) => task.taskId === "synthetic-app#check"),
+      ).toMatchObject({
+        hash: expect.stringMatching(/^[0-9a-f]+$/),
+        execution: { exitCode: 0 },
+      });
+      await expect(
+        lstat(`${directory}/packages/library/library.finished`),
+      ).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("fails when persistent companions exit successfully before owners", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;

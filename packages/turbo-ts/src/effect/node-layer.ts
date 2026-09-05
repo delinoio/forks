@@ -2025,7 +2025,7 @@ const decodedDaemonResponse = (
   };
 };
 
-const respondGrpc = (
+export const respondGrpc = (
   stream: ServerHttp2Stream,
   method: string,
   response: DaemonResponse,
@@ -2040,8 +2040,14 @@ const respondGrpc = (
           ? {}
           : { "grpc-message": encodeURIComponent(response.error) }),
       });
-      stream.end(grpcFrame(daemonResponsePayload(method, response)), () =>
-        resume(Effect.void),
+      stream.end(
+        grpcFrame(daemonResponsePayload(method, response)),
+        (cause?: Error | null) =>
+          resume(
+            cause === undefined || cause === null
+              ? Effect.void
+              : Effect.fail(daemonProtocolError(cause)),
+          ),
       );
     } catch (cause) {
       resume(Effect.fail(daemonProtocolError(cause)));

@@ -226,8 +226,9 @@ Symlinks and other non-regular destinations are rejected. An existing regular
 log destination is unlinked before task output is written so a hard link cannot
 redirect truncation outside the execution directory.
 Persistent companions must remain alive until their foreground owners
-complete; any earlier natural exit fails the group, and foreground owners
-sharing a companion remain subject to the run's concurrency limit.
+complete; any earlier natural exit fails the group without replacing outcomes
+for foreground tasks that already completed, and foreground owners sharing a
+companion remain subject to the run's concurrency limit.
 Persistent task scopes always bypass local and remote caching, regardless of
 their configured cache value.
 On Windows, npm, pnpm, and Yarn task commands use their standard command shims
@@ -507,8 +508,11 @@ changes and active JavaScript, Cargo, or uv workspace manifest changes refresh
 package discovery and output patterns before the next run. Explicit graph,
 structured-log, profile, trace, and heap artifacts, default profile artifacts,
 and write-enabled local cache directories are treated as run-owned paths and
-never trigger another watch run. Watch-time discovery honors `--single-package`
-for both initial and refreshed repository models.
+never trigger another watch run. Default profile matching is limited to the
+generated `profile.<timestamp>` names, their anonymous variant, and atomic
+temporary files; other root-level `profile.*` files remain ordinary watch
+inputs. Watch-time discovery honors `--single-package` for both initial and
+refreshed repository models.
 Internal-directory exclusions are matched relative to the watched repository,
 so reserved names in ancestor directories do not suppress repository events.
 Windows-originated `.git`, `.turbo`, and `node_modules` components are matched
@@ -581,8 +585,10 @@ task filters. The `query affected --tasks` shortcut uses the same resolved task
 graph for explicitly requested bare and package-qualified names, including root
 tasks and configured commandless tasks, and propagates dependency-task reasons
 through transitive affected package chains, while its unfiltered form retains
-script-backed task enumeration. Cyclic package graphs never include the starting
-package in its own dependency or dependent relationship collections.
+script-backed task enumeration. The `query affected --packages` shortcut accepts
+plain names that retain every matching ecosystem scope and qualified identities
+that select one scope. Cyclic package graphs never include the starting package
+in its own dependency or dependent relationship collections.
 Boundary diagnostics evaluate root, package, and tag dependency and dependent
 permissions against manifest and configured implicit package dependencies. Package-graph
 center selection retains the named package and its
@@ -674,11 +680,13 @@ mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
 completed task's full log replay. Structured log files append typed task events
 as work runs and end with a typed run summary. An explicit structured-log
 artifact and explicit named, anonymous, or trace profile artifacts are excluded
-from task and global file hashes. Root-level `profile.*` artifacts are likewise
-excluded whenever a bare profile option selects the generated default path.
-Simultaneous bare named and anonymous profiles use distinct `profile.*`
-destinations. A structured-log artifact may not replace a mandatory task control
-input or match a declared task output or resolved task-log path. Timestamped
+from task and global file hashes. Root-level generated
+`profile.<timestamp>` artifacts, their anonymous variant, and atomic temporary
+files are likewise excluded whenever a bare profile option selects the default
+path; other `profile.*` files remain inputs. Simultaneous bare named and
+anonymous profiles use distinct generated destinations. A structured-log
+artifact may not replace a mandatory task control input or match a declared task
+output or resolved task-log path. Timestamped
 streaming applies the timestamp
 writer to a final unterminated task line. Errors-only failure replay does
 not duplicate output already recorded while the task ran and reads the complete

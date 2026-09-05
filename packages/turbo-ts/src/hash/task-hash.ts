@@ -31,6 +31,7 @@ import {
   uvEnvironmentFilePaths,
   uvTaskControlInputCandidates,
 } from "../repository/model.js";
+import { isDefaultProfileArtifactName } from "../run/profile.js";
 import { xxhash64Hex } from "./xxhash64.js";
 
 const compareCodeUnits = (left: string, right: string): number =>
@@ -723,7 +724,7 @@ const inputExclusionPredicate = (
       excludeDefaultProfileArtifacts &&
       comparableInputPath(parentPath(path, windowsPathSeparators)) ===
         comparableRoot &&
-      baseName(path, windowsPathSeparators).startsWith("profile.")
+      isDefaultProfileArtifactName(baseName(path, windowsPathSeparators))
     );
   };
 };

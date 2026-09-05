@@ -1358,7 +1358,9 @@ export const executeQueryAffected = (
     const packageItems = [...affected.values()]
       .filter(
         (packageModel) =>
-          requested.size === 0 || requested.has(packageModel.name),
+          requested.size === 0 ||
+          requested.has(packageModel.name) ||
+          requested.has(packageModel.identity),
       )
       .sort((left, right) => left.name.localeCompare(right.name))
       .map((packageModel) => ({
