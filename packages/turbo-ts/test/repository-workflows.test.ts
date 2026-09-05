@@ -2813,7 +2813,7 @@ describe("repository workflow gate", () => {
       scripts: Record<string, string>;
     };
     manifest.scripts.build =
-      "node -e \"const fs=require('node:fs');fs.mkdirSync('../../generated',{recursive:true});fs.writeFileSync('../../generated/output.txt','generated');console.log('app root output build')\"";
+      "node -e \"const fs=require('node:fs');fs.mkdirSync('../../generated',{recursive:true});fs.writeFileSync('../../generated/output.txt','generated');console.log(['app','root','output','build'].join(' '))\"";
     await writeFile(
       manifestPath,
       `${JSON.stringify(manifest, undefined, 2)}\n`,
