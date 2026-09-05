@@ -5,6 +5,7 @@ import {
   graphql,
   introspectionFromSchema,
 } from "graphql";
+import { selectByGlobs } from "../core/glob.js";
 import {
   isAbsolutePath,
   isPathContained,
@@ -39,7 +40,10 @@ import type {
   RepositoryModel,
   RepositoryPackage,
 } from "../repository/model.js";
-import { loadWorkflowRepository } from "./repository.js";
+import {
+  loadWorkflowRepository,
+  repositoryGlobalInputPatterns,
+} from "./repository.js";
 
 const schemaSource = `
   scalar JSON
@@ -406,7 +410,9 @@ const calculateAffectedRepository = (
         packageModel.identity !== repository.rootPackage.identity,
     );
     const directlyAffected = new Map<string, RepositoryPackage>();
-    let globalChange = false;
+    let globalChange =
+      selectByGlobs(changedPaths, repositoryGlobalInputPatterns(repository))
+        .length > 0;
     for (const path of changedPaths) {
       const owners = childPackages.filter((packageModel) => {
         const directories = new Set(

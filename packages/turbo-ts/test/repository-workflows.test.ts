@@ -5218,6 +5218,126 @@ importers:
     }
   }, 60_000);
 
+  it("treats workspace-local global inputs as repository-wide changes", async () => {
+    const fixtureParent = join(repositoryRoot, ".turbo");
+    await mkdir(fixtureParent, { recursive: true });
+    for (const configurationMode of ["legacy", "global"] as const) {
+      const directory = await mkdtemp(
+        join(fixtureParent, `turbo-ts-${configurationMode}-global-input-`),
+      );
+      const git = (...arguments_: ReadonlyArray<string>) =>
+        execFilePromise("/usr/bin/git", [
+          "-C",
+          directory,
+          "-c",
+          "user.email=synthetic@example.test",
+          "-c",
+          "user.name=Synthetic Fixture",
+          ...arguments_,
+        ]);
+      try {
+        await prepareFixture(directory);
+        const configurationPath = join(directory, "turbo.json");
+        const configuration = JSON.parse(
+          await readFile(configurationPath, "utf8"),
+        ) as {
+          globalDependencies?: Array<string>;
+          global?: { inputs: Array<string> };
+          futureFlags?: Record<string, boolean>;
+        };
+        const globalInput = "packages/app/shared.json";
+        if (configurationMode === "legacy") {
+          configuration.globalDependencies = [globalInput];
+        } else {
+          configuration.futureFlags = { globalConfiguration: true };
+          configuration.global = { inputs: [globalInput] };
+        }
+        await writeFile(
+          configurationPath,
+          `${JSON.stringify(configuration, undefined, 2)}\n`,
+        );
+        await writeFile(join(directory, globalInput), "base\n");
+        await git("init", "--quiet");
+        await git("add", ".");
+        await git("commit", "--quiet", "-m", "base");
+        await git("branch", "-M", "main");
+        await writeFile(join(directory, globalInput), "changed\n");
+        await git("add", ".");
+        await git("commit", "--quiet", "-m", "change global input");
+
+        const listResult = await execFilePromise(
+          process.execPath,
+          [candidate, "ls", "--affected", "--output=json", "--cwd", directory],
+          {
+            env: {
+              ...differentialEnvironment,
+              TURBO_SCM_BASE: "HEAD~1",
+              TURBO_SCM_HEAD: "HEAD",
+            },
+          },
+        );
+        const listedPackages = (
+          JSON.parse(listResult.stdout) as {
+            packages: { items: ReadonlyArray<{ name: string }> };
+          }
+        ).packages.items.map((item) => item.name);
+        expect(listedPackages).toEqual(["synthetic-app", "synthetic-library"]);
+
+        const queryResult = await execFilePromise(process.execPath, [
+          candidate,
+          "query",
+          '{ affectedPackages(base: "HEAD~1", head: "HEAD") { items { name reason } } affectedTasks(base: "HEAD~1", head: "HEAD", tasks: ["build"]) { items { fullName reason } } }',
+          "--cwd",
+          directory,
+        ]);
+        const queryData = (
+          JSON.parse(queryResult.stdout) as {
+            data: {
+              affectedPackages: {
+                items: ReadonlyArray<{
+                  name: string;
+                  reason: { __typename: string };
+                }>;
+              };
+              affectedTasks: {
+                items: ReadonlyArray<{
+                  fullName: string;
+                  reason: { __typename: string };
+                }>;
+              };
+            };
+          }
+        ).data;
+        expect(
+          Object.fromEntries(
+            queryData.affectedPackages.items.map((item) => [
+              item.name,
+              item.reason.__typename,
+            ]),
+          ),
+        ).toEqual({
+          "//": "FileChanged",
+          "synthetic-app": "FileChanged",
+          "synthetic-library": "FileChanged",
+        });
+        expect(
+          Object.fromEntries(
+            queryData.affectedTasks.items.map((item) => [
+              item.fullName,
+              item.reason.__typename,
+            ]),
+          ),
+        ).toEqual({
+          "//#build": "TaskFileChanged",
+          "synthetic-app#build": "TaskFileChanged",
+          "synthetic-library#build": "TaskFileChanged",
+        });
+      } finally {
+        await rm(directory, { force: true, recursive: true });
+      }
+    }
+  }, 60_000);
+
   it("includes the root package in affected GraphQL collections", async () => {
     const fixtureParent = join(repositoryRoot, ".turbo");
     await mkdir(fixtureParent, { recursive: true });

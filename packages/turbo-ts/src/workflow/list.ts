@@ -1,4 +1,5 @@
 import { Effect } from "effect";
+import { selectByGlobs } from "../core/glob.js";
 import { ConfigurationError } from "../effect/errors.js";
 import {
   EnvironmentService,
@@ -10,6 +11,7 @@ import { selectPackages } from "../graph/task-graph.js";
 import { configuredEnvironmentValue } from "../repository/model.js";
 import {
   loadWorkflowRepository,
+  repositoryGlobalInputPatterns,
   repositoryPackageManagerLabel,
 } from "./repository.js";
 
@@ -136,7 +138,12 @@ export const executeList = (
         .split("\0")
         .filter(Boolean);
       const selected = new Set<string>();
-      let rootChanged = false;
+      let rootChanged =
+        selectByGlobs(
+          paths,
+          repositoryGlobalInputPatterns(repository),
+          platform === "win32",
+        ).length > 0;
       for (const path of paths) {
         const owners = repository.packages.filter((packageModel) => {
           const directories = new Set(

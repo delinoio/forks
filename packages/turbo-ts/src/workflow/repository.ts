@@ -99,6 +99,13 @@ export const repositoryPackageManagerLabel = (
   repository: Pick<RepositoryModel, "manager">,
 ): string => (repository.manager === "pnpm" ? "pnpm9" : repository.manager);
 
+export const repositoryGlobalInputPatterns = (
+  repository: Pick<RepositoryModel, "rootConfiguration">,
+): ReadonlyArray<string> =>
+  repository.rootConfiguration.value.futureFlags?.globalConfiguration === true
+    ? (repository.rootConfiguration.value.global?.inputs ?? [])
+    : (repository.rootConfiguration.value.globalDependencies ?? []);
+
 export const isInternalRepositoryPath = (
   root: string,
   path: string,
