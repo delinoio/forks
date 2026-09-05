@@ -1962,6 +1962,8 @@ describe("repository workflow gate", () => {
         setImmediate(() => callback(failure));
       },
       close: () => undefined,
+      writableEnded: true,
+      rstCode: http2Constants.NGHTTP2_CANCEL,
     } as unknown as ServerHttp2Stream;
     await expect(
       Effect.runPromise(

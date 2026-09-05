@@ -2042,12 +2042,20 @@ export const respondGrpc = (
       });
       stream.end(
         grpcFrame(daemonResponsePayload(method, response)),
-        (cause?: Error | null) =>
+        (cause?: Error | null) => {
+          // Node can report a write error after a peer received the complete
+          // response and closed with NO_ERROR. Keep that acknowledgement, but
+          // fail real reset codes; remove this exception when Node no longer
+          // reports delivery-complete closes as callback errors.
           resume(
-            cause === undefined || cause === null
+            cause === undefined ||
+              cause === null ||
+              (stream.writableEnded &&
+                stream.rstCode === http2Constants.NGHTTP2_NO_ERROR)
               ? Effect.void
               : Effect.fail(daemonProtocolError(cause)),
-          ),
+          );
+        },
       );
     } catch (cause) {
       resume(Effect.fail(daemonProtocolError(cause)));
