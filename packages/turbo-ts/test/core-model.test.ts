@@ -268,6 +268,12 @@ describe("core repository model", () => {
       ]),
     ).toBe(true);
     expect(
+      canMatchGlobsDescendantWithExclusions("dist", [
+        "dist/*.js",
+        "!dist/ignore.js",
+      ]),
+    ).toBe(true);
+    expect(
       canMatchGlobsDescendantWithExclusions("dist/source/newdir", [
         "dist/**/*.js",
         "!dist/source/**",

@@ -39,7 +39,7 @@ export const canMatchGlobsDescendantWithExclusions = (
   !patterns.some(
     (pattern) =>
       pattern.startsWith("!") &&
-      canMatchGlobDescendant(path, pattern.slice(1), windowsPathSeparators),
+      matchesGlob(path, pattern.slice(1), windowsPathSeparators),
   );
 
 export const selectByGlobs = (

@@ -865,6 +865,10 @@ describe("repository workflow gate", () => {
         ["--log-file=artifact.json", "--profile=./artifact.json"],
         ["--profile=artifact.json", "--anon-profile=./artifact.json"],
         ["--profile", "--trace="],
+        ["--heap=artifact.json", "--log-file=./artifact.json"],
+        ["--heap=artifact.json", "--profile=./artifact.json"],
+        ["--heap=artifact.json", "--anon-profile=./artifact.json"],
+        ["--heap=artifact.json", "--trace=./artifact.json"],
       ]) {
         await expect(
           execFilePromise(process.execPath, [
@@ -4247,7 +4251,24 @@ describe("repository workflow gate", () => {
         stdout,
       ).toBe(1);
 
+      const outputDirectoryAlphaRuns = (
+        stdout.match(/synthetic-app:alpha: cache miss, executing/g) ?? []
+      ).length;
+      const outputDirectoryBetaRuns = (
+        stdout.match(/synthetic-app:beta: cache miss, executing/g) ?? []
+      ).length;
       await mkdir(join(applicationDirectory, "dist"));
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(
+        (stdout.match(/synthetic-app:alpha: cache miss, executing/g) ?? [])
+          .length,
+        stdout,
+      ).toBe(outputDirectoryAlphaRuns);
+      expect(
+        (stdout.match(/synthetic-app:beta: cache miss, executing/g) ?? [])
+          .length,
+        stdout,
+      ).toBe(outputDirectoryBetaRuns);
       await writeFile(
         join(applicationDirectory, "dist/config.json"),
         "excluded output input\n",
@@ -4255,7 +4276,7 @@ describe("repository workflow gate", () => {
       await waitUntil(
         () =>
           (stdout.match(/synthetic-app:alpha: cache miss, executing/g) ?? [])
-            .length >= 3,
+            .length > outputDirectoryAlphaRuns,
       );
       await new Promise((resolve) => setTimeout(resolve, 500));
       expect(

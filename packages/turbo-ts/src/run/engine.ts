@@ -3601,12 +3601,68 @@ export const executeRun = (
         { concurrency: 8 },
       ),
     );
+    const clock = yield* ClockService;
+    const runStartedAt = yield* clock.now;
+    const ordinaryRun =
+      parsed.graph === undefined && parsed.dryRun === undefined;
+    const structuredLogPath =
+      !ordinaryRun || parsed.logFile === undefined
+        ? undefined
+        : parsed.logFile === ""
+          ? joinPath(options.root, ".turbo", "logs", `${runStartedAt}.json`)
+          : configuredStructuredLogPath;
+    const defaultProfilePath = joinPath(
+      options.root,
+      defaultProfileArtifactName(runStartedAt, false),
+    );
+    const defaultAnonymousProfilePath =
+      parsed.profile === "" && parsed.anonymousProfile === ""
+        ? joinPath(options.root, defaultProfileArtifactName(runStartedAt, true))
+        : defaultProfilePath;
+    const resolvedProfilePath =
+      !ordinaryRun || parsed.profile === undefined
+        ? undefined
+        : (resolveExplicitRunArtifactPath(parsed.profile) ??
+          defaultProfilePath);
+    const resolvedAnonymousProfilePath =
+      !ordinaryRun || parsed.anonymousProfile === undefined
+        ? undefined
+        : (resolveExplicitRunArtifactPath(parsed.anonymousProfile) ??
+          defaultAnonymousProfilePath);
+    const resolvedHeapPath =
+      !ordinaryRun || parsed.heap === undefined
+        ? undefined
+        : isAbsolutePath(parsed.heap)
+          ? parsed.heap
+          : joinPath(options.root, parsed.heap);
+    const resolvedTracePath =
+      !ordinaryRun || parsed.trace === undefined
+        ? undefined
+        : (resolveExplicitRunArtifactPath(parsed.trace) ?? defaultProfilePath);
+    const artifactDestinations = [
+      ["--log-file", structuredLogPath],
+      ["--profile", resolvedProfilePath],
+      ["--anon-profile", resolvedAnonymousProfilePath],
+      ["--heap", resolvedHeapPath],
+      ["--trace", resolvedTracePath],
+    ] as const;
+    const artifactOwners = new Map<string, string>();
+    for (const [owner, path] of artifactDestinations) {
+      if (path === undefined) continue;
+      const identity = comparableInputPath(path);
+      const existingOwner = artifactOwners.get(identity);
+      if (existingOwner !== undefined) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path,
+            message: `${owner} must not resolve to the same run artifact as ${existingOwner}`,
+          }),
+        );
+      }
+      artifactOwners.set(identity, owner);
+    }
     const profileService = yield* Effect.serviceOption(RuntimeProfileService);
-    if (
-      parsed.heap !== undefined &&
-      parsed.graph === undefined &&
-      parsed.dryRun === undefined
-    ) {
+    if (resolvedHeapPath !== undefined) {
       if (profileService._tag === "None") {
         return yield* Effect.fail(
           new ConfigurationError({
@@ -3615,11 +3671,7 @@ export const executeRun = (
           }),
         );
       }
-      yield* profileService.value.heapSnapshot(
-        isAbsolutePath(parsed.heap)
-          ? parsed.heap
-          : joinPath(options.root, parsed.heap),
-      );
+      yield* profileService.value.heapSnapshot(resolvedHeapPath);
     }
     const hashes = yield* applyCargoWorkspaceHashes(
       repository,
@@ -3943,57 +3995,6 @@ export const executeRun = (
           }),
         ),
       );
-    }
-    const clock = yield* ClockService;
-    const runStartedAt = yield* clock.now;
-    const structuredLogPath =
-      parsed.logFile === undefined
-        ? undefined
-        : parsed.logFile === ""
-          ? joinPath(options.root, ".turbo", "logs", `${runStartedAt}.json`)
-          : configuredStructuredLogPath;
-    const defaultProfilePath = joinPath(
-      options.root,
-      defaultProfileArtifactName(runStartedAt, false),
-    );
-    const defaultAnonymousProfilePath =
-      parsed.profile === "" && parsed.anonymousProfile === ""
-        ? joinPath(options.root, defaultProfileArtifactName(runStartedAt, true))
-        : defaultProfilePath;
-    const resolvedProfilePath =
-      parsed.profile === undefined
-        ? undefined
-        : (resolveExplicitRunArtifactPath(parsed.profile) ??
-          defaultProfilePath);
-    const resolvedAnonymousProfilePath =
-      parsed.anonymousProfile === undefined
-        ? undefined
-        : (resolveExplicitRunArtifactPath(parsed.anonymousProfile) ??
-          defaultAnonymousProfilePath);
-    const resolvedTracePath =
-      parsed.trace === undefined
-        ? undefined
-        : (resolveExplicitRunArtifactPath(parsed.trace) ?? defaultProfilePath);
-    const artifactDestinations = [
-      ["--log-file", structuredLogPath],
-      ["--profile", resolvedProfilePath],
-      ["--anon-profile", resolvedAnonymousProfilePath],
-      ["--trace", resolvedTracePath],
-    ] as const;
-    const artifactOwners = new Map<string, string>();
-    for (const [owner, path] of artifactDestinations) {
-      if (path === undefined) continue;
-      const identity = comparableInputPath(path);
-      const existingOwner = artifactOwners.get(identity);
-      if (existingOwner !== undefined) {
-        return yield* Effect.fail(
-          new ConfigurationError({
-            path,
-            message: `${owner} must not resolve to the same run artifact as ${existingOwner}`,
-          }),
-        );
-      }
-      artifactOwners.set(identity, owner);
     }
     const structuredLogSemaphore = yield* Effect.makeSemaphore(1);
     if (structuredLogPath !== undefined) {

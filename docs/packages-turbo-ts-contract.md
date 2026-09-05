@@ -713,10 +713,10 @@ path; other `profile.*` files remain inputs. Simultaneous bare named and
 anonymous profiles use distinct generated destinations. A structured-log
 artifact may not replace a mandatory task control input or match a declared task
 output or resolved task-log path. Every active structured-log, named-profile,
-anonymous-profile, and trace destination must also resolve to a distinct path;
-collisions fail before an artifact is written or a task starts. Timestamped
-streaming applies the timestamp
-writer to a final unterminated task line. Errors-only failure replay does
+anonymous-profile, heap-snapshot, and trace destination must also resolve to a
+distinct path; collisions fail before an artifact is written or a task starts.
+Timestamped streaming applies the timestamp writer to a final unterminated task
+line. Errors-only failure replay does
 not duplicate output already recorded while the task ran and reads the complete
 task log instead of the bounded diagnostic tail. CLI `--global-deps`
 patterns are merged into task hash inputs, and their repository-relative Git
