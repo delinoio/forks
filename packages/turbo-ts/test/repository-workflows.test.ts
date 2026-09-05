@@ -46,6 +46,7 @@ import {
 } from "../src/effect/services.js";
 import { pruneLockfile } from "../src/repository/lockfiles.js";
 import {
+  executeRun,
   renderRunTui,
   renderTimestampedStreamText,
   resolveRunUiMode,
@@ -803,6 +804,48 @@ describe("repository workflow gate", () => {
     }
   }, 60_000);
 
+  it("creates parent directories for rendered graph files", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-graph-parent-"));
+    try {
+      await prepareFixture(directory);
+      const renderedBytes = new TextEncoder().encode("synthetic graph\n");
+      const exitCode = await Effect.runPromise(
+        Effect.gen(function* () {
+          const processService = yield* ProcessService;
+          return yield* executeRun(
+            parseRunArguments([
+              "run",
+              "build",
+              "--graph=reports/tasks.png",
+              "--cwd",
+              directory,
+            ]),
+          ).pipe(
+            Effect.provide(
+              Layer.succeed(ProcessService, {
+                ...processService,
+                runBytes: (request) =>
+                  request.command === "dot"
+                    ? Effect.succeed({
+                        exitCode: 0,
+                        stdout: renderedBytes,
+                        stderr: new Uint8Array(),
+                      })
+                    : processService.runBytes(request),
+              }),
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(exitCode).toBe(0);
+      expect([
+        ...(await readFile(join(directory, "reports/tasks.png"))),
+      ]).toEqual([...renderedBytes]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("derives read-only watch caching after environment resolution", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-cache-"));
     try {
@@ -1142,6 +1185,49 @@ describe("repository workflow gate", () => {
       }
     }
   }, 30_000);
+
+  it("writes simultaneous default profiles to distinct destinations", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-default-profiles-"),
+    );
+    try {
+      await prepareFixture(directory);
+      await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--no-cache",
+        "--profile",
+        "--anon-profile",
+        "--cwd",
+        directory,
+      ]);
+      const artifacts = (await readdir(directory)).filter((path) =>
+        path.startsWith("profile."),
+      );
+      expect(artifacts).toHaveLength(2);
+      const profileNames = await Promise.all(
+        artifacts.map(async (artifact) =>
+          (
+            JSON.parse(await readFile(join(directory, artifact), "utf8")) as {
+              readonly traceEvents: ReadonlyArray<{ readonly name: string }>;
+            }
+          ).traceEvents.map((event) => event.name),
+        ),
+      );
+      expect(
+        profileNames.some((names) => names.includes("synthetic-app#build")),
+      ).toBe(true);
+      expect(
+        profileNames.some(
+          (names) =>
+            names.length === 2 && names.every((name) => name === "build"),
+        ),
+      ).toBe(true);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
 
   it("hashes repository-contained heap snapshots before execution", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-heap-input-"));
@@ -4836,6 +4922,21 @@ importers:
         ]),
       ).rejects.toThrow(/repository metadata or a root control path/);
       expect(await readFile(rootManifestPath, "utf8")).toBe(rootManifest);
+      const appManifestPath = join(directory, "packages/app/package.json");
+      const appManifest = await readFile(appManifestPath, "utf8");
+      await expect(
+        execFilePromise(process.execPath, [
+          candidate,
+          "prune",
+          "synthetic-app",
+          "--out-dir=packages/app/package.json",
+          "--cwd",
+          directory,
+        ]),
+      ).rejects.toThrow(
+        /prune output must not contain or be nested within a repository package or workspace control directory/,
+      );
+      expect(await readFile(appManifestPath, "utf8")).toBe(appManifest);
       const unselectedWorkspace = join(directory, "packages/other");
       await mkdir(unselectedWorkspace);
       await writeFile(
@@ -4980,14 +5081,19 @@ importers:
       ).rejects.toThrow(/prune output must not contain the repository root/);
       await rm(join(directory, "output-alias"));
       await symlink("packages/app", join(directory, "output-parent"));
-      await execFilePromise(process.execPath, [
-        candidate,
-        "prune",
-        "synthetic-app",
-        "--out-dir=output-parent/generated-out",
-        "--cwd",
-        directory,
-      ]);
+      await expect(
+        execFilePromise(process.execPath, [
+          candidate,
+          "prune",
+          "synthetic-app",
+          "--out-dir=output-parent/generated-out",
+          "--cwd",
+          directory,
+        ]),
+      ).rejects.toThrow(
+        /prune output must not contain or be nested within a repository package or workspace control directory/,
+      );
+      expect(await readFile(appManifestPath, "utf8")).toBe(appManifest);
       expect(
         await readdir(
           join(

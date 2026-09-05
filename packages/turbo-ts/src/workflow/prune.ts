@@ -568,15 +568,18 @@ export const executePrune = (
       canonicalOutputPath,
     );
     if (
-      protectedWorkspaceRoots.some((sourceRoot) =>
-        isPathContained(canonicalOutputRoot, sourceRoot),
+      protectedWorkspaceRoots.some(
+        (sourceRoot) =>
+          isPathContained(canonicalOutputRoot, sourceRoot) ||
+          (sourceRoot !== normalizePath(repository.root) &&
+            isPathContained(sourceRoot, canonicalOutputRoot)),
       )
     ) {
       return yield* Effect.fail(
         new ConfigurationError({
           path: outputRoot,
           message:
-            "prune output must not contain a repository package or workspace control directory",
+            "prune output must not contain or be nested within a repository package or workspace control directory",
         }),
       );
     }

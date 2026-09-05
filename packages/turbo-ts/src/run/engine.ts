@@ -3741,6 +3741,7 @@ export const executeRun = (
             ),
           );
           if (rendered._tag === "Right" && rendered.right.exitCode === 0) {
+            yield* fileSystem.makeDirectory(parentPath(graphPath));
             yield* fileSystem.writeBytes(graphPath, rendered.right.stdout);
           } else {
             yield* terminal.writeStderr(
@@ -4501,10 +4502,22 @@ export const executeRun = (
       });
     const namedProfileEvents = profileEvents(false);
     const anonymousProfileEvents = profileEvents(true);
-    for (const [requestedPath, traceEvents] of [
-      [parsed.profile, namedProfileEvents],
-      [parsed.anonymousProfile, anonymousProfileEvents],
-      [parsed.trace, namedProfileEvents],
+    const defaultProfilePath = joinPath(
+      options.root,
+      `profile.${runStartedAt}`,
+    );
+    const defaultAnonymousProfilePath =
+      parsed.profile === "" && parsed.anonymousProfile === ""
+        ? `${defaultProfilePath}.anonymous`
+        : defaultProfilePath;
+    for (const [requestedPath, traceEvents, defaultPath] of [
+      [parsed.profile, namedProfileEvents, defaultProfilePath],
+      [
+        parsed.anonymousProfile,
+        anonymousProfileEvents,
+        defaultAnonymousProfilePath,
+      ],
+      [parsed.trace, namedProfileEvents, defaultProfilePath],
     ] as const) {
       if (requestedPath === undefined) continue;
       if (profileService._tag === "None") {
@@ -4516,8 +4529,7 @@ export const executeRun = (
         );
       }
       const resolvedPath =
-        resolveExplicitRunArtifactPath(requestedPath) ??
-        joinPath(options.root, `profile.${runStartedAt}`);
+        resolveExplicitRunArtifactPath(requestedPath) ?? defaultPath;
       yield* profileService.value.writeTrace(resolvedPath, traceEvents);
     }
     const summaryRecord = { type: "run_summary", ...summary } as const;

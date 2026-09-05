@@ -625,7 +625,8 @@ configuration formatting, supports production manifests, and
 rejects output roots that could contain the source repository, any discovered
 package, or any discovered Cargo or uv workspace-control directory. Output
 roots also cannot replace or be nested within repository metadata, root control
-paths, the active lockfile or configuration, or package-manager controls.
+paths, the active lockfile or configuration, package-manager controls, or a
+non-root package or workspace-control directory.
 Selected package copies stop at nested workspace roots outside the selected
 closure.
 Generated installation manifests and configuration files use readable `0644`
@@ -666,16 +667,18 @@ stream, grouped, timestamped stream, and NDJSON output;
 completion and info; Chrome-compatible named and anonymous profiles; and the
 approved V8 heap snapshot and trace substitutions. TUI requests retain stream
 semantics when no interactive terminal is available, and all color output
-continues to honor `NO_COLOR`. Interactive TUI mode renders task status and
+continues to honor `NO_COLOR`. Rendered graph files create missing destination
+parent directories. Interactive TUI mode renders task status and
 falls back to stream mode when either terminal side is non-interactive. JSON
 mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
 completed task's full log replay. Structured log files append typed task events
 as work runs and end with a typed run summary. An explicit structured-log
 artifact and explicit named, anonymous, or trace profile artifacts are excluded
 from task and global file hashes. Root-level `profile.*` artifacts are likewise
-excluded whenever a bare profile option selects the generated default path. A
-structured-log artifact may not replace a mandatory task control input or match
-a declared task output or resolved task-log path. Timestamped
+excluded whenever a bare profile option selects the generated default path.
+Simultaneous bare named and anonymous profiles use distinct `profile.*`
+destinations. A structured-log artifact may not replace a mandatory task control
+input or match a declared task output or resolved task-log path. Timestamped
 streaming applies the timestamp
 writer to a final unterminated task line. Errors-only failure replay does
 not duplicate output already recorded while the task ran and reads the complete
