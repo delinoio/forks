@@ -600,10 +600,12 @@ server shutdown interrupt in-flight resolver effects and their subprocesses.
 Top-level package predicates are
 applied, external dependencies come from manifest references resolved against
 the parsed lockfile, including npm v2/v3 package locations whose entries omit
-the package name, and Yarn Berry entries report their installed `version`
-rather than descriptor ranges. Lockfile reading and parsing are deferred until
-the `externalDependencies` field is selected, so independent fields remain
-available if the discovered lockfile later becomes unavailable or invalid.
+the package name. npm root, workspace, and workspace-link records are excluded
+from external package results. Yarn Berry entries report their installed
+`version` rather than descriptor ranges. Lockfile reading and parsing are
+deferred until the `externalDependencies` field is selected, so independent
+fields remain available if the discovered lockfile later becomes unavailable
+or invalid.
 Package-manager fields use protocol identifiers;
 only pnpm's compatibility family uses the versioned `pnpm9` label. File queries
 enforce repository containment
@@ -621,8 +623,11 @@ emits ordinary and Docker layouts, creates reduced lockfiles with
 reference-compatible canonical
 configuration formatting, supports production manifests, and
 rejects output roots that could contain the source repository, any discovered
-package, or any discovered Cargo or uv workspace-control directory. Selected
-package copies stop at nested workspace roots outside the selected closure.
+package, or any discovered Cargo or uv workspace-control directory. Output
+roots also cannot replace or be nested within repository metadata, root control
+paths, the active lockfile or configuration, or package-manager controls.
+Selected package copies stop at nested workspace roots outside the selected
+closure.
 Generated installation manifests and configuration files use readable `0644`
 modes. It
 never follows workspace symlinks into a prune output. Output safety and traversal
@@ -670,7 +675,7 @@ artifact and explicit named, anonymous, or trace profile artifacts are excluded
 from task and global file hashes. Root-level `profile.*` artifacts are likewise
 excluded whenever a bare profile option selects the generated default path. A
 structured-log artifact may not replace a mandatory task control input or match
-a declared task output. Timestamped
+a declared task output or resolved task-log path. Timestamped
 streaming applies the timestamp
 writer to a final unterminated task line. Errors-only failure replay does
 not duplicate output already recorded while the task ran and reads the complete
@@ -686,7 +691,8 @@ profiles use each task's scheduling timestamps. Generated profiles omit tasks
 that were never scheduled, while summary task entries represent them with a
 null `execution` value. Requested heap snapshots are written
 before task input hashes are computed so repository-contained snapshots cannot
-invalidate a cache key after hashing. Task summaries record the
+invalidate a cache key after hashing, and missing destination parent directories
+are created. Task summaries record the
 resolved transitive external-dependency closure hash for graph-bearing npm,
 pnpm, Yarn, Cargo, uv, Bun, Aube, and Nub lockfiles and the actual encoded log
 path, including collision-qualified identifiers and alternate execution scopes.

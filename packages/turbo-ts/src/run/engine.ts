@@ -3489,6 +3489,12 @@ export const executeRun = (
       affected.filters.length === 0,
     );
     const graph = cargoWorkspacePlan.graph;
+    const logIdentifiers = taskLogIdentifiers(
+      repository,
+      graph,
+      cargoWorkspacePlan.scopes,
+      platform === "win32",
+    );
     const configuredStructuredLogPath =
       parsed.graph === undefined &&
       parsed.dryRun === undefined &&
@@ -3548,6 +3554,24 @@ export const executeRun = (
             path: configuredStructuredLogPath,
             message:
               "structured log path must not match a declared task output",
+          }),
+        );
+      }
+      const taskLogCollision = [...graph.nodes.values()].some(
+        (node) =>
+          comparableInputPath(
+            taskLogPath(
+              node,
+              cargoWorkspacePlan.scopes.get(node.id),
+              logIdentifiers.get(node.id),
+            ),
+          ) === structuredLogIdentity,
+      );
+      if (taskLogCollision) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: configuredStructuredLogPath,
+            message: "structured log path must not replace a task log",
           }),
         );
       }
@@ -3628,12 +3652,6 @@ export const executeRun = (
           cacheability.runtimeInputsRestorable ? [] : [id],
         ),
       ),
-    );
-    const logIdentifiers = taskLogIdentifiers(
-      repository,
-      graph,
-      cargoWorkspacePlan.scopes,
-      platform === "win32",
     );
     const orderedNodes = [...graph.nodes.values()].sort((left, right) =>
       left.id.localeCompare(right.id),

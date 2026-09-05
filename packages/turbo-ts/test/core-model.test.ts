@@ -313,7 +313,7 @@ describe("core repository model", () => {
       parseLockfile(
         "/repo/package-lock.json",
         encoder.encode(
-          '{"lockfileVersion":3,"packages":{"node_modules/a":{"version":"1.0.0"},"node_modules/@scope/b":{"version":"2.0.0"},"node_modules/parent/node_modules/nested":{"version":"3.0.0"}}}',
+          '{"name":"synthetic-root","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"synthetic-root","version":"1.0.0"},"packages/app":{"name":"synthetic-app","version":"1.0.0"},"node_modules/synthetic-app":{"name":"synthetic-app","version":"1.0.0","resolved":"packages/app","link":true},"node_modules/a":{"version":"1.0.0"},"node_modules/@scope/b":{"version":"2.0.0"},"node_modules/parent/node_modules/nested":{"version":"3.0.0"}}}',
         ),
       ),
     ).toMatchObject({

@@ -938,6 +938,33 @@ describe("repository workflow gate", () => {
         "structured log path must not match a declared task output",
       );
       expect(await readFile(outputLogPath, "utf8")).toBe("existing log\n");
+
+      const taskLogPath = join(
+        directory,
+        "packages/app/.turbo/turbo-build.log",
+      );
+      await mkdir(dirname(taskLogPath), { recursive: true });
+      await writeFile(taskLogPath, "existing task log\n");
+      const taskLogCollision = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--filter=synthetic-app",
+        "--log-file=packages/app/.turbo/turbo-build.log",
+        "--cwd",
+        directory,
+      ]).then(
+        () => ({ failed: false, stderr: "" }),
+        (error: { readonly stderr?: string }) => ({
+          failed: true,
+          stderr: error.stderr ?? "",
+        }),
+      );
+      expect(taskLogCollision.failed).toBe(true);
+      expect(taskLogCollision.stderr).toContain(
+        "structured log path must not replace a task log",
+      );
+      expect(await readFile(taskLogPath, "utf8")).toBe("existing task log\n");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -1127,7 +1154,7 @@ describe("repository workflow gate", () => {
         "--single-package",
         "--no-cache",
         "--json",
-        "--heap=run.heapsnapshot",
+        "--heap=profiles/run.heapsnapshot",
         "--cwd",
         directory,
       ]);
@@ -1137,8 +1164,11 @@ describe("repository workflow gate", () => {
         }>;
       };
       expect(summary.tasks).toHaveLength(1);
-      expect(summary.tasks[0]!.inputs["run.heapsnapshot"]).toMatch(
+      expect(summary.tasks[0]!.inputs["profiles/run.heapsnapshot"]).toMatch(
         /^[0-9a-f]{40}$/,
+      );
+      expect(existsSync(join(directory, "profiles/run.heapsnapshot"))).toBe(
+        true,
       );
     } finally {
       await rm(directory, { force: true, recursive: true });
@@ -4775,6 +4805,37 @@ importers:
     const outside = await mkdtemp(join(tmpdir(), "turbo-ts-prune-control-"));
     try {
       await prepareFixture(directory);
+      const gitMetadata = join(directory, ".git");
+      await mkdir(gitMetadata);
+      await writeFile(join(gitMetadata, "sentinel"), "preserved\n");
+      for (const outputDirectory of [".git", ".git/prune-output"]) {
+        await expect(
+          execFilePromise(process.execPath, [
+            candidate,
+            "prune",
+            "synthetic-app",
+            `--out-dir=${outputDirectory}`,
+            "--cwd",
+            directory,
+          ]),
+        ).rejects.toThrow(/repository metadata or a root control path/);
+        expect(await readFile(join(gitMetadata, "sentinel"), "utf8")).toBe(
+          "preserved\n",
+        );
+      }
+      const rootManifestPath = join(directory, "package.json");
+      const rootManifest = await readFile(rootManifestPath, "utf8");
+      await expect(
+        execFilePromise(process.execPath, [
+          candidate,
+          "prune",
+          "synthetic-app",
+          "--out-dir=package.json",
+          "--cwd",
+          directory,
+        ]),
+      ).rejects.toThrow(/repository metadata or a root control path/);
+      expect(await readFile(rootManifestPath, "utf8")).toBe(rootManifest);
       const unselectedWorkspace = join(directory, "packages/other");
       await mkdir(unselectedWorkspace);
       await writeFile(

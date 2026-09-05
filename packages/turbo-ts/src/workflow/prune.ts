@@ -39,6 +39,20 @@ export interface PruneOptions {
   readonly useGitignore: boolean;
 }
 
+const rootControlNames = [
+  ".gitignore",
+  ".npmrc",
+  ".pnpmfile.cjs",
+  ".pnp.cjs",
+  ".yarnrc",
+  ".yarnrc.yml",
+  "bunfig.toml",
+  "package.json",
+  "pnpm-workspace.yaml",
+  "turbo.json",
+  "turbo.jsonc",
+] as const;
+
 export const parsePruneArguments = (
   arguments_: ReadonlyArray<string>,
 ): PruneOptions => {
@@ -516,6 +530,32 @@ export const executePrune = (
         }),
       );
     }
+    const protectedRepositoryPaths = yield* Effect.forEach(
+      [
+        joinPath(repository.root, ".git"),
+        joinPath(repository.root, ".yarn"),
+        ...rootControlNames.map((name) => joinPath(repository.root, name)),
+        repository.rootConfiguration.path,
+        repository.lockfile,
+        ...(repository.packageManagerExecutableInput === undefined
+          ? []
+          : [repository.packageManagerExecutableInput]),
+      ],
+      canonicalOutputPath,
+    );
+    if (
+      protectedRepositoryPaths.some((sourcePath) =>
+        isPathContained(sourcePath, canonicalOutputRoot),
+      )
+    ) {
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: outputRoot,
+          message:
+            "prune output must not replace repository metadata or a root control path",
+        }),
+      );
+    }
     const protectedWorkspaceRoots = yield* Effect.forEach(
       [
         ...new Set(
@@ -568,20 +608,7 @@ export const executePrune = (
       canonicalOutputRoot,
       ignoreMatcher,
     );
-    const rootFiles = [
-      ".gitignore",
-      ".npmrc",
-      ".pnpmfile.cjs",
-      ".pnp.cjs",
-      ".yarnrc",
-      ".yarnrc.yml",
-      "bunfig.toml",
-      "package.json",
-      "pnpm-workspace.yaml",
-      "turbo.json",
-      "turbo.jsonc",
-    ];
-    for (const name of rootFiles) {
+    for (const name of rootControlNames) {
       const source = joinPath(repository.root, name);
       if (name === "package.json") {
         yield* writeManifest(

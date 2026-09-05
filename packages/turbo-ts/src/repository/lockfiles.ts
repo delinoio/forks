@@ -89,23 +89,49 @@ const collectPackages = (value: unknown): ReadonlyArray<LockfilePackage> => {
 };
 
 const collectNpmPackages = (value: unknown): ReadonlyArray<LockfilePackage> => {
-  const packages = new Map(
-    collectPackages(value).map((entry) => [
-      `${entry.name}@${entry.version}`,
-      entry,
-    ]),
-  );
-  const locations = objectValue(objectValue(value)?.packages);
-  for (const [location, value] of Object.entries(locations ?? {})) {
-    const entry = objectValue(value);
-    const match = /(?:^|\/)node_modules\/((?:@[^/]+\/)?[^/]+)$/.exec(location);
-    if (match?.[1] === undefined || typeof entry?.version !== "string") {
-      continue;
+  const packages = new Map<string, LockfilePackage>();
+  const document = objectValue(value);
+  const locations = objectValue(document?.packages);
+  if (locations === undefined) {
+    const pending = [objectValue(document?.dependencies)];
+    let nodes = 0;
+    while (pending.length > 0) {
+      const dependencies = pending.pop();
+      for (const [name, value] of Object.entries(dependencies ?? {})) {
+        nodes += 1;
+        if (nodes > maximumNodes) {
+          throw new TypeError(
+            "lockfile structure exceeds the node safety limit",
+          );
+        }
+        const entry = objectValue(value);
+        if (typeof entry?.version === "string") {
+          packages.set(`${name}@${entry.version}`, {
+            name,
+            version: entry.version,
+          });
+        }
+        pending.push(objectValue(entry?.dependencies));
+      }
     }
-    packages.set(`${match[1]}@${entry.version}`, {
-      name: match[1],
-      version: entry.version,
-    });
+  } else {
+    for (const [location, value] of Object.entries(locations)) {
+      const entry = objectValue(value);
+      const match = /(?:^|\/)node_modules\/((?:@[^/]+\/)?[^/]+)$/.exec(
+        location,
+      );
+      if (
+        match?.[1] === undefined ||
+        typeof entry?.version !== "string" ||
+        entry.link === true
+      ) {
+        continue;
+      }
+      packages.set(`${match[1]}@${entry.version}`, {
+        name: match[1],
+        version: entry.version,
+      });
+    }
   }
   return [...packages.values()].sort((left, right) =>
     `${left.name}@${left.version}`.localeCompare(

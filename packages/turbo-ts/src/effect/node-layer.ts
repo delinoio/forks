@@ -2458,8 +2458,9 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
 
 const runtimeProfileLayer = Layer.succeed(RuntimeProfileService, {
   heapSnapshot: (path) =>
-    Effect.try({
-      try: () => {
+    Effect.tryPromise({
+      try: async () => {
+        await mkdir(dirname(path), { recursive: true });
         writeHeapSnapshot(path);
       },
       catch: filesystemError,
