@@ -29,6 +29,7 @@ import {
   TerminalService,
 } from "../effect/services.js";
 import { configuredEnvironmentValue } from "../repository/model.js";
+import { canonicalExistingAncestorPath } from "../run/engine.js";
 import {
   loadWorkflowRepository,
   repositoryPackageManagerLabel,
@@ -847,6 +848,8 @@ const serveDaemon = (
             repository.root,
             cacheDirectoryValue,
           );
+      const canonicalCacheDirectory =
+        yield* canonicalExistingAncestorPath(cacheDirectory);
       const ignoredRepositoryPath = (path: string): boolean =>
         [
           joinPathWithSeparators(
@@ -856,6 +859,7 @@ const serveDaemon = (
           ),
           parentPath(paths.log, windowsPathSeparators),
           cacheDirectory,
+          canonicalCacheDirectory,
         ].some((root) => isPathContained(root, path, windowsPathSeparators));
       const shutdown = yield* Deferred.make<void>();
       const activity = yield* Queue.sliding<void>(1);

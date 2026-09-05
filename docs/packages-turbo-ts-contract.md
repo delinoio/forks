@@ -516,10 +516,12 @@ changes and active JavaScript, Cargo, or uv workspace manifest changes refresh
 package discovery and output patterns before the next run. Explicit graph,
 structured-log, profile, trace, and heap artifacts, default profile artifacts,
 and write-enabled local cache directories are treated as run-owned paths and
-never trigger another watch run. Write-enabled cache directories are resolved
-through existing ancestor symlinks before event filtering. Default profile
-matching is limited to the generated `profile.<timestamp>` names, their
-anonymous variant, and atomic
+never trigger another watch run. Explicit artifact paths are resolved through
+existing ancestor symlinks so lexical destinations, canonical targets, atomic
+temporaries, and watcher notifications for the symlink ancestor remain
+suppressed. Write-enabled cache directories are resolved through existing
+ancestor symlinks before event filtering. Default profile matching is limited
+to the generated `profile.<timestamp>` names, their anonymous variant, and atomic
 temporary files; other root-level `profile.*` files remain ordinary watch
 inputs. Watch-time discovery honors `--single-package` for both initial and
 refreshed repository models.
@@ -548,6 +550,10 @@ service over HTTP/2. Hello, status, and shutdown calls interoperate in both
 directions with the 2.10.12 executable; package and watch calls share the same
 bounded framing and scoped sessions. Clients terminate a response as soon as
 its accumulated frame exceeds the 1 MiB payload limit plus framing bytes.
+Oversized request streams discard retained frame data and are never dispatched
+to a daemon handler after cancellation. Nonzero `grpc-message` diagnostics in
+response headers or trailers are percent-decoded; malformed encodings fail with
+a typed protocol error.
 Requests that exceed the transport queue receive an immediate protocol error
 instead of displacing an older request. Unsupported-method and queue-capacity
 responses run in the server Scope so endpoint teardown interrupts pending
@@ -561,7 +567,8 @@ beneath `node_modules` remain observable. Directory events conservatively mark
 positive output globs when descendants can match, even when an exclusion can
 match only part of that subtree; an event rooted in a fully excluded subtree is
 ignored. Git metadata, the resolved cache directory, and daemon-owned logs
-remain excluded.
+remain excluded. Cache filtering covers both the configured lexical directory
+and its target resolved through existing ancestor symlinks.
 Output-change registration/query calls return their protocol data rather than
 empty acknowledgments. Changed-output snapshots consume only the exact glob
 generations reported after their response is written successfully. A failed

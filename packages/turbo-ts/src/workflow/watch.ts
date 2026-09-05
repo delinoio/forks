@@ -176,21 +176,55 @@ export const runOwnedPath = (
       const name = baseName(candidate, windowsPathSeparators);
       return windowsPathSeparators ? name.toLowerCase() : name;
     };
-    const pathIdentity = comparablePath(normalizedPath);
-    if (
-      exactPaths.some((exactPath) => {
-        const exactName = comparableBaseName(exactPath);
-        const observedName = comparableBaseName(normalizedPath);
-        return (
-          comparablePath(exactPath) === pathIdentity ||
-          (comparablePath(parentPath(exactPath, windowsPathSeparators)) ===
-            comparablePath(parentPath(normalizedPath, windowsPathSeparators)) &&
-            observedName.startsWith(`${exactName}.`) &&
-            observedName.endsWith(".tmp"))
-        );
-      })
-    ) {
+    const pathContains = (root: string, candidate: string): boolean => {
+      const rootIdentity = comparablePath(root).replace(/\/$/, "");
+      const candidateIdentity = comparablePath(candidate);
+      return (
+        candidateIdentity === rootIdentity ||
+        candidateIdentity.startsWith(`${rootIdentity}/`)
+      );
+    };
+    const matchesArtifactPath = (
+      exactPath: string,
+      observedPath: string,
+    ): boolean => {
+      const exactName = comparableBaseName(exactPath);
+      const observedName = comparableBaseName(observedPath);
+      return (
+        comparablePath(exactPath) === comparablePath(observedPath) ||
+        (comparablePath(parentPath(exactPath, windowsPathSeparators)) ===
+          comparablePath(parentPath(observedPath, windowsPathSeparators)) &&
+          observedName.startsWith(`${exactName}.`) &&
+          observedName.endsWith(".tmp"))
+      );
+    };
+    if (exactPaths.some((exactPath) => matchesArtifactPath(exactPath, path))) {
       return true;
+    }
+    if (exactPaths.length > 0) {
+      const canonicalObservedPath = yield* canonicalExistingAncestorPath(
+        normalizedPath,
+        "watch event",
+      );
+      const canonicalArtifactPaths = yield* Effect.forEach(
+        exactPaths,
+        (exactPath) => canonicalExistingAncestorPath(exactPath, "run artifact"),
+        { concurrency: 8 },
+      );
+      const observedAlias =
+        comparablePath(normalizedPath) !==
+        comparablePath(canonicalObservedPath);
+      if (
+        canonicalArtifactPaths.some(
+          (canonicalArtifactPath, index) =>
+            matchesArtifactPath(canonicalArtifactPath, canonicalObservedPath) ||
+            (observedAlias &&
+              pathContains(normalizedPath, exactPaths[index]!) &&
+              pathContains(canonicalObservedPath, canonicalArtifactPath)),
+        )
+      ) {
+        return true;
+      }
     }
     const writesDefaultProfile =
       ordinaryRun &&

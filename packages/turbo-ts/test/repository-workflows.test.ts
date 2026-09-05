@@ -1218,6 +1218,51 @@ describe("repository workflow gate", () => {
     }
   });
 
+  it("matches run-owned watch artifacts through symlinked directories", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-watch-artifact-link-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const artifactTarget = join(directory, "real-artifacts");
+      const artifactLink = join(directory, "artifact-alias");
+      await mkdir(artifactTarget);
+      await symlink(
+        process.platform === "win32" ? artifactTarget : "real-artifacts",
+        artifactLink,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      const repository = await Effect.runPromise(
+        loadWorkflowRepository({ cwd: directory }).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const options = parseWatchArguments([
+        "build",
+        "--graph=artifact-alias/tasks.dot",
+      ]).run;
+      const isRunOwned = (path: string) =>
+        Effect.runPromise(
+          runOwnedPath(repository, options, path, {}, 8, false).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+
+      await expect(isRunOwned(artifactLink)).resolves.toBe(true);
+      await expect(isRunOwned(join(artifactTarget, "tasks.dot"))).resolves.toBe(
+        true,
+      );
+      await expect(
+        isRunOwned(join(artifactTarget, "tasks.dot.1234.abcdef.tmp")),
+      ).resolves.toBe(true);
+      await expect(
+        isRunOwned(join(artifactTarget, "unrelated.txt")),
+      ).resolves.toBe(false);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("excludes an explicit structured log from task hashes", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-log-hash-"));
     try {
@@ -2576,6 +2621,201 @@ describe("repository workflow gate", () => {
     }
   });
 
+  it("does not dispatch an oversized daemon request with a valid prefix", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-daemon-request-limit-"),
+    );
+    const socket = join(directory, "turbod.sock");
+    let requestDispatched = false;
+    const serveFiber = Effect.runFork(
+      Stream.runForEach(makeDaemonServe()(socket), (connection) =>
+        Stream.runForEach(connection.requests, () =>
+          Effect.sync(() => {
+            requestDispatched = true;
+          }),
+        ),
+      ),
+    );
+    let session: ReturnType<typeof connectHttp2> | undefined;
+    try {
+      await waitUntil(() => existsSync(socket));
+      await new Promise<void>((resolve, reject) => {
+        session = connectHttp2("http://localhost", {
+          createConnection: () => createNetConnection(socket),
+        });
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          session?.destroy();
+          resolve();
+        };
+        const timeout = setTimeout(
+          () => reject(new Error("oversized daemon request remained open")),
+          2_000,
+        );
+        session.once("error", finish);
+        const stream = session.request({
+          [http2Constants.HTTP2_HEADER_METHOD]: "POST",
+          [http2Constants.HTTP2_HEADER_PATH]: "/turbodprotocol.Turbod/Shutdown",
+          [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+        });
+        stream.once("error", finish);
+        stream.once("close", finish);
+        stream.write(Buffer.alloc(5), () => {
+          setTimeout(() => stream.end(Buffer.alloc(1024 * 1024 + 1)), 25);
+        });
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(requestDispatched).toBe(false);
+    } finally {
+      session?.destroy();
+      await Effect.runPromise(Fiber.interrupt(serveFiber));
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("decodes daemon errors from response headers and trailers", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-daemon-error-message-"),
+    );
+    const socket = join(directory, "turbod.sock");
+    const server = createHttp2Server();
+    const message = "daemon request queue is full: déjà vu / 100%";
+    let responseIndex = 0;
+    server.on("stream", (stream) => {
+      stream.on("error", () => undefined);
+      const useTrailers = responseIndex === 1;
+      responseIndex += 1;
+      if (useTrailers) {
+        stream.respond(
+          {
+            [http2Constants.HTTP2_HEADER_STATUS]: 200,
+            [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+          },
+          { waitForTrailers: true },
+        );
+        stream.once("wantTrailers", () =>
+          stream.sendTrailers({
+            "grpc-status": "13",
+            "grpc-message": encodeURIComponent(message),
+          }),
+        );
+      } else {
+        stream.respond({
+          [http2Constants.HTTP2_HEADER_STATUS]: 200,
+          [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+          "grpc-status": "13",
+          "grpc-message": encodeURIComponent(message),
+        });
+      }
+      stream.end(Buffer.alloc(5));
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const fail = (cause: Error) => reject(cause);
+        server.once("error", fail);
+        server.listen(socket, () => {
+          server.off("error", fail);
+          resolve();
+        });
+      });
+      const responses = await Effect.runPromise(
+        Effect.gen(function* () {
+          const daemon = yield* DaemonService;
+          const fromHeaders = yield* daemon.request(socket, {
+            id: "headers",
+            method: DaemonMethod.status,
+          });
+          const fromTrailers = yield* daemon.request(socket, {
+            id: "trailers",
+            method: DaemonMethod.status,
+          });
+          return { fromHeaders, fromTrailers };
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(responses.fromHeaders.error).toBe(message);
+      expect(responses.fromTrailers.error).toBe(message);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects malformed daemon error message encodings", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-daemon-malformed-message-"),
+    );
+    const socket = join(directory, "turbod.sock");
+    const server = createHttp2Server();
+    let responseIndex = 0;
+    server.on("stream", (stream) => {
+      stream.on("error", () => undefined);
+      const useTrailers = responseIndex === 1;
+      responseIndex += 1;
+      if (useTrailers) {
+        stream.respond(
+          {
+            [http2Constants.HTTP2_HEADER_STATUS]: 200,
+            [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+          },
+          { waitForTrailers: true },
+        );
+        stream.once("wantTrailers", () =>
+          stream.sendTrailers({
+            "grpc-status": "13",
+            "grpc-message": "malformed%ZZmessage",
+          }),
+        );
+      } else {
+        stream.respond({
+          [http2Constants.HTTP2_HEADER_STATUS]: 200,
+          [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+          "grpc-status": "13",
+          "grpc-message": "malformed%ZZmessage",
+        });
+      }
+      stream.end(Buffer.alloc(5));
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const fail = (cause: Error) => reject(cause);
+        server.once("error", fail);
+        server.listen(socket, () => {
+          server.off("error", fail);
+          resolve();
+        });
+      });
+      const results = await Effect.runPromise(
+        Effect.gen(function* () {
+          const daemon = yield* DaemonService;
+          return yield* Effect.forEach(["headers", "trailers"], (id) =>
+            daemon
+              .request(socket, { id, method: DaemonMethod.status })
+              .pipe(Effect.either),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      for (const result of results) {
+        expect(result).toMatchObject({
+          _tag: "Left",
+          left: {
+            _tag: "BoundaryError",
+            boundary: "daemon",
+            message: expect.stringContaining("malformed grpc-message"),
+          },
+        });
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("interrupts rejected daemon responses with the server scope", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-scope-"));
@@ -3025,6 +3265,110 @@ describe("repository workflow gate", () => {
               ],
             },
           ],
+        },
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("ignores daemon cache writes through symlinked directories", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-daemon-cache-link-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const cacheTarget = join(directory, "cache-target");
+      await mkdir(cacheTarget);
+      await symlink(
+        process.platform === "win32" ? cacheTarget : "cache-target",
+        join(directory, "cache-alias"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      const configurationPath = join(directory, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.cacheDir = "cache-alias";
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+
+      const responses = new Map<string, unknown>();
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const daemon = yield* DaemonService;
+          const registered = yield* Deferred.make<void>();
+          const connection = (request: {
+            readonly id: string;
+            readonly method: (typeof DaemonMethod)[keyof typeof DaemonMethod];
+            readonly params?: unknown;
+          }) => ({
+            requests: Stream.fromEffect(
+              request.id === "get"
+                ? Deferred.await(registered).pipe(
+                    Effect.zipRight(Effect.sleep("50 millis")),
+                    Effect.as(request),
+                  )
+                : Effect.succeed(request),
+            ),
+            respond: (response: { readonly id: string }) =>
+              Effect.sync(() => {
+                responses.set(request.id, response);
+              }).pipe(
+                request.id === "notify"
+                  ? Effect.zipRight(Deferred.succeed(registered, undefined))
+                  : (effect) => effect,
+                Effect.asVoid,
+              ),
+          });
+          return yield* executeDaemon({
+            command: "serve",
+            cwd: directory,
+            idleMilliseconds: 100,
+            json: false,
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(DaemonService, {
+                  ...daemon,
+                  serve: () =>
+                    Stream.fromIterable([
+                      connection({
+                        id: "notify",
+                        method: DaemonMethod.notifyOutputsWritten,
+                        params: {
+                          hash: "synthetic-hash",
+                          outputGlobs: ["cache-target/*.js"],
+                          outputExclusionGlobs: [],
+                        },
+                      }),
+                      connection({
+                        id: "get",
+                        method: DaemonMethod.getChangedOutputs,
+                        params: { hashes: ["synthetic-hash"] },
+                      }),
+                    ]),
+                }),
+                Layer.succeed(FileWatcherService, {
+                  watch: () =>
+                    Stream.fromEffect(Deferred.await(registered)).pipe(
+                      Stream.as({
+                        path: join(cacheTarget, "output.js"),
+                        kind: "modify" as const,
+                        entryKind: "file" as const,
+                      }),
+                    ),
+                }),
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(responses.get("get")).toMatchObject({
+        result: {
+          changedOutputs: [{ hash: "synthetic-hash", changedOutputGlobs: [] }],
         },
       });
     } finally {

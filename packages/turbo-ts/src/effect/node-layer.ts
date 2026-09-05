@@ -1804,6 +1804,15 @@ const grpcPayload = (contents: Uint8Array): Buffer => {
   return Buffer.from(contents.subarray(5, length + 5));
 };
 
+const decodeGrpcMessage = (value: unknown): string => {
+  const encoded = String(value ?? "daemon request failed");
+  try {
+    return decodeURIComponent(encoded);
+  } catch (cause) {
+    throw new TypeError(`malformed grpc-message encoding: ${String(cause)}`);
+  }
+};
+
 const readProtocolVarint = (
   bytes: Uint8Array,
   start: number,
@@ -2222,15 +2231,20 @@ export const makeDaemonServe = (setup: Partial<DaemonEndpointSetup> = {}) => {
                 stream.on("error", () => undefined);
                 const chunks: Array<Buffer> = [];
                 let length = 0;
+                let overflowed = false;
                 stream.on("data", (chunk: Buffer) => {
+                  if (overflowed) return;
                   length += chunk.length;
                   if (length > maximumDaemonFrameBytes) {
+                    overflowed = true;
+                    chunks.length = 0;
                     stream.close(http2Constants.NGHTTP2_CANCEL);
                     return;
                   }
                   chunks.push(chunk);
                 });
                 stream.on("end", () => {
+                  if (overflowed) return;
                   try {
                     const path = String(
                       headers[http2Constants.HTTP2_HEADER_PATH] ?? "",
@@ -2373,25 +2387,19 @@ const daemonLayer = Layer.succeed(DaemonService, {
       const chunks: Array<Buffer> = [];
       let responseLength = 0;
       let responseError: string | undefined;
-      stream.on("response", (headers) => {
-        if (
-          headers["grpc-status"] !== undefined &&
-          headers["grpc-status"] !== "0"
-        ) {
-          responseError = String(
-            headers["grpc-message"] ?? "daemon request failed",
-          );
+      const recordResponseError = (status: unknown, message: unknown): void => {
+        if (status === undefined || status === "0") return;
+        try {
+          responseError = decodeGrpcMessage(message);
+        } catch (cause) {
+          complete(Effect.fail(daemonProtocolError(cause)));
         }
+      };
+      stream.on("response", (headers) => {
+        recordResponseError(headers["grpc-status"], headers["grpc-message"]);
       });
       stream.on("trailers", (headers) => {
-        if (
-          headers["grpc-status"] !== undefined &&
-          headers["grpc-status"] !== "0"
-        ) {
-          responseError = String(
-            headers["grpc-message"] ?? "daemon request failed",
-          );
-        }
+        recordResponseError(headers["grpc-status"], headers["grpc-message"]);
       });
       stream.on("data", (chunk: Buffer) => {
         if (settled) return;
