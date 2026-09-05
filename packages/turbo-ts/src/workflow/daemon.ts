@@ -668,6 +668,7 @@ const startDaemon = (
 
 const stopDaemon = (
   paths: DaemonPaths,
+  removeStateDirectory = false,
 ): Effect.Effect<
   void,
   BoundaryError,
@@ -682,7 +683,13 @@ const stopDaemon = (
     yield* fileSystem.makeDirectory(paths.stateDirectory);
     yield* Effect.acquireUseRelease(
       acquireDaemonOperationLock(paths),
-      () => stopDaemonWithLock(paths),
+      () =>
+        Effect.gen(function* () {
+          yield* stopDaemonWithLock(paths);
+          if (removeStateDirectory) {
+            yield* fileSystem.remove(paths.stateDirectory).pipe(Effect.ignore);
+          }
+        }),
       (contents) => releaseStartLock(paths, contents),
     );
   });
@@ -1192,8 +1199,7 @@ export const executeDaemon = (
       return 0;
     }
     if (options.command === "clean") {
-      yield* stopDaemon(paths);
-      yield* fileSystem.remove(paths.stateDirectory).pipe(Effect.ignore);
+      yield* stopDaemon(paths, true);
       return 0;
     }
     if (options.command === "restart") {

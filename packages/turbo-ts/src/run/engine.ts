@@ -1407,7 +1407,8 @@ const collectOutputPaths = (
   });
 
 const taskOutputContainsPath = (
-  repository: RepositoryModel,
+  repositoryRoot: string,
+  packageDirectory: string,
   node: TaskNode,
   path: string,
   windowsPathSeparators: boolean,
@@ -1419,16 +1420,16 @@ const taskOutputContainsPath = (
   );
   if (
     packagePatterns.length > 0 &&
-    isPathContained(node.package.directory, path, windowsPathSeparators) &&
+    isPathContained(packageDirectory, path, windowsPathSeparators) &&
     matchesGlobsWithExclusions(
-      [relativePath(node.package.directory, path, windowsPathSeparators)],
+      [relativePath(packageDirectory, path, windowsPathSeparators)],
       packagePatterns,
       windowsPathSeparators,
     )
   ) {
     return true;
   }
-  if (!isPathContained(repository.root, path, windowsPathSeparators)) {
+  if (!isPathContained(repositoryRoot, path, windowsPathSeparators)) {
     return false;
   }
   const rootPatterns = outputPatterns.flatMap((pattern) => {
@@ -1441,7 +1442,7 @@ const taskOutputContainsPath = (
   return (
     rootPatterns.length > 0 &&
     matchesGlobsWithExclusions(
-      [relativePath(repository.root, path, windowsPathSeparators)],
+      [relativePath(repositoryRoot, path, windowsPathSeparators)],
       rootPatterns,
       windowsPathSeparators,
     )
@@ -2682,7 +2683,7 @@ const executeTask = (
                   if (event.kind === "end") {
                     if (displaysStreamedOutput) {
                       for (const chunk of finishTaskOutput(renderState)) {
-                        yield* writeTaskEvent(renderLevel, chunk);
+                        yield* writeTaskEvent(renderLevel, chunk, false);
                       }
                     }
                     return;
@@ -2702,6 +2703,13 @@ const executeTask = (
                     yield* writeTaskEvent(event.level, event.output);
                     continue;
                   }
+                  yield* clock.now.pipe(
+                    Effect.flatMap((timestamp) =>
+                      writeStructuredRecord(
+                        taskRecord(timestamp, event.level, event.output),
+                      ),
+                    ),
+                  );
                   renderLevel = event.level;
                   const rendered = renderTaskOutputChunk(
                     renderState,
@@ -2712,7 +2720,7 @@ const executeTask = (
                   );
                   renderState = rendered.state;
                   for (const chunk of rendered.chunks) {
-                    yield* writeTaskEvent(event.level, chunk);
+                    yield* writeTaskEvent(event.level, chunk, false);
                   }
                 }
               }),
@@ -3159,8 +3167,9 @@ const readyForegroundCohorts = (
   return cohorts.sort((left, right) => left[0]!.localeCompare(right[0]!));
 };
 
-const canonicalContainmentPath = (
+const canonicalExistingAncestorPath = (
   path: string,
+  description = "cache directory",
 ): Effect.Effect<string, ConfigurationError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -3180,7 +3189,7 @@ const canonicalContainmentPath = (
         return yield* Effect.fail(
           new ConfigurationError({
             path,
-            message: "unable to resolve cache directory ancestry",
+            message: `unable to resolve ${description} ancestry`,
           }),
         );
       }
@@ -3281,8 +3290,8 @@ export const executeRun = (
       platform === "win32",
     );
     const [canonicalRoot, canonicalCacheDirectory] = yield* Effect.all([
-      canonicalContainmentPath(unresolvedOptions.root),
-      canonicalContainmentPath(unresolvedOptions.cacheDirectory),
+      canonicalExistingAncestorPath(unresolvedOptions.root),
+      canonicalExistingAncestorPath(unresolvedOptions.cacheDirectory),
     ]);
     if (isPathContained(canonicalCacheDirectory, canonicalRoot)) {
       return yield* Effect.fail(
@@ -3527,20 +3536,34 @@ export const executeRun = (
       return platform === "win32" ? normalized.toLowerCase() : normalized;
     };
     if (configuredStructuredLogPath !== undefined) {
-      const structuredLogIdentity = comparableInputPath(
+      const canonicalStructuredLogPath = yield* canonicalExistingAncestorPath(
         configuredStructuredLogPath,
+        "run artifact",
       );
-      const controlCollision = [...selectedGraph.nodes.values()].some((node) =>
-        implicitTaskInputCandidates(
-          repository,
-          node,
-          environment,
-          platform === "win32",
-        ).some(
-          (candidate) =>
-            comparableInputPath(candidate) === structuredLogIdentity,
-        ),
+      const structuredLogIdentity = comparableInputPath(
+        canonicalStructuredLogPath,
       );
+      const controlCandidates = [...selectedGraph.nodes.values()].flatMap(
+        (node) =>
+          implicitTaskInputCandidates(
+            repository,
+            node,
+            environment,
+            platform === "win32",
+          ),
+      );
+      const controlCollision = (yield* Effect.forEach(
+        controlCandidates,
+        (candidate) =>
+          canonicalExistingAncestorPath(candidate, "task control input").pipe(
+            Effect.map(
+              (canonicalCandidate) =>
+                comparableInputPath(canonicalCandidate) ===
+                structuredLogIdentity,
+            ),
+          ),
+        { concurrency: 8 },
+      )).some(Boolean);
       if (controlCollision) {
         return yield* Effect.fail(
           new ConfigurationError({
@@ -3550,14 +3573,25 @@ export const executeRun = (
           }),
         );
       }
-      const outputCollision = [...selectedGraph.nodes.values()].some((node) =>
-        taskOutputContainsPath(
-          repository,
-          node,
-          configuredStructuredLogPath,
-          platform === "win32",
-        ),
-      );
+      const outputCollision = (yield* Effect.forEach(
+        [...selectedGraph.nodes.values()],
+        (node) =>
+          canonicalExistingAncestorPath(
+            node.package.directory,
+            "task output root",
+          ).pipe(
+            Effect.map((canonicalPackageDirectory) =>
+              taskOutputContainsPath(
+                canonicalRoot,
+                canonicalPackageDirectory,
+                node,
+                canonicalStructuredLogPath,
+                platform === "win32",
+              ),
+            ),
+          ),
+        { concurrency: 8 },
+      )).some(Boolean);
       if (outputCollision) {
         return yield* Effect.fail(
           new ConfigurationError({
@@ -3567,16 +3601,25 @@ export const executeRun = (
           }),
         );
       }
-      const taskLogCollision = [...graph.nodes.values()].some(
+      const taskLogCollision = (yield* Effect.forEach(
+        [...graph.nodes.values()],
         (node) =>
-          comparableInputPath(
+          canonicalExistingAncestorPath(
             taskLogPath(
               node,
               cargoWorkspacePlan.scopes.get(node.id),
               logIdentifiers.get(node.id),
             ),
-          ) === structuredLogIdentity,
-      );
+            "task log",
+          ).pipe(
+            Effect.map(
+              (canonicalTaskLogPath) =>
+                comparableInputPath(canonicalTaskLogPath) ===
+                structuredLogIdentity,
+            ),
+          ),
+        { concurrency: 8 },
+      )).some(Boolean);
       if (taskLogCollision) {
         return yield* Effect.fail(
           new ConfigurationError({
@@ -3661,7 +3704,9 @@ export const executeRun = (
     const artifactOwners = new Map<string, string>();
     for (const [owner, path] of artifactDestinations) {
       if (path === undefined) continue;
-      const identity = comparableInputPath(path);
+      const identity = comparableInputPath(
+        yield* canonicalExistingAncestorPath(path, "run artifact"),
+      );
       const existingOwner = artifactOwners.get(identity);
       if (existingOwner !== undefined) {
         return yield* Effect.fail(

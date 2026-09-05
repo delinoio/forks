@@ -96,6 +96,7 @@ import {
   initialPendingWatchChanges,
   parseWatchArguments,
   resolvedWatchRunOptions,
+  runOwnedPath,
   takePendingWatchChanges,
 } from "../src/workflow/watch.js";
 
@@ -967,6 +968,68 @@ describe("repository workflow gate", () => {
     }
   }, 20_000);
 
+  it("preserves structured channels across streamed partial lines", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-log-channels-"));
+    try {
+      await prepareFixture(directory);
+      const manifestPath = join(directory, "packages/app/package.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.channels =
+        "node -e \"process.stdout.write('stdout-fragment'); setTimeout(() => process.stderr.write('stderr-line\\\\n'), 25)\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+      const configurationPath = join(directory, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.channels = {};
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+
+      await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "channels",
+        "--filter=synthetic-app",
+        "--no-cache",
+        "--log-file=run.ndjson",
+        "--cwd",
+        directory,
+      ]);
+      const records = (await readFile(join(directory, "run.ndjson"), "utf8"))
+        .trim()
+        .split("\n")
+        .map(
+          (line) =>
+            JSON.parse(line) as {
+              readonly type: string;
+              readonly source?: string;
+              readonly level?: string;
+              readonly text?: string;
+            },
+        );
+      expect(
+        records
+          .filter(
+            (record) =>
+              record.type === "task_event" &&
+              record.source === "synthetic-app:channels" &&
+              (record.text === "stdout-fragment" ||
+                record.text === "stderr-line\n"),
+          )
+          .map(({ level, text }) => ({ level, text })),
+      ).toEqual([
+        { level: "stdout", text: "stdout-fragment" },
+        { level: "stderr", text: "stderr-line\n" },
+      ]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
   it("rejects colliding run artifact destinations before task execution", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-artifacts-"));
     const artifactPath = join(directory, "artifact.json");
@@ -987,6 +1050,8 @@ describe("repository workflow gate", () => {
         await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
       }
       await writeFile(artifactPath, "preserved\n");
+      await mkdir(join(directory, "real-artifacts"));
+      await symlink("real-artifacts", join(directory, "artifact-alias"));
       for (const options of [
         ["--log-file=artifact.json", "--profile=./artifact.json"],
         ["--profile=artifact.json", "--anon-profile=./artifact.json"],
@@ -995,6 +1060,10 @@ describe("repository workflow gate", () => {
         ["--heap=artifact.json", "--profile=./artifact.json"],
         ["--heap=artifact.json", "--anon-profile=./artifact.json"],
         ["--heap=artifact.json", "--trace=./artifact.json"],
+        [
+          "--profile=artifact-alias/result.json",
+          "--trace=real-artifacts/result.json",
+        ],
       ]) {
         await expect(
           execFilePromise(process.execPath, [
@@ -1108,6 +1177,36 @@ describe("repository workflow gate", () => {
     }
   });
 
+  it("matches run-owned watch artifacts case-insensitively on Windows", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-case-"));
+    try {
+      await prepareFixture(directory);
+      const repository = await Effect.runPromise(
+        loadWorkflowRepository({ cwd: directory }).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const options = parseWatchArguments([
+        "build",
+        "--heap=packages/app/snapshot.heapsnapshot",
+      ]).run;
+      for (const path of [
+        join(directory, "PACKAGES/APP/SNAPSHOT.HEAPSNAPSHOT"),
+        join(
+          directory,
+          "PACKAGES/APP/SNAPSHOT.HEAPSNAPSHOT.1234.0123456789ABCDEF.TMP",
+        ),
+      ]) {
+        expect(runOwnedPath(repository, options, path, {}, 8, true)).toBe(true);
+        expect(runOwnedPath(repository, options, path, {}, 8, false)).toBe(
+          false,
+        );
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("excludes an explicit structured log from task hashes", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-log-hash-"));
     try {
@@ -1169,6 +1268,28 @@ describe("repository workflow gate", () => {
       );
       expect(collision.failed).toBe(true);
       expect(collision.stderr).toContain(
+        "structured log path must not replace a task control input",
+      );
+      expect(await readFile(manifestPath, "utf8")).toBe(manifest);
+      await symlink(".", join(directory, "repository-alias"));
+      const aliasedCollision = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--filter=synthetic-app",
+        "--no-cache",
+        "--log-file=repository-alias/packages/app/package.json",
+        "--cwd",
+        directory,
+      ]).then(
+        () => ({ failed: false, stderr: "" }),
+        (error: { readonly stderr?: string }) => ({
+          failed: true,
+          stderr: error.stderr ?? "",
+        }),
+      );
+      expect(aliasedCollision.failed).toBe(true);
+      expect(aliasedCollision.stderr).toContain(
         "structured log path must not replace a task control input",
       );
       expect(await readFile(manifestPath, "utf8")).toBe(manifest);
@@ -3001,6 +3122,74 @@ describe("repository workflow gate", () => {
             yield* Deferred.succeed(allowServe, undefined);
             expect(yield* Fiber.join(stopFiber)).toBe(0);
             expect(yield* Fiber.join(serveFiber)).toBe(0);
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("holds the daemon lifecycle lock through state cleanup", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-clean-"));
+    try {
+      await prepareFixture(directory);
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const fileSystem = yield* FileSystemService;
+            const processService = yield* ProcessService;
+            const cleanupStarted = yield* Deferred.make<void>();
+            const allowCleanup = yield* Deferred.make<void>();
+            let stateDirectory: string | undefined;
+            let spawnAttempts = 0;
+            const overrides = Layer.mergeAll(
+              Layer.succeed(FileSystemService, {
+                ...fileSystem,
+                createExclusiveFile: (path, contents) =>
+                  fileSystem.createExclusiveFile(path, contents).pipe(
+                    Effect.tap((created) =>
+                      created && path.endsWith("turbod.lock")
+                        ? Effect.sync(() => {
+                            stateDirectory = dirname(path);
+                          })
+                        : Effect.void,
+                    ),
+                  ),
+                remove: (path) =>
+                  path === stateDirectory
+                    ? Deferred.succeed(cleanupStarted, undefined).pipe(
+                        Effect.zipRight(Deferred.await(allowCleanup)),
+                        Effect.zipRight(fileSystem.remove(path)),
+                      )
+                    : fileSystem.remove(path),
+              }),
+              Layer.succeed(ProcessService, {
+                ...processService,
+                spawnDetached: () =>
+                  Effect.sync(() => {
+                    spawnAttempts += 1;
+                    return 99999999;
+                  }),
+              }),
+            );
+            const runDaemon = (command: "clean" | "start") =>
+              executeDaemon({
+                command,
+                cwd: directory,
+                idleMilliseconds: 30_000,
+                json: false,
+              }).pipe(Effect.provide(overrides));
+            const cleanFiber = yield* Effect.forkScoped(runDaemon("clean"));
+            yield* Deferred.await(cleanupStarted);
+            const startResult = yield* runDaemon("start").pipe(Effect.either);
+            expect(startResult).toMatchObject({
+              _tag: "Left",
+              left: { message: "another daemon start is in progress" },
+            });
+            expect(spawnAttempts).toBe(0);
+            yield* Deferred.succeed(allowCleanup, undefined);
+            expect(yield* Fiber.join(cleanFiber)).toBe(0);
           }),
         ).pipe(Effect.provide(nodeFoundationLayer)),
       );
@@ -5239,6 +5428,14 @@ dependencies = ["external-package 2.0.0"]
         "../library/shared.txt",
         join(directory, "packages/app/shared-link.txt"),
       );
+      const manifestPaths = [
+        "package.json",
+        "packages/app/package.json",
+        "packages/library/package.json",
+      ];
+      for (const path of manifestPaths) {
+        await chmod(join(directory, path), 0o700);
+      }
       const implementation = await executeDifferentialCommand(
         process.execPath,
         [
@@ -5267,6 +5464,9 @@ dependencies = ["external-package 2.0.0"]
       expect(pnpmHook).toBe("module.exports = { hooks: {} };\n");
       expect(yarnPatch).toBe("patch\n");
       expect(yarnRelease).toBe("release\n");
+      for (const path of manifestPaths) {
+        expect((await stat(join(output, path))).mode & 0o777).toBe(0o644);
+      }
       expect(
         await readFile(
           join(output, "packages/app/generated.txt"),
@@ -5307,6 +5507,12 @@ dependencies = ["external-package 2.0.0"]
         ),
       ).toBe("patch\n");
       for (const root of ["full", "json"]) {
+        for (const path of manifestPaths) {
+          expect(
+            (await stat(join(directory, "docker-result", root, path))).mode &
+              0o777,
+          ).toBe(0o644);
+        }
         expect(
           await readFile(
             join(directory, `docker-result/${root}/.yarn/releases/yarn.cjs`),

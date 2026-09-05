@@ -429,14 +429,12 @@ const writeManifest = (
 ): Effect.Effect<void, unknown, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
+    const sourceText = yield* fileSystem.readText(source);
     if (!production) {
-      yield* fileSystem.copyFile(source, destination);
+      yield* fileSystem.writeTextAtomic(destination, sourceText, 0o644);
       return;
     }
-    const manifest = JSON.parse(yield* fileSystem.readText(source)) as Record<
-      string,
-      unknown
-    >;
+    const manifest = JSON.parse(sourceText) as Record<string, unknown>;
     delete manifest.devDependencies;
     yield* fileSystem.writeTextAtomic(
       destination,
@@ -898,13 +896,11 @@ export const executePrune = (
         continue;
       }
       const sourceManifest = joinPath(packageModel.directory, "package.json");
-      if (options.production) {
-        yield* writeManifest(
-          sourceManifest,
-          joinPath(fullRoot, packageModel.relativeDirectory, "package.json"),
-          true,
-        );
-      }
+      yield* writeManifest(
+        sourceManifest,
+        joinPath(fullRoot, packageModel.relativeDirectory, "package.json"),
+        options.production,
+      );
       if (options.docker) {
         yield* writeManifest(
           sourceManifest,

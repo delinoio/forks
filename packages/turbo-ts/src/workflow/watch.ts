@@ -126,7 +126,7 @@ const configuredOutputPath = (
   );
 };
 
-const runOwnedPath = (
+export const runOwnedPath = (
   repository: RepositoryModel,
   options: ParsedRunOptions,
   path: string,
@@ -164,17 +164,27 @@ const runOwnedPath = (
     ordinaryRun ? resolveArtifactPath(options.trace) : undefined,
   ].filter((candidate): candidate is string => candidate !== undefined);
   const normalizedPath = normalizePath(path, windowsPathSeparators);
+  const comparablePath = (candidate: string): string => {
+    const normalized = normalizePath(candidate, windowsPathSeparators);
+    return windowsPathSeparators ? normalized.toLowerCase() : normalized;
+  };
+  const comparableBaseName = (candidate: string): string => {
+    const name = baseName(candidate, windowsPathSeparators);
+    return windowsPathSeparators ? name.toLowerCase() : name;
+  };
+  const pathIdentity = comparablePath(normalizedPath);
   if (
-    exactPaths.some(
-      (exactPath) =>
-        exactPath === normalizedPath ||
-        (normalizePath(parentPath(exactPath, windowsPathSeparators)) ===
-          normalizePath(parentPath(normalizedPath, windowsPathSeparators)) &&
-          baseName(normalizedPath, windowsPathSeparators).startsWith(
-            `${baseName(exactPath, windowsPathSeparators)}.`,
-          ) &&
-          baseName(normalizedPath, windowsPathSeparators).endsWith(".tmp")),
-    )
+    exactPaths.some((exactPath) => {
+      const exactName = comparableBaseName(exactPath);
+      const observedName = comparableBaseName(normalizedPath);
+      return (
+        comparablePath(exactPath) === pathIdentity ||
+        (comparablePath(parentPath(exactPath, windowsPathSeparators)) ===
+          comparablePath(parentPath(normalizedPath, windowsPathSeparators)) &&
+          observedName.startsWith(`${exactName}.`) &&
+          observedName.endsWith(".tmp"))
+      );
+    })
   ) {
     return true;
   }
@@ -183,11 +193,9 @@ const runOwnedPath = (
     [options.profile, options.anonymousProfile, options.trace].includes("");
   if (
     writesDefaultProfile &&
-    normalizePath(parentPath(normalizedPath, windowsPathSeparators)) ===
-      normalizePath(repository.root, windowsPathSeparators) &&
-    isDefaultProfileArtifactName(
-      baseName(normalizedPath, windowsPathSeparators),
-    )
+    comparablePath(parentPath(normalizedPath, windowsPathSeparators)) ===
+      comparablePath(repository.root) &&
+    isDefaultProfileArtifactName(comparableBaseName(normalizedPath))
   ) {
     return true;
   }
