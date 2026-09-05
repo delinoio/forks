@@ -9,10 +9,16 @@ import {
   randomBytes,
   timingSafeEqual,
 } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import {
+  createReadStream,
+  createWriteStream,
+  constants as fileSystemConstants,
+  watch as watchFileSystem,
+} from "node:fs";
 import {
   appendFile,
   chmod,
+  copyFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -27,13 +33,31 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
-import { availableParallelism, tmpdir } from "node:os";
-import { join } from "node:path";
+import { createServer as createHttpServer } from "node:http";
+import {
+  connect as connectHttp2,
+  createServer as createHttp2Server,
+  type Http2Server,
+  constants as http2Constants,
+  type ServerHttp2Session,
+  type ServerHttp2Stream,
+} from "node:http2";
+import { createConnection as createNetConnection } from "node:net";
+import {
+  arch,
+  availableParallelism,
+  freemem,
+  release as kernelRelease,
+  platform as operatingSystem,
+  tmpdir,
+} from "node:os";
+import { dirname, join } from "node:path";
 import { Readable, Transform, type Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
+import { writeHeapSnapshot } from "node:v8";
 import { createZstdDecompress, zstdCompress, zstdDecompress } from "node:zlib";
-import { Cause, Effect, Exit, Layer, Option, Ref, Stream } from "effect";
+import { Cause, Effect, Exit, Fiber, Layer, Option, Ref, Stream } from "effect";
 import { createXxhash64 } from "../hash/xxhash64.js";
 import { BoundaryError, ProcessExecutionError } from "./errors.js";
 import {
@@ -43,23 +67,33 @@ import {
   CompressionService,
   ConcurrencyService,
   CredentialService,
+  type DaemonConnection,
+  DaemonMethod,
+  type DaemonMethod as DaemonMethodType,
+  type DaemonResponse,
   DaemonService,
   DigestService,
   deterministicRetryLayer,
   EnvironmentService,
   type ExecutionRequest,
   ExitStatusService,
+  type FileChange,
   type FileSystemOperations,
   FileSystemService,
+  FileWatcherService,
   GitService,
   HttpService,
+  type LoopbackHttpResponse,
+  LoopbackHttpService,
   ObservabilityService,
   type OutputChunkHandler,
   PackageManagerService,
   ProcessService,
   RandomnessService,
+  RuntimeProfileService,
   SignalService,
   SigningService,
+  SystemService,
   TelemetryService,
   type TerminalOperations,
   TerminalService,
@@ -85,11 +119,95 @@ const filesystemError = (cause: unknown): BoundaryError =>
     retryable: false,
   });
 
+const unsupportedDirectorySyncErrorCodes = new Set([
+  "EINVAL",
+  "EISDIR",
+  "ENOTSUP",
+  "EOPNOTSUPP",
+]);
+
+export const isUnsupportedDirectorySyncError = (cause: unknown): boolean =>
+  typeof cause === "object" &&
+  cause !== null &&
+  "code" in cause &&
+  typeof cause.code === "string" &&
+  unsupportedDirectorySyncErrorCodes.has(cause.code);
+
+const syncParentDirectory = async (path: string): Promise<void> => {
+  if (operatingSystem() === "win32") return;
+  let directory: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    directory = await open(dirname(path), "r");
+    await directory.sync();
+  } catch (cause) {
+    if (!isUnsupportedDirectorySyncError(cause)) throw cause;
+  } finally {
+    await directory?.close();
+  }
+};
+
 const isMissingFileError = (cause: unknown): boolean =>
   typeof cause === "object" &&
   cause !== null &&
   "code" in cause &&
   cause.code === "ENOENT";
+
+const isExistingPathError = (cause: unknown): boolean =>
+  typeof cause === "object" &&
+  cause !== null &&
+  "code" in cause &&
+  cause.code === "EEXIST";
+
+const ensurePrivateDirectoryPath = async (path: string): Promise<void> => {
+  try {
+    await mkdir(path, { mode: 0o700 });
+  } catch (cause) {
+    if (!isExistingPathError(cause)) throw cause;
+  }
+
+  if (operatingSystem() === "win32") {
+    if (!(await lstat(path)).isDirectory()) {
+      throw new TypeError("private directory path is not a real directory");
+    }
+    return;
+  }
+
+  if (typeof process.getuid !== "function") {
+    throw new TypeError("current user identity is unavailable");
+  }
+  const directory = await open(
+    path,
+    fileSystemConstants.O_RDONLY |
+      fileSystemConstants.O_DIRECTORY |
+      fileSystemConstants.O_NOFOLLOW,
+  );
+  try {
+    let metadata = await directory.stat();
+    if (!metadata.isDirectory()) {
+      throw new TypeError("private directory path is not a real directory");
+    }
+    if (metadata.uid !== process.getuid()) {
+      throw new TypeError("private directory is not owned by the current user");
+    }
+    const mode = metadata.mode & 0o777;
+    if ((mode & 0o022) !== 0) {
+      throw new TypeError("private directory is writable by another user");
+    }
+    if (mode !== 0o700) {
+      await directory.chmod(0o700);
+      metadata = await directory.stat();
+    }
+    if (
+      !metadata.isDirectory() ||
+      metadata.uid !== process.getuid() ||
+      (metadata.mode & 0o777) !== 0o700
+    ) {
+      throw new TypeError("private directory security validation failed");
+    }
+  } finally {
+    await directory.close();
+  }
+};
 
 const metadataKind = (
   metadata: Awaited<ReturnType<typeof lstat>>,
@@ -837,6 +955,11 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
       },
       catch: filesystemError,
     }),
+  ensurePrivateDirectory: (path) =>
+    Effect.tryPromise({
+      try: () => ensurePrivateDirectoryPath(path),
+      catch: filesystemError,
+    }),
   createExclusiveFile: (path, contents) =>
     Effect.tryPromise({
       try: async () => {
@@ -868,6 +991,52 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
   writeText: (path, contents) =>
     Effect.tryPromise({
       try: () => writeFile(path, contents, "utf8"),
+      catch: filesystemError,
+    }),
+  writeTextAtomic: (path, contents, mode = 0o600) =>
+    Effect.tryPromise({
+      try: async () => {
+        await mkdir(dirname(path), { recursive: true });
+        const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+        let handle: Awaited<ReturnType<typeof open>> | undefined;
+        try {
+          handle = await open(temporary, "wx", mode);
+          await handle.writeFile(contents, "utf8");
+          await handle.chmod(mode);
+          await handle.sync();
+          await handle.close();
+          handle = undefined;
+          await rename(temporary, path);
+          await syncParentDirectory(path);
+        } catch (cause) {
+          await handle?.close().catch(() => undefined);
+          await rm(temporary, { force: true }).catch(() => undefined);
+          throw cause;
+        }
+      },
+      catch: filesystemError,
+    }),
+  writeBytesAtomic: (path, contents, mode = 0o600) =>
+    Effect.tryPromise({
+      try: async () => {
+        await mkdir(dirname(path), { recursive: true });
+        const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+        let handle: Awaited<ReturnType<typeof open>> | undefined;
+        try {
+          handle = await open(temporary, "wx", mode);
+          await handle.writeFile(contents);
+          await handle.chmod(mode);
+          await handle.sync();
+          await handle.close();
+          handle = undefined;
+          await rename(temporary, path);
+          await syncParentDirectory(path);
+        } catch (cause) {
+          await handle?.close().catch(() => undefined);
+          await rm(temporary, { force: true }).catch(() => undefined);
+          throw cause;
+        }
+      },
       catch: filesystemError,
     }),
   appendText: (path, contents) =>
@@ -931,6 +1100,14 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
   remove: (path) =>
     Effect.tryPromise({
       try: () => rm(path, { force: true, recursive: true }),
+      catch: filesystemError,
+    }),
+  copyFile: (source, destination) =>
+    Effect.tryPromise({
+      try: async () => {
+        await mkdir(dirname(destination), { recursive: true });
+        await copyFile(source, destination);
+      },
       catch: filesystemError,
     }),
   realPath: (path) =>
@@ -1029,10 +1206,10 @@ export const collectChildProcessOutput = (
         completeClose();
       });
     };
-    const emitOutput = (chunk: string) => {
+    const emitOutput = (chunk: string, level: "stdout" | "stderr") => {
       if (onOutputChunk === undefined) return;
       try {
-        const completion: unknown = onOutputChunk(chunk);
+        const completion: unknown = onOutputChunk(chunk, level);
         if (
           completion === null ||
           (typeof completion !== "object" &&
@@ -1063,13 +1240,13 @@ export const collectChildProcessOutput = (
       if (settled) return;
       stdout = appendCapturedOutput(stdout, chunk);
       combinedOutput = appendCapturedOutput(combinedOutput, chunk);
-      emitOutput(chunk);
+      emitOutput(chunk, "stdout");
     });
     child.stderr.on("data", (chunk: string) => {
       if (settled) return;
       stderr = appendCapturedOutput(stderr, chunk);
       combinedOutput = appendCapturedOutput(combinedOutput, chunk);
-      emitOutput(chunk);
+      emitOutput(chunk, "stderr");
     });
     child.onceError(fail);
     child.stdin.on("error", fail);
@@ -1311,12 +1488,110 @@ const processLayer = Layer.succeed(ProcessService, {
         ),
       terminateChild,
     ),
+  spawnDetached: (request) =>
+    Effect.async<number, ProcessExecutionError>((resume) => {
+      let child: ChildProcess;
+      let settled = false;
+      const settle = (
+        result: Effect.Effect<number, ProcessExecutionError>,
+      ): void => {
+        if (settled) return;
+        settled = true;
+        resume(result);
+      };
+      const consumeLateError = (): void => undefined;
+      const onError = (cause: Error): void => {
+        child.off("spawn", onSpawn);
+        settle(Effect.fail(processExecutionError(request.command, cause)));
+      };
+      const onSpawn = (): void => {
+        child.off("error", onError);
+        child.on("error", consumeLateError);
+        if (child.pid === undefined) {
+          settle(
+            Effect.fail(
+              processExecutionError(
+                request.command,
+                new Error("detached process has no process identifier"),
+              ),
+            ),
+          );
+          return;
+        }
+        child.unref();
+        settle(Effect.succeed(child.pid));
+      };
+      try {
+        const invocation = resolveSpawnInvocation(
+          request.command,
+          request.args,
+          process.platform,
+          configuredWindowsCommandInterpreter(),
+        );
+        child = spawn(invocation.command, [...invocation.args], {
+          cwd: request.cwd,
+          detached: true,
+          env: makeChildEnvironment(
+            request.inheritEnvironment === false ? {} : process.env,
+            request.env,
+            process.platform,
+          ),
+          shell: false,
+          stdio: "ignore",
+          windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+        });
+        child.once("error", onError);
+        child.once("spawn", onSpawn);
+      } catch (cause) {
+        settle(Effect.fail(processExecutionError(request.command, cause)));
+        return;
+      }
+      return Effect.sync(() => {
+        if (settled) return;
+        settled = true;
+        child.off("error", onError);
+        child.off("spawn", onSpawn);
+        child.on("error", consumeLateError);
+        if (child.pid === undefined) {
+          child.once("spawn", () => child.unref());
+        } else {
+          child.unref();
+        }
+      });
+    }),
+  isProcessAlive: (pid) =>
+    Effect.sync(() => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (cause) {
+        return !(
+          typeof cause === "object" &&
+          cause !== null &&
+          "code" in cause &&
+          cause.code === "ESRCH"
+        );
+      }
+    }),
+  terminateProcess: (pid, force) =>
+    Effect.try({
+      try: () => {
+        // Node cannot provide a graceful Win32 Ctrl+C bridge. Gate 3's
+        // documented Windows behavior is therefore forceful tree termination.
+        process.kill(
+          pid,
+          process.platform === "win32" || force ? "SIGKILL" : "SIGTERM",
+        );
+      },
+      catch: (cause) => processExecutionError(String(pid), cause),
+    }),
 });
 
 const environmentLayer = Layer.succeed(EnvironmentService, {
   argv: Effect.sync(() => [...process.argv]),
   cwd: Effect.sync(() => process.cwd()),
   platform: Effect.succeed(process.platform),
+  executablePath: Effect.succeed(process.execPath),
   get: (name) => Effect.sync(() => process.env[name]),
   entries: Effect.sync(() => ({ ...process.env })),
 });
@@ -1382,6 +1657,15 @@ export const makeTerminalOperations = (
   writeStderr: makeTerminalWriter(stderr),
   stdoutColorEnabled: Effect.sync(() => noColor() === undefined),
   stderrColorEnabled: Effect.sync(() => noColor() === undefined),
+  stdinIsTerminal: Effect.sync(() => process.stdin.isTTY === true),
+  stdoutIsTerminal: Effect.sync(
+    () => "isTTY" in stdout && stdout.isTTY === true,
+  ),
+  columns: Effect.sync(() =>
+    "columns" in stdout && typeof stdout.columns === "number"
+      ? stdout.columns
+      : 80,
+  ),
 });
 
 const terminalLayer = Layer.succeed(
@@ -1424,6 +1708,1014 @@ const randomnessLayer = Layer.succeed(RandomnessService, {
         retryable: false,
       }),
   }),
+});
+
+type WatcherOverflowRetry = (retry: () => void) => () => void;
+
+const defaultWatcherOverflowRetry: WatcherOverflowRetry = (retry) => {
+  const timeout = setTimeout(retry, 10);
+  timeout.unref();
+  return () => clearTimeout(timeout);
+};
+
+export const makeBufferedFileWatcherEmitter = (
+  root: string,
+  offer: (change: FileChange) => boolean,
+  scheduleRetry: WatcherOverflowRetry = defaultWatcherOverflowRetry,
+) => {
+  let closed = false;
+  let overflowed = false;
+  let cancelRetry: (() => void) | undefined;
+  const invalidation: FileChange = { path: root, kind: "unknown" };
+  const scheduleInvalidation = () => {
+    if (closed || cancelRetry !== undefined) return;
+    cancelRetry = scheduleRetry(() => {
+      cancelRetry = undefined;
+      if (closed || !overflowed) return;
+      if (offer(invalidation)) {
+        overflowed = false;
+      } else {
+        scheduleInvalidation();
+      }
+    });
+  };
+  return {
+    push: (change: FileChange) => {
+      if (closed) return;
+      if (overflowed) {
+        if (offer(invalidation)) {
+          overflowed = false;
+        } else {
+          scheduleInvalidation();
+        }
+        return;
+      }
+      if (!offer(change)) {
+        overflowed = true;
+        scheduleInvalidation();
+      }
+    },
+    close: () => {
+      closed = true;
+      cancelRetry?.();
+      cancelRetry = undefined;
+    },
+  };
+};
+
+const fileWatcherLayer = Layer.succeed(FileWatcherService, {
+  watch: (root) =>
+    Stream.asyncPush<FileChange, BoundaryError>(
+      (emit) =>
+        Effect.acquireRelease(
+          Effect.try({
+            try: () => {
+              const transport = makeBufferedFileWatcherEmitter(
+                root,
+                emit.single,
+              );
+              const watcher = watchFileSystem(
+                root,
+                { recursive: true, persistent: true },
+                (event, filename) => {
+                  if (filename === null) {
+                    transport.push({ path: root, kind: "unknown" });
+                    return;
+                  }
+                  const path = join(root, String(filename));
+                  if (event === "change") {
+                    transport.push({ path, kind: "modify" });
+                    return;
+                  }
+                  lstat(path).then(
+                    (metadata) =>
+                      transport.push({
+                        path,
+                        kind: "rename",
+                        entryKind: metadataKind(metadata),
+                      }),
+                    (cause) =>
+                      isMissingFileError(cause)
+                        ? transport.push({ path, kind: "remove" })
+                        : emit.fail(filesystemError(cause)),
+                  );
+                },
+              );
+              watcher.once("error", (cause) =>
+                emit.fail(filesystemError(cause)),
+              );
+              return { transport, watcher };
+            },
+            catch: filesystemError,
+          }),
+          ({ transport, watcher }) =>
+            Effect.sync(() => {
+              transport.close();
+              watcher.close();
+            }),
+        ),
+      { bufferSize: 4_096, strategy: "dropping" },
+    ),
+});
+
+const signalLayer = Layer.succeed(SignalService, {
+  signals: Stream.asyncPush<"SIGINT" | "SIGTERM">(
+    (emit) =>
+      Effect.acquireRelease(
+        Effect.sync(() => {
+          const onInterrupt = () => emit.single("SIGINT");
+          const onTerminate = () => emit.single("SIGTERM");
+          process.on("SIGINT", onInterrupt);
+          process.on("SIGTERM", onTerminate);
+          return { onInterrupt, onTerminate };
+        }),
+        ({ onInterrupt, onTerminate }) =>
+          Effect.sync(() => {
+            process.off("SIGINT", onInterrupt);
+            process.off("SIGTERM", onTerminate);
+          }),
+      ),
+    { bufferSize: 8, strategy: "sliding" },
+  ),
+});
+
+const daemonProtocolError = (cause: unknown): BoundaryError =>
+  new BoundaryError({
+    boundary: "daemon",
+    message: String(cause),
+    retryable: false,
+  });
+
+const protocolVarint = (value: number): Buffer => {
+  const bytes: Array<number> = [];
+  let remaining = Math.max(0, Math.floor(value));
+  do {
+    const byte = remaining % 128;
+    remaining = Math.floor(remaining / 128);
+    bytes.push(byte | (remaining > 0 ? 0x80 : 0));
+  } while (remaining > 0);
+  return Buffer.from(bytes);
+};
+
+const protocolField = (field: number, contents: Uint8Array): Buffer =>
+  Buffer.concat([
+    protocolVarint(field * 8 + 2),
+    protocolVarint(contents.length),
+    contents,
+  ]);
+
+const protocolString = (field: number, value: string): Buffer =>
+  protocolField(field, Buffer.from(value));
+
+const protocolInteger = (field: number, value: number): Buffer =>
+  Buffer.concat([protocolVarint(field * 8), protocolVarint(value)]);
+
+const maximumDaemonPayloadBytes = 1024 * 1024;
+const maximumDaemonFrameBytes = maximumDaemonPayloadBytes + 5;
+
+const grpcFrame = (payload: Uint8Array): Buffer => {
+  const header = Buffer.alloc(5);
+  header.writeUInt32BE(payload.length, 1);
+  return Buffer.concat([header, payload]);
+};
+
+const grpcPayload = (contents: Uint8Array): Buffer => {
+  if (contents.length < 5 || contents[0] !== 0) {
+    throw new TypeError("malformed gRPC daemon frame");
+  }
+  const length = Buffer.from(contents).readUInt32BE(1);
+  if (length > maximumDaemonPayloadBytes || length + 5 > contents.length) {
+    throw new TypeError("daemon frame exceeds its declared size");
+  }
+  return Buffer.from(contents.subarray(5, length + 5));
+};
+
+const decodeGrpcMessage = (value: unknown): string => {
+  const encoded = String(value ?? "daemon request failed");
+  try {
+    return decodeURIComponent(encoded);
+  } catch (cause) {
+    throw new TypeError(`malformed grpc-message encoding: ${String(cause)}`);
+  }
+};
+
+const readProtocolVarint = (
+  bytes: Uint8Array,
+  start: number,
+): readonly [number, number] => {
+  let result = 0;
+  let scale = 1;
+  let index = start;
+  for (; index < bytes.length && index - start < 10; index += 1) {
+    const byte = bytes[index]!;
+    result += (byte & 0x7f) * scale;
+    if ((byte & 0x80) === 0) return [result, index + 1];
+    scale *= 128;
+  }
+  throw new TypeError("malformed protobuf varint");
+};
+
+const protocolFields = (
+  bytes: Uint8Array,
+): ReadonlyMap<number, ReadonlyArray<number | Buffer>> => {
+  const fields = new Map<number, Array<number | Buffer>>();
+  let offset = 0;
+  while (offset < bytes.length) {
+    const [tag, afterTag] = readProtocolVarint(bytes, offset);
+    offset = afterTag;
+    const field = Math.floor(tag / 8);
+    const wire = tag % 8;
+    let value: number | Buffer;
+    if (wire === 0) {
+      [value, offset] = readProtocolVarint(bytes, offset);
+    } else if (wire === 2) {
+      const [length, afterLength] = readProtocolVarint(bytes, offset);
+      offset = afterLength;
+      if (
+        length > maximumDaemonPayloadBytes ||
+        offset + length > bytes.length
+      ) {
+        throw new TypeError("malformed protobuf length");
+      }
+      value = Buffer.from(bytes.subarray(offset, offset + length));
+      offset += length;
+    } else {
+      throw new TypeError(`unsupported protobuf wire type ${wire}`);
+    }
+    const values = fields.get(field) ?? [];
+    values.push(value);
+    fields.set(field, values);
+  }
+  return fields;
+};
+
+const daemonRequestPayload = (
+  request: import("./services.js").DaemonRequest,
+): Buffer => {
+  if (request.method === "Hello") {
+    const params = request.params as { readonly version?: unknown } | undefined;
+    return Buffer.concat([
+      protocolString(
+        1,
+        typeof params?.version === "string" ? params.version : "2.0.0",
+      ),
+      protocolInteger(3, 2),
+    ]);
+  }
+  if (request.method === "NotifyOutputsWritten") {
+    const params = request.params as
+      | {
+          readonly hash?: unknown;
+          readonly outputGlobs?: unknown;
+          readonly outputExclusionGlobs?: unknown;
+          readonly timeSaved?: unknown;
+        }
+      | undefined;
+    return Buffer.concat([
+      ...(typeof params?.hash === "string"
+        ? [protocolString(1, params.hash)]
+        : []),
+      ...(Array.isArray(params?.outputGlobs)
+        ? params.outputGlobs.flatMap((value) =>
+            typeof value === "string" ? [protocolString(2, value)] : [],
+          )
+        : []),
+      ...(Array.isArray(params?.outputExclusionGlobs)
+        ? params.outputExclusionGlobs.flatMap((value) =>
+            typeof value === "string" ? [protocolString(3, value)] : [],
+          )
+        : []),
+      ...(typeof params?.timeSaved === "number"
+        ? [protocolInteger(4, params.timeSaved)]
+        : []),
+    ]);
+  }
+  if (request.method === "GetChangedOutputs") {
+    const params = request.params as
+      | { readonly hashes?: unknown; readonly outputGlobsHash?: unknown }
+      | undefined;
+    return Buffer.concat([
+      ...(Array.isArray(params?.hashes)
+        ? params.hashes.flatMap((value) =>
+            typeof value === "string" ? [protocolString(1, value)] : [],
+          )
+        : []),
+      ...(typeof params?.outputGlobsHash === "number"
+        ? [protocolInteger(2, params.outputGlobsHash)]
+        : []),
+    ]);
+  }
+  return Buffer.alloc(0);
+};
+
+const protocolStrings = (
+  fields: ReadonlyMap<number, ReadonlyArray<number | Buffer>>,
+  field: number,
+): ReadonlyArray<string> =>
+  (fields.get(field) ?? []).flatMap((value) =>
+    value instanceof Buffer ? [value.toString("utf8")] : [],
+  );
+
+const decodedDaemonRequest = (
+  method: DaemonMethodType,
+  payload: Uint8Array,
+): unknown => {
+  const fields = protocolFields(payload);
+  if (method === DaemonMethod.hello) {
+    const version = fields.get(1)?.[0];
+    const supportedVersion = fields.get(3)?.[0];
+    return {
+      version: version instanceof Buffer ? version.toString("utf8") : "",
+      supportedVersion:
+        typeof supportedVersion === "number" ? supportedVersion : 0,
+    };
+  }
+  if (method === DaemonMethod.notifyOutputsWritten) {
+    const hash = fields.get(1)?.[0];
+    const timeSaved = fields.get(4)?.[0];
+    return {
+      hash: hash instanceof Buffer ? hash.toString("utf8") : "",
+      outputGlobs: protocolStrings(fields, 2),
+      outputExclusionGlobs: protocolStrings(fields, 3),
+      timeSaved: typeof timeSaved === "number" ? timeSaved : 0,
+    };
+  }
+  if (method === DaemonMethod.getChangedOutputs) {
+    const outputGlobsHash = fields.get(2)?.[0];
+    return {
+      hashes: protocolStrings(fields, 1),
+      outputGlobsHash:
+        typeof outputGlobsHash === "number" ? outputGlobsHash : 0,
+    };
+  }
+  return {};
+};
+
+const daemonResponsePayload = (
+  method: string,
+  response: DaemonResponse,
+): Buffer => {
+  if (response.error !== undefined) return Buffer.alloc(0);
+  if (method === "Status") {
+    const result = response.result as
+      | { readonly logFile?: unknown; readonly uptimeMilliseconds?: unknown }
+      | undefined;
+    const status = Buffer.concat([
+      protocolString(
+        1,
+        typeof result?.logFile === "string" ? result.logFile : "",
+      ),
+      protocolInteger(
+        2,
+        typeof result?.uptimeMilliseconds === "number"
+          ? result.uptimeMilliseconds
+          : 0,
+      ),
+    ]);
+    return protocolField(1, status);
+  }
+  if (method === "DiscoverPackages") {
+    const result = response.result as
+      | {
+          readonly packages?: unknown;
+          readonly packageManager?: unknown;
+        }
+      | undefined;
+    const packages = Array.isArray(result?.packages)
+      ? result.packages.flatMap((entry) => {
+          if (typeof entry !== "object" || entry === null) return [];
+          const value = entry as {
+            readonly name?: unknown;
+            readonly path?: unknown;
+          };
+          return [
+            protocolField(
+              1,
+              Buffer.concat([
+                protocolString(
+                  1,
+                  typeof value.name === "string" ? value.name : "",
+                ),
+                protocolString(
+                  2,
+                  typeof value.path === "string" ? value.path : "",
+                ),
+              ]),
+            ),
+          ];
+        })
+      : [];
+    return Buffer.concat([
+      ...packages,
+      protocolString(
+        2,
+        typeof result?.packageManager === "string" ? result.packageManager : "",
+      ),
+    ]);
+  }
+  if (method === "GetChangedOutputs") {
+    const result = response.result as
+      | { readonly changedOutputs?: unknown }
+      | undefined;
+    return Buffer.concat(
+      Array.isArray(result?.changedOutputs)
+        ? result.changedOutputs.flatMap((entry) => {
+            if (typeof entry !== "object" || entry === null) return [];
+            const value = entry as {
+              readonly hash?: unknown;
+              readonly changedOutputGlobs?: unknown;
+            };
+            return [
+              protocolField(
+                1,
+                Buffer.concat([
+                  protocolString(
+                    1,
+                    typeof value.hash === "string" ? value.hash : "",
+                  ),
+                  ...(Array.isArray(value.changedOutputGlobs)
+                    ? value.changedOutputGlobs.flatMap((glob) =>
+                        typeof glob === "string"
+                          ? [protocolString(2, glob)]
+                          : [],
+                      )
+                    : []),
+                ]),
+              ),
+            ];
+          })
+        : [],
+    );
+  }
+  return Buffer.alloc(0);
+};
+
+const decodedDaemonResponse = (
+  method: string,
+  payload: Uint8Array,
+): unknown => {
+  const outer = protocolFields(payload);
+  if (method === DaemonMethod.status) {
+    const status = outer.get(1)?.[0];
+    if (!(status instanceof Buffer)) return {};
+    const fields = protocolFields(status);
+    const logFile = fields.get(1)?.[0];
+    const uptimeMilliseconds = fields.get(2)?.[0];
+    return {
+      logFile: logFile instanceof Buffer ? logFile.toString("utf8") : "",
+      uptimeMilliseconds:
+        typeof uptimeMilliseconds === "number" ? uptimeMilliseconds : 0,
+    };
+  }
+  if (method === DaemonMethod.discoverPackages) {
+    const packageManager = outer.get(2)?.[0];
+    return {
+      packages: (outer.get(1) ?? []).flatMap((package_) => {
+        if (!(package_ instanceof Buffer)) return [];
+        const fields = protocolFields(package_);
+        const name = fields.get(1)?.[0];
+        const path = fields.get(2)?.[0];
+        return [
+          {
+            name: name instanceof Buffer ? name.toString("utf8") : "",
+            path: path instanceof Buffer ? path.toString("utf8") : "",
+          },
+        ];
+      }),
+      packageManager:
+        packageManager instanceof Buffer ? packageManager.toString("utf8") : "",
+    };
+  }
+  if (method === DaemonMethod.getChangedOutputs) {
+    return {
+      changedOutputs: (outer.get(1) ?? []).flatMap((changedOutput) => {
+        if (!(changedOutput instanceof Buffer)) return [];
+        const fields = protocolFields(changedOutput);
+        const hash = fields.get(1)?.[0];
+        return [
+          {
+            hash: hash instanceof Buffer ? hash.toString("utf8") : "",
+            changedOutputGlobs: protocolStrings(fields, 2),
+          },
+        ];
+      }),
+    };
+  }
+  return {};
+};
+
+export const respondGrpc = (
+  stream: ServerHttp2Stream,
+  method: string,
+  response: DaemonResponse,
+): Effect.Effect<void, BoundaryError> =>
+  Effect.async((resume) => {
+    try {
+      stream.respond({
+        [http2Constants.HTTP2_HEADER_STATUS]: 200,
+        [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+        "grpc-status": response.error === undefined ? "0" : "13",
+        ...(response.error === undefined
+          ? {}
+          : { "grpc-message": encodeURIComponent(response.error) }),
+      });
+      stream.end(
+        grpcFrame(daemonResponsePayload(method, response)),
+        (cause?: Error | null) => {
+          resume(
+            cause === undefined || cause === null
+              ? Effect.void
+              : Effect.fail(daemonProtocolError(cause)),
+          );
+        },
+      );
+    } catch (cause) {
+      resume(Effect.fail(daemonProtocolError(cause)));
+    }
+    return Effect.sync(() => stream.close());
+  });
+
+interface DaemonEndpointIdentity {
+  readonly device: number;
+  readonly inode: number;
+}
+
+interface DaemonEndpointSetup {
+  readonly metadata: (path: string) => Promise<DaemonEndpointIdentity>;
+  readonly setPermissions: (path: string, mode: number) => Promise<void>;
+  readonly respond: typeof respondGrpc;
+  readonly platform: NodeJS.Platform;
+}
+
+const closeBoundDaemonServer = async (
+  endpoint: string,
+  server: Http2Server,
+  sessions: ReadonlySet<ServerHttp2Session>,
+  endpointIdentity?: DaemonEndpointIdentity,
+): Promise<void> => {
+  for (const session of sessions) session.destroy();
+  if (server.listening) {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+  if (endpointIdentity === undefined) return;
+  const currentIdentity = await lstat(endpoint).catch(() => undefined);
+  if (
+    currentIdentity !== undefined &&
+    currentIdentity.dev === endpointIdentity.device &&
+    currentIdentity.ino === endpointIdentity.inode
+  ) {
+    await rm(endpoint, { force: true }).catch(() => undefined);
+  }
+};
+
+export const makeDaemonServe = (setup: Partial<DaemonEndpointSetup> = {}) => {
+  const metadata =
+    setup.metadata ??
+    (async (path: string) => {
+      const value = await lstat(path);
+      return { device: value.dev, inode: value.ino };
+    });
+  const setPermissions = setup.setPermissions ?? chmod;
+  const respond = setup.respond ?? respondGrpc;
+  const platform = setup.platform ?? process.platform;
+  const fileBackedEndpoint = platform !== "win32";
+  return (endpoint: string) =>
+    Stream.asyncPush<DaemonConnection, BoundaryError>(
+      (emit) =>
+        Effect.gen(function* () {
+          const scope = yield* Effect.scope;
+          const respondRejectedRequest = (
+            stream: ServerHttp2Stream,
+            method: string,
+            response: DaemonResponse,
+          ): void => {
+            respond(stream, method, response).pipe(
+              Effect.catchAll(() => Effect.sync(() => stream.close())),
+              Effect.forkIn(scope),
+              Effect.runFork,
+            );
+          };
+          return yield* Effect.acquireRelease(
+            Effect.async<
+              {
+                readonly server: Http2Server;
+                readonly sessions: Set<ServerHttp2Session>;
+                readonly endpointIdentity?: DaemonEndpointIdentity;
+              },
+              BoundaryError
+            >((resume) => {
+              const sessions = new Set<ServerHttp2Session>();
+              const server = createHttp2Server();
+              server.on("session", (session) => {
+                sessions.add(session);
+                session.once("close", () => sessions.delete(session));
+              });
+              server.on("stream", (stream, headers) => {
+                // Stream protocol failures are handled by closing that stream;
+                // consume its error event so Node does not promote a hostile
+                // client frame into an uncaught process-level exception.
+                stream.on("error", () => undefined);
+                const chunks: Array<Buffer> = [];
+                let length = 0;
+                let overflowed = false;
+                stream.on("data", (chunk: Buffer) => {
+                  if (overflowed) return;
+                  length += chunk.length;
+                  if (length > maximumDaemonFrameBytes) {
+                    overflowed = true;
+                    chunks.length = 0;
+                    stream.close(http2Constants.NGHTTP2_CANCEL);
+                    return;
+                  }
+                  chunks.push(chunk);
+                });
+                stream.on("end", () => {
+                  if (overflowed) return;
+                  try {
+                    const path = String(
+                      headers[http2Constants.HTTP2_HEADER_PATH] ?? "",
+                    );
+                    const method = path.slice(path.lastIndexOf("/") + 1);
+                    if (
+                      !Object.values(DaemonMethod).includes(
+                        method as DaemonMethodType,
+                      )
+                    ) {
+                      respondRejectedRequest(stream, DaemonMethod.status, {
+                        id: String(stream.id),
+                        error: `unsupported daemon method: ${method}`,
+                      });
+                      return;
+                    }
+                    const payload = grpcPayload(Buffer.concat(chunks));
+                    const accepted = emit.single({
+                      requests: Stream.succeed({
+                        id: String(stream.id),
+                        method: method as DaemonMethodType,
+                        params: decodedDaemonRequest(
+                          method as DaemonMethodType,
+                          new Uint8Array(payload),
+                        ),
+                      }),
+                      respond: (response) =>
+                        respondGrpc(stream, method, response),
+                    });
+                    if (!accepted) {
+                      respondRejectedRequest(stream, method, {
+                        id: String(stream.id),
+                        error: "daemon request queue is full",
+                      });
+                    }
+                  } catch {
+                    // A malformed client stream is isolated to that HTTP/2
+                    // stream. Failing the outer Stream would tear down the
+                    // shared daemon and let one corrupt frame deny service to
+                    // every healthy client.
+                    stream.close(http2Constants.NGHTTP2_PROTOCOL_ERROR);
+                  }
+                });
+              });
+              const fail = (cause: Error) =>
+                resume(Effect.fail(daemonProtocolError(cause)));
+              server.once("error", fail);
+              (fileBackedEndpoint
+                ? mkdir(dirname(endpoint), { recursive: true, mode: 0o700 })
+                : Promise.resolve()
+              )
+                .then(() => {
+                  server.listen(endpoint, () => {
+                    let endpointIdentity: DaemonEndpointIdentity | undefined;
+                    (fileBackedEndpoint
+                      ? metadata(endpoint).then((endpointMetadata) => {
+                          endpointIdentity = endpointMetadata;
+                          return setPermissions(endpoint, 0o600);
+                        })
+                      : Promise.resolve()
+                    )
+                      .then(() => {
+                        server.off("error", fail);
+                        server.on("error", (cause) =>
+                          emit.fail(daemonProtocolError(cause)),
+                        );
+                        resume(
+                          Effect.succeed({
+                            server,
+                            sessions,
+                            endpointIdentity,
+                          }),
+                        );
+                      })
+                      .catch((cause) => {
+                        server.off("error", fail);
+                        server.on("error", () => undefined);
+                        void closeBoundDaemonServer(
+                          endpoint,
+                          server,
+                          sessions,
+                          endpointIdentity,
+                        ).then(
+                          () => fail(cause as Error),
+                          (closeCause) => fail(closeCause as Error),
+                        );
+                      });
+                  });
+                })
+                .catch((cause) => fail(cause as Error));
+            }),
+            ({ server, sessions, endpointIdentity }) =>
+              Effect.promise(() =>
+                closeBoundDaemonServer(
+                  endpoint,
+                  server,
+                  sessions,
+                  endpointIdentity,
+                ),
+              ),
+          );
+        }),
+      { bufferSize: 64, strategy: "dropping" },
+    );
+};
+
+const daemonLayer = Layer.succeed(DaemonService, {
+  serve: makeDaemonServe(),
+  request: (endpoint, request, timeoutMilliseconds = 5_000) =>
+    Effect.async<DaemonResponse, BoundaryError>((resume) => {
+      const session = connectHttp2("http://localhost", {
+        createConnection: () => createNetConnection(endpoint),
+      });
+      let settled = false;
+      const complete = (
+        effect: Effect.Effect<DaemonResponse, BoundaryError>,
+      ) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        session.destroy();
+        resume(effect);
+      };
+      const timeout = setTimeout(
+        () =>
+          complete(
+            Effect.fail(daemonProtocolError("daemon request timed out")),
+          ),
+        timeoutMilliseconds,
+      );
+      session.once("error", (cause) =>
+        complete(Effect.fail(daemonProtocolError(cause))),
+      );
+      const stream = session.request({
+        [http2Constants.HTTP2_HEADER_METHOD]: "POST",
+        [http2Constants.HTTP2_HEADER_PATH]: `/turbodprotocol.Turbod/${request.method}`,
+        [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+        te: "trailers",
+      });
+      const chunks: Array<Buffer> = [];
+      let responseLength = 0;
+      let responseError: string | undefined;
+      const recordResponseError = (status: unknown, message: unknown): void => {
+        if (status === undefined || status === "0") return;
+        try {
+          responseError = decodeGrpcMessage(message);
+        } catch (cause) {
+          complete(Effect.fail(daemonProtocolError(cause)));
+        }
+      };
+      stream.on("response", (headers) => {
+        recordResponseError(headers["grpc-status"], headers["grpc-message"]);
+      });
+      stream.on("trailers", (headers) => {
+        recordResponseError(headers["grpc-status"], headers["grpc-message"]);
+      });
+      stream.on("data", (chunk: Buffer) => {
+        if (settled) return;
+        responseLength += chunk.length;
+        if (responseLength > maximumDaemonFrameBytes) {
+          chunks.length = 0;
+          stream.close(http2Constants.NGHTTP2_CANCEL);
+          complete(
+            Effect.fail(
+              daemonProtocolError(
+                new TypeError("daemon frame exceeds its declared size"),
+              ),
+            ),
+          );
+          return;
+        }
+        chunks.push(chunk);
+      });
+      stream.on("end", () => {
+        if (settled) return;
+        try {
+          const payload =
+            responseLength === 0 && responseError !== undefined
+              ? undefined
+              : grpcPayload(Buffer.concat(chunks));
+          complete(
+            Effect.succeed({
+              id: request.id,
+              result:
+                payload === undefined
+                  ? undefined
+                  : decodedDaemonResponse(request.method, payload),
+              error: responseError,
+            }),
+          );
+        } catch (cause) {
+          complete(Effect.fail(daemonProtocolError(cause)));
+        }
+      });
+      stream.once("error", (cause) =>
+        complete(Effect.fail(daemonProtocolError(cause))),
+      );
+      stream.end(grpcFrame(daemonRequestPayload(request)));
+      return Effect.sync(() => complete(Effect.interrupt));
+    }),
+});
+
+const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
+  serve: (requestedPort, handler) =>
+    Effect.gen(function* () {
+      const scope = yield* Effect.scope;
+      return yield* Effect.acquireRelease(
+        Effect.async<
+          {
+            readonly server: ReturnType<typeof createHttpServer>;
+            readonly port: number;
+          },
+          BoundaryError
+        >((resume) => {
+          const server = createHttpServer((request, response) => {
+            const chunks: Array<Buffer> = [];
+            let size = 0;
+            let oversized = false;
+            let connectionClosed = false;
+            let handlerFiber:
+              | Fiber.RuntimeFiber<LoopbackHttpResponse, BoundaryError>
+              | undefined;
+            const interruptHandler = (): void => {
+              connectionClosed = true;
+              if (handlerFiber !== undefined) {
+                Effect.runFork(Fiber.interrupt(handlerFiber));
+              }
+            };
+            request.once("aborted", interruptHandler);
+            request.once("error", interruptHandler);
+            response.once("close", interruptHandler);
+            request.on("data", (chunk: Buffer) => {
+              if (oversized || connectionClosed) return;
+              size += chunk.length;
+              if (size > 1024 * 1024) {
+                oversized = true;
+                chunks.length = 0;
+                response.writeHead(413);
+                response.end();
+                return;
+              }
+              chunks.push(chunk);
+            });
+            request.on("end", () => {
+              if (oversized || connectionClosed) return;
+              const headers = Object.fromEntries(
+                Object.entries(request.headers).flatMap(([key, value]) =>
+                  value === undefined
+                    ? []
+                    : [[key, Array.isArray(value) ? value.join(", ") : value]],
+                ),
+              );
+              const requestEffect = handler({
+                method: request.method ?? "GET",
+                path: request.url ?? "/",
+                headers,
+                body: new Uint8Array(Buffer.concat(chunks)),
+              }).pipe(
+                Effect.forkIn(scope),
+                Effect.tap((fiber) =>
+                  Effect.sync(() => {
+                    handlerFiber = fiber;
+                    if (connectionClosed) {
+                      Effect.runFork(Fiber.interrupt(fiber));
+                    }
+                  }),
+                ),
+                Effect.flatMap(Fiber.join),
+              );
+              Effect.runPromiseExit(requestEffect).then((exit) => {
+                request.off("aborted", interruptHandler);
+                request.off("error", interruptHandler);
+                response.off("close", interruptHandler);
+                if (
+                  connectionClosed ||
+                  response.destroyed ||
+                  response.writableEnded
+                ) {
+                  return;
+                }
+                if (Exit.isSuccess(exit)) {
+                  response.writeHead(exit.value.status, exit.value.headers);
+                  response.end(exit.value.body);
+                  return;
+                }
+                if (Cause.isInterruptedOnly(exit.cause)) return;
+                response.writeHead(500, {
+                  "content-type": "text/plain; charset=utf-8",
+                });
+                response.end(Cause.pretty(exit.cause));
+              });
+            });
+          });
+          server.once("error", (cause) =>
+            resume(
+              Effect.fail(
+                new BoundaryError({
+                  boundary: "http-server",
+                  message: String(cause),
+                  retryable: false,
+                }),
+              ),
+            ),
+          );
+          server.listen(requestedPort, "127.0.0.1", () => {
+            const address = server.address();
+            if (address === null || typeof address === "string") {
+              resume(
+                Effect.fail(
+                  new BoundaryError({
+                    boundary: "http-server",
+                    message: "loopback server has no TCP address",
+                    retryable: false,
+                  }),
+                ),
+              );
+              return;
+            }
+            resume(
+              Effect.succeed({
+                server,
+                port: address.port,
+              }),
+            );
+          });
+        }),
+        ({ server }) =>
+          Effect.promise(async () => {
+            server.closeAllConnections();
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+          }),
+      ).pipe(
+        Effect.map(({ server, port }) => ({
+          port,
+          closed: Effect.async<void, BoundaryError>((resume) => {
+            server.once("close", () => resume(Effect.void));
+          }),
+        })),
+      );
+    }),
+});
+
+const runtimeProfileLayer = Layer.succeed(RuntimeProfileService, {
+  heapSnapshot: (path) =>
+    Effect.tryPromise({
+      try: async () => {
+        await mkdir(dirname(path), { recursive: true });
+        writeHeapSnapshot(path);
+      },
+      catch: filesystemError,
+    }),
+  writeTrace: (path, events) =>
+    Effect.tryPromise({
+      try: async () => {
+        await mkdir(dirname(path), { recursive: true });
+        const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+        try {
+          await writeFile(
+            temporary,
+            `${JSON.stringify({ traceEvents: events })}\n`,
+            { encoding: "utf8", flag: "wx", mode: 0o600 },
+          );
+          await rename(temporary, path);
+        } catch (cause) {
+          await rm(temporary, { force: true }).catch(() => undefined);
+          throw cause;
+        }
+      },
+      catch: filesystemError,
+    }),
+});
+
+const systemLayer = Layer.succeed(SystemService, {
+  information: Effect.sync(() => ({
+    architecture: arch(),
+    operatingSystem: operatingSystem(),
+    kernelRelease: kernelRelease(),
+    nodeVersion: process.version,
+    availableMemoryMegabytes: Math.floor(freemem() / 1024 / 1024),
+    availableCpuCores: availableParallelism(),
+    temporaryDirectory: tmpdir(),
+    userIdentifier:
+      typeof process.getuid === "function" ? String(process.getuid()) : "user",
+    processIdentifier: process.pid,
+  })),
 });
 
 const compressionError = (cause: unknown): BoundaryError =>
@@ -1735,6 +3027,12 @@ const signingLayer = Layer.succeed(SigningService, {
 });
 
 const digestLayer = Layer.succeed(DigestService, {
+  sha256: (value) =>
+    Effect.sync(() =>
+      createHash("sha256")
+        .update(typeof value === "string" ? value : Buffer.from(value))
+        .digest("hex"),
+    ),
   gitBlobSha1: (contents) =>
     Effect.try({
       try: () =>
@@ -1857,17 +3155,21 @@ export const nodeFoundationLayer = Layer.mergeAll(
   terminalLayer,
   clockLayer,
   randomnessLayer,
+  fileWatcherLayer,
+  signalLayer,
   compressionLayer,
   httpLayer,
+  loopbackHttpLayer,
   signingLayer,
   digestLayer,
+  daemonLayer,
+  runtimeProfileLayer,
+  systemLayer,
   Layer.succeed(GitService, boundaryFailure("git")),
   Layer.succeed(PackageManagerService, boundaryFailure("package-manager")),
-  Layer.succeed(SignalService, boundaryFailure("signals")),
   concurrencyLayer,
   Layer.succeed(CredentialService, boundaryFailure("credentials")),
   Layer.succeed(CacheService, boundaryFailure("cache")),
-  Layer.succeed(DaemonService, boundaryFailure("daemon")),
   Layer.succeed(TelemetryService, boundaryFailure("telemetry")),
   Layer.succeed(ObservabilityService, boundaryFailure("observability")),
   deterministicRetryLayer,

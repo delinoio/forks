@@ -2,7 +2,10 @@ import { Effect } from "effect";
 import { satisfies } from "semver";
 import { parse as parseToml } from "smol-toml";
 import { parse as parseYaml } from "yaml";
-import type { LoadedRootConfiguration } from "../config/runtime.js";
+import type {
+  LoadedPackageConfiguration,
+  LoadedRootConfiguration,
+} from "../config/runtime.js";
 import { loadPackageConfiguration, mergePipeline } from "../config/runtime.js";
 import { canMatchGlobDescendant, selectByGlobs } from "../core/glob.js";
 import {
@@ -16,7 +19,7 @@ import {
 } from "../core/path.js";
 import { RepositoryError } from "../effect/errors.js";
 import { FileSystemService, ProcessService } from "../effect/services.js";
-import type { Pipeline } from "../generated/configuration.js";
+import type { BoundariesConfig, Pipeline } from "../generated/configuration.js";
 
 export const packageManagerNames = [
   "npm",
@@ -74,10 +77,14 @@ export interface RepositoryPackage {
   readonly cargoCompilerIdentity?: string;
   readonly cargoHostTarget?: string;
   readonly workspaceDirectory?: string;
+  readonly configurationPath?: string;
+  readonly tags?: ReadonlyArray<string> | null;
+  readonly boundaries?: BoundariesConfig | null;
   readonly manager: PackageManagerName;
   readonly scripts: Readonly<Record<string, string>>;
   readonly dependencyNames: ReadonlyArray<string>;
   readonly internalDependencies: ReadonlyArray<string>;
+  readonly productionInternalDependencies: ReadonlyArray<string>;
   readonly excludedTasks: ReadonlySet<string>;
   readonly tasks: Readonly<Record<string, Pipeline>>;
   readonly manifest: PackageManifest;
@@ -95,6 +102,10 @@ export interface RepositoryModel {
   readonly packages: ReadonlyArray<RepositoryPackage>;
   readonly packagesByIdentity: ReadonlyMap<string, RepositoryPackage>;
   readonly packagesByName: ReadonlyMap<string, RepositoryPackage>;
+}
+
+export interface RepositoryDiscoveryOptions {
+  readonly singlePackage?: boolean;
 }
 
 type PackageEcosystem = "javascript" | "cargo" | "uv";
@@ -516,11 +527,21 @@ const workspacePatterns = (
 
 const dependencyEntries = (
   manifest: PackageManifest,
-): ReadonlyArray<readonly [string, string]> => [
-  ...Object.entries(manifest.dependencies ?? {}),
-  ...Object.entries(manifest.devDependencies ?? {}),
-  ...Object.entries(manifest.optionalDependencies ?? {}),
-  ...Object.entries(manifest.peerDependencies ?? {}),
+): ReadonlyArray<
+  readonly [name: string, specification: string, production: boolean]
+> => [
+  ...Object.entries(manifest.dependencies ?? {}).map(
+    ([name, specification]) => [name, specification, true] as const,
+  ),
+  ...Object.entries(manifest.devDependencies ?? {}).map(
+    ([name, specification]) => [name, specification, false] as const,
+  ),
+  ...Object.entries(manifest.optionalDependencies ?? {}).map(
+    ([name, specification]) => [name, specification, true] as const,
+  ),
+  ...Object.entries(manifest.peerDependencies ?? {}).map(
+    ([name, specification]) => [name, specification, true] as const,
+  ),
 ];
 
 const dependencyNames = (manifest: PackageManifest): ReadonlyArray<string> =>
@@ -665,6 +686,7 @@ const javascriptInternalDependencies = (
 ): Effect.Effect<
   {
     readonly internalDependencies: ReadonlyArray<string>;
+    readonly productionInternalDependencies: ReadonlyArray<string>;
     readonly cacheInputsComplete: boolean;
   },
   never,
@@ -695,7 +717,7 @@ const javascriptInternalDependencies = (
         : packagesByFilesystemIdentity.get(declaringFilesystemIdentity);
     const references = yield* Effect.forEach(
       dependencyEntries(manifest),
-      ([name, specification]) => {
+      ([name, specification, production]) => {
         const localPath = localPathSpecification(
           declaringDirectory,
           specification,
@@ -710,6 +732,7 @@ const javascriptInternalDependencies = (
                   : packagesByFilesystemIdentity.get(identity);
               return {
                 internalDependency,
+                production,
                 cacheInputsComplete: internalDependency !== undefined,
               };
             }),
@@ -723,6 +746,7 @@ const javascriptInternalDependencies = (
         return target === undefined
           ? Effect.succeed({
               internalDependency: undefined,
+              production,
               cacheInputsComplete: true,
             })
           : referencesWorkspacePackage(
@@ -732,6 +756,7 @@ const javascriptInternalDependencies = (
             ).pipe(
               Effect.map((matches) => ({
                 internalDependency: matches ? target.identity : undefined,
+                production,
                 cacheInputsComplete: true,
               })),
             );
@@ -742,6 +767,17 @@ const javascriptInternalDependencies = (
       internalDependencies: [
         ...new Set(
           references
+            .map(({ internalDependency }) => internalDependency)
+            .filter(
+              (name): name is string =>
+                name !== undefined && name !== declaringPackageIdentity,
+            ),
+        ),
+      ].sort(),
+      productionInternalDependencies: [
+        ...new Set(
+          references
+            .filter(({ production }) => production)
             .map(({ internalDependency }) => internalDependency)
             .filter(
               (name): name is string =>
@@ -776,6 +812,7 @@ const polyglotScripts = (
 
 interface CargoPackageMetadata {
   readonly name: string;
+  readonly version?: string;
   readonly dependencies: ReadonlyArray<CargoDependencyMetadata>;
   readonly dependencyNames: ReadonlyArray<string>;
   readonly entrypointNames: ReadonlyArray<string>;
@@ -800,7 +837,10 @@ interface CargoDependencyMetadata {
 }
 
 interface RepositoryPackageDraft
-  extends Omit<RepositoryPackage, "identity" | "internalDependencies"> {
+  extends Omit<
+    RepositoryPackage,
+    "identity" | "internalDependencies" | "productionInternalDependencies"
+  > {
   readonly cargoDependencies: ReadonlyArray<CargoDependencyMetadata>;
   readonly uvDependencySources?: ReadonlyMap<
     string,
@@ -822,6 +862,7 @@ export const parseCargoMetadata = (
     readonly packages?: ReadonlyArray<{
       readonly id?: unknown;
       readonly name?: unknown;
+      readonly version?: unknown;
       readonly manifest_path?: unknown;
       readonly dependencies?: ReadonlyArray<{
         readonly name?: unknown;
@@ -882,6 +923,9 @@ export const parseCargoMetadata = (
     return [
       {
         name: packageMetadata.name,
+        ...(typeof packageMetadata.version === "string"
+          ? { version: packageMetadata.version }
+          : {}),
         manifestPath: normalizePath(packageMetadata.manifest_path),
         dependencies,
         dependencyNames: [
@@ -1030,6 +1074,7 @@ const rustCompilerIdentity = (
 
 interface PythonProjectMetadata {
   readonly name?: string;
+  readonly version?: string;
   readonly cacheInputsComplete: boolean;
   readonly dependencyNames: ReadonlyArray<string>;
   readonly dependencySources: ReadonlyMap<
@@ -1896,6 +1941,7 @@ const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
   }
   return {
     name: typeof project?.name === "string" ? project.name : undefined,
+    version: typeof project?.version === "string" ? project.version : undefined,
     cacheInputsComplete: [...directRequirementNames].every((name) =>
       dependencySources.has(name),
     ),
@@ -2038,6 +2084,7 @@ const cargoTasks = (
 export const discoverRepository = (
   root: string,
   rootConfiguration: LoadedRootConfiguration,
+  options: RepositoryDiscoveryOptions = {},
 ): Effect.Effect<
   RepositoryModel,
   RepositoryError,
@@ -2082,12 +2129,12 @@ export const discoverRepository = (
       managerIdentity.name,
       managerIdentity.version,
     );
-    const patterns = yield* workspacePatterns(
-      root,
-      managerIdentity.name,
-      rootManifest,
-    );
-    const workspaceDirectories = yield* walkDirectories(root, patterns);
+    const patterns = options.singlePackage
+      ? []
+      : yield* workspacePatterns(root, managerIdentity.name, rootManifest);
+    const workspaceDirectories = options.singlePackage
+      ? []
+      : yield* walkDirectories(root, patterns);
     const candidateDirectoryPaths = new Set(
       selectByGlobs(
         workspaceDirectories
@@ -2168,6 +2215,9 @@ export const discoverRepository = (
               ? {}
               : { cacheControlInputPaths }),
             manager: managerIdentity.name,
+            configurationPath: packageConfiguration.path,
+            tags: packageConfiguration.tags,
+            boundaries: packageConfiguration.boundaries,
             scripts: manifest.scripts ?? {},
             cargoDependencies:
               [] satisfies ReadonlyArray<CargoDependencyMetadata>,
@@ -2183,10 +2233,12 @@ export const discoverRepository = (
       (entry): entry is NonNullable<typeof entry> => entry !== undefined,
     );
     const cargoEnabled =
+      !options.singlePackage &&
       rootConfiguration.value.futureFlags?.experimentalCargoWorkspaces === true;
     const pythonEnabled =
+      !options.singlePackage &&
       rootConfiguration.value.futureFlags?.experimentalPythonWorkspaces ===
-      true;
+        true;
     const directories =
       cargoEnabled || pythonEnabled
         ? yield* walkDirectories(root, ["**"])
@@ -2423,7 +2475,7 @@ export const discoverRepository = (
             };
             const configuredBuildTarget =
               yield* cargoBuildTargetConfigured(directory);
-            const packageConfiguration =
+            const packageConfiguration: LoadedPackageConfiguration =
               directory === root
                 ? {
                     excludedTasks: new Set<string>(),
@@ -2469,6 +2521,9 @@ export const discoverRepository = (
                     cargoHostTarget: compilerIdentity.hostTarget,
                   }),
               workspaceDirectory: metadata.workspaceDirectory,
+              configurationPath: packageConfiguration.path,
+              tags: packageConfiguration.tags,
+              boundaries: packageConfiguration.boundaries,
               manager: "cargo" as const,
               scripts: polyglotScripts("cargo", metadata.entrypointNames),
               cargoDependencies: metadata.dependencies,
@@ -2487,6 +2542,9 @@ export const discoverRepository = (
               ),
               manifest: {
                 name: metadata.name,
+                ...(metadata.version === undefined
+                  ? {}
+                  : { version: metadata.version }),
                 private: true,
               } satisfies PackageManifest,
             };
@@ -2532,7 +2590,7 @@ export const discoverRepository = (
           if (metadata.name === undefined) {
             return undefined;
           }
-          const packageConfiguration =
+          const packageConfiguration: LoadedPackageConfiguration =
             directory === root
               ? {
                   excludedTasks: new Set<string>(),
@@ -2560,6 +2618,9 @@ export const discoverRepository = (
             cachePathRestorable: yield* cachePathIsRestorable(root, directory),
             cacheInputsComplete: metadata.cacheInputsComplete,
             workspaceDirectory: root,
+            configurationPath: packageConfiguration.path,
+            tags: packageConfiguration.tags,
+            boundaries: packageConfiguration.boundaries,
             manager: "uv" as const,
             scripts: polyglotScripts("uv", []),
             cargoDependencies:
@@ -2574,6 +2635,9 @@ export const discoverRepository = (
             ),
             manifest: {
               name: metadata.name,
+              ...(metadata.version === undefined
+                ? {}
+                : { version: metadata.version }),
               private: true,
             } satisfies PackageManifest,
           };
@@ -2797,6 +2861,9 @@ export const discoverRepository = (
             internalDependencies: resolvedDependencies.flatMap(({ target }) =>
               target === undefined ? [] : [target.identity],
             ),
+            productionInternalDependencies: resolvedDependencies.flatMap(
+              ({ target }) => (target === undefined ? [] : [target.identity]),
+            ),
           };
         }
         if (packageDraft.manager === "uv") {
@@ -2809,6 +2876,8 @@ export const discoverRepository = (
               packageDraft.cacheInputsComplete &&
               (resolution?.cacheInputsComplete ?? true),
             internalDependencies: resolution?.internalDependencies ?? [],
+            productionInternalDependencies:
+              resolution?.internalDependencies ?? [],
           };
         }
         const resolution = javascriptDependencyResolutionByDirectory.get(
@@ -2820,17 +2889,21 @@ export const discoverRepository = (
             packageDraft.cacheInputsComplete &&
             (resolution?.cacheInputsComplete ?? true),
           internalDependencies: resolution?.internalDependencies ?? [],
+          productionInternalDependencies:
+            resolution?.productionInternalDependencies ?? [],
         };
       })
       .sort((left, right) => left.identity.localeCompare(right.identity));
-    const rootTasks = Object.fromEntries(
-      Object.entries(rootConfiguration.value.tasks ?? {}).flatMap(
-        ([name, definition]) =>
-          name.startsWith("//#") && name.length > 3
-            ? [[name.slice(3), definition] as const]
-            : [],
-      ),
-    );
+    const rootTasks = options.singlePackage
+      ? (rootConfiguration.value.tasks ?? {})
+      : Object.fromEntries(
+          Object.entries(rootConfiguration.value.tasks ?? {}).flatMap(
+            ([name, definition]) =>
+              name.startsWith("//#") && name.length > 3
+                ? [[name.slice(3), definition] as const]
+                : [],
+          ),
+        );
     const rootDependencyResolution =
       javascriptDependencyResolutionByDirectory.get(normalizePath(root));
     const rootEnvironmentControls = yield* yarnEnvironmentControls(
@@ -2858,14 +2931,17 @@ export const discoverRepository = (
       dependencyNames: dependencyNames(rootManifest),
       internalDependencies:
         rootDependencyResolution?.internalDependencies ?? [],
+      productionInternalDependencies:
+        rootDependencyResolution?.productionInternalDependencies ?? [],
       excludedTasks: new Set<string>(),
       tasks: rootTasks,
       manifest: rootManifest,
     };
     const lockfile = yield* findLockfile(root, managerIdentity.name);
+    const repositoryPackages = options.singlePackage ? [rootPackage] : packages;
     const packagesByIdentity = new Map<string, RepositoryPackage>([
       [rootPackage.identity, rootPackage],
-      ...packages.map((entry) => [entry.identity, entry] as const),
+      ...repositoryPackages.map((entry) => [entry.identity, entry] as const),
     ]);
     return {
       root,
@@ -2878,7 +2954,7 @@ export const discoverRepository = (
       rootConfiguration,
       rootPackage,
       lockfile,
-      packages,
+      packages: repositoryPackages,
       packagesByIdentity,
       packagesByName: packagesByIdentity,
     };

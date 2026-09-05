@@ -37,4 +37,13 @@ describe("deterministic normalizers", () => {
       "turbo-ts <VERSION> (compatible with turbo <VERSION>)\n",
     );
   });
+
+  it("normalizes only the complete command banner", () => {
+    expect(normalizeOutput(`• ${versionOutput}\n`, ["branding"])).toBe(
+      "• turbo 2.10.12\n",
+    );
+    expect(
+      normalizeOutput(`task printed • ${versionOutput}\n`, ["branding"]),
+    ).toBe(`task printed • ${versionOutput}\n`);
+  });
 });

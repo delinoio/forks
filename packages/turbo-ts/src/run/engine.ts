@@ -51,6 +51,7 @@ import {
   ProcessService,
   RandomnessService,
   RetryScheduleService,
+  RuntimeProfileService,
   SigningService,
   TerminalService,
 } from "../effect/services.js";
@@ -66,8 +67,10 @@ import {
 import {
   decodeNullDelimitedGitOutput,
   effectiveTaskInputs,
+  hashGlobalInputFiles,
   hashTask,
   implicitTaskInputCandidates,
+  owningLockfile,
   type TaskHashResult,
   taskEnvironment,
 } from "../hash/task-hash.js";
@@ -78,6 +81,7 @@ import {
   renderLogEvent,
   renderTaskOutputChunk,
 } from "../logging/events.js";
+import { resolveLockfilePackageClosure } from "../repository/lockfiles.js";
 import {
   cargoHomeConfigurationPresent,
   configuredEnvironmentValue,
@@ -94,6 +98,7 @@ import {
   yarnUserConfigurationPresent,
 } from "../repository/model.js";
 import { type ParsedRunOptions, parseConcurrency } from "./options.js";
+import { defaultProfileArtifactName } from "./profile.js";
 
 interface CachePolicy {
   readonly localRead: boolean;
@@ -136,6 +141,7 @@ interface ResolvedRunOptions {
   readonly tasks: ReadonlyArray<string>;
   readonly passThroughArguments: ReadonlyArray<string>;
   readonly filters: ReadonlyArray<string>;
+  readonly globalDependencies: ReadonlyArray<string>;
   readonly affected: boolean;
   readonly concurrency: number;
   readonly continueMode: "always" | "dependencies-successful" | "never";
@@ -152,16 +158,73 @@ interface ResolvedRunOptions {
   readonly parallel: boolean;
   readonly remote?: RemoteCacheOptions;
   readonly colorEnabled: boolean;
+  readonly json: boolean;
+  readonly ui: "tui" | "stream" | "stream-with-experimental-timestamps";
+  readonly logOrder: "auto" | "stream" | "grouped";
+  readonly logPrefix: "auto" | "none" | "task";
 }
 
-interface TaskOutcome {
+type WriteStructuredRecord = (
+  record: Readonly<Record<string, unknown>>,
+) => Effect.Effect<void, unknown, never>;
+
+type OutputPermit = <A, E, R>(
+  output: Effect.Effect<A, E, R>,
+) => Effect.Effect<A, E, R>;
+
+export const resolveRunUiMode = (
+  requested: ResolvedRunOptions["ui"],
+  stdinIsTerminal: boolean,
+  stdoutIsTerminal: boolean,
+  json: boolean,
+): ResolvedRunOptions["ui"] =>
+  requested === "tui" && (json || !stdinIsTerminal || !stdoutIsTerminal)
+    ? "stream"
+    : requested;
+
+export const renderTimestampedStreamText = (
+  timestamp: number,
+  text: string,
+): string => renderTimestampedStreamChunk(true, timestamp, text).text;
+
+const renderTimestampedStreamChunk = (
+  atLineStart: boolean,
+  timestamp: number,
+  text: string,
+): { readonly atLineStart: boolean; readonly text: string } => {
+  if (text === "") return { atLineStart, text };
+  const prefix = `[${new Date(timestamp).toISOString()}] `;
+  const rendered = `${atLineStart ? prefix : ""}${text.replaceAll(
+    "\n",
+    `\n${prefix}`,
+  )}`.slice(0, text.endsWith("\n") ? -prefix.length : undefined);
+  return { atLineStart: text.endsWith("\n"), text: rendered };
+};
+
+type RunTuiStatus = "queued" | "running" | "succeeded" | "failed" | "skipped";
+
+export const renderRunTui = (
+  statuses: ReadonlyMap<string, RunTuiStatus>,
+): string =>
+  `\u001b[2J\u001b[Hturbo-ts\n\n${[...statuses]
+    .map(([id, status]) => `${status.padEnd(9)} ${id}`)
+    .join("\n")}\n`;
+
+interface TaskExecutionResult {
   readonly id: string;
   readonly exitCode: number;
   readonly hash?: string;
   readonly skipped: boolean;
+  readonly cacheSource?: "local" | "remote";
+  readonly cacheTimeSaved?: number;
 }
 
-type RunRequirements =
+interface TaskOutcome extends TaskExecutionResult {
+  readonly startTime: number;
+  readonly endTime: number;
+}
+
+export type RunRequirements =
   | ClockService
   | CompressionService
   | ConcurrencyService
@@ -498,6 +561,7 @@ export const resolveOptions = (
     tasks: parsed.tasks,
     passThroughArguments: parsed.passThroughArguments,
     filters: parsed.filters,
+    globalDependencies: parsed.globalDependencies,
     affected: parsed.affected,
     concurrency: parseConcurrency(
       concurrency ?? undefined,
@@ -542,6 +606,10 @@ export const resolveOptions = (
     parallel: parsed.parallel,
     remote,
     colorEnabled: !parsed.noColor && environmentValue("NO_COLOR") === undefined,
+    json: parsed.json,
+    ui: parsed.ui ?? value.ui ?? global?.ui ?? "stream",
+    logOrder: parsed.logOrder ?? "auto",
+    logPrefix: parsed.logPrefix ?? "auto",
   };
 };
 
@@ -555,6 +623,10 @@ interface AffectedPackages {
   readonly packages: ReadonlySet<string>;
   readonly changedFiles: ReadonlyArray<string>;
   readonly rootChanged: boolean;
+}
+
+interface RunExecutionContext {
+  readonly changedPaths?: ReadonlyArray<string>;
 }
 
 const packageRelativeChangedFile = (
@@ -588,6 +660,64 @@ const parseGitRange = (selector: string): GitRange => {
     });
   }
   return { source: selector, base, head };
+};
+
+const affectedPackagesFromChangedFiles = (
+  repository: RepositoryModel,
+  changedFiles: ReadonlyArray<string>,
+  globalInputsAreTaskAware: boolean,
+  windowsPathSeparators: boolean,
+  commandGlobalDependencies: ReadonlyArray<string> = [],
+): AffectedPackages => {
+  const globalDependencyPatterns = [
+    ...(repository.rootConfiguration.value.futureFlags?.globalConfiguration ===
+    true
+      ? globalInputsAreTaskAware
+        ? []
+        : (repository.rootConfiguration.value.global?.inputs ?? [])
+      : (repository.rootConfiguration.value.globalDependencies ?? [])),
+    ...commandGlobalDependencies,
+  ];
+  const globalDependencyChanged =
+    selectByGlobs(changedFiles, globalDependencyPatterns, windowsPathSeparators)
+      .length > 0;
+  const ordinaryRootChanged = changedFiles.some(
+    (path) =>
+      !repository.packages.some(
+        (packageModel) =>
+          packageModel.relativeDirectory !== "." &&
+          packageRelativeChangedFile(packageModel, path) !== undefined,
+      ),
+  );
+  const rootConfigurationChanged = changedFiles.includes(
+    relativePath(repository.root, repository.rootConfiguration.path),
+  );
+  const gitIgnoreChanged = changedFiles.some(
+    (path) => path === ".gitignore" || path.endsWith("/.gitignore"),
+  );
+  const rootChanged =
+    globalDependencyChanged ||
+    rootConfigurationChanged ||
+    gitIgnoreChanged ||
+    (!globalInputsAreTaskAware && ordinaryRootChanged);
+  return {
+    packages: rootChanged
+      ? new Set(
+          repository.packages.map((packageModel) => packageModel.identity),
+        )
+      : new Set(
+          repository.packages
+            .filter((packageModel) =>
+              changedFiles.some(
+                (path) =>
+                  packageRelativeChangedFile(packageModel, path) !== undefined,
+              ),
+            )
+            .map((packageModel) => packageModel.identity),
+        ),
+    changedFiles,
+    rootChanged,
+  };
 };
 
 const gitRangeSelector = (rawFilter: string): string | undefined => {
@@ -694,57 +824,12 @@ const findAffectedPackages = (
             cause instanceof RepositoryError ? cause.message : String(cause),
         }),
     });
-    const globalDependencyPatterns =
-      repository.rootConfiguration.value.futureFlags?.globalConfiguration ===
-      true
-        ? globalInputsAreTaskAware
-          ? []
-          : (repository.rootConfiguration.value.global?.inputs ?? [])
-        : (repository.rootConfiguration.value.globalDependencies ?? []);
-    const globalDependencyChanged =
-      selectByGlobs(
-        changedFiles,
-        globalDependencyPatterns,
-        windowsPathSeparators,
-      ).length > 0;
-    const ordinaryRootChanged = changedFiles.some(
-      (path) =>
-        !repository.packages.some(
-          (packageModel) =>
-            packageModel.relativeDirectory !== "." &&
-            packageRelativeChangedFile(packageModel, path) !== undefined,
-        ),
-    );
-    const rootConfigurationChanged = changedFiles.includes(
-      relativePath(repository.root, repository.rootConfiguration.path),
-    );
-    const gitIgnoreChanged = changedFiles.some(
-      (path) => path === ".gitignore" || path.endsWith("/.gitignore"),
-    );
-    const rootChanged =
-      globalDependencyChanged ||
-      rootConfigurationChanged ||
-      gitIgnoreChanged ||
-      (!globalInputsAreTaskAware && ordinaryRootChanged);
-    return {
-      packages: rootChanged
-        ? new Set(
-            repository.packages.map((packageModel) => packageModel.identity),
-          )
-        : new Set(
-            repository.packages
-              .filter((packageModel) =>
-                changedFiles.some(
-                  (path) =>
-                    packageRelativeChangedFile(packageModel, path) !==
-                    undefined,
-                ),
-              )
-              .map((packageModel) => packageModel.identity),
-          ),
+    return affectedPackagesFromChangedFiles(
+      repository,
       changedFiles,
-      rootChanged,
-    };
+      globalInputsAreTaskAware,
+      windowsPathSeparators,
+    );
   });
 
 const defaultAffectedSelector = "$TURBO_DEFAULT_AFFECTED$";
@@ -1321,6 +1406,49 @@ const collectOutputPaths = (
     return [...selected].sort();
   });
 
+const taskOutputContainsPath = (
+  repositoryRoot: string,
+  packageDirectory: string,
+  node: TaskNode,
+  path: string,
+  windowsPathSeparators: boolean,
+): boolean => {
+  const rootOutputPrefix = "$TURBO_ROOT$/";
+  const outputPatterns = node.definition.outputs ?? [];
+  const packagePatterns = outputPatterns.filter(
+    (pattern) => !pattern.replace(/^!/, "").startsWith(rootOutputPrefix),
+  );
+  if (
+    packagePatterns.length > 0 &&
+    isPathContained(packageDirectory, path, windowsPathSeparators) &&
+    matchesGlobsWithExclusions(
+      [relativePath(packageDirectory, path, windowsPathSeparators)],
+      packagePatterns,
+      windowsPathSeparators,
+    )
+  ) {
+    return true;
+  }
+  if (!isPathContained(repositoryRoot, path, windowsPathSeparators)) {
+    return false;
+  }
+  const rootPatterns = outputPatterns.flatMap((pattern) => {
+    const negative = pattern.startsWith("!");
+    const value = negative ? pattern.slice(1) : pattern;
+    return value.startsWith(rootOutputPrefix)
+      ? [`${negative ? "!" : ""}${value.slice(rootOutputPrefix.length)}`]
+      : [];
+  });
+  return (
+    rootPatterns.length > 0 &&
+    matchesGlobsWithExclusions(
+      [relativePath(repositoryRoot, path, windowsPathSeparators)],
+      rootPatterns,
+      windowsPathSeparators,
+    )
+  );
+};
+
 const collectCacheEntries = (
   repository: RepositoryModel,
   nodes: ReadonlyArray<TaskNode>,
@@ -1490,7 +1618,11 @@ const shouldReplayOutput = (
   mode === undefined || mode === "full" || (mode === "new-only" && !cacheHit);
 
 type TaskOutputQueueEvent =
-  | { readonly kind: "chunk"; readonly output: string }
+  | {
+      readonly kind: "chunk";
+      readonly output: string;
+      readonly level: "stdout" | "stderr";
+    }
   | { readonly kind: "end" };
 
 const persistentOutputCaptureCharacters = 64 * 1024;
@@ -1696,6 +1828,108 @@ const taskExecutionDirectory = (
   scope: TaskCommandScope | undefined,
 ): string =>
   scope?.kind === "cargo-workspace" ? scope.directory : node.package.directory;
+
+const taskLogPath = (
+  node: TaskNode,
+  scope: TaskCommandScope | undefined,
+  identifier = node.task,
+): string =>
+  joinPath(
+    taskExecutionDirectory(node, scope),
+    ".turbo",
+    `turbo-${encodeTaskLogIdentifier(identifier)}.log`,
+  );
+
+const emptyExternalDependenciesHash = "459c029558afe716";
+
+const packagesExternalDependenciesHash = (
+  repository: RepositoryModel,
+  packageModels: ReadonlyArray<RepositoryPackage>,
+  lockfile: string | undefined,
+): Effect.Effect<string, RepositoryError, FileSystemService> =>
+  Effect.gen(function* () {
+    if (lockfile === undefined) return emptyExternalDependenciesHash;
+    const fileSystem = yield* FileSystemService;
+    const contents = yield* fileSystem
+      .readBytes(lockfile)
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new RepositoryError({ path: lockfile, message: error.message }),
+        ),
+      );
+    const identities = yield* Effect.try({
+      try: () => {
+        const workspacePackages = repository.packages.flatMap((packageModel) =>
+          packageModel.manifest.version === undefined
+            ? []
+            : [
+                {
+                  name: packageModel.name,
+                  version: packageModel.manifest.version,
+                },
+              ],
+        );
+        return [
+          ...new Set(
+            packageModels.flatMap((packageModel) => {
+              const manifestDependencyReferences = new Map(
+                [
+                  packageModel.manifest.dependencies,
+                  packageModel.manifest.devDependencies,
+                  packageModel.manifest.optionalDependencies,
+                  packageModel.manifest.peerDependencies,
+                ].flatMap((dependencies) => Object.entries(dependencies ?? {})),
+              );
+              const directExternalDependencies =
+                packageModel.dependencyNames.map(
+                  (name) =>
+                    [name, manifestDependencyReferences.get(name)] as const,
+                );
+              return resolveLockfilePackageClosure(lockfile, contents, {
+                workspacePath: packageModel.relativeDirectory,
+                packageName: packageModel.name,
+                packageVersion: packageModel.manifest.version,
+                directDependencies: directExternalDependencies,
+                workspacePackages,
+              }).map(
+                (dependency) => `${dependency.name}@${dependency.version}`,
+              );
+            }),
+          ),
+        ].sort();
+      },
+      catch: (cause) =>
+        new RepositoryError({ path: lockfile, message: String(cause) }),
+    });
+    return identities.length === 0
+      ? emptyExternalDependenciesHash
+      : xxhash64Hex(JSON.stringify(identities));
+  });
+
+const packageExternalDependenciesHash = (
+  repository: RepositoryModel,
+  packageModel: RepositoryPackage,
+  lockfile: string | undefined,
+): Effect.Effect<string, RepositoryError, FileSystemService> =>
+  packagesExternalDependenciesHash(repository, [packageModel], lockfile);
+
+const taskExternalDependenciesHash = (
+  repository: RepositoryModel,
+  node: TaskNode,
+  scope: TaskCommandScope | undefined,
+): Effect.Effect<string, RepositoryError, FileSystemService> =>
+  owningLockfile(repository, node).pipe(
+    Effect.flatMap((lockfile) =>
+      packagesExternalDependenciesHash(
+        repository,
+        scope?.kind === "cargo-workspace"
+          ? scope.members.map((member) => member.package)
+          : [node.package],
+        lockfile,
+      ),
+    ),
+  );
 
 const taskLogIdentifiers = (
   repository: RepositoryModel,
@@ -2123,7 +2357,9 @@ const executeTask = (
   withCachePublicationPermit: CachePublicationPermit = (publication) =>
     publication,
   logIdentifier = node.task,
-): Effect.Effect<TaskOutcome, unknown, RunRequirements> =>
+  withOutputPermit: OutputPermit = (output) => output,
+  writeStructuredRecord: WriteStructuredRecord = () => Effect.void,
+): Effect.Effect<TaskExecutionResult, unknown, RunRequirements> =>
   Effect.gen(function* () {
     const terminal = yield* TerminalService;
     const fileSystem = yield* FileSystemService;
@@ -2137,10 +2373,67 @@ const executeTask = (
     const warningColor = options.colorEnabled
       ? yield* terminal.stderrColorEnabled
       : false;
+    const taskLabel = `${node.package.name}:${node.task}`;
+    const prefixTask = options.logPrefix !== "none";
+    let timestampedStreamAtLineStart = true;
+    const renderStreamText = (timestamp: number, text: string): string => {
+      if (options.ui !== "stream-with-experimental-timestamps") return text;
+      const rendered = renderTimestampedStreamChunk(
+        timestampedStreamAtLineStart,
+        timestamp,
+        text,
+      );
+      timestampedStreamAtLineStart = rendered.atLineStart;
+      return rendered.text;
+    };
+    const taskRecord = (
+      timestamp: number,
+      level: "info" | "stdout" | "stderr",
+      text: string,
+    ) =>
+      ({
+        type: "task_event",
+        timestamp,
+        source: taskLabel,
+        level,
+        text,
+      }) as const;
+    const writeTaskEvent = (
+      level: "info" | "stdout" | "stderr",
+      text: string,
+      recordStructuredOutput = true,
+    ) =>
+      clock.now.pipe(
+        Effect.flatMap((timestamp) => {
+          const record = taskRecord(timestamp, level, text);
+          return (
+            recordStructuredOutput ? writeStructuredRecord(record) : Effect.void
+          ).pipe(
+            Effect.zipRight(
+              options.json
+                ? terminal.writeStdout(`${JSON.stringify(record)}\n`)
+                : options.ui === "tui"
+                  ? Effect.void
+                  : terminal.writeStdout(renderStreamText(timestamp, text)),
+            ),
+          );
+        }),
+      );
+    const writeTaskWarning = (message: string) =>
+      clock.now.pipe(
+        Effect.flatMap((timestamp) =>
+          writeStructuredRecord(taskRecord(timestamp, "stderr", message)).pipe(
+            Effect.zipRight(
+              terminal.writeStderr(
+                renderLogEvent({ kind: "warning", message }, warningColor),
+              ),
+            ),
+          ),
+        ),
+      );
     if (node.command === undefined) {
       return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
     }
-    const taskLabel = `${node.package.name}:${node.task}`;
     const outputMode =
       options.outputLogs ?? node.definition.outputLogs ?? undefined;
     const showHashEvent =
@@ -2164,11 +2457,55 @@ const executeTask = (
       maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
       maxSizeBytes: options.cacheMaxSizeBytes,
     };
-    const logPath = joinPath(
-      executionDirectory,
-      ".turbo",
-      `turbo-${encodeTaskLogIdentifier(logIdentifier)}.log`,
-    );
+    const logPath = taskLogPath(node, scope, logIdentifier);
+    const replayTaskLog = (recordOutput: boolean) =>
+      Effect.gen(function* () {
+        const hasLog = yield* fileSystem
+          .exists(logPath)
+          .pipe(
+            Effect.mapError(
+              (error) =>
+                new RepositoryError({ path: logPath, message: error.message }),
+            ),
+          );
+        if (!hasLog) return;
+        let renderState = initialTaskOutputRenderState;
+        yield* fileSystem.readTextChunks(logPath).pipe(
+          Stream.mapError(
+            (error) =>
+              new RepositoryError({ path: logPath, message: error.message }),
+          ),
+          Stream.runForEach((output) =>
+            Effect.gen(function* () {
+              const timestamp = yield* clock.now;
+              const record = taskRecord(timestamp, "info", output);
+              if (recordOutput) yield* writeStructuredRecord(record);
+              if (options.json) {
+                yield* terminal.writeStdout(`${JSON.stringify(record)}\n`);
+                return;
+              }
+              const rendered = renderTaskOutputChunk(
+                renderState,
+                taskLabel,
+                output,
+                color,
+                prefixTask,
+              );
+              renderState = rendered.state;
+              for (const chunk of rendered.chunks) {
+                yield* terminal.writeStdout(renderStreamText(timestamp, chunk));
+              }
+            }),
+          ),
+        );
+        if (!options.json) {
+          for (const chunk of finishTaskOutput(renderState)) {
+            yield* terminal.writeStdout(
+              renderStreamText(yield* clock.now, chunk),
+            );
+          }
+        }
+      });
     const cacheRestoreRequested =
       cacheable &&
       !options.force &&
@@ -2188,17 +2525,9 @@ const executeTask = (
             ),
           ),
           Effect.catchTag("RepositoryError", (error) =>
-            terminal
-              .writeStderr(
-                renderLogEvent(
-                  {
-                    kind: "warning",
-                    message: `cache restore preparation failed for ${taskLabel}; executing task locally without cache reads: ${error.message}`,
-                  },
-                  warningColor,
-                ),
-              )
-              .pipe(Effect.ignore, Effect.as(undefined)),
+            writeTaskWarning(
+              `cache restore preparation failed for ${taskLabel}; executing task locally without cache reads: ${error.message}`,
+            ).pipe(Effect.ignore, Effect.as(undefined)),
           ),
         )
       : [];
@@ -2213,6 +2542,8 @@ const executeTask = (
       options.cacheExclusionDirectory,
     );
     let cacheHit = false;
+    let cacheSource: TaskExecutionResult["cacheSource"];
+    let cacheTimeSaved = 0;
     if (cacheRestoreEnabled && options.cachePolicy.localRead) {
       cacheHit = yield* restoreLocalCache(
         repository.root,
@@ -2220,19 +2551,15 @@ const executeTask = (
         hash.hash,
         restoreScope,
         platform === "win32",
+        (duration) => {
+          cacheSource = "local";
+          cacheTimeSaved = duration;
+        },
       ).pipe(
         Effect.catchTag("CacheError", (error) =>
-          terminal
-            .writeStderr(
-              renderLogEvent(
-                {
-                  kind: "warning",
-                  message: `local cache restore failed for ${taskLabel}; continuing without local cache: ${error.message}`,
-                },
-                warningColor,
-              ),
-            )
-            .pipe(Effect.ignore, Effect.as(false)),
+          writeTaskWarning(
+            `local cache restore failed for ${taskLabel}; continuing without local cache: ${error.message}`,
+          ).pipe(Effect.ignore, Effect.as(false)),
         ),
       );
     }
@@ -2248,90 +2575,54 @@ const executeTask = (
         hash.hash,
         restoreScope,
         platform === "win32",
+        (duration) => {
+          cacheSource = "remote";
+          cacheTimeSaved = duration;
+        },
       ).pipe(
         Effect.catchTag("CacheError", (error) =>
-          terminal
-            .writeStderr(
-              renderLogEvent(
-                {
-                  kind: "warning",
-                  message: `remote cache restore failed for ${taskLabel}; executing task locally: ${error.message}`,
-                },
-                warningColor,
-              ),
-            )
-            .pipe(Effect.ignore, Effect.as(false)),
+          writeTaskWarning(
+            `remote cache restore failed for ${taskLabel}; executing task locally: ${error.message}`,
+          ).pipe(Effect.ignore, Effect.as(false)),
         ),
       );
     }
     if (cacheHit) {
       if (outputMode !== "none" && showHashEvent) {
-        yield* terminal.writeStdout(
+        yield* writeTaskEvent(
+          "info",
           renderLogEvent(
             { kind: "cache-hit", task: taskLabel, hash: hash.hash },
             color,
+            options.json ? false : prefixTask,
           ),
         );
       }
       if (shouldReplayOutput(outputMode, true)) {
-        yield* Effect.gen(function* () {
-          const hasLog = yield* fileSystem.exists(logPath).pipe(
-            Effect.mapError(
-              (error) =>
-                new RepositoryError({
-                  path: logPath,
-                  message: error.message,
-                }),
-            ),
-          );
-          if (!hasLog) return;
-          let renderState = initialTaskOutputRenderState;
-          yield* fileSystem.readTextChunks(logPath).pipe(
-            Stream.mapError(
-              (error) =>
-                new RepositoryError({ path: logPath, message: error.message }),
-            ),
-            Stream.runForEach((output) =>
-              Effect.gen(function* () {
-                const rendered = renderTaskOutputChunk(
-                  renderState,
-                  taskLabel,
-                  output,
-                  color,
-                );
-                renderState = rendered.state;
-                for (const chunk of rendered.chunks) {
-                  yield* terminal.writeStdout(chunk);
-                }
-              }),
-            ),
-          );
-          for (const chunk of finishTaskOutput(renderState)) {
-            yield* terminal.writeStdout(chunk);
-          }
-        }).pipe(
-          Effect.catchTag("RepositoryError", (error) =>
-            terminal
-              .writeStderr(
-                renderLogEvent(
-                  {
-                    kind: "warning",
-                    message: `cached log replay failed for ${taskLabel}; preserving successful cache hit: ${error.message}`,
-                  },
-                  warningColor,
-                ),
-              )
-              .pipe(Effect.ignore),
+        yield* withOutputPermit(replayTaskLog(true)).pipe(
+          Effect.catchAll((error) =>
+            writeTaskWarning(
+              `cached log replay failed for ${taskLabel}; preserving successful cache hit: ${String(error)}`,
+            ).pipe(Effect.ignore),
           ),
         );
       }
-      return { id: node.id, exitCode: 0, hash: hash.hash, skipped: false };
+      return {
+        id: node.id,
+        exitCode: 0,
+        hash: hash.hash,
+        skipped: false,
+        cacheSource,
+        cacheTimeSaved,
+      };
     }
     if (outputMode !== "none" && showHashEvent) {
-      yield* terminal.writeStdout(
+      yield* writeTaskEvent(
+        "info",
         renderLogEvent(
           { kind: "cache-miss", task: taskLabel, hash: hash.hash },
           color,
+          options.json ? false : prefixTask,
         ),
       );
     }
@@ -2343,13 +2634,21 @@ const executeTask = (
       scope,
     );
     const processService = yield* ProcessService;
-    const startProcess = (onOutputChunk?: (chunk: string) => void) =>
+    const startProcess = (
+      onOutputChunk?: (
+        chunk: string,
+        level: "stdout" | "stderr",
+      ) => void | PromiseLike<void>,
+    ) =>
       processService.run({
         command: invocation.command,
         args: invocation.arguments,
         cwd: invocation.cwd,
         inheritEnvironment: false,
-        stdio: node.definition.interactive === true ? "inherit" : "capture",
+        stdio:
+          node.definition.interactive === true && !options.json
+            ? "inherit"
+            : "capture",
         onOutputChunk,
         maxCapturedOutputCharacters:
           onOutputChunk === undefined
@@ -2360,72 +2659,150 @@ const executeTask = (
           TURBO_HASH: hash.hash,
         },
       });
-    const streamsCapturedOutput = node.definition.interactive !== true;
+    const streamsCapturedOutput =
+      node.definition.interactive !== true || options.json;
     const displaysStreamedOutput =
-      streamsCapturedOutput && shouldReplayOutput(outputMode, false);
-    const result = streamsCapturedOutput
-      ? yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* fileSystem.writeText(logPath, "");
-            const outputQueue = yield* Queue.bounded<TaskOutputQueueEvent>(
-              persistentOutputQueueCapacity,
-            );
-            yield* Effect.addFinalizer(() => Queue.shutdown(outputQueue));
-            const outputFiber = yield* Effect.forkScoped(
-              Effect.gen(function* () {
-                let renderState = initialTaskOutputRenderState;
-                while (true) {
-                  const event = yield* Queue.take(outputQueue);
-                  if (event.kind === "end") {
-                    if (displaysStreamedOutput) {
-                      for (const chunk of finishTaskOutput(renderState)) {
-                        yield* terminal.writeStdout(chunk);
-                      }
+      streamsCapturedOutput &&
+      shouldReplayOutput(outputMode, false) &&
+      options.logOrder !== "grouped" &&
+      options.ui !== "tui";
+    const buffersJsonOutput =
+      streamsCapturedOutput && options.json && !displaysStreamedOutput;
+    const captureProcessOutput = (bufferedJsonPath?: string) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* fileSystem.writeText(logPath, "");
+          if (bufferedJsonPath !== undefined) {
+            yield* fileSystem.writeText(bufferedJsonPath, "");
+          }
+          const outputQueue = yield* Queue.bounded<TaskOutputQueueEvent>(
+            persistentOutputQueueCapacity,
+          );
+          yield* Effect.addFinalizer(() => Queue.shutdown(outputQueue));
+          const outputFiber = yield* Effect.forkScoped(
+            Effect.gen(function* () {
+              let renderState = initialTaskOutputRenderState;
+              let renderLevel: "stdout" | "stderr" = "stdout";
+              while (true) {
+                const event = yield* Queue.take(outputQueue);
+                if (event.kind === "end") {
+                  if (displaysStreamedOutput) {
+                    for (const chunk of finishTaskOutput(renderState)) {
+                      yield* writeTaskEvent(renderLevel, chunk, false);
                     }
-                    return;
                   }
-                  yield* fileSystem.appendText(logPath, event.output);
-                  if (!displaysStreamedOutput) continue;
-                  const rendered = renderTaskOutputChunk(
-                    renderState,
-                    taskLabel,
-                    event.output,
-                    color,
-                  );
-                  renderState = rendered.state;
-                  for (const chunk of rendered.chunks) {
-                    yield* terminal.writeStdout(chunk);
-                  }
+                  return;
                 }
-              }),
-            );
-            const processResult = yield* Effect.raceFirst(
-              startProcess((output) =>
-                Effect.runPromise(
-                  Queue.offer(outputQueue, { kind: "chunk", output }).pipe(
-                    Effect.asVoid,
+                yield* fileSystem.appendText(logPath, event.output);
+                if (!displaysStreamedOutput) {
+                  const timestamp = yield* clock.now;
+                  const record = taskRecord(
+                    timestamp,
+                    event.level,
+                    event.output,
+                  );
+                  yield* writeStructuredRecord(record);
+                  if (bufferedJsonPath !== undefined) {
+                    yield* fileSystem.appendText(
+                      bufferedJsonPath,
+                      `${JSON.stringify(record)}\n`,
+                    );
+                  }
+                  continue;
+                }
+                if (options.json) {
+                  yield* writeTaskEvent(event.level, event.output);
+                  continue;
+                }
+                yield* clock.now.pipe(
+                  Effect.flatMap((timestamp) =>
+                    writeStructuredRecord(
+                      taskRecord(timestamp, event.level, event.output),
+                    ),
                   ),
-                ),
+                );
+                renderLevel = event.level;
+                const rendered = renderTaskOutputChunk(
+                  renderState,
+                  taskLabel,
+                  event.output,
+                  color,
+                  prefixTask,
+                );
+                renderState = rendered.state;
+                for (const chunk of rendered.chunks) {
+                  yield* writeTaskEvent(event.level, chunk, false);
+                }
+              }
+            }),
+          );
+          const processResult = yield* Effect.raceFirst(
+            startProcess((output, level) =>
+              Effect.runPromise(
+                Queue.offer(outputQueue, {
+                  kind: "chunk",
+                  output,
+                  level,
+                }).pipe(Effect.asVoid),
               ),
-              Fiber.join(outputFiber).pipe(Effect.flatMap(() => Effect.never)),
+            ),
+            Fiber.join(outputFiber).pipe(Effect.flatMap(() => Effect.never)),
+          );
+          yield* Queue.offer(outputQueue, { kind: "end" });
+          yield* Fiber.join(outputFiber);
+          const replayBufferedJson =
+            shouldReplayOutput(outputMode, false) ||
+            (outputMode === "errors-only" && processResult.exitCode !== 0);
+          if (
+            bufferedJsonPath !== undefined &&
+            replayBufferedJson &&
+            options.ui !== "tui"
+          ) {
+            yield* withOutputPermit(
+              fileSystem
+                .readTextChunks(bufferedJsonPath)
+                .pipe(
+                  Stream.runForEach((output) => terminal.writeStdout(output)),
+                ),
             );
-            yield* Queue.offer(outputQueue, { kind: "end" });
-            yield* Fiber.join(outputFiber);
-            return processResult;
-          }),
-        )
+          }
+          return processResult;
+        }),
+      );
+    const result = streamsCapturedOutput
+      ? buffersJsonOutput
+        ? yield* fileSystem.withTemporaryDirectory((directory) =>
+            captureProcessOutput(joinPath(directory, "task-output.ndjson")),
+          )
+        : yield* captureProcessOutput()
       : yield* Effect.scoped(startProcess());
     const output = result.combinedOutput;
     if (!streamsCapturedOutput) {
       yield* fileSystem.writeText(logPath, output);
     }
+    const replayCompletedOutput =
+      shouldReplayOutput(outputMode, false) ||
+      (outputMode === "errors-only" && result.exitCode !== 0);
     if (
-      (!displaysStreamedOutput && shouldReplayOutput(outputMode, false)) ||
-      (outputMode === "errors-only" && result.exitCode !== 0)
+      !displaysStreamedOutput &&
+      replayCompletedOutput &&
+      options.ui !== "tui"
     ) {
-      yield* terminal.writeStdout(
-        renderLogEvent({ kind: "task-output", task: taskLabel, output }, color),
-      );
+      if (streamsCapturedOutput) {
+        if (!buffersJsonOutput) {
+          yield* withOutputPermit(replayTaskLog(false));
+        }
+      } else {
+        yield* writeTaskEvent(
+          "stdout",
+          renderLogEvent(
+            { kind: "task-output", task: taskLabel, output },
+            color,
+            options.json ? false : prefixTask,
+          ),
+          !streamsCapturedOutput,
+        );
+      }
     }
     if (result.exitCode !== 0) {
       return {
@@ -2450,29 +2827,15 @@ const executeTask = (
             platform === "win32",
           ).pipe(
             Effect.catchAll((error) =>
-              terminal
-                .writeStderr(
-                  renderLogEvent(
-                    {
-                      kind: "warning",
-                      message: `cache output collection failed for ${taskLabel}; skipping cache publication while preserving successful task result: ${error.message}`,
-                    },
-                    warningColor,
-                  ),
-                )
-                .pipe(Effect.ignore, Effect.as(undefined)),
+              writeTaskWarning(
+                `cache output collection failed for ${taskLabel}; skipping cache publication while preserving successful task result: ${error.message}`,
+              ).pipe(Effect.ignore, Effect.as(undefined)),
             ),
           );
           if (collected === undefined) return;
           if (collected.kind === "too-large") {
-            yield* terminal.writeStderr(
-              renderLogEvent(
-                {
-                  kind: "warning",
-                  message: `cache write skipped for ${taskLabel}; ${collected.inputBytes} bytes of task outputs exceed the ${maximumCacheArchiveInputBytes} byte safety limit`,
-                },
-                warningColor,
-              ),
+            yield* writeTaskWarning(
+              `cache write skipped for ${taskLabel}; ${collected.inputBytes} bytes of task outputs exceed the ${maximumCacheArchiveInputBytes} byte safety limit`,
             );
             return;
           }
@@ -2486,17 +2849,9 @@ const executeTask = (
               platform === "win32",
             ).pipe(
               Effect.catchAll((error) =>
-                terminal
-                  .writeStderr(
-                    renderLogEvent(
-                      {
-                        kind: "warning",
-                        message: `local cache write failed for ${taskLabel}; preserving successful task result: ${error.message}`,
-                      },
-                      warningColor,
-                    ),
-                  )
-                  .pipe(Effect.ignore),
+                writeTaskWarning(
+                  `local cache write failed for ${taskLabel}; preserving successful task result: ${error.message}`,
+                ).pipe(Effect.ignore),
               ),
             );
           }
@@ -2509,17 +2864,9 @@ const executeTask = (
               platform === "win32",
             ).pipe(
               Effect.catchAll((error) =>
-                terminal
-                  .writeStderr(
-                    renderLogEvent(
-                      {
-                        kind: "warning",
-                        message: `remote cache upload failed for ${taskLabel}; preserving successful task result: ${error.message}`,
-                      },
-                      warningColor,
-                    ),
-                  )
-                  .pipe(Effect.ignore),
+                writeTaskWarning(
+                  `remote cache upload failed for ${taskLabel}; preserving successful task result: ${error.message}`,
+                ).pipe(Effect.ignore),
               ),
             );
           }
@@ -2536,6 +2883,8 @@ const computeTaskHashes = (
   sourceEnvironment: Readonly<Record<string, string | undefined>>,
   caseInsensitiveEnvironmentNames: boolean,
   cacheabilityByTask: ReadonlyMap<string, TaskScopeCacheability>,
+  excludedInputPaths: ReadonlyArray<string>,
+  excludeDefaultProfileArtifacts: boolean,
 ): Effect.Effect<
   ReadonlyMap<string, TaskHashResult>,
   RepositoryError,
@@ -2566,6 +2915,9 @@ const computeTaskHashes = (
         ),
         cacheabilityByTask.get(id)?.uvRuntimeIdentity,
         cacheabilityByTask.get(id)?.packageManagerRuntimeIdentity,
+        options.globalDependencies,
+        excludedInputPaths,
+        excludeDefaultProfileArtifacts,
       );
       hashes.set(id, result);
     }
@@ -2710,6 +3062,8 @@ const applyCargoWorkspaceHashes = (
   sourceEnvironment: Readonly<Record<string, string | undefined>>,
   caseInsensitiveEnvironmentNames: boolean,
   cacheabilityByTask: ReadonlyMap<string, TaskScopeCacheability>,
+  excludedInputPaths: ReadonlyArray<string>,
+  excludeDefaultProfileArtifacts: boolean,
 ): Effect.Effect<
   ReadonlyMap<string, TaskHashResult>,
   RepositoryError,
@@ -2765,6 +3119,9 @@ const applyCargoWorkspaceHashes = (
           ),
           cacheabilityByTask.get(id)?.uvRuntimeIdentity,
           cacheabilityByTask.get(id)?.packageManagerRuntimeIdentity,
+          options.globalDependencies,
+          excludedInputPaths,
+          excludeDefaultProfileArtifacts,
         ),
       );
       changed.add(id);
@@ -2845,8 +3202,9 @@ const readyForegroundCohorts = (
   return cohorts.sort((left, right) => left[0]!.localeCompare(right[0]!));
 };
 
-const canonicalContainmentPath = (
+export const canonicalExistingAncestorPath = (
   path: string,
+  description = "cache directory",
 ): Effect.Effect<string, ConfigurationError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -2866,7 +3224,7 @@ const canonicalContainmentPath = (
         return yield* Effect.fail(
           new ConfigurationError({
             path,
-            message: "unable to resolve cache directory ancestry",
+            message: `unable to resolve ${description} ancestry`,
           }),
         );
       }
@@ -2885,6 +3243,7 @@ const canonicalContainmentPath = (
 
 export const executeRun = (
   parsed: ParsedRunOptions,
+  context: RunExecutionContext = {},
 ): Effect.Effect<number, unknown, RunRequirements> =>
   Effect.gen(function* () {
     const environmentService = yield* EnvironmentService;
@@ -2966,8 +3325,8 @@ export const executeRun = (
       platform === "win32",
     );
     const [canonicalRoot, canonicalCacheDirectory] = yield* Effect.all([
-      canonicalContainmentPath(unresolvedOptions.root),
-      canonicalContainmentPath(unresolvedOptions.cacheDirectory),
+      canonicalExistingAncestorPath(unresolvedOptions.root),
+      canonicalExistingAncestorPath(unresolvedOptions.cacheDirectory),
     ]);
     if (isPathContained(canonicalCacheDirectory, canonicalRoot)) {
       return yield* Effect.fail(
@@ -2978,8 +3337,23 @@ export const executeRun = (
         }),
       );
     }
+    const terminal = yield* TerminalService;
+    const stdinIsTerminal =
+      terminal.stdinIsTerminal === undefined
+        ? false
+        : yield* terminal.stdinIsTerminal;
+    const stdoutIsTerminal =
+      terminal.stdoutIsTerminal === undefined
+        ? false
+        : yield* terminal.stdoutIsTerminal;
     const options: ResolvedRunOptions = {
       ...unresolvedOptions,
+      ui: resolveRunUiMode(
+        unresolvedOptions.ui,
+        stdinIsTerminal,
+        stdoutIsTerminal,
+        unresolvedOptions.json,
+      ),
       cacheExclusionDirectory: isPathContained(
         canonicalRoot,
         canonicalCacheDirectory,
@@ -2990,7 +3364,9 @@ export const executeRun = (
           )
         : unresolvedOptions.cacheDirectory,
     };
-    const repository = yield* discoverRepository(options.root, configuration);
+    const repository = yield* discoverRepository(options.root, configuration, {
+      singlePackage: parsed.singlePackage,
+    });
     const containedPackage = repository.packages.find((packageModel) =>
       isPathContained(
         canonicalCacheDirectory,
@@ -3003,33 +3379,6 @@ export const executeRun = (
           path: unresolvedOptions.cacheDirectory,
           message: `cache directory must not contain package ${containedPackage.name}`,
         }),
-      );
-    }
-    if (options.cachePolicy.localRead || options.cachePolicy.localWrite) {
-      yield* evictLocalCache({
-        directory: options.cacheDirectory,
-        maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
-        maxSizeBytes: options.cacheMaxSizeBytes,
-      }).pipe(
-        Effect.catchTag("CacheError", (error) =>
-          Effect.gen(function* () {
-            const terminal = yield* TerminalService;
-            const warningColor = options.colorEnabled
-              ? yield* terminal.stderrColorEnabled
-              : false;
-            yield* terminal
-              .writeStderr(
-                renderLogEvent(
-                  {
-                    kind: "warning",
-                    message: `local cache eviction failed; continuing without cache maintenance: ${error.message}`,
-                  },
-                  warningColor,
-                ),
-              )
-              .pipe(Effect.ignore);
-          }),
-        ),
       );
     }
     const packageManagerCheckDisabled =
@@ -3064,6 +3413,18 @@ export const executeRun = (
       platform === "win32",
     );
     const flags = repository.rootConfiguration.value.futureFlags;
+    const watchChanges =
+      flags?.watchUsingTaskInputs === true && context.changedPaths !== undefined
+        ? affectedPackagesFromChangedFiles(
+            repository,
+            context.changedPaths.map((path) =>
+              relativePath(repository.root, path),
+            ),
+            true,
+            platform === "win32",
+            options.globalDependencies,
+          )
+        : undefined;
     const useTaskInputs =
       (options.affected && flags?.affectedUsingTaskInputs === true) ||
       (affected.hasGitRangeFilter && flags?.filterUsingTasks === true);
@@ -3144,7 +3505,7 @@ export const executeRun = (
       options.only,
       flags?.strictTaskEntrypointSelection === true,
     );
-    const selectedGraph = useTaskInputs
+    const affectedGraph = useTaskInputs
       ? selectAffectedTasks(
           repository,
           unfilteredGraph,
@@ -3157,6 +3518,24 @@ export const executeRun = (
           platform === "win32",
         )
       : unfilteredGraph;
+    const selectedGraph =
+      watchChanges === undefined
+        ? affectedGraph
+        : retainTaskEntrypoints(
+            affectedGraph,
+            affectedTaskEntrypoints(
+              repository,
+              affectedGraph,
+              watchChanges.changedFiles,
+              watchChanges.rootChanged,
+              "",
+              undefined,
+              environment,
+              options.environmentMode,
+              options.frameworkInference,
+              platform === "win32",
+            ),
+          );
     const cargoWorkspacePlan = planCargoWorkspaceTasks(
       repository,
       selectedGraph,
@@ -3164,6 +3543,157 @@ export const executeRun = (
       affected.filters.length === 0,
     );
     const graph = cargoWorkspacePlan.graph;
+    const logIdentifiers = taskLogIdentifiers(
+      repository,
+      graph,
+      cargoWorkspacePlan.scopes,
+      platform === "win32",
+    );
+    const resolveExplicitRunArtifactPath = (
+      requestedPath: string | undefined,
+    ): string | undefined =>
+      requestedPath === undefined || requestedPath === ""
+        ? undefined
+        : isAbsolutePath(requestedPath)
+          ? requestedPath
+          : joinPath(options.root, requestedPath);
+    const clock = yield* ClockService;
+    const runStartedAt = yield* clock.now;
+    const ordinaryRun =
+      parsed.graph === undefined && parsed.dryRun === undefined;
+    const structuredLogPath =
+      !ordinaryRun || parsed.logFile === undefined
+        ? undefined
+        : parsed.logFile === ""
+          ? joinPath(options.root, ".turbo", "logs", `${runStartedAt}.json`)
+          : resolveExplicitRunArtifactPath(parsed.logFile);
+    const comparableInputPath = (path: string): string => {
+      const normalized = normalizePath(path, platform === "win32");
+      return platform === "win32" ? normalized.toLowerCase() : normalized;
+    };
+    const canonicalArtifactPaths = new Map<string, string>();
+    const canonicalRunArtifactPath = (
+      path: string,
+    ): Effect.Effect<string, ConfigurationError, FileSystemService> => {
+      const lexicalIdentity = comparableInputPath(path);
+      const cached = canonicalArtifactPaths.get(lexicalIdentity);
+      if (cached !== undefined) return Effect.succeed(cached);
+      return canonicalExistingAncestorPath(path, "run artifact").pipe(
+        Effect.tap((canonicalPath) =>
+          Effect.sync(() => {
+            canonicalArtifactPaths.set(lexicalIdentity, canonicalPath);
+          }),
+        ),
+      );
+    };
+    if (structuredLogPath !== undefined) {
+      const canonicalStructuredLogPath =
+        yield* canonicalRunArtifactPath(structuredLogPath);
+      const structuredLogIdentity = comparableInputPath(
+        canonicalStructuredLogPath,
+      );
+      const controlCandidates = [...selectedGraph.nodes.values()].flatMap(
+        (node) =>
+          implicitTaskInputCandidates(
+            repository,
+            node,
+            environment,
+            platform === "win32",
+          ),
+      );
+      const controlCollision = (yield* Effect.forEach(
+        controlCandidates,
+        (candidate) =>
+          canonicalExistingAncestorPath(candidate, "task control input").pipe(
+            Effect.map(
+              (canonicalCandidate) =>
+                comparableInputPath(canonicalCandidate) ===
+                structuredLogIdentity,
+            ),
+          ),
+        { concurrency: 8 },
+      )).some(Boolean);
+      if (controlCollision) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: structuredLogPath,
+            message:
+              "structured log path must not replace a task control input",
+          }),
+        );
+      }
+      const outputCollision = (yield* Effect.forEach(
+        [...selectedGraph.nodes.values()],
+        (node) =>
+          canonicalExistingAncestorPath(
+            node.package.directory,
+            "task output root",
+          ).pipe(
+            Effect.map((canonicalPackageDirectory) =>
+              taskOutputContainsPath(
+                canonicalRoot,
+                canonicalPackageDirectory,
+                node,
+                canonicalStructuredLogPath,
+                platform === "win32",
+              ),
+            ),
+          ),
+        { concurrency: 8 },
+      )).some(Boolean);
+      if (outputCollision) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: structuredLogPath,
+            message:
+              "structured log path must not match a declared task output",
+          }),
+        );
+      }
+      const taskLogCollision = (yield* Effect.forEach(
+        [...graph.nodes.values()],
+        (node) =>
+          canonicalExistingAncestorPath(
+            taskLogPath(
+              node,
+              cargoWorkspacePlan.scopes.get(node.id),
+              logIdentifiers.get(node.id),
+            ),
+            "task log",
+          ).pipe(
+            Effect.map(
+              (canonicalTaskLogPath) =>
+                comparableInputPath(canonicalTaskLogPath) ===
+                structuredLogIdentity,
+            ),
+          ),
+        { concurrency: 8 },
+      )).some(Boolean);
+      if (taskLogCollision) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: structuredLogPath,
+            message: "structured log path must not replace a task log",
+          }),
+        );
+      }
+    }
+    const excludedInputPathCandidates = [
+      structuredLogPath,
+      ...(parsed.graph === undefined && parsed.dryRun === undefined
+        ? [parsed.profile, parsed.anonymousProfile, parsed.trace].map(
+            resolveExplicitRunArtifactPath,
+          )
+        : []),
+    ].filter((path): path is string => path !== undefined);
+    const excludedInputPaths = yield* Effect.forEach(
+      excludedInputPathCandidates,
+      canonicalRunArtifactPath,
+    );
+    const excludeDefaultProfileArtifacts =
+      parsed.graph === undefined &&
+      parsed.dryRun === undefined &&
+      [parsed.profile, parsed.anonymousProfile, parsed.trace].includes("");
     const cacheabilityByTask = new Map(
       yield* Effect.forEach(
         [...graph.nodes],
@@ -3179,6 +3709,70 @@ export const executeRun = (
         { concurrency: 8 },
       ),
     );
+    const defaultProfilePath = joinPath(
+      options.root,
+      defaultProfileArtifactName(runStartedAt, false),
+    );
+    const defaultAnonymousProfilePath =
+      parsed.profile === "" && parsed.anonymousProfile === ""
+        ? joinPath(options.root, defaultProfileArtifactName(runStartedAt, true))
+        : defaultProfilePath;
+    const resolvedProfilePath =
+      !ordinaryRun || parsed.profile === undefined
+        ? undefined
+        : (resolveExplicitRunArtifactPath(parsed.profile) ??
+          defaultProfilePath);
+    const resolvedAnonymousProfilePath =
+      !ordinaryRun || parsed.anonymousProfile === undefined
+        ? undefined
+        : (resolveExplicitRunArtifactPath(parsed.anonymousProfile) ??
+          defaultAnonymousProfilePath);
+    const resolvedHeapPath =
+      !ordinaryRun || parsed.heap === undefined
+        ? undefined
+        : isAbsolutePath(parsed.heap)
+          ? parsed.heap
+          : joinPath(options.root, parsed.heap);
+    const resolvedTracePath =
+      !ordinaryRun || parsed.trace === undefined
+        ? undefined
+        : (resolveExplicitRunArtifactPath(parsed.trace) ?? defaultProfilePath);
+    const artifactDestinations = [
+      ["--log-file", structuredLogPath],
+      ["--profile", resolvedProfilePath],
+      ["--anon-profile", resolvedAnonymousProfilePath],
+      ["--heap", resolvedHeapPath],
+      ["--trace", resolvedTracePath],
+    ] as const;
+    const artifactOwners = new Map<string, string>();
+    for (const [owner, path] of artifactDestinations) {
+      if (path === undefined) continue;
+      const identity = comparableInputPath(
+        yield* canonicalRunArtifactPath(path),
+      );
+      const existingOwner = artifactOwners.get(identity);
+      if (existingOwner !== undefined) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path,
+            message: `${owner} must not resolve to the same run artifact as ${existingOwner}`,
+          }),
+        );
+      }
+      artifactOwners.set(identity, owner);
+    }
+    const profileService = yield* Effect.serviceOption(RuntimeProfileService);
+    if (resolvedHeapPath !== undefined) {
+      if (profileService._tag === "None") {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: "<arguments>",
+            message: "runtime heap profiling is unavailable",
+          }),
+        );
+      }
+      yield* profileService.value.heapSnapshot(resolvedHeapPath);
+    }
     const hashes = yield* applyCargoWorkspaceHashes(
       repository,
       graph,
@@ -3189,12 +3783,16 @@ export const executeRun = (
         environment,
         platform === "win32",
         cacheabilityByTask,
+        excludedInputPaths,
+        excludeDefaultProfileArtifacts,
       ),
       cargoWorkspacePlan.scopes,
       options,
       environment,
       platform === "win32",
       cacheabilityByTask,
+      excludedInputPaths,
+      excludeDefaultProfileArtifacts,
     );
     const unrestorableCacheInputs = taskIdsWithUnrestorableCacheInputs(
       graph,
@@ -3205,12 +3803,312 @@ export const executeRun = (
         ),
       ),
     );
-    const logIdentifiers = taskLogIdentifiers(
-      repository,
-      graph,
-      cargoWorkspacePlan.scopes,
-      platform === "win32",
+    const orderedNodes = [...graph.nodes.values()].sort((left, right) =>
+      left.id.localeCompare(right.id),
     );
+    const globalInputFileHashes =
+      orderedNodes[0] === undefined
+        ? yield* hashGlobalInputFiles(
+            repository,
+            options.cacheExclusionDirectory,
+            options.globalDependencies,
+            excludedInputPaths,
+            excludeDefaultProfileArtifacts,
+          )
+        : hashes.get(orderedNodes[0].id)!.globalInputFileHashes;
+    const isMonorepo =
+      !parsed.singlePackage &&
+      repository.packages.some(
+        (packageModel) =>
+          normalizePath(packageModel.directory, platform === "win32") !==
+          normalizePath(repository.root, platform === "win32"),
+      );
+    if (parsed.graph !== undefined) {
+      const edges = orderedNodes.flatMap((node) =>
+        node.dependencies.length === 0
+          ? ([[node.id, "___ROOT___"]] as const)
+          : node.dependencies.map(
+              (dependency) => [node.id, dependency] as const,
+            ),
+      );
+      const requestedPath = parsed.graph;
+      const extension = requestedPath.toLowerCase().split(".").pop();
+      const dotOutput = `\ndigraph {\n\tcompound = "true"\n\tnewrank = "true"\n\tsubgraph "root" {\n${edges
+        .map(
+          ([source, target]) =>
+            `\t\t${JSON.stringify(`[root] ${source}`)} -> ${JSON.stringify(`[root] ${target}`)}`,
+        )
+        .join("\n")}\n\t}\n}\n\n`;
+      const mermaidIdentifiers = new Map(
+        [...new Set(edges.flat())]
+          .sort((left, right) => left.localeCompare(right))
+          .map((value, index) => [value, `N${index}`]),
+      );
+      const mermaidOutput = `graph TD\n${edges
+        .map(
+          ([source, target]) =>
+            `\t${mermaidIdentifiers.get(source)}(${JSON.stringify(source)}) --> ${mermaidIdentifiers.get(target)}(${JSON.stringify(target)})`,
+        )
+        .join("\n")}`;
+      if (requestedPath === "") {
+        const terminal = yield* TerminalService;
+        yield* terminal.writeStdout(dotOutput);
+      } else {
+        const terminal = yield* TerminalService;
+        const graphPath = isAbsolutePath(requestedPath)
+          ? requestedPath
+          : joinPath(options.root, requestedPath);
+        if (extension === "mermaid" || extension === "mmd") {
+          yield* fileSystem.writeTextAtomic(graphPath, mermaidOutput);
+        } else if (extension === "html") {
+          const serializedDot = JSON.stringify(dotOutput).replaceAll(
+            ">",
+            "\\u003E",
+          );
+          yield* fileSystem.writeTextAtomic(
+            graphPath,
+            `\n<!DOCTYPE html>\n<html>\n<head>\n  <meta charset="utf-8">\n  <title>Graph</title>\n</head>\n<body>\n  <script src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2-pre.1/viz.js"></script>\n  <script src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2-pre.1/full.render.js"></script>\n  <script>\nconst s = ${serializedDot}.replace(/\\_\\_\\_ROOT\\_\\_\\_/g, "Root").replace(/\\[root\\]/g, "");new Viz().renderSVGElement(s).then(el => document.body.appendChild(el)).catch(e => console.error(e));\n  </script>\n</body>\n</html>\n`,
+          );
+        } else if (
+          extension !== undefined &&
+          ["jpg", "json", "pdf", "png", "svg"].includes(extension)
+        ) {
+          if (["jpg", "json", "pdf", "png"].includes(extension)) {
+            yield* terminal.writeStderr(
+              " WARNING  --graph with this output format is deprecated and will be removed in version 3.0. Use `turbo query` for programmatic graph access.\n",
+            );
+          }
+          const processService = yield* ProcessService;
+          const rendered = yield* Effect.either(
+            Effect.scoped(
+              processService.runBytes({
+                command: "dot",
+                args: [`-T${extension === "jpg" ? "jpeg" : extension}`],
+                cwd: options.root,
+                stdin: dotOutput,
+                inheritEnvironment: true,
+              }),
+            ),
+          );
+          if (rendered._tag === "Right" && rendered.right.exitCode === 0) {
+            yield* fileSystem.makeDirectory(parentPath(graphPath));
+            yield* fileSystem.writeBytes(graphPath, rendered.right.stdout);
+          } else {
+            yield* terminal.writeStderr(
+              " WARNING  `turbo-ts` uses Graphviz to generate an image of your graph, but Graphviz isn't installed on this machine.\n\n",
+            );
+            yield* terminal.writeStdout(dotOutput);
+            return 0;
+          }
+        } else {
+          yield* fileSystem.writeTextAtomic(graphPath, dotOutput);
+        }
+        yield* terminal.writeStdout(
+          `\n✓ Generated task graph in ${graphPath}\n`,
+        );
+      }
+      return 0;
+    }
+    const summariesNeedDependencyHashes =
+      parsed.dryRun === "json" ||
+      parsed.summarize ||
+      parsed.json ||
+      parsed.logFile !== undefined;
+    const externalDependencyHashes = new Map(
+      summariesNeedDependencyHashes
+        ? yield* Effect.forEach(
+            orderedNodes,
+            (node) =>
+              taskExternalDependenciesHash(
+                repository,
+                node,
+                cargoWorkspacePlan.scopes.get(node.id),
+              ).pipe(Effect.map((hash) => [node.id, hash] as const)),
+            { concurrency: 8 },
+          )
+        : [],
+    );
+    const globalExternalDependenciesHash = summariesNeedDependencyHashes
+      ? yield* packageExternalDependenciesHash(
+          repository,
+          repository.rootPackage,
+          repository.lockfile,
+        )
+      : emptyExternalDependenciesHash;
+    if (parsed.dryRun !== undefined) {
+      const terminal = yield* TerminalService;
+      if (parsed.dryRun === "json") {
+        yield* terminal.writeStdout(
+          `${JSON.stringify(
+            {
+              id: xxhash64Hex(
+                `${options.root}\0${options.tasks.join("\0")}\0${orderedNodes
+                  .map((node) => hashes.get(node.id)!.hash)
+                  .join("\0")}`,
+              ),
+              version: "1",
+              turboVersion: "2.10.12",
+              monorepo: isMonorepo,
+              globalCacheInputs: {
+                rootKey: "I can’t see ya, but I know you’re here",
+                files: globalInputFileHashes,
+                hashOfExternalDependencies: globalExternalDependenciesHash,
+                hashOfInternalDependencies: "",
+                environmentVariables: {
+                  specified: { env: [], passThroughEnv: null },
+                  configured: [],
+                  inferred: [],
+                  passthrough: null,
+                },
+                engines: null,
+              },
+              packages: [
+                ...new Set(orderedNodes.map((node) => node.package.name)),
+              ],
+              envMode: options.environmentMode,
+              frameworkInference: options.frameworkInference,
+              tasks: orderedNodes.map((node) => ({
+                taskId: node.id,
+                task: node.task,
+                package: node.package.name,
+                hash: hashes.get(node.id)!.hash,
+                inputs: Object.fromEntries(
+                  Object.entries(hashes.get(node.id)!.inputFileHashes).filter(
+                    ([path]) => !path.startsWith("$TURBO_ROOT$/"),
+                  ),
+                ),
+                hashOfExternalDependencies: externalDependencyHashes.get(
+                  node.id,
+                )!,
+                cache: {
+                  local: false,
+                  remote: false,
+                  status: "MISS",
+                  timeSaved: 0,
+                },
+                command: node.command ?? "",
+                cliArguments: parsed.passThroughArguments,
+                outputs: (node.definition.outputs ?? []).filter(
+                  (output) => !output.startsWith("!"),
+                ),
+                excludedOutputs: (() => {
+                  const outputs =
+                    node.definition.outputs?.filter((output) =>
+                      output.startsWith("!"),
+                    ) ?? [];
+                  return outputs.length === 0 ? null : outputs;
+                })(),
+                logFile: relativePath(
+                  repository.root,
+                  taskLogPath(
+                    node,
+                    cargoWorkspacePlan.scopes.get(node.id),
+                    logIdentifiers.get(node.id),
+                  ),
+                ),
+                directory:
+                  node.package.relativeDirectory === "."
+                    ? ""
+                    : node.package.relativeDirectory,
+                dependencies: node.dependencies,
+                dependents: orderedNodes
+                  .filter((entry) => entry.dependencies.includes(node.id))
+                  .map((entry) => entry.id),
+                with: node.with,
+                resolvedTaskDefinition: {
+                  outputs: node.definition.outputs ?? [],
+                  cache: node.definition.cache !== false,
+                  dependsOn: node.definition.dependsOn ?? [],
+                  inputs: node.definition.inputs ?? [],
+                  outputLogs: node.definition.outputLogs ?? "full",
+                  persistent: node.definition.persistent ?? false,
+                  interruptible: node.definition.interruptible ?? false,
+                  env: node.definition.env ?? [],
+                  passThroughEnv: node.definition.passThroughEnv ?? null,
+                  interactive: node.definition.interactive ?? false,
+                },
+                expandedOutputs: [],
+                framework: "",
+                envMode: options.environmentMode,
+                environmentVariables: {
+                  specified: {
+                    env: Object.keys(hashes.get(node.id)!.environment),
+                    passThroughEnv: null,
+                  },
+                  configured: [],
+                  inferred: [],
+                  passthrough: null,
+                },
+              })),
+              user: "",
+              scm: { type: "git", sha: null, branch: null },
+            },
+            undefined,
+            2,
+          )}\n\n`,
+        );
+      } else {
+        const packages = [
+          ...new Map(
+            orderedNodes.map((node) => [node.package.identity, node.package]),
+          ).values(),
+        ];
+        yield* terminal.writeStdout(
+          `Packages in Scope\nName Path\n${packages
+            .map(
+              (packageModel) =>
+                `${packageModel.name} ${packageModel.relativeDirectory}`,
+            )
+            .join("\n")}\n\nTasks to Run\n${orderedNodes
+            .map(
+              (node) =>
+                `${node.id}\n  Task = ${node.task}\n  Package = ${node.package.name}\n  Hash = ${hashes.get(node.id)!.hash}\n  Directory = ${node.package.relativeDirectory}\n  Command = ${node.command ?? ""}\n  Dependencies = ${node.dependencies.join(", ")}\n  Inputs Files Considered = ${hashes.get(node.id)!.inputFiles.length}`,
+            )
+            .join("\n")}\n`,
+        );
+      }
+      return 0;
+    }
+    if (options.cachePolicy.localRead || options.cachePolicy.localWrite) {
+      yield* evictLocalCache({
+        directory: options.cacheDirectory,
+        maxAgeMilliseconds: options.cacheMaxAgeMilliseconds,
+        maxSizeBytes: options.cacheMaxSizeBytes,
+      }).pipe(
+        Effect.catchTag("CacheError", (error) =>
+          Effect.gen(function* () {
+            const terminal = yield* TerminalService;
+            const warningColor = options.colorEnabled
+              ? yield* terminal.stderrColorEnabled
+              : false;
+            yield* terminal
+              .writeStderr(
+                renderLogEvent(
+                  {
+                    kind: "warning",
+                    message: `local cache eviction failed; continuing without cache maintenance: ${error.message}`,
+                  },
+                  warningColor,
+                ),
+              )
+              .pipe(Effect.ignore);
+          }),
+        ),
+      );
+    }
+    const structuredLogSemaphore = yield* Effect.makeSemaphore(1);
+    if (structuredLogPath !== undefined) {
+      yield* fileSystem.writeTextAtomic(structuredLogPath, "");
+    }
+    const writeStructuredRecord: WriteStructuredRecord = (record) =>
+      structuredLogPath === undefined
+        ? Effect.void
+        : structuredLogSemaphore.withPermits(1)(
+            fileSystem.appendText(
+              structuredLogPath,
+              `${JSON.stringify(record)}\n`,
+            ),
+          );
     const groups = taskGroups(graph);
     const pending = new Map(groups.map((members) => [members[0]!, members]));
     const outcomes = new Map<string, TaskOutcome>();
@@ -3218,6 +4116,28 @@ export const executeRun = (
       options.concurrency,
     );
     const withCachePublicationPermit = yield* makeCachePublicationPermit;
+    const outputSemaphore = yield* Effect.makeSemaphore(1);
+    const withOutputPermit: OutputPermit = (output) =>
+      options.logOrder === "grouped"
+        ? outputSemaphore.withPermits(1)(output)
+        : output;
+    const tuiStatuses = new Map<string, RunTuiStatus>(
+      orderedNodes.map((node) => [node.id, "queued"]),
+    );
+    const tuiSemaphore = yield* Effect.makeSemaphore(1);
+    const updateTuiStatus = (
+      id: string,
+      status: RunTuiStatus,
+    ): Effect.Effect<void> => {
+      if (options.ui !== "tui") return Effect.void;
+      tuiStatuses.set(id, status);
+      return tuiSemaphore
+        .withPermits(1)(terminal.writeStdout(renderRunTui(tuiStatuses)))
+        .pipe(Effect.ignore);
+    };
+    if (options.ui === "tui") {
+      yield* terminal.writeStdout(`\u001b[?25l${renderRunTui(tuiStatuses)}`);
+    }
     const runGroup = ([, members]: readonly [
       string,
       ReadonlyArray<string>,
@@ -3228,57 +4148,78 @@ export const executeRun = (
     > => {
       const memberSet = new Set(members);
       const groupOutcomes = new Map<string, TaskOutcome>();
+      const taskStartedAt = new Map<string, number>();
       const runNode = (
         id: string,
-      ): Effect.Effect<TaskOutcome, CacheRollbackError, RunRequirements> => {
-        const node = graph.nodes.get(id)!;
-        const dependencyFailed = node.dependencies.some((dependency) => {
-          const outcome =
-            groupOutcomes.get(dependency) ?? outcomes.get(dependency);
-          return (
-            outcome !== undefined && (outcome.exitCode !== 0 || outcome.skipped)
-          );
-        });
-        if (
-          !options.parallel &&
-          dependencyFailed &&
-          options.continueMode !== "always"
-        ) {
-          return Effect.succeed({
-            id,
-            exitCode: 1,
-            skipped: true,
+      ): Effect.Effect<TaskOutcome, CacheRollbackError, RunRequirements> =>
+        Effect.gen(function* () {
+          const clock = yield* ClockService;
+          const startTime = yield* clock.now;
+          taskStartedAt.set(id, startTime);
+          const node = graph.nodes.get(id)!;
+          yield* updateTuiStatus(id, "running");
+          const dependencyFailed = node.dependencies.some((dependency) => {
+            const outcome =
+              groupOutcomes.get(dependency) ?? outcomes.get(dependency);
+            return (
+              outcome !== undefined &&
+              (outcome.exitCode !== 0 || outcome.skipped)
+            );
           });
-        }
-        return executeTask(
-          repository,
-          node,
-          options,
-          hashes.get(id)!,
-          environment,
-          cargoWorkspacePlan.scopes.get(id),
-          cacheabilityByTask.get(id)!.cacheable &&
-            !unrestorableCacheInputs.has(id),
-          withCachePublicationPermit,
-          logIdentifiers.get(id),
-        ).pipe(
-          Effect.catchAll((cause) =>
-            cause instanceof CacheRollbackError
-              ? Effect.fail(cause)
-              : Effect.gen(function* () {
-                  const terminal = yield* TerminalService;
-                  yield* terminal
-                    .writeStderr(`turbo-ts: ${String(cause)}\n`)
-                    .pipe(Effect.ignore);
-                  return {
-                    id,
-                    exitCode: 1,
-                    skipped: false,
-                  } satisfies TaskOutcome;
-                }),
-          ),
-        );
-      };
+          const result: TaskExecutionResult =
+            !options.parallel &&
+            dependencyFailed &&
+            options.continueMode !== "always"
+              ? { id, exitCode: 1, skipped: true }
+              : yield* executeTask(
+                  repository,
+                  node,
+                  options,
+                  hashes.get(id)!,
+                  environment,
+                  cargoWorkspacePlan.scopes.get(id),
+                  cacheabilityByTask.get(id)!.cacheable &&
+                    !unrestorableCacheInputs.has(id),
+                  withCachePublicationPermit,
+                  logIdentifiers.get(id),
+                  withOutputPermit,
+                  writeStructuredRecord,
+                ).pipe(
+                  Effect.catchAll((cause) =>
+                    cause instanceof CacheRollbackError
+                      ? Effect.fail(cause)
+                      : Effect.gen(function* () {
+                          const message = `turbo-ts: ${String(cause)}`;
+                          const timestamp = yield* clock.now;
+                          yield* writeStructuredRecord({
+                            type: "task_event",
+                            timestamp,
+                            source: `${node.package.name}:${node.task}`,
+                            level: "stderr",
+                            text: message,
+                          }).pipe(Effect.ignore);
+                          yield* terminal
+                            .writeStderr(`${message}\n`)
+                            .pipe(Effect.ignore);
+                          return {
+                            id,
+                            exitCode: 1,
+                            skipped: false,
+                          } satisfies TaskExecutionResult;
+                        }),
+                  ),
+                );
+          const endTime = yield* clock.now;
+          yield* updateTuiStatus(
+            id,
+            result.skipped
+              ? "skipped"
+              : result.exitCode === 0
+                ? "succeeded"
+                : "failed",
+          );
+          return { ...result, startTime, endTime };
+        });
       const targets = new Set(
         members.flatMap((id) => graph.nodes.get(id)!.with),
       );
@@ -3303,13 +4244,22 @@ export const executeRun = (
               .get(id)!
               .with.filter((companion) => backgroundSet.has(companion))
               .every((companion) => startedBackground.has(companion));
-          const backgroundOutcomes = (): ReadonlyArray<TaskOutcome> =>
-            backgroundFibers.map(({ id }) => ({
-              id,
-              exitCode: 0,
-              hash: hashes.get(id)!.hash,
-              skipped: false,
-            }));
+          const backgroundOutcomes = (): Effect.Effect<
+            ReadonlyArray<TaskOutcome>,
+            never,
+            ClockService
+          > =>
+            Effect.gen(function* () {
+              const endTime = yield* (yield* ClockService).now;
+              return backgroundFibers.map(({ id }) => ({
+                id,
+                exitCode: 0,
+                hash: hashes.get(id)!.hash,
+                skipped: false,
+                startTime: taskStartedAt.get(id) ?? endTime,
+                endTime,
+              }));
+            });
           const firstBackgroundFailure = () => {
             const failures = backgroundFibers.map(({ fiber }) =>
               Fiber.join(fiber).pipe(
@@ -3412,9 +4362,18 @@ export const executeRun = (
             const scheduledForeground = scheduledCohorts.flat();
             const foregroundCompletion = foregroundSemaphore
               .withPermits(scheduledForeground.length)(
-                Effect.forEach(scheduledForeground, runNode, {
-                  concurrency: "unbounded",
-                }),
+                Effect.forEach(
+                  scheduledForeground,
+                  (id) =>
+                    runNode(id).pipe(
+                      Effect.tap((outcome) =>
+                        Effect.sync(() => {
+                          groupOutcomes.set(outcome.id, outcome);
+                        }),
+                      ),
+                    ),
+                  { concurrency: "unbounded" },
+                ),
               )
               .pipe(
                 Effect.map((outcome) => ({
@@ -3430,29 +4389,31 @@ export const executeRun = (
                     firstBackgroundFailure(),
                   );
             if (completion._tag === "BackgroundFailed") {
+              const endTime = yield* (yield* ClockService).now;
               return members.map((id) =>
                 id === completion.outcome.id
                   ? completion.outcome
-                  : {
+                  : (groupOutcomes.get(id) ?? {
                       id,
                       exitCode: 1,
                       skipped: true,
-                    },
+                      startTime: taskStartedAt.get(id) ?? endTime,
+                      endTime,
+                    }),
               );
             }
             for (const outcome of completion.outcomes) {
               remaining.delete(outcome.id);
-              groupOutcomes.set(outcome.id, outcome);
               results.push(outcome);
             }
             if (
               options.continueMode === "never" &&
               completion.outcomes.some((outcome) => outcome.exitCode !== 0)
             ) {
-              return [...results, ...backgroundOutcomes()];
+              return [...results, ...(yield* backgroundOutcomes())];
             }
           }
-          return [...results, ...backgroundOutcomes()];
+          return [...results, ...(yield* backgroundOutcomes())];
         }),
       );
     };
@@ -3523,8 +4484,194 @@ export const executeRun = (
           }
         }
       }),
+    ).pipe(
+      Effect.ensuring(
+        options.ui === "tui"
+          ? terminal.writeStdout("\u001b[?25h").pipe(Effect.ignore)
+          : Effect.void,
+      ),
     );
-    return [...outcomes.values()].some((outcome) => outcome.exitCode !== 0)
+    const runFinishedAt = yield* (yield* ClockService).now;
+    const exitCode = [...outcomes.values()].some(
+      (outcome) => outcome.exitCode !== 0,
+    )
       ? 1
       : 0;
+    const successfulTasks = [...outcomes.values()].filter(
+      (outcome) => outcome.exitCode === 0 && !outcome.skipped,
+    ).length;
+    const failedTasks = [...outcomes.values()].filter(
+      (outcome) => outcome.exitCode !== 0 && !outcome.skipped,
+    ).length;
+    const summaryTasks = orderedNodes.map((node) => {
+      const taskHash = hashes.get(node.id)!;
+      const outcome = outcomes.get(node.id);
+      const excludedOutputs =
+        node.definition.outputs?.filter((output) => output.startsWith("!")) ??
+        [];
+      return {
+        taskId: node.id,
+        task: node.task,
+        package: node.package.name,
+        hash: taskHash.hash,
+        inputs: Object.fromEntries(
+          Object.entries(taskHash.inputFileHashes).filter(
+            ([path]) => !path.startsWith("$TURBO_ROOT$/"),
+          ),
+        ),
+        hashOfExternalDependencies:
+          externalDependencyHashes.get(node.id) ??
+          emptyExternalDependenciesHash,
+        cache: {
+          local: outcome?.cacheSource === "local",
+          remote: outcome?.cacheSource === "remote",
+          status: outcome?.cacheSource === undefined ? "MISS" : "HIT",
+          timeSaved: outcome?.cacheTimeSaved ?? 0,
+        },
+        command: node.command ?? "",
+        cliArguments: parsed.passThroughArguments,
+        outputs: (node.definition.outputs ?? []).filter(
+          (output) => !output.startsWith("!"),
+        ),
+        excludedOutputs: excludedOutputs.length === 0 ? null : excludedOutputs,
+        logFile: relativePath(
+          repository.root,
+          taskLogPath(
+            node,
+            cargoWorkspacePlan.scopes.get(node.id),
+            logIdentifiers.get(node.id),
+          ),
+        ),
+        directory:
+          node.package.relativeDirectory === "."
+            ? ""
+            : node.package.relativeDirectory,
+        dependencies: node.dependencies,
+        dependents: orderedNodes
+          .filter((entry) => entry.dependencies.includes(node.id))
+          .map((entry) => entry.id),
+        with: node.with,
+        resolvedTaskDefinition: {
+          outputs: node.definition.outputs ?? [],
+          cache: node.definition.cache !== false,
+          dependsOn: node.definition.dependsOn ?? [],
+          inputs: node.definition.inputs ?? [],
+          outputLogs: node.definition.outputLogs ?? "full",
+          persistent: node.definition.persistent ?? false,
+          interruptible: node.definition.interruptible ?? false,
+          env: node.definition.env ?? [],
+          passThroughEnv: node.definition.passThroughEnv ?? null,
+          interactive: node.definition.interactive ?? false,
+        },
+        expandedOutputs: [],
+        framework: "",
+        envMode: options.environmentMode,
+        environmentVariables: {
+          specified: {
+            env: Object.keys(taskHash.environment),
+            passThroughEnv: null,
+          },
+          configured: [],
+          inferred: [],
+          passthrough: null,
+        },
+        execution:
+          outcome === undefined
+            ? null
+            : {
+                startTime: outcome.startTime,
+                endTime: outcome.endTime,
+                exitCode: outcome.exitCode,
+              },
+      };
+    });
+    const summaryIsEmitted =
+      parsed.summarize || parsed.json || parsed.logFile !== undefined;
+    const runId = summaryIsEmitted
+      ? yield* (yield* RandomnessService).uuidV7
+      : "";
+    const summary = {
+      id: runId,
+      version: "1",
+      turboVersion: "2.10.12",
+      monorepo: isMonorepo,
+      globalCacheInputs: {
+        rootKey: "I can’t see ya, but I know you’re here",
+        files: globalInputFileHashes,
+        hashOfExternalDependencies: globalExternalDependenciesHash,
+        hashOfInternalDependencies: "",
+        environmentVariables: {
+          specified: { env: [], passThroughEnv: null },
+          configured: [],
+          inferred: [],
+          passthrough: null,
+        },
+        engines: null,
+      },
+      execution: {
+        command: `turbo-ts run ${options.tasks.join(" ")}`,
+        repoPath: "",
+        success: successfulTasks,
+        failed: failedTasks,
+        cached: [...outcomes.values()].filter(
+          (outcome) => outcome.cacheSource !== undefined,
+        ).length,
+        attempted: outcomes.size,
+        startTime: runStartedAt,
+        endTime: runFinishedAt,
+        exitCode,
+      },
+      packages: [...new Set(orderedNodes.map((node) => node.package.name))],
+      envMode: options.environmentMode,
+      frameworkInference: options.frameworkInference,
+      tasks: summaryTasks,
+      user: "",
+      scm: { type: "git", sha: null, branch: null },
+    };
+    if (parsed.summarize) {
+      yield* fileSystem.writeTextAtomic(
+        joinPath(options.root, ".turbo", "runs", `${runId}.json`),
+        `${JSON.stringify(summary, undefined, 2)}\n`,
+      );
+    }
+    const profileEvents = (anonymous: boolean) =>
+      orderedNodes.flatMap((node) => {
+        const outcome = outcomes.get(node.id);
+        if (outcome === undefined) return [];
+        return [
+          {
+            name: anonymous ? node.task : node.id,
+            cat: "turbo-ts",
+            ph: "X",
+            ts: outcome.startTime * 1_000,
+            dur: Math.max(0, outcome.endTime - outcome.startTime) * 1_000,
+            pid: 1,
+            tid: 1,
+          },
+        ];
+      });
+    const namedProfileEvents = profileEvents(false);
+    const anonymousProfileEvents = profileEvents(true);
+    for (const [resolvedPath, traceEvents] of [
+      [resolvedProfilePath, namedProfileEvents],
+      [resolvedAnonymousProfilePath, anonymousProfileEvents],
+      [resolvedTracePath, namedProfileEvents],
+    ] as const) {
+      if (resolvedPath === undefined) continue;
+      if (profileService._tag === "None") {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: "<arguments>",
+            message: "runtime trace profiling is unavailable",
+          }),
+        );
+      }
+      yield* profileService.value.writeTrace(resolvedPath, traceEvents);
+    }
+    const summaryRecord = { type: "run_summary", ...summary } as const;
+    yield* writeStructuredRecord(summaryRecord);
+    if (parsed.json) {
+      yield* terminal.writeStdout(`${JSON.stringify(summaryRecord)}\n`);
+    }
+    return exitCode;
   });

@@ -1,0 +1,158 @@
+import { Effect } from "effect";
+import ignore, { type Ignore } from "ignore";
+import {
+  isPathContained,
+  joinPath,
+  normalizePath,
+  parentPath,
+  relativePath,
+} from "../core/path.js";
+import { RepositoryError } from "../effect/errors.js";
+import { FileSystemService, ProcessService } from "../effect/services.js";
+
+interface IgnoreRules {
+  readonly directory: string;
+  readonly matcher: Ignore;
+}
+
+export interface GitIgnoreMatcher {
+  readonly ignores: (path: string, directory?: boolean) => boolean;
+  readonly wasDirectory: (path: string) => boolean;
+}
+
+const traversalIgnoredDirectories = new Set([
+  ".git",
+  ".turbo",
+  ".venv",
+  "node_modules",
+]);
+
+const matchesRules = (
+  root: string,
+  rules: ReadonlyArray<IgnoreRules>,
+  path: string,
+  directory: boolean,
+): boolean => {
+  const normalized = normalizePath(path);
+  if (!isPathContained(root, normalized)) return false;
+  let ignored = false;
+  for (const entry of rules) {
+    if (!isPathContained(entry.directory, normalized)) continue;
+    const relative = relativePath(entry.directory, normalized);
+    if (relative === ".") continue;
+    const result = entry.matcher.test(
+      directory && !relative.endsWith("/") ? `${relative}/` : relative,
+    );
+    if (result.ignored) ignored = true;
+    if (result.unignored) ignored = false;
+  }
+  return ignored;
+};
+
+export const loadGitIgnoreMatcher = (
+  root: string,
+): Effect.Effect<
+  GitIgnoreMatcher,
+  RepositoryError,
+  FileSystemService | ProcessService
+> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const processService = yield* ProcessService;
+    const normalizedRoot = normalizePath(root);
+    const trackedResult = yield* Effect.scoped(
+      processService.runBytes({
+        command: "git",
+        args: ["ls-files", "--cached", "-z", "--"],
+        cwd: normalizedRoot,
+        inheritEnvironment: true,
+      }),
+    ).pipe(Effect.either);
+    const caseInsensitivePaths =
+      /^[A-Za-z]:[\\/]/.test(normalizedRoot) ||
+      /^[\\/]{2}[^\\/]+[\\/][^\\/]+/.test(normalizedRoot);
+    const comparablePath = (path: string): string => {
+      const normalized = normalizePath(path, caseInsensitivePaths);
+      return caseInsensitivePaths ? normalized.toLowerCase() : normalized;
+    };
+    const trackedFiles = new Set<string>();
+    const trackedDirectories = new Set<string>();
+    if (trackedResult._tag === "Right" && trackedResult.right.exitCode === 0) {
+      for (const relative of new TextDecoder()
+        .decode(trackedResult.right.stdout)
+        .split("\0")) {
+        if (relative === "") continue;
+        const absolute = normalizePath(
+          joinPath(normalizedRoot, relative),
+          caseInsensitivePaths,
+        );
+        trackedFiles.add(comparablePath(absolute));
+        let directory = parentPath(absolute, caseInsensitivePaths);
+        while (
+          isPathContained(normalizedRoot, directory, caseInsensitivePaths)
+        ) {
+          trackedDirectories.add(comparablePath(directory));
+          if (comparablePath(directory) === comparablePath(normalizedRoot)) {
+            break;
+          }
+          directory = parentPath(directory, caseInsensitivePaths);
+        }
+      }
+    }
+    const knownDirectories = new Set(trackedDirectories);
+    const rules: Array<IgnoreRules> = [];
+    const pending = [normalizedRoot];
+    while (pending.length > 0) {
+      const directory = pending.pop()!;
+      const ignorePath = joinPath(directory, ".gitignore");
+      const hasIgnoreFile = yield* fileSystem
+        .exists(ignorePath)
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({ path: ignorePath, message: error.message }),
+          ),
+        );
+      if (hasIgnoreFile) {
+        const source = yield* fileSystem.readText(ignorePath).pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({
+                path: ignorePath,
+                message: error.message,
+              }),
+          ),
+        );
+        rules.push({ directory, matcher: ignore().add(source) });
+      }
+      const entries = yield* fileSystem
+        .list(directory)
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({ path: directory, message: error.message }),
+          ),
+        );
+      for (const entry of entries) {
+        if (entry.kind !== "directory") continue;
+        const path = joinPath(directory, entry.name);
+        knownDirectories.add(comparablePath(path));
+        if (traversalIgnoredDirectories.has(entry.name)) continue;
+        if (!matchesRules(normalizedRoot, rules, path, true))
+          pending.push(path);
+      }
+    }
+    return {
+      ignores: (path, directory = false) => {
+        const comparable = comparablePath(path);
+        if (
+          trackedFiles.has(comparable) ||
+          (directory && trackedDirectories.has(comparable))
+        ) {
+          return false;
+        }
+        return matchesRules(normalizedRoot, rules, path, directory);
+      },
+      wasDirectory: (path) => knownDirectories.has(comparablePath(path)),
+    };
+  });

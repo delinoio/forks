@@ -22,6 +22,9 @@ export const evidenceId = {
   normalizersAllowlist: "normalizers.allowlist",
   normalizersDeterministic: "normalizers.deterministic",
   oracleExternal: "oracle.external",
+  repositoryWorkflows: "repository.workflows",
+  repositoryProtocol: "repository.protocol",
+  repositorySecurity: "repository.security",
 } as const;
 
 export type EvidenceId = (typeof evidenceId)[keyof typeof evidenceId];
@@ -110,6 +113,21 @@ export const evidenceRegistry = {
     kind: "rstest",
     file: "test/cli-and-oracle.test.ts",
     binding: "oracleExternal",
+  },
+  [evidenceId.repositoryWorkflows]: {
+    kind: "rstest",
+    file: "test/repository-workflows.test.ts",
+    binding: "repositoryWorkflows",
+  },
+  [evidenceId.repositoryProtocol]: {
+    kind: "rstest",
+    file: "test/repository-workflows.test.ts",
+    binding: "repositoryProtocol",
+  },
+  [evidenceId.repositorySecurity]: {
+    kind: "rstest",
+    file: "test/repository-workflows.test.ts",
+    binding: "repositorySecurity",
   },
 } as const satisfies Record<EvidenceId, EvidenceRegistration>;
 

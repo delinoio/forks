@@ -29,7 +29,11 @@ export const normalizeOutput = (
   let output = input;
   if (selected.has("branding")) {
     output = mapOutputLines(output, (contents) =>
-      contents === versionOutput ? packageVersion : contents,
+      contents === versionOutput
+        ? packageVersion
+        : contents === `• ${versionOutput}`
+          ? `• turbo ${compatibilityVersion}`
+          : contents,
     );
   }
   if (selected.has("version")) {
@@ -39,7 +43,9 @@ export const normalizeOutput = (
       }
       return contents === versionOutput
         ? "turbo-ts <VERSION> (compatible with turbo <VERSION>)"
-        : contents;
+        : contents === `• ${versionOutput}`
+          ? "• turbo-ts <VERSION> (compatible with turbo <VERSION>)"
+          : contents;
     });
   }
   return output;

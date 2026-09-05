@@ -68,12 +68,15 @@ export const renderTaskOutputChunk = (
   task: string,
   output: string,
   color: boolean,
+  prefixTask = true,
 ): {
   readonly state: TaskOutputRenderState;
   readonly chunks: ReadonlyArray<string>;
 } => {
   const chunks: Array<string> = [];
-  const prefix = `${color ? cyan : ""}${task}:${color ? reset : ""} `;
+  const prefix = prefixTask
+    ? `${color ? cyan : ""}${task}:${color ? reset : ""} `
+    : "";
   let pending = state.pending;
   let atLineStart = state.atLineStart;
   let offset = 0;
@@ -115,18 +118,23 @@ export const finishTaskOutput = (
   return chunks;
 };
 
-export const renderLogEvent = (event: LogEvent, color: boolean): string => {
+export const renderLogEvent = (
+  event: LogEvent,
+  color: boolean,
+  prefixTask = true,
+): string => {
   switch (event.kind) {
     case "cache-hit":
-      return `${event.task}: cache hit, replaying logs ${event.hash}\n`;
+      return `${prefixTask ? `${event.task}: ` : ""}cache hit, replaying logs ${event.hash}\n`;
     case "cache-miss":
-      return `${event.task}: cache miss, executing ${event.hash}\n`;
+      return `${prefixTask ? `${event.task}: ` : ""}cache miss, executing ${event.hash}\n`;
     case "task-output": {
       const rendered = renderTaskOutputChunk(
         initialTaskOutputRenderState,
         event.task,
         event.output,
         color,
+        prefixTask,
       );
       return [...rendered.chunks, ...finishTaskOutput(rendered.state)].join("");
     }
