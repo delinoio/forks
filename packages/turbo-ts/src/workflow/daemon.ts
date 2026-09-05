@@ -265,7 +265,7 @@ const daemonPaths = (
           ? DaemonEndpointKind.windowsNamedPipe
           : DaemonEndpointKind.unixSocket,
       pid: joinPath(stateDirectory, "turbod.pid"),
-      lock: joinPath(stateDirectory, "turbod.lock"),
+      lock: `${stateDirectory}.lock`,
       activeLog: joinPath(stateDirectory, "turbod.log-path"),
       log: joinPath(root, ".turbo", "daemon", `${hash}-turbo.log.${date}`),
     };
@@ -943,7 +943,7 @@ const serveDaemon = (
                   ),
                 ];
                 const changed =
-                  change.entryKind === "directory"
+                  change.entryKind === "directory" || change.kind === "remove"
                     ? canMatchGlobsDescendantWithExclusions(relative, patterns)
                     : matchesGlobsWithExclusions([relative], patterns);
                 if (changed) {

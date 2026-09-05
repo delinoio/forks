@@ -105,7 +105,8 @@ const execFilePromise = promisify(execFile);
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const fixture = join(packageRoot, "test/fixtures/basic-workspace");
-const candidate = join(packageRoot, "dist/bin/turbo-ts.js");
+const candidateUrl = new URL("../dist/bin/turbo-ts.js", import.meta.url);
+const candidate = fileURLToPath(candidateUrl);
 const official = join(repositoryRoot, "node_modules/.bin/turbo");
 // Keep Gate 3 output comparisons independent of ambient Gate 4 CI and color
 // behavior. Remove this override when environment.platform gains coverage.
@@ -3145,7 +3146,7 @@ describe("repository workflow gate", () => {
     }
   });
 
-  it("tracks registered internal outputs and partial directory exclusions", async () => {
+  it("tracks registered internal outputs and directory removals with partial exclusions", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-output-"));
     try {
       await prepareFixture(directory);
@@ -3231,8 +3232,7 @@ describe("repository workflow gate", () => {
                           },
                           {
                             path: join(root, "dist"),
-                            kind: "rename" as const,
-                            entryKind: "directory" as const,
+                            kind: "remove" as const,
                           },
                           {
                             path: join(root, ".turbo/cache/output.js"),
@@ -3805,6 +3805,7 @@ describe("repository workflow gate", () => {
             const cleanupStarted = yield* Deferred.make<void>();
             const allowCleanup = yield* Deferred.make<void>();
             let stateDirectory: string | undefined;
+            let lifecycleLock: string | undefined;
             let spawnAttempts = 0;
             const overrides = Layer.mergeAll(
               Layer.succeed(FileSystemService, {
@@ -3812,9 +3813,10 @@ describe("repository workflow gate", () => {
                 createExclusiveFile: (path, contents) =>
                   fileSystem.createExclusiveFile(path, contents).pipe(
                     Effect.tap((created) =>
-                      created && path.endsWith("turbod.lock")
+                      created && path.endsWith(".lock")
                         ? Effect.sync(() => {
-                            stateDirectory = dirname(path);
+                            lifecycleLock = path;
+                            stateDirectory = path.slice(0, -".lock".length);
                           })
                         : Effect.void,
                     ),
@@ -3845,6 +3847,8 @@ describe("repository workflow gate", () => {
               }).pipe(Effect.provide(overrides));
             const cleanFiber = yield* Effect.forkScoped(runDaemon("clean"));
             yield* Deferred.await(cleanupStarted);
+            expect(lifecycleLock).toBe(`${stateDirectory}.lock`);
+            expect(yield* fileSystem.exists(lifecycleLock!)).toBe(true);
             const startResult = yield* runDaemon("start").pipe(Effect.either);
             expect(startResult).toMatchObject({
               _tag: "Left",
@@ -4221,8 +4225,8 @@ describe("repository workflow gate", () => {
               const fileSystemLayer = Layer.succeed(FileSystemService, {
                 ...fileSystem,
                 createExclusiveFile: (path, contents) => {
-                  if (path.endsWith("turbod.lock")) {
-                    stateDirectory = dirname(path);
+                  if (path.endsWith(".lock")) {
+                    stateDirectory = path.slice(0, -".lock".length);
                   }
                   return fileSystem.createExclusiveFile(path, contents);
                 },
@@ -4547,7 +4551,7 @@ describe("repository workflow gate", () => {
       await writeFile(running.pid_file, "99999999\n");
       await writeFile(running.sock_file, "stale socket\n");
       await writeFile(
-        join(dirname(running.pid_file), "turbod.lock"),
+        `${dirname(running.pid_file)}.lock`,
         `${Date.now() + 24 * 60 * 60 * 1_000}\n`,
       );
       await runCandidate("daemon", "start", "--idle-time=30s");
@@ -6380,6 +6384,45 @@ dependencies = ["external-package 2.0.0"]
       await rm(directory, { force: true, recursive: true });
     }
   }, 30_000);
+
+  it("writes ordinary and Docker prune lockfiles with readable modes", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-mode-"));
+    const runPrune = (...arguments_: ReadonlyArray<string>) =>
+      execFilePromise(
+        process.execPath,
+        [
+          "--input-type=module",
+          "--eval",
+          `process.umask(0o077); await import(${JSON.stringify(candidateUrl.href)})`,
+          candidate,
+          "--cwd",
+          directory,
+          "prune",
+          "synthetic-app",
+          ...arguments_,
+        ],
+        { env: differentialEnvironment },
+      );
+    try {
+      await prepareFixture(directory);
+      await runPrune("--out-dir=ordinary-result");
+      expect(
+        (await stat(join(directory, "ordinary-result/pnpm-lock.yaml"))).mode &
+          0o777,
+      ).toBe(0o644);
+
+      await runPrune("--docker", "--out-dir=docker-result");
+      for (const path of [
+        "docker-result/pnpm-lock.yaml",
+        "docker-result/json/pnpm-lock.yaml",
+      ]) {
+        expect((await stat(join(directory, path))).mode & 0o777).toBe(0o644);
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
 
   it("copies opted-in global dependency files into prune source trees", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-global-"));
@@ -8278,6 +8321,97 @@ importers:
         "synthetic-core#build": "TaskFileChanged",
         "synthetic-library#build": "TaskDependencyTaskChanged",
       });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("uses qualified task definitions for unfiltered affected reasons", async () => {
+    const fixtureParent = join(repositoryRoot, ".turbo");
+    await mkdir(fixtureParent, { recursive: true });
+    const directory = await mkdtemp(
+      join(fixtureParent, "turbo-ts-query-qualified-reasons-"),
+    );
+    const git = (...arguments_: ReadonlyArray<string>) =>
+      execFilePromise("/usr/bin/git", [
+        "-C",
+        directory,
+        "-c",
+        "user.email=synthetic@example.test",
+        "-c",
+        "user.name=Synthetic Fixture",
+        ...arguments_,
+      ]);
+    try {
+      await prepareFixture(directory);
+      const configurationPath = join(directory, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks = {
+        "synthetic-app#build": { dependsOn: ["^build"] },
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      await git("init", "--quiet");
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "base");
+      await writeFile(
+        join(directory, "packages/library/source.txt"),
+        "qualified task dependency changed\n",
+      );
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "changed");
+
+      const runAffected = (...fields: ReadonlyArray<string>) =>
+        execFilePromise(process.execPath, [
+          candidate,
+          "query",
+          "affected",
+          "--tasks",
+          ...fields,
+          "--base=HEAD~1",
+          "--head=HEAD",
+          "--cwd",
+          directory,
+        ]);
+      const [unfiltered, filtered, graphqlResult] = await Promise.all([
+        runAffected(),
+        runAffected("build"),
+        execFilePromise(process.execPath, [
+          candidate,
+          "query",
+          '{ affectedTasks(base: "HEAD~1", head: "HEAD", tasks: ["build"]) { items { fullName reason } } }',
+          "--cwd",
+          directory,
+        ]),
+      ]);
+      const reasonForApplication = (source: string) =>
+        (
+          JSON.parse(source) as {
+            data: {
+              affectedTasks: {
+                items: ReadonlyArray<{
+                  fullName: string;
+                  reason: { __typename: string };
+                }>;
+              };
+            };
+          }
+        ).data.affectedTasks.items.find(
+          (item) => item.fullName === "synthetic-app#build",
+        )?.reason.__typename;
+      expect(reasonForApplication(unfiltered.stdout)).toBe(
+        "TaskDependencyTaskChanged",
+      );
+      expect(reasonForApplication(filtered.stdout)).toBe(
+        reasonForApplication(unfiltered.stdout),
+      );
+      expect(reasonForApplication(graphqlResult.stdout)).toBe(
+        reasonForApplication(unfiltered.stdout),
+      );
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

@@ -542,8 +542,9 @@ ignore rules. Removal events without type metadata reuse directory kinds from
 the loaded ignore snapshot or later watcher observations.
 
 The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
-identity, per-user temporary state directory, atomic PID and start lock files,
-0600 Unix sockets on POSIX, per-user named-pipe endpoints on Windows, and
+identity, per-user temporary state directory, atomic PID files, and a lifecycle
+lock beside rather than inside the removable repository state directory. It
+uses 0600 Unix sockets on POSIX, per-user named-pipe endpoints on Windows, and
 stale-state cleanup. Named pipes skip Unix filesystem ownership and permission
 operations. Its public transport is the official `turbodprotocol.Turbod` gRPC
 service over HTTP/2. Hello, status, and shutdown calls interoperate in both
@@ -566,7 +567,9 @@ Registered outputs beneath `.turbo` outside the resolved cache directory and
 beneath `node_modules` remain observable. Directory events conservatively mark
 positive output globs when descendants can match, even when an exclusion can
 match only part of that subtree; an event rooted in a fully excluded subtree is
-ignored. Git metadata, the resolved cache directory, and daemon-owned logs
+ignored. Removal events without entry-type metadata receive the same
+conservative descendant matching because a removed path may have been an output
+directory. Git metadata, the resolved cache directory, and daemon-owned logs
 remain excluded. Cache filtering covers both the configured lexical directory
 and its target resolved through existing ancestor symlinks.
 Output-change registration/query calls return their protocol data rather than
@@ -620,10 +623,11 @@ Task relationship collections
 come from the resolved task graph. GraphQL affected collections calculate the
 requested base/head range, include dependent packages, and apply package and
 task filters. The `query affected --tasks` shortcut uses the same resolved task
-graph for explicitly requested bare and package-qualified names, including root
-tasks and configured commandless tasks, and propagates dependency-task reasons
-through transitive affected package chains, while its unfiltered form retains
-script-backed task enumeration. The `query affected --packages` shortcut accepts
+graph for task reasons in both filtered and unfiltered forms. Explicitly
+requested bare and package-qualified names include root tasks and configured
+commandless tasks and propagate dependency-task reasons through transitive
+affected package chains, while the unfiltered form retains script-backed task
+enumeration. The `query affected --packages` shortcut accepts
 plain names that retain every matching ecosystem scope and qualified identities
 that select one scope. Cyclic package graphs never include the starting package
 in its own dependency or dependent relationship collections.
@@ -677,8 +681,8 @@ paths, the active lockfile or configuration, package-manager controls, or a
 non-root package or workspace-control directory.
 Selected package copies stop at nested workspace roots outside the selected
 closure.
-Generated installation manifests and configuration files use readable `0644`
-modes. It
+Generated installation manifests, configuration files, and reduced lockfiles
+use readable `0644` modes. It
 never follows workspace symlinks into a prune output. Output safety and traversal
 exclusions use canonical locations. Contained relative file symlinks are
 recreated without dereferencing unless their resolved target enters an
@@ -746,11 +750,13 @@ distinct path; collisions fail before an artifact is written or a task starts.
 Timestamped streaming applies the timestamp writer to a final unterminated task
 line and retains line-start state across bounded output chunks, so one
 continuous line receives one timestamp. Live structured task events retain
-their stdout or stderr channel. Compatible cached task logs contain merged
-plain output without channel metadata, so their replay uses the neutral `info`
-level instead of asserting a stdout channel. Errors-only failure replay does
-not duplicate output already recorded while the task ran and reads the complete
-task log instead of the bounded diagnostic tail. CLI `--global-deps`
+their stdout or stderr channel, including grouped JSON and errors-only failure
+replay buffered through a scoped temporary journal. Compatible cached task logs
+contain merged plain output without channel metadata, so their replay uses the
+neutral `info` level instead of asserting a stdout channel. Errors-only failure
+replay does not duplicate output already recorded while the task ran and reads
+the complete on-disk output instead of the bounded diagnostic tail. CLI
+`--global-deps`
 patterns are merged into task hash inputs, and their repository-relative Git
 blob hashes are reported in summary `globalCacheInputs.files`, including when a
 valid requested task is filtered to a successful no-op. Dry runs do not perform local

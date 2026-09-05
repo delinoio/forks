@@ -953,6 +953,29 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
       },
       catch: filesystemError,
     }),
+  writeBytesAtomic: (path, contents, mode = 0o600) =>
+    Effect.tryPromise({
+      try: async () => {
+        await mkdir(dirname(path), { recursive: true });
+        const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+        let handle: Awaited<ReturnType<typeof open>> | undefined;
+        try {
+          handle = await open(temporary, "wx", mode);
+          await handle.writeFile(contents);
+          await handle.chmod(mode);
+          await handle.sync();
+          await handle.close();
+          handle = undefined;
+          await rename(temporary, path);
+          await syncParentDirectory(path);
+        } catch (cause) {
+          await handle?.close().catch(() => undefined);
+          await rm(temporary, { force: true }).catch(() => undefined);
+          throw cause;
+        }
+      },
+      catch: filesystemError,
+    }),
   appendText: (path, contents) =>
     Effect.tryPromise({
       try: () => appendFile(path, contents, "utf8"),

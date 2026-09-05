@@ -358,6 +358,102 @@ describe("core CLI execution", () => {
     }
   }, 15_000);
 
+  it("preserves live output channels in buffered JSON modes", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks["channel-output"] = { cache: false };
+      configuration.tasks["quiet-channel-output"] = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts["channel-output"] =
+        "node -e \"process.stdout.write('live-stdout\\n'); process.stderr.write('live-stderr\\n'); process.exitCode=7\"";
+      manifest.scripts["quiet-channel-output"] =
+        "node -e \"process.stderr.write('successful-stderr\\n')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+      const taskRecords = (output: string) =>
+        output
+          .trim()
+          .split("\n")
+          .map(
+            (line) =>
+              JSON.parse(line) as {
+                readonly type?: string;
+                readonly level?: string;
+                readonly text?: string;
+              },
+          )
+          .filter((record) => record.type === "task_event");
+      for (const mode of [
+        ["--output-logs=full", "--log-order=grouped"],
+        ["--output-logs=errors-only"],
+      ] as const) {
+        const result = await run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "channel-output",
+            "--cwd",
+            directory,
+            "--filter=synthetic-library",
+            "--no-cache",
+            "--json",
+            ...mode,
+          ],
+          repositoryRoot,
+        );
+        expect(result.exitCode).toBe(1);
+        const records = taskRecords(result.stdout);
+        expect(
+          records.filter((record) => record.text === "live-stdout\n"),
+        ).toEqual([
+          expect.objectContaining({ level: "stdout", text: "live-stdout\n" }),
+        ]);
+        expect(
+          records.filter((record) => record.text === "live-stderr\n"),
+        ).toEqual([
+          expect.objectContaining({ level: "stderr", text: "live-stderr\n" }),
+        ]);
+      }
+
+      const successful = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "quiet-channel-output",
+          "--cwd",
+          directory,
+          "--filter=synthetic-library",
+          "--no-cache",
+          "--json",
+          "--output-logs=errors-only",
+        ],
+        repositoryRoot,
+      );
+      expect(successful.exitCode).toBe(0);
+      expect(
+        taskRecords(successful.stdout).some(
+          (record) => record.text === "successful-stderr\n",
+        ),
+      ).toBe(false);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("preserves continuous lines across bounded display flushes", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;

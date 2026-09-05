@@ -1413,25 +1413,30 @@ export const executeQueryAffected = (
       package: { name: packageModel.name },
       reason: taskReason(packageModel, name, dependsOn, node, graph),
     });
-    const requestedTaskGraph =
-      requested.size === 0
-        ? undefined
-        : repositoryTaskGraph(repository, [...requested]);
-    const requestedTaskIds = new Set(requestedTaskGraph?.entrypoints ?? []);
+    const requestedTaskGraph = repositoryTaskGraph(
+      repository,
+      requested.size === 0 ? undefined : [...requested],
+    );
+    const requestedTaskIds = new Set(requestedTaskGraph.entrypoints);
     const taskItems = (
       options.packages
         ? []
         : requested.size === 0
           ? [...affected.values()].flatMap((packageModel) =>
-              Object.keys(packageModel.scripts).map((name) =>
-                taskItem(
+              Object.keys(packageModel.scripts).map((name) => {
+                const node = requestedTaskGraph.nodes.get(
+                  `${packageModel.identity}#${name}`,
+                );
+                return taskItem(
                   packageModel,
                   name,
-                  packageModel.tasks[name]?.dependsOn ?? [],
-                ),
-              ),
+                  node?.definition.dependsOn ?? [],
+                  node,
+                  requestedTaskGraph,
+                );
+              }),
             )
-          : [...requestedTaskGraph!.nodes.values()]
+          : [...requestedTaskGraph.nodes.values()]
               .filter(
                 (node) =>
                   affected.has(node.package.identity) &&

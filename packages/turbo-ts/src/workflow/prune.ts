@@ -944,14 +944,16 @@ export const executePrune = (
     const lockfileName = repository.lockfile.slice(
       repository.lockfile.lastIndexOf("/") + 1,
     );
-    yield* fileSystem.writeBytes(
+    yield* fileSystem.writeBytesAtomic(
       joinPath(outputRoot, lockfileName),
       prunedLockfile,
+      0o644,
     );
     if (options.docker) {
-      yield* fileSystem.writeBytes(
+      yield* fileSystem.writeBytesAtomic(
         joinPath(jsonRoot, lockfileName),
         prunedLockfile,
+        0o644,
       );
     }
     return 0;

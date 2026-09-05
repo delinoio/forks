@@ -2666,82 +2666,115 @@ const executeTask = (
       shouldReplayOutput(outputMode, false) &&
       options.logOrder !== "grouped" &&
       options.ui !== "tui";
-    const result = streamsCapturedOutput
-      ? yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* fileSystem.writeText(logPath, "");
-            const outputQueue = yield* Queue.bounded<TaskOutputQueueEvent>(
-              persistentOutputQueueCapacity,
-            );
-            yield* Effect.addFinalizer(() => Queue.shutdown(outputQueue));
-            const outputFiber = yield* Effect.forkScoped(
-              Effect.gen(function* () {
-                let renderState = initialTaskOutputRenderState;
-                let renderLevel: "stdout" | "stderr" = "stdout";
-                while (true) {
-                  const event = yield* Queue.take(outputQueue);
-                  if (event.kind === "end") {
-                    if (displaysStreamedOutput) {
-                      for (const chunk of finishTaskOutput(renderState)) {
-                        yield* writeTaskEvent(renderLevel, chunk, false);
-                      }
+    const buffersJsonOutput =
+      streamsCapturedOutput && options.json && !displaysStreamedOutput;
+    const captureProcessOutput = (bufferedJsonPath?: string) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* fileSystem.writeText(logPath, "");
+          if (bufferedJsonPath !== undefined) {
+            yield* fileSystem.writeText(bufferedJsonPath, "");
+          }
+          const outputQueue = yield* Queue.bounded<TaskOutputQueueEvent>(
+            persistentOutputQueueCapacity,
+          );
+          yield* Effect.addFinalizer(() => Queue.shutdown(outputQueue));
+          const outputFiber = yield* Effect.forkScoped(
+            Effect.gen(function* () {
+              let renderState = initialTaskOutputRenderState;
+              let renderLevel: "stdout" | "stderr" = "stdout";
+              while (true) {
+                const event = yield* Queue.take(outputQueue);
+                if (event.kind === "end") {
+                  if (displaysStreamedOutput) {
+                    for (const chunk of finishTaskOutput(renderState)) {
+                      yield* writeTaskEvent(renderLevel, chunk, false);
                     }
-                    return;
                   }
-                  yield* fileSystem.appendText(logPath, event.output);
-                  if (!displaysStreamedOutput) {
-                    yield* clock.now.pipe(
-                      Effect.flatMap((timestamp) =>
-                        writeStructuredRecord(
-                          taskRecord(timestamp, event.level, event.output),
-                        ),
-                      ),
-                    );
-                    continue;
-                  }
-                  if (options.json) {
-                    yield* writeTaskEvent(event.level, event.output);
-                    continue;
-                  }
-                  yield* clock.now.pipe(
-                    Effect.flatMap((timestamp) =>
-                      writeStructuredRecord(
-                        taskRecord(timestamp, event.level, event.output),
-                      ),
-                    ),
-                  );
-                  renderLevel = event.level;
-                  const rendered = renderTaskOutputChunk(
-                    renderState,
-                    taskLabel,
-                    event.output,
-                    color,
-                    prefixTask,
-                  );
-                  renderState = rendered.state;
-                  for (const chunk of rendered.chunks) {
-                    yield* writeTaskEvent(event.level, chunk, false);
-                  }
+                  return;
                 }
-              }),
-            );
-            const processResult = yield* Effect.raceFirst(
-              startProcess((output, level) =>
-                Effect.runPromise(
-                  Queue.offer(outputQueue, {
-                    kind: "chunk",
-                    output,
-                    level,
-                  }).pipe(Effect.asVoid),
-                ),
+                yield* fileSystem.appendText(logPath, event.output);
+                if (!displaysStreamedOutput) {
+                  const timestamp = yield* clock.now;
+                  const record = taskRecord(
+                    timestamp,
+                    event.level,
+                    event.output,
+                  );
+                  yield* writeStructuredRecord(record);
+                  if (bufferedJsonPath !== undefined) {
+                    yield* fileSystem.appendText(
+                      bufferedJsonPath,
+                      `${JSON.stringify(record)}\n`,
+                    );
+                  }
+                  continue;
+                }
+                if (options.json) {
+                  yield* writeTaskEvent(event.level, event.output);
+                  continue;
+                }
+                yield* clock.now.pipe(
+                  Effect.flatMap((timestamp) =>
+                    writeStructuredRecord(
+                      taskRecord(timestamp, event.level, event.output),
+                    ),
+                  ),
+                );
+                renderLevel = event.level;
+                const rendered = renderTaskOutputChunk(
+                  renderState,
+                  taskLabel,
+                  event.output,
+                  color,
+                  prefixTask,
+                );
+                renderState = rendered.state;
+                for (const chunk of rendered.chunks) {
+                  yield* writeTaskEvent(event.level, chunk, false);
+                }
+              }
+            }),
+          );
+          const processResult = yield* Effect.raceFirst(
+            startProcess((output, level) =>
+              Effect.runPromise(
+                Queue.offer(outputQueue, {
+                  kind: "chunk",
+                  output,
+                  level,
+                }).pipe(Effect.asVoid),
               ),
-              Fiber.join(outputFiber).pipe(Effect.flatMap(() => Effect.never)),
+            ),
+            Fiber.join(outputFiber).pipe(Effect.flatMap(() => Effect.never)),
+          );
+          yield* Queue.offer(outputQueue, { kind: "end" });
+          yield* Fiber.join(outputFiber);
+          const replayBufferedJson =
+            shouldReplayOutput(outputMode, false) ||
+            (outputMode === "errors-only" && processResult.exitCode !== 0);
+          if (
+            bufferedJsonPath !== undefined &&
+            replayBufferedJson &&
+            options.ui !== "tui"
+          ) {
+            yield* withOutputPermit(
+              fileSystem
+                .readTextChunks(bufferedJsonPath)
+                .pipe(
+                  Stream.runForEach((output) => terminal.writeStdout(output)),
+                ),
             );
-            yield* Queue.offer(outputQueue, { kind: "end" });
-            yield* Fiber.join(outputFiber);
-            return processResult;
-          }),
-        )
+          }
+          return processResult;
+        }),
+      );
+    const result = streamsCapturedOutput
+      ? buffersJsonOutput
+        ? yield* fileSystem.withTemporaryDirectory((directory) =>
+            captureProcessOutput(joinPath(directory, "task-output.ndjson")),
+          )
+        : yield* captureProcessOutput()
       : yield* Effect.scoped(startProcess());
     const output = result.combinedOutput;
     if (!streamsCapturedOutput) {
@@ -2756,7 +2789,9 @@ const executeTask = (
       options.ui !== "tui"
     ) {
       if (streamsCapturedOutput) {
-        yield* withOutputPermit(replayTaskLog(false));
+        if (!buffersJsonOutput) {
+          yield* withOutputPermit(replayTaskLog(false));
+        }
       } else {
         yield* writeTaskEvent(
           "stdout",

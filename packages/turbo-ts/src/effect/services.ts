@@ -71,6 +71,11 @@ export interface FileSystemOperations {
     contents: string,
     mode?: number,
   ) => Effect.Effect<void, BoundaryError>;
+  readonly writeBytesAtomic: (
+    path: string,
+    contents: Uint8Array,
+    mode?: number,
+  ) => Effect.Effect<void, BoundaryError>;
   readonly appendText: (
     path: string,
     contents: string,
