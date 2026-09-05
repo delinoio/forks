@@ -328,6 +328,7 @@ export interface LockfilePackageClosureContext {
   readonly packageName: string;
   readonly packageVersion?: string;
   readonly directDependencies: ReadonlyArray<LockfileDependencyReference>;
+  readonly workspacePackages?: ReadonlyArray<LockfilePackage>;
 }
 
 const lockfilePackageIdentity = (value: LockfilePackage): string =>
@@ -427,6 +428,7 @@ const resolveGraphPackageClosure = (
   entries: ReadonlyArray<LockfileGraphEntry>,
   directDependencies: ReadonlyArray<LockfileDependencyReference>,
   initialEntries: ReadonlyArray<LockfileGraphEntry> = [],
+  excludedEntries: ReadonlyArray<LockfileGraphEntry> = [],
 ): ReadonlyArray<LockfilePackage> => {
   const packages = new Map<string, LockfilePackage>();
   const closure = resolveGraphEntryClosure(
@@ -434,9 +436,9 @@ const resolveGraphPackageClosure = (
     directDependencies,
     initialEntries,
   );
-  const declaringEntries = new Set(initialEntries);
+  const internalEntries = new Set([...initialEntries, ...excludedEntries]);
   for (const entry of closure) {
-    if (declaringEntries.has(entry)) continue;
+    if (internalEntries.has(entry)) continue;
     for (const package_ of entry.packages) {
       packages.set(lockfilePackageIdentity(package_), package_);
     }
@@ -551,6 +553,10 @@ const parseYarnBerryGraph = (
           includeDevelopmentDependencies,
         ),
         sourceKey: descriptors,
+        localWorkspace: [
+          ...selectorList,
+          ...(resolution === undefined ? [] : [resolution]),
+        ].some((alias) => workspaceReferencePath(alias) !== undefined),
       },
     ];
   });
@@ -1299,6 +1305,9 @@ export const resolveLockfilePackageClosure = (
   if (parsed.format === "yarn-berry") {
     const graph = parseYarnBerryGraph(source);
     const workspacePath = normalizeWorkspacePath(context.workspacePath);
+    const localWorkspaceEntries = graph.filter(
+      (entry) => entry.localWorkspace === true,
+    );
     const workspaceEntries = graph.filter((entry) =>
       entry.aliases.some(
         (alias) => workspaceReferencePath(alias) === workspacePath,
@@ -1308,10 +1317,21 @@ export const resolveLockfilePackageClosure = (
       graph,
       context.directDependencies,
       workspaceEntries,
+      localWorkspaceEntries,
     );
   }
   if (parsed.format === "cargo") {
     const graph = parseCargoGraph(source);
+    const workspacePackageIdentities = new Set(
+      (context.workspacePackages ?? []).map(lockfilePackageIdentity),
+    );
+    const localWorkspaceEntries = graph.filter(
+      (entry) =>
+        entry.localWorkspace === true &&
+        entry.packages.some((package_) =>
+          workspacePackageIdentities.has(lockfilePackageIdentity(package_)),
+        ),
+    );
     const workspaceEntries = graph.filter(
       (entry) =>
         entry.localWorkspace === true &&
@@ -1326,6 +1346,7 @@ export const resolveLockfilePackageClosure = (
       graph,
       workspaceEntries.length === 0 ? context.directDependencies : [],
       workspaceEntries,
+      localWorkspaceEntries,
     );
   }
   if (parsed.format === "uv") {
@@ -1351,6 +1372,7 @@ export const resolveLockfilePackageClosure = (
       graph,
       workspaceEntries.length === 0 ? context.directDependencies : [],
       workspaceEntries,
+      graph.filter((entry) => entry.localWorkspace === true),
     );
   }
   if (parsed.format === "bun-text") {

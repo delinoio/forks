@@ -308,11 +308,25 @@ export const parseRunArguments = (
         const consumesAdjacent =
           !argument.includes("=") &&
           (adjacent === "true" || adjacent === "false");
-        summarize = argument.includes("=")
-          ? !argument.endsWith("=false")
-          : consumesAdjacent
-            ? adjacent === "true"
-            : true;
+        const explicitValue = argument.includes("=")
+          ? argument.slice(argument.indexOf("=") + 1)
+          : undefined;
+        if (
+          explicitValue !== undefined &&
+          explicitValue !== "true" &&
+          explicitValue !== "false"
+        ) {
+          throw new ConfigurationError({
+            path: "<arguments>",
+            message: `invalid summarize value: ${explicitValue}`,
+          });
+        }
+        summarize =
+          explicitValue !== undefined
+            ? explicitValue === "true"
+            : consumesAdjacent
+              ? adjacent === "true"
+              : true;
         if (consumesAdjacent) index += 1;
         break;
       }

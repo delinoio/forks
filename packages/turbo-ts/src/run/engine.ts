@@ -86,7 +86,6 @@ import {
   cargoHomeConfigurationPresent,
   configuredEnvironmentValue,
   discoverRepository,
-  internalPackageNames,
   listRepositoryFiles,
   npmUserConfigurationPresent,
   type PackageManagerRuntimeIdentity,
@@ -186,13 +185,20 @@ export const resolveRunUiMode = (
 export const renderTimestampedStreamText = (
   timestamp: number,
   text: string,
-): string => {
-  if (text === "") return "";
+): string => renderTimestampedStreamChunk(true, timestamp, text).text;
+
+const renderTimestampedStreamChunk = (
+  atLineStart: boolean,
+  timestamp: number,
+  text: string,
+): { readonly atLineStart: boolean; readonly text: string } => {
+  if (text === "") return { atLineStart, text };
   const prefix = `[${new Date(timestamp).toISOString()}] `;
-  return `${prefix}${text.replaceAll("\n", `\n${prefix}`)}`.slice(
-    0,
-    text.endsWith("\n") ? -prefix.length : undefined,
-  );
+  const rendered = `${atLineStart ? prefix : ""}${text.replaceAll(
+    "\n",
+    `\n${prefix}`,
+  )}`.slice(0, text.endsWith("\n") ? -prefix.length : undefined);
+  return { atLineStart: text.endsWith("\n"), text: rendered };
 };
 
 type RunTuiStatus = "queued" | "running" | "succeeded" | "failed" | "skipped";
@@ -1852,14 +1858,20 @@ const packagesExternalDependenciesHash = (
         ),
       );
     const identities = yield* Effect.try({
-      try: () =>
-        [
+      try: () => {
+        const workspacePackages = repository.packages.flatMap((packageModel) =>
+          packageModel.manifest.version === undefined
+            ? []
+            : [
+                {
+                  name: packageModel.name,
+                  version: packageModel.manifest.version,
+                },
+              ],
+        );
+        return [
           ...new Set(
             packageModels.flatMap((packageModel) => {
-              const internalNames = internalPackageNames(
-                repository,
-                packageModel,
-              );
               const manifestDependencyReferences = new Map(
                 [
                   packageModel.manifest.dependencies,
@@ -1868,9 +1880,8 @@ const packagesExternalDependenciesHash = (
                   packageModel.manifest.peerDependencies,
                 ].flatMap((dependencies) => Object.entries(dependencies ?? {})),
               );
-              const directExternalDependencies = packageModel.dependencyNames
-                .filter((name) => !internalNames.has(name))
-                .map(
+              const directExternalDependencies =
+                packageModel.dependencyNames.map(
                   (name) =>
                     [name, manifestDependencyReferences.get(name)] as const,
                 );
@@ -1879,14 +1890,14 @@ const packagesExternalDependenciesHash = (
                 packageName: packageModel.name,
                 packageVersion: packageModel.manifest.version,
                 directDependencies: directExternalDependencies,
-              }).flatMap((dependency) =>
-                internalNames.has(dependency.name)
-                  ? []
-                  : [`${dependency.name}@${dependency.version}`],
+                workspacePackages,
+              }).map(
+                (dependency) => `${dependency.name}@${dependency.version}`,
               );
             }),
           ),
-        ].sort(),
+        ].sort();
+      },
       catch: (cause) =>
         new RepositoryError({ path: lockfile, message: String(cause) }),
     });
@@ -2363,6 +2374,17 @@ const executeTask = (
       : false;
     const taskLabel = `${node.package.name}:${node.task}`;
     const prefixTask = options.logPrefix !== "none";
+    let timestampedStreamAtLineStart = true;
+    const renderStreamText = (timestamp: number, text: string): string => {
+      if (options.ui !== "stream-with-experimental-timestamps") return text;
+      const rendered = renderTimestampedStreamChunk(
+        timestampedStreamAtLineStart,
+        timestamp,
+        text,
+      );
+      timestampedStreamAtLineStart = rendered.atLineStart;
+      return rendered.text;
+    };
     const taskRecord = (
       timestamp: number,
       level: "info" | "stdout" | "stderr",
@@ -2391,11 +2413,7 @@ const executeTask = (
                 ? terminal.writeStdout(`${JSON.stringify(record)}\n`)
                 : options.ui === "tui"
                   ? Effect.void
-                  : terminal.writeStdout(
-                      options.ui === "stream-with-experimental-timestamps"
-                        ? renderTimestampedStreamText(timestamp, text)
-                        : text,
-                    ),
+                  : terminal.writeStdout(renderStreamText(timestamp, text)),
             ),
           );
         }),
@@ -2459,7 +2477,7 @@ const executeTask = (
           Stream.runForEach((output) =>
             Effect.gen(function* () {
               const timestamp = yield* clock.now;
-              const record = taskRecord(timestamp, "stdout", output);
+              const record = taskRecord(timestamp, "info", output);
               if (recordOutput) yield* writeStructuredRecord(record);
               if (options.json) {
                 yield* terminal.writeStdout(`${JSON.stringify(record)}\n`);
@@ -2474,11 +2492,7 @@ const executeTask = (
               );
               renderState = rendered.state;
               for (const chunk of rendered.chunks) {
-                yield* terminal.writeStdout(
-                  options.ui === "stream-with-experimental-timestamps"
-                    ? renderTimestampedStreamText(timestamp, chunk)
-                    : chunk,
-                );
+                yield* terminal.writeStdout(renderStreamText(timestamp, chunk));
               }
             }),
           ),
@@ -2486,9 +2500,7 @@ const executeTask = (
         if (!options.json) {
           for (const chunk of finishTaskOutput(renderState)) {
             yield* terminal.writeStdout(
-              options.ui === "stream-with-experimental-timestamps"
-                ? renderTimestampedStreamText(yield* clock.now, chunk)
-                : chunk,
+              renderStreamText(yield* clock.now, chunk),
             );
           }
         }

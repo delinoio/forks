@@ -36,10 +36,9 @@ import {
   type LockfilePackage,
   resolveLockfilePackageClosure,
 } from "../repository/lockfiles.js";
-import {
-  internalPackageNames,
-  type RepositoryModel,
-  type RepositoryPackage,
+import type {
+  RepositoryModel,
+  RepositoryPackage,
 } from "../repository/model.js";
 import {
   loadWorkflowRepository,
@@ -1034,11 +1033,18 @@ const executeGraphql = (
               return yield* Effect.try({
                 try: () => {
                   const dependencies = new Map<string, LockfilePackage>();
+                  const workspacePackages = repository.packages.flatMap(
+                    (packageModel) =>
+                      packageModel.manifest.version === undefined
+                        ? []
+                        : [
+                            {
+                              name: packageModel.name,
+                              version: packageModel.manifest.version,
+                            },
+                          ],
+                  );
                   for (const model of models) {
-                    const internalNames = internalPackageNames(
-                      repository,
-                      model,
-                    );
                     const manifestReferences = new Map(
                       [
                         model.manifest.dependencies,
@@ -1047,11 +1053,9 @@ const executeGraphql = (
                         model.manifest.peerDependencies,
                       ].flatMap((entries) => Object.entries(entries ?? {})),
                     );
-                    const directDependencies = model.dependencyNames
-                      .filter((name) => !internalNames.has(name))
-                      .map(
-                        (name) => [name, manifestReferences.get(name)] as const,
-                      );
+                    const directDependencies = model.dependencyNames.map(
+                      (name) => [name, manifestReferences.get(name)] as const,
+                    );
                     for (const dependency of resolveLockfilePackageClosure(
                       repository.lockfile!,
                       lockfileContents,
@@ -1060,14 +1064,13 @@ const executeGraphql = (
                         packageName: model.name,
                         packageVersion: model.manifest.version,
                         directDependencies,
+                        workspacePackages,
                       },
                     )) {
-                      if (!internalNames.has(dependency.name)) {
-                        dependencies.set(
-                          `${dependency.name}@${dependency.version}`,
-                          dependency,
-                        );
-                      }
+                      dependencies.set(
+                        `${dependency.name}@${dependency.version}`,
+                        dependency,
+                      );
                     }
                   }
                   return [...dependencies.values()].sort((left, right) =>

@@ -58,6 +58,7 @@ import {
   SystemService,
   TerminalService,
 } from "../src/effect/services.js";
+import { xxhash64Hex } from "../src/hash/xxhash64.js";
 import { pruneLockfile } from "../src/repository/lockfiles.js";
 import {
   executeRun,
@@ -898,6 +899,73 @@ describe("repository workflow gate", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 60_000);
+
+  it("does not assert a stream channel for cached plain-log replay", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-level-"));
+    const structuredLog = join(directory, "run.ndjson");
+    try {
+      await prepareFixture(directory);
+      const manifestPath = join(directory, "packages/app/package.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.diagnostic =
+        "node -e \"process.stderr.write('cached diagnostic\\n')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+      const configurationPath = join(directory, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.diagnostic = {};
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      const arguments_ = [
+        candidate,
+        "run",
+        "diagnostic",
+        "--filter=synthetic-app",
+        "--json",
+        "--log-file=run.ndjson",
+        "--cwd",
+        directory,
+      ];
+      const first = await execFilePromise(process.execPath, arguments_);
+      const parseRecords = (source: string) =>
+        source
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(
+        parseRecords(first.stdout).find(
+          (record) =>
+            typeof record.text === "string" &&
+            record.text.includes("cached diagnostic\n"),
+        )?.level,
+      ).toBe("stderr");
+      const cached = await execFilePromise(process.execPath, arguments_);
+      expect(
+        parseRecords(cached.stdout).find(
+          (record) =>
+            typeof record.text === "string" &&
+            record.text.includes("cached diagnostic\n"),
+        )?.level,
+      ).toBe("info");
+      const cachedLogRecords = parseRecords(
+        await readFile(structuredLog, "utf8"),
+      );
+      expect(
+        cachedLogRecords.find(
+          (record) =>
+            typeof record.text === "string" &&
+            record.text.includes("cached diagnostic\n"),
+        )?.level,
+      ).toBe("info");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
 
   it("rejects colliding run artifact destinations before task execution", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-artifacts-"));
@@ -1799,6 +1867,36 @@ describe("repository workflow gate", () => {
           .split("\n")
           .find((line) => line.includes("unterminated-tail")),
       ).toMatch(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] /);
+
+      applicationManifest.scripts["long-line"] =
+        "node -e \"process.stdout.write('x'.repeat(70 * 1024))\"";
+      await writeFile(
+        applicationManifestPath,
+        `${JSON.stringify(applicationManifest, undefined, 2)}\n`,
+      );
+      configuration.tasks["long-line"] = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      const longLine = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "long-line",
+        "--filter=synthetic-app",
+        "--ui=stream-with-experimental-timestamps",
+        "--log-prefix=none",
+        "--cwd",
+        directory,
+      ]);
+      const renderedLongLine = longLine.stdout
+        .split("\n")
+        .find((line) => line.includes("x".repeat(128)));
+      expect(
+        renderedLongLine?.match(
+          /\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] /g,
+        ),
+      ).toHaveLength(1);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -4657,6 +4755,113 @@ snapshots:
       await rm(outside, { force: true, recursive: true });
     }
   }, 30_000);
+
+  it("preserves same-named external packages in queries and summaries", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-external-name-collision-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const sharedDirectory = join(directory, "packages/shared");
+      await mkdir(sharedDirectory);
+      await writeFile(
+        join(sharedDirectory, "package.json"),
+        `${JSON.stringify({
+          name: "shared-name",
+          version: "1.0.0",
+          private: true,
+          scripts: { build: "node -e \"console.log('shared build')\"" },
+        })}\n`,
+      );
+      const appManifestPath = join(directory, "packages/app/package.json");
+      const appManifest = JSON.parse(
+        await readFile(appManifestPath, "utf8"),
+      ) as {
+        dependencies: Record<string, string>;
+        scripts: Record<string, string>;
+      };
+      appManifest.dependencies = {
+        "external-parent": "1.0.0",
+        "shared-name": "workspace:*",
+      };
+      await writeFile(
+        appManifestPath,
+        `${JSON.stringify(appManifest, undefined, 2)}\n`,
+      );
+      await writeFile(
+        join(directory, "pnpm-lock.yaml"),
+        `lockfileVersion: '9.0'
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+importers:
+  .: {}
+  packages/app:
+    dependencies:
+      external-parent:
+        specifier: 1.0.0
+        version: 1.0.0
+      shared-name:
+        specifier: workspace:*
+        version: link:../shared
+  packages/library: {}
+  packages/shared: {}
+packages:
+  external-parent@1.0.0: {}
+  shared-name@2.0.0: {}
+snapshots:
+  external-parent@1.0.0:
+    dependencies:
+      shared-name: 2.0.0
+  shared-name@2.0.0: {}
+`,
+      );
+
+      const query = await execFilePromise(process.execPath, [
+        candidate,
+        "query",
+        "{ externalDependencies { items } }",
+        "--cwd",
+        directory,
+      ]);
+      expect(JSON.parse(query.stdout)).toEqual({
+        data: {
+          externalDependencies: {
+            items: [
+              { name: "external-parent", version: "1.0.0" },
+              { name: "shared-name", version: "2.0.0" },
+            ],
+          },
+        },
+      });
+
+      const dryRun = await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--filter=synthetic-app",
+        "--dry=json",
+        "--cwd",
+        directory,
+      ]);
+      const summary = JSON.parse(dryRun.stdout) as {
+        readonly tasks: ReadonlyArray<{
+          readonly taskId: string;
+          readonly hashOfExternalDependencies: string;
+        }>;
+      };
+      expect(
+        summary.tasks.find((task) => task.taskId === "synthetic-app#build")
+          ?.hashOfExternalDependencies,
+      ).toBe(
+        xxhash64Hex(
+          JSON.stringify(["external-parent@1.0.0", "shared-name@2.0.0"]),
+        ),
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
 
   it("excludes transitive Cargo workspaces from query external dependencies", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-query-cargo-"));

@@ -500,10 +500,13 @@ nested Git-ignore rules and configured task-output patterns suppress generated
 files except where an output exclusion denies the changed file. Package-relative
 outputs are matched from their package directory, while `$TURBO_ROOT$/` outputs
 and exclusions are matched from the repository root. Partial output matching is
-limited to directory events. Ignore and output filtering occurs before manifest
-or configuration refresh classification, so generated manifests cannot cause a
-watch loop. Changes to an ignore file reload the matcher before stale ignore
-rules are applied and remain user-visible triggers.
+limited to directory events. A directory event at the root of a fully excluded
+output subtree remains an input event, while an exclusion that covers only part
+of the directory's descendants does not cancel a positive partial match. Ignore
+and output filtering occurs before manifest or configuration refresh
+classification, so generated manifests cannot cause a watch loop. Changes to an
+ignore file reload the matcher before stale ignore rules are applied and remain
+user-visible triggers.
 Git-ignore matching does not suppress files already tracked in the Git index or
 directory events whose subtree contains tracked files. `.venv` trees remain
 internally ignored even when the repository root does not list them.
@@ -627,8 +630,10 @@ applied, external dependencies come from manifest references resolved against
 the parsed lockfile, including npm v2/v3 package locations whose entries omit
 the package name. Internal workspaces are excluded across the complete
 transitive workspace dependency closure for both query results and external
-dependency hashes. npm root, workspace, and workspace-link records are excluded
-from external package results. Yarn Berry entries report their installed
+dependency hashes by their lockfile workspace identity rather than their bare
+package name, so same-named registry packages remain external. npm root,
+workspace, and workspace-link records are excluded from external package
+results. Yarn Berry entries report their installed
 `version` rather than descriptor ranges. Lockfile reading and parsing are
 deferred until the `externalDependencies` field is selected, so independent
 fields remain available if the discovered lockfile later becomes unavailable
@@ -719,7 +724,11 @@ output or resolved task-log path. Every active structured-log, named-profile,
 anonymous-profile, heap-snapshot, and trace destination must also resolve to a
 distinct path; collisions fail before an artifact is written or a task starts.
 Timestamped streaming applies the timestamp writer to a final unterminated task
-line. Errors-only failure replay does
+line and retains line-start state across bounded output chunks, so one
+continuous line receives one timestamp. Live structured task events retain
+their stdout or stderr channel. Compatible cached task logs contain merged
+plain output without channel metadata, so their replay uses the neutral `info`
+level instead of asserting a stdout channel. Errors-only failure replay does
 not duplicate output already recorded while the task ran and reads the complete
 task log instead of the bounded diagnostic tail. CLI `--global-deps`
 patterns are merged into task hash inputs, and their repository-relative Git
@@ -740,6 +749,8 @@ pnpm, Yarn, Cargo, uv, Bun, Aube, and Nub lockfiles and the actual encoded log
 path, including collision-qualified identifiers and alternate execution scopes.
 Global summary inputs record the corresponding root-manifest external-dependency
 closure hash instead of the empty-closure hash when root dependencies resolve.
+The equals form of `--summarize` accepts only `true` or `false`; other explicit
+values fail argument parsing without creating a summary.
 Graph-bearing closures retain the declaring manifest reference or resolved
 workspace entry so multiple locked versions of one name do not broaden a task's
 external dependency hash. Cargo closures also retain parenthesized source

@@ -279,6 +279,25 @@ describe("core repository model", () => {
         "!dist/source/**",
       ]),
     ).toBe(false);
+    expect(
+      canMatchGlobsDescendantWithExclusions("dist/private", [
+        "dist/**",
+        "!dist/private/**",
+      ]),
+    ).toBe(false);
+    expect(
+      canMatchGlobsDescendantWithExclusions("dist", [
+        "dist/**",
+        "!dist/private/**",
+      ]),
+    ).toBe(true);
+    expect(
+      canMatchGlobsDescendantWithExclusions(
+        "dist\\private",
+        ["dist/**", "!dist/private/**"],
+        true,
+      ),
+    ).toBe(false);
   });
 
   it("parses JSONC without interpreting comment markers inside strings", () => {
@@ -551,6 +570,40 @@ version = "4.0.0"
         }).map((dependency) => `${dependency.name}@${dependency.version}`),
       ).toEqual(["a@1.0.0", "b@2.0.0", "c@3.0.0"]);
     }
+  });
+
+  it("preserves external packages that share workspace names", () => {
+    const source = `__metadata:
+  version: 8
+"app@workspace:packages/app":
+  version: 1.0.0
+  resolution: "app@workspace:packages/app"
+  dependencies:
+    foo: "workspace:packages/foo"
+    x: "npm:^1.0.0"
+"foo@workspace:packages/foo":
+  version: 1.0.0
+  resolution: "foo@workspace:packages/foo"
+"foo@npm:^2.0.0":
+  version: 2.0.0
+  resolution: "foo@npm:2.0.0"
+"x@npm:^1.0.0":
+  version: 1.0.0
+  resolution: "x@npm:1.0.0"
+  dependencies:
+    foo: "npm:^2.0.0"
+`;
+    expect(
+      resolveLockfilePackageClosure("/repo/yarn.lock", encoder.encode(source), {
+        workspacePath: "packages/app",
+        packageName: "app",
+        packageVersion: "1.0.0",
+        directDependencies: [
+          ["foo", "workspace:packages/foo"],
+          ["x", "^1.0.0"],
+        ],
+      }).map((dependency) => `${dependency.name}@${dependency.version}`),
+    ).toEqual(["foo@2.0.0", "x@1.0.0"]);
   });
 
   it("uses declaring references to disambiguate lockfile graph closures", () => {
@@ -1248,6 +1301,20 @@ version = "1.0.0"
         "--no-cache",
       ]).noCache,
     ).toBe(true);
+  });
+
+  it("rejects invalid explicit summarize values", () => {
+    for (const value of ["", "fales", "TRUE", "0"]) {
+      expect(() =>
+        parseRunArguments(["run", "build", `--summarize=${value}`]),
+      ).toThrow(/invalid summarize value/);
+    }
+    expect(
+      parseRunArguments(["run", "build", "--summarize=true"]).summarize,
+    ).toBe(true);
+    expect(
+      parseRunArguments(["run", "build", "--summarize=false"]).summarize,
+    ).toBe(false);
   });
 
   it("rejects blank remote cache timeout arguments", () => {
