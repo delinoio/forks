@@ -1,5 +1,8 @@
 import { Deferred, Effect, Queue, Stream } from "effect";
-import { matchesGlobsWithExclusions } from "../core/glob.js";
+import {
+  canMatchGlobsDescendantWithExclusions,
+  matchesGlobsWithExclusions,
+} from "../core/glob.js";
 import {
   isPathContained,
   joinPath,
@@ -798,15 +801,18 @@ const serveDaemon = (
             }
             const relative = relativePath(repository.root, change.path);
             for (const registration of outputRegistrations.values()) {
-              const patterns = [
-                ...registration.outputGlobs,
-                ...registration.outputExclusionGlobs.map((glob) => `!${glob}`),
-              ];
-              if (!matchesGlobsWithExclusions([relative], patterns)) {
-                continue;
-              }
               for (const glob of registration.outputGlobs) {
-                if (matchesGlobsWithExclusions([relative], [glob])) {
+                const patterns = [
+                  glob,
+                  ...registration.outputExclusionGlobs.map(
+                    (excluded) => `!${excluded}`,
+                  ),
+                ];
+                if (
+                  matchesGlobsWithExclusions([relative], patterns) ||
+                  (change.entryKind === "directory" &&
+                    canMatchGlobsDescendantWithExclusions(relative, patterns))
+                ) {
                   registration.changedOutputGlobs.add(glob);
                 }
               }

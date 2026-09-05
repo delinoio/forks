@@ -26,6 +26,22 @@ export const canMatchGlobDescendant = (
     { dot: true, partial: true },
   );
 
+export const canMatchGlobsDescendantWithExclusions = (
+  path: string,
+  patterns: ReadonlyArray<string>,
+  windowsPathSeparators = false,
+): boolean =>
+  patterns.some(
+    (pattern) =>
+      !pattern.startsWith("!") &&
+      canMatchGlobDescendant(path, pattern, windowsPathSeparators),
+  ) &&
+  !patterns.some(
+    (pattern) =>
+      pattern.startsWith("!") &&
+      canMatchGlobDescendant(path, pattern.slice(1), windowsPathSeparators),
+  );
+
 export const selectByGlobs = (
   values: ReadonlyArray<string>,
   patterns: ReadonlyArray<string>,

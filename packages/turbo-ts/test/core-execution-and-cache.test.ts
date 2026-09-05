@@ -4291,6 +4291,162 @@ describe("core CLI execution", () => {
     }
   }, 60_000);
 
+  it("summarizes external dependencies from every grouped Cargo member", async () => {
+    const directory = await makeFixture();
+    const commandDirectory = `${directory}/commands`;
+    const cargoWorkspaceDirectory = `${directory}/rust`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(
+          {
+            futureFlags: {
+              experimentalCargoWorkspaces: true,
+              strictTaskEntrypointSelection: true,
+            },
+            tasks: { test: { cache: false } },
+          },
+          undefined,
+          2,
+        )}\n`,
+      );
+      const cargoPackages = ["a", "b"].map((name) => {
+        const packageDirectory = `${cargoWorkspaceDirectory}/${name}`;
+        const packageName = `rust-${name}`;
+        return {
+          id: `path+file://${packageDirectory}#${packageName}@0.1.0`,
+          name: packageName,
+          packageDirectory,
+        };
+      });
+      for (const cargoPackage of cargoPackages) {
+        await mkdir(`${cargoPackage.packageDirectory}/src`, {
+          recursive: true,
+        });
+        await writeFile(
+          `${cargoPackage.packageDirectory}/Cargo.toml`,
+          `[package]\nname = "${cargoPackage.name}"\nversion = "0.1.0"\nedition = "2024"\n`,
+        );
+        await writeFile(
+          `${cargoPackage.packageDirectory}/src/lib.rs`,
+          "pub fn value() {}\n",
+        );
+      }
+      await writeFile(
+        `${cargoWorkspaceDirectory}/Cargo.toml`,
+        '[workspace]\nmembers = ["a", "b"]\nresolver = "3"\n',
+      );
+      await writeFile(
+        `${cargoWorkspaceDirectory}/Cargo.lock`,
+        `version = 4
+
+[[package]]
+name = "external-only-for-b"
+version = "2.0.0"
+source = "registry+https://example.test/index"
+
+[[package]]
+name = "rust-a"
+version = "0.1.0"
+
+[[package]]
+name = "rust-b"
+version = "0.1.0"
+dependencies = [
+ "external-only-for-b 2.0.0",
+]
+`,
+      );
+      await mkdir(commandDirectory);
+      const cargoMetadata = JSON.stringify({
+        workspace_root: cargoWorkspaceDirectory,
+        workspace_members: cargoPackages.map(({ id }) => id),
+        target_directory: `${cargoWorkspaceDirectory}/target`,
+        packages: cargoPackages.map(({ id, name, packageDirectory }) => ({
+          id,
+          name,
+          version: "0.1.0",
+          manifest_path: `${packageDirectory}/Cargo.toml`,
+          dependencies:
+            name === "rust-b"
+              ? [
+                  {
+                    name: "external-only-for-b",
+                    source: "registry+https://example.test/index",
+                  },
+                ]
+              : [],
+          targets: [{ kind: ["lib"], name: name.replaceAll("-", "_") }],
+        })),
+      });
+      const cargoCommand = `${commandDirectory}/cargo`;
+      const rustcCommand = `${commandDirectory}/rustc`;
+      await writeFile(
+        cargoCommand,
+        `#!/usr/bin/env node\nif (process.argv.includes("metadata")) process.stdout.write(${JSON.stringify(cargoMetadata)}); else if (process.argv.includes("--version")) console.log("cargo 1.96.0-nightly"); else console.log("cargo test output");\n`,
+      );
+      await writeFile(
+        rustcCommand,
+        '#!/usr/bin/env node\nconsole.log("rustc 1.96.0-nightly");\nconsole.log("host: synthetic-target-triple");\n',
+      );
+      await chmod(cargoCommand, 0o755);
+      await chmod(rustcCommand, 0o755);
+      const environment = {
+        ...process.env,
+        PATH: `${commandDirectory}${delimiter}${process.env.PATH ?? ""}`,
+        NO_COLOR: "1",
+        TURBO_TELEMETRY_DISABLED: "1",
+      };
+      const expectedHash = xxhash64Hex(
+        JSON.stringify(["external-only-for-b@2.0.0"]),
+      );
+      const dry = await run(
+        process.execPath,
+        [candidateEntrypoint, "run", "test", "--dry=json", "--cwd", directory],
+        repositoryRoot,
+        environment,
+      );
+      expect(dry.exitCode, dry.stderr).toBe(0);
+      const drySummary = JSON.parse(dry.stdout) as {
+        readonly tasks: ReadonlyArray<{
+          readonly package: string;
+          readonly hashOfExternalDependencies: string;
+        }>;
+      };
+      expect(drySummary.tasks).toHaveLength(1);
+      expect(drySummary.tasks[0]).toMatchObject({
+        package: "rust-a",
+        hashOfExternalDependencies: expectedHash,
+      });
+      const completed = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "test",
+          "--summarize",
+          "--json",
+          "--no-cache",
+          "--cwd",
+          directory,
+        ],
+        repositoryRoot,
+        environment,
+      );
+      expect(completed.exitCode, completed.stderr).toBe(0);
+      const completedSummary = JSON.parse(
+        completed.stdout.trim().split("\n").at(-1)!,
+      ) as typeof drySummary;
+      expect(completedSummary.tasks).toHaveLength(1);
+      expect(completedSummary.tasks[0]?.hashOfExternalDependencies).toBe(
+        expectedHash,
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("preserves strict uv controls when propagating Cargo workspace hashes", async () => {
     const directory = await makeFixture();
     const commandDirectory = `${directory}/commands`;

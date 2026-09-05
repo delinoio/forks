@@ -25,7 +25,11 @@ import type {
   BoundariesConfig,
   Permissions,
 } from "../generated/configuration.js";
-import { buildTaskGraph } from "../graph/task-graph.js";
+import {
+  buildTaskGraph,
+  type TaskGraph,
+  type TaskNode,
+} from "../graph/task-graph.js";
 import { decodeNullDelimitedGitOutput } from "../hash/task-hash.js";
 import {
   type LockfilePackage,
@@ -317,6 +321,37 @@ const repositoryTaskGraph = (
       ),
     ].sort();
   return buildTaskGraph(repository, models, taskNames, false);
+};
+
+type AffectedTaskReason =
+  | "TaskAllChanged"
+  | "TaskDependencyTaskChanged"
+  | "TaskFileChanged";
+
+const affectedTaskReason = (
+  graph: TaskGraph,
+  node: TaskNode,
+  affected: ReadonlyMap<string, RepositoryPackage>,
+  directlyAffected: ReadonlySet<string>,
+): AffectedTaskReason => {
+  if (directlyAffected.has(node.package.identity)) return "TaskFileChanged";
+  const visited = new Set([node.id]);
+  const pending = [...node.dependencies];
+  while (pending.length > 0) {
+    const dependencyId = pending.shift()!;
+    if (visited.has(dependencyId)) continue;
+    visited.add(dependencyId);
+    const dependency = graph.nodes.get(dependencyId);
+    if (dependency === undefined) continue;
+    if (
+      dependency.package.identity !== node.package.identity &&
+      affected.has(dependency.package.identity)
+    ) {
+      return "TaskDependencyTaskChanged";
+    }
+    pending.push(...dependency.dependencies);
+  }
+  return "TaskAllChanged";
 };
 
 const calculateAffectedRepository = (
@@ -743,6 +778,12 @@ const repositoryQueryRoot = (
       } as TaskView,
     ]),
   );
+  const taskNodesByView = new Map(
+    [...taskGraph.nodes.values()].map((node) => [
+      taskViews.get(node.id)!,
+      node,
+    ]),
+  );
   for (const node of taskGraph.nodes.values()) {
     const mutable = taskViews.get(node.id)!;
     const directDependencies = node.dependencies;
@@ -911,15 +952,16 @@ const repositoryQueryRoot = (
           : allTasks.filter((task) => requested.has(task.name));
       return list(
         selected.map((task) => {
-          const packageModel = models.find(
-            (model) => packageView(model) === task.package,
-          )!;
+          const node = taskNodesByView.get(task)!;
           return {
             ...task,
             reason: {
-              __typename: result.directlyAffected.has(packageModel.identity)
-                ? "TaskFileChanged"
-                : "TaskDependencyTaskChanged",
+              __typename: affectedTaskReason(
+                taskGraph,
+                node,
+                result.affected,
+                result.directlyAffected,
+              ),
             },
           };
         }),
@@ -1326,8 +1368,19 @@ export const executeQueryAffected = (
       packageModel: RepositoryPackage,
       name: string,
       dependsOn: ReadonlyArray<string>,
-      dependencyPackageIdentities?: ReadonlyArray<string>,
+      node?: TaskNode,
+      graph?: TaskGraph,
     ) => {
+      if (node !== undefined && graph !== undefined) {
+        return {
+          __typename: affectedTaskReason(
+            graph,
+            node,
+            affected,
+            directlyAffected,
+          ),
+        };
+      }
       if (directlyAffected.has(packageModel.identity)) {
         return { __typename: "TaskFileChanged" };
       }
@@ -1335,11 +1388,7 @@ export const executeQueryAffected = (
         (dependency) => affected.has(dependency),
       );
       const changedDependencyTask =
-        dependencyPackageIdentities === undefined
-          ? changedDependency && dependsOn.includes(`^${name}`)
-          : dependencyPackageIdentities.some((identity) =>
-              affected.has(identity),
-            );
+        changedDependency && dependsOn.includes(`^${name}`);
       return {
         __typename: changedDependencyTask
           ? "TaskDependencyTaskChanged"
@@ -1350,17 +1399,13 @@ export const executeQueryAffected = (
       packageModel: RepositoryPackage,
       name: string,
       dependsOn: ReadonlyArray<string>,
-      dependencyPackageIdentities?: ReadonlyArray<string>,
+      node?: TaskNode,
+      graph?: TaskGraph,
     ) => ({
       name,
       fullName: `${packageModel.name}#${name}`,
       package: { name: packageModel.name },
-      reason: taskReason(
-        packageModel,
-        name,
-        dependsOn,
-        dependencyPackageIdentities,
-      ),
+      reason: taskReason(packageModel, name, dependsOn, node, graph),
     });
     const requestedTaskGraph =
       requested.size === 0
@@ -1391,13 +1436,8 @@ export const executeQueryAffected = (
                   node.package,
                   node.task,
                   node.definition.dependsOn ?? [],
-                  node.dependencies.flatMap((dependency) => {
-                    const dependencyNode =
-                      requestedTaskGraph!.nodes.get(dependency);
-                    return dependencyNode === undefined
-                      ? []
-                      : [dependencyNode.package.identity];
-                  }),
+                  node,
+                  requestedTaskGraph,
                 ),
               )
     ).sort((left, right) => left.fullName.localeCompare(right.fullName));

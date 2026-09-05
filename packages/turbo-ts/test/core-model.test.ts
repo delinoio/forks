@@ -10,7 +10,11 @@ import {
   mergePipeline,
   parseJsonConfiguration,
 } from "../src/config/runtime.js";
-import { matchesGlob, selectByGlobs } from "../src/core/glob.js";
+import {
+  canMatchGlobsDescendantWithExclusions,
+  matchesGlob,
+  selectByGlobs,
+} from "../src/core/glob.js";
 import {
   isAbsolutePath,
   isPathContained,
@@ -257,6 +261,18 @@ describe("core repository model", () => {
     expect(
       selectByGlobs(["src\\config.json", "src/config.json"], ["**", "!src/**"]),
     ).toEqual(["src\\config.json"]);
+    expect(
+      canMatchGlobsDescendantWithExclusions("dist/generated", [
+        "dist/**/*.js",
+        "!dist/source/**",
+      ]),
+    ).toBe(true);
+    expect(
+      canMatchGlobsDescendantWithExclusions("dist/source/newdir", [
+        "dist/**/*.js",
+        "!dist/source/**",
+      ]),
+    ).toBe(false);
   });
 
   it("parses JSONC without interpreting comment markers inside strings", () => {

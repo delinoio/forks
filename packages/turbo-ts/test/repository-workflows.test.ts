@@ -65,6 +65,7 @@ import {
   repositoryPackageManagerLabel,
 } from "../src/workflow/repository.js";
 import {
+  executeWatch,
   parseWatchArguments,
   resolvedWatchRunOptions,
 } from "../src/workflow/watch.js";
@@ -1781,7 +1782,7 @@ describe("repository workflow gate", () => {
                         method: DaemonMethod.notifyOutputsWritten,
                         params: {
                           hash: "synthetic-hash",
-                          outputGlobs: ["packages/app/build/**"],
+                          outputGlobs: ["packages/app/build/*.js"],
                         },
                       }),
                       connection(
@@ -1809,8 +1810,9 @@ describe("repository workflow gate", () => {
                     Stream.fromEffect(
                       Effect.sleep("10 millis").pipe(
                         Effect.as({
-                          path: join(root, "packages/app/build/output.txt"),
-                          kind: "modify" as const,
+                          path: join(root, "packages/app/build"),
+                          kind: "rename" as const,
+                          entryKind: "directory" as const,
                         }),
                       ),
                     ),
@@ -1825,7 +1827,7 @@ describe("repository workflow gate", () => {
           changedOutputs: [
             {
               hash: "synthetic-hash",
-              changedOutputGlobs: ["packages/app/build/**"],
+              changedOutputGlobs: ["packages/app/build/*.js"],
             },
           ],
         },
@@ -2570,6 +2572,109 @@ describe("repository workflow gate", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 60_000);
+
+  it("watches an active root configuration outside the repository", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "turbo-ts-watch-external-"));
+    const directory = join(parent, "repository");
+    const configurationDirectory = join(parent, "configuration");
+    const configurationPath = join(configurationDirectory, "custom.json");
+    const unrelatedPath = join(configurationDirectory, "unrelated.txt");
+    const watchedRoots: Array<string> = [];
+    try {
+      await prepareFixture(directory);
+      await mkdir(configurationDirectory);
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify({ tasks: { build: {} } }, undefined, 2)}\n`,
+      );
+      const manifestPath = join(directory, "packages/app/package.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"require('node:fs').appendFileSync('build-runs.txt','build\\n')\"";
+      manifest.scripts.prepare =
+        "node -e \"require('node:fs').appendFileSync('prepare-runs.txt','prepare\\n')\"";
+      await writeFile(
+        manifestPath,
+        `${JSON.stringify(manifest, undefined, 2)}\n`,
+      );
+      const externalChanges = Stream.concat(
+        Stream.succeed({
+          path: unrelatedPath,
+          kind: "modify" as const,
+          entryKind: "file" as const,
+        }),
+        Stream.fromEffect(
+          Effect.sleep("250 millis").pipe(
+            Effect.zipRight(
+              Effect.promise(() =>
+                writeFile(
+                  configurationPath,
+                  `${JSON.stringify(
+                    {
+                      tasks: {
+                        build: { dependsOn: ["prepare"] },
+                        prepare: {},
+                      },
+                    },
+                    undefined,
+                    2,
+                  )}\n`,
+                ),
+              ),
+            ),
+            Effect.as({
+              path: configurationPath,
+              kind: "modify" as const,
+              entryKind: "file" as const,
+            }),
+          ),
+        ),
+      );
+      await Effect.runPromise(
+        executeWatch(
+          parseWatchArguments([
+            "build",
+            "--filter=synthetic-app",
+            "--cwd",
+            directory,
+            "--root-turbo-json",
+            configurationPath,
+            "--no-cache",
+          ]),
+        ).pipe(
+          Effect.provide(
+            Layer.succeed(FileWatcherService, {
+              watch: (root) => {
+                watchedRoots.push(root);
+                return root === configurationDirectory
+                  ? externalChanges
+                  : Stream.empty;
+              },
+            }),
+          ),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(new Set(watchedRoots)).toEqual(
+        new Set([directory, configurationDirectory]),
+      );
+      expect(
+        (await readFile(join(directory, "packages/app/build-runs.txt"), "utf8"))
+          .trim()
+          .split("\n"),
+      ).toEqual(["build", "build"]);
+      expect(
+        await readFile(
+          join(directory, "packages/app/prepare-runs.txt"),
+          "utf8",
+        ),
+      ).toBe("prepare\n");
+    } finally {
+      await rm(parent, { force: true, recursive: true });
+    }
+  }, 30_000);
 
   it("coalesces file storms, restarts watch runs, and closes on interruption", async () => {
     const parent = await mkdtemp(join(tmpdir(), "turbo-ts-watch-parent-"));
@@ -4795,7 +4900,7 @@ importers:
     }
   });
 
-  it("propagates dependency-task reasons through affected package chains", async () => {
+  it("traces dependency-task reasons through affected task edges", async () => {
     const fixtureParent = join(repositoryRoot, ".turbo");
     await mkdir(fixtureParent, { recursive: true });
     const directory = await mkdtemp(
@@ -4820,14 +4925,30 @@ importers:
       const applicationConfiguration = JSON.parse(
         await readFile(applicationConfigurationPath, "utf8"),
       ) as {
-        tasks: { build: { dependsOn?: Array<string> } };
+        tasks: Record<string, { dependsOn?: Array<string> }>;
       };
-      applicationConfiguration.tasks.build.dependsOn = [
+      applicationConfiguration.tasks.build!.dependsOn = [
         "synthetic-library#compile",
       ];
+      applicationConfiguration.tasks.check = { dependsOn: ["prepare"] };
       await writeFile(
         applicationConfigurationPath,
         `${JSON.stringify(applicationConfiguration, undefined, 2)}\n`,
+      );
+      const applicationManifestPath = join(
+        directory,
+        "packages/app/package.json",
+      );
+      const applicationManifest = JSON.parse(
+        await readFile(applicationManifestPath, "utf8"),
+      ) as { scripts: Record<string, string> };
+      applicationManifest.scripts.prepare =
+        "node -e \"console.log('app prepare')\"";
+      applicationManifest.scripts.check =
+        "node -e \"console.log('app check')\"";
+      await writeFile(
+        applicationManifestPath,
+        `${JSON.stringify(applicationManifest, undefined, 2)}\n`,
       );
       const libraryManifestPath = join(
         directory,
@@ -4882,6 +5003,7 @@ importers:
         "affected",
         "--tasks",
         "build",
+        "check",
         "--base=HEAD~1",
         "--head=HEAD",
         "--cwd",
@@ -4890,7 +5012,7 @@ importers:
       const graphqlResult = await execFilePromise(process.execPath, [
         candidate,
         "query",
-        '{ affectedTasks(base: "HEAD~1", head: "HEAD", tasks: ["build"]) { items { fullName reason } } }',
+        '{ affectedTasks(base: "HEAD~1", head: "HEAD", tasks: ["build", "check"]) { items { fullName reason } } }',
         "--cwd",
         directory,
       ]);
@@ -4930,6 +5052,7 @@ importers:
       expect(taskReasons(shortcutItems)).toEqual(taskReasons(graphqlItems));
       expect(taskReasons(shortcutItems)).toEqual({
         "synthetic-app#build": "TaskDependencyTaskChanged",
+        "synthetic-app#check": "TaskAllChanged",
         "synthetic-core#build": "TaskFileChanged",
         "synthetic-library#build": "TaskDependencyTaskChanged",
       });

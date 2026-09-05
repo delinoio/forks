@@ -1,6 +1,6 @@
 import { Effect, Ref, Stream } from "effect";
 import {
-  canMatchGlobDescendant,
+  canMatchGlobsDescendantWithExclusions,
   matchesGlobsWithExclusions,
 } from "../core/glob.js";
 import {
@@ -101,11 +101,7 @@ const configuredOutputPath = (
     return (
       matchesGlobsWithExclusions([relative], patterns) ||
       (entryKind === "directory" &&
-        patterns.some(
-          (pattern) =>
-            !pattern.startsWith("!") &&
-            canMatchGlobDescendant(relative, pattern),
-        ))
+        canMatchGlobsDescendantWithExclusions(relative, patterns))
     );
   };
   return [repository.rootPackage, ...repository.packages].some((packageModel) =>
@@ -266,10 +262,43 @@ export const executeWatch = (
       changes: [],
     });
     const activeRuns = yield* Ref.make(0);
-    const changes = watcher.watch(repository.root).pipe(
+    const absoluteRootTurboJson =
+      options.run.rootTurboJson === undefined
+        ? undefined
+        : isAbsolutePath(options.run.rootTurboJson)
+          ? options.run.rootTurboJson
+          : joinPath(repository.root, options.run.rootTurboJson);
+    const externalConfigurationChanges =
+      absoluteRootTurboJson !== undefined &&
+      !isPathContained(repository.root, absoluteRootTurboJson)
+        ? watcher.watch(parentPath(absoluteRootTurboJson)).pipe(
+            Stream.filter(
+              (change) =>
+                change.kind === "unknown" ||
+                normalizePath(change.path) ===
+                  normalizePath(absoluteRootTurboJson),
+            ),
+            Stream.map((change) =>
+              change.kind === "unknown"
+                ? { ...change, path: absoluteRootTurboJson }
+                : change,
+            ),
+          )
+        : Stream.empty;
+    const watchedChanges = Stream.merge(
+      watcher.watch(repository.root),
+      externalConfigurationChanges,
+    );
+    const changes = watchedChanges.pipe(
       Stream.filterEffect((change) =>
         Effect.gen(function* () {
-          if (isInternalRepositoryPath(repository.root, change.path)) {
+          const isExternalRootTurboJsonChange =
+            absoluteRootTurboJson !== undefined &&
+            normalizePath(change.path) === normalizePath(absoluteRootTurboJson);
+          if (
+            !isExternalRootTurboJsonChange &&
+            isInternalRepositoryPath(repository.root, change.path)
+          ) {
             return false;
           }
           if (change.kind === "unknown") {
