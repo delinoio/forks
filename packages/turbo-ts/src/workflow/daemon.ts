@@ -55,11 +55,30 @@ interface DaemonPaths {
   readonly hash: string;
   readonly stateDirectory: string;
   readonly socket: string;
+  readonly endpointKind: DaemonEndpointKind;
   readonly pid: string;
   readonly lock: string;
   readonly activeLog: string;
   readonly log: string;
 }
+
+const DaemonEndpointKind = {
+  unixSocket: "unixSocket",
+  windowsNamedPipe: "windowsNamedPipe",
+} as const;
+
+type DaemonEndpointKind =
+  (typeof DaemonEndpointKind)[keyof typeof DaemonEndpointKind];
+
+export const daemonEndpointPath = (
+  stateDirectory: string,
+  repositoryHash: string,
+  userHash: string,
+  operatingSystem: string,
+): string =>
+  operatingSystem === "win32"
+    ? `\\\\.\\pipe\\turbod-${userHash}-${repositoryHash}`
+    : joinPath(stateDirectory, "turbod.sock");
 
 interface OutputRegistration {
   readonly outputGlobs: ReadonlyArray<string>;
@@ -197,6 +216,9 @@ const daemonPaths = (
       );
     }
     const hash = (yield* digest.sha256(root)).slice(0, 16);
+    const userHash = (yield* digest.sha256(
+      `${information.userIdentifier}\0${information.temporaryDirectory}`,
+    )).slice(0, 16);
     const stateDirectory = joinPath(
       information.temporaryDirectory,
       `turbod-${information.userIdentifier}`,
@@ -206,7 +228,16 @@ const daemonPaths = (
     return {
       hash,
       stateDirectory,
-      socket: joinPath(stateDirectory, "turbod.sock"),
+      socket: daemonEndpointPath(
+        stateDirectory,
+        hash,
+        userHash,
+        information.operatingSystem,
+      ),
+      endpointKind:
+        information.operatingSystem === "win32"
+          ? DaemonEndpointKind.windowsNamedPipe
+          : DaemonEndpointKind.unixSocket,
       pid: joinPath(stateDirectory, "turbod.pid"),
       lock: joinPath(stateDirectory, "turbod.lock"),
       activeLog: joinPath(stateDirectory, "turbod.log-path"),
@@ -248,7 +279,9 @@ const cleanStaleState = (
     const fileSystem = yield* FileSystemService;
     yield* Effect.all([
       fileSystem.remove(paths.pid).pipe(Effect.ignore),
-      fileSystem.remove(paths.socket).pipe(Effect.ignore),
+      ...(paths.endpointKind === DaemonEndpointKind.unixSocket
+        ? [fileSystem.remove(paths.socket).pipe(Effect.ignore)]
+        : []),
       fileSystem.remove(paths.activeLog).pipe(Effect.ignore),
     ]);
   });
@@ -1025,6 +1058,9 @@ const serveDaemon = (
                         `${new Date(yield* clock.now).toISOString()} rpc=${request.method} response_error=${responseResult.left.message}\n`,
                       )
                       .pipe(Effect.ignore);
+                    if (request.method === DaemonMethod.shutdown) {
+                      yield* Deferred.succeed(shutdown, undefined);
+                    }
                     return;
                   }
                   for (const [
@@ -1076,6 +1112,56 @@ const serveDaemon = (
     }),
   );
 
+export const followDaemonLog = (
+  logPath: string,
+): Effect.Effect<
+  void,
+  BoundaryError,
+  FileSystemService | FileWatcherService | SignalService | TerminalService
+> =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystemService;
+      const watcher = yield* FileWatcherService;
+      const signals = yield* SignalService;
+      const terminal = yield* TerminalService;
+      const chunkSize = 64 * 1024;
+      let offset = 0;
+      let decoder = new TextDecoder();
+      const writeAvailable = Effect.gen(function* () {
+        const metadata = yield* fileSystem
+          .metadata(logPath)
+          .pipe(Effect.orElseSucceed(() => undefined));
+        if (metadata === undefined || metadata.kind !== "file") return;
+        if (metadata.size < offset) {
+          offset = 0;
+          decoder = new TextDecoder();
+        }
+        const availableUntil = metadata.size;
+        while (offset < availableUntil) {
+          const contents = yield* fileSystem
+            .readBytesRange(
+              logPath,
+              offset,
+              Math.min(chunkSize, availableUntil - offset),
+            )
+            .pipe(Effect.orElseSucceed(() => new Uint8Array()));
+          if (contents.byteLength === 0) return;
+          offset += contents.byteLength;
+          const text = decoder.decode(contents, { stream: true });
+          if (text !== "") yield* terminal.writeStdout(text);
+        }
+      });
+      yield* writeAvailable;
+      const follow = watcher.watch(parentPath(logPath)).pipe(
+        Stream.filter((change) => watcherPathsMatch(change.path, logPath)),
+        Stream.mapEffect(() => writeAvailable),
+        Stream.runDrain,
+      );
+      yield* Effect.race(follow, Stream.runHead(signals.signals));
+    }),
+  );
+
 export const executeDaemon = (
   options: DaemonOptions,
 ): Effect.Effect<
@@ -1119,8 +1205,6 @@ export const executeDaemon = (
       return 0;
     }
     if (options.command === "logs") {
-      const watcher = yield* FileWatcherService;
-      const signals = yield* SignalService;
       const state = yield* daemonStatusWhenReady(paths);
       if (state === undefined) {
         yield* terminal.writeStderr(
@@ -1129,31 +1213,8 @@ export const executeDaemon = (
         return 1;
       }
       const logPath = state.logPath;
-      return yield* Effect.scoped(
-        Effect.gen(function* () {
-          let contents = yield* fileSystem
-            .readText(logPath)
-            .pipe(Effect.orElseSucceed(() => ""));
-          yield* terminal.writeStdout(contents);
-          const follow = watcher.watch(parentPath(logPath)).pipe(
-            Stream.filter((change) => watcherPathsMatch(change.path, logPath)),
-            Stream.mapEffect(() =>
-              fileSystem.readText(logPath).pipe(Effect.orElseSucceed(() => "")),
-            ),
-            Stream.mapEffect((updated) => {
-              const offset = updated.startsWith(contents) ? contents.length : 0;
-              const appended = updated.slice(offset);
-              contents = updated;
-              return appended === ""
-                ? Effect.void
-                : terminal.writeStdout(appended);
-            }),
-            Stream.runDrain,
-          );
-          yield* Effect.race(follow, Stream.runHead(signals.signals));
-          return 0;
-        }),
-      );
+      yield* followDaemonLog(logPath);
+      return 0;
     }
     const state = yield* daemonStatusWhenReady(paths);
     if (state === undefined) {

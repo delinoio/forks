@@ -227,8 +227,9 @@ log destination is unlinked before task output is written so a hard link cannot
 redirect truncation outside the execution directory.
 Persistent companions must remain alive until their foreground owners
 complete; any earlier natural exit fails the group without replacing outcomes
-for foreground tasks that already completed, and foreground owners sharing a
-companion remain subject to the run's concurrency limit.
+for foreground tasks that already completed, including owners that finish in
+the same concurrent cohort before the companion exit is observed. Foreground
+owners sharing a companion remain subject to the run's concurrency limit.
 Persistent task scopes always bypass local and remote caching, regardless of
 their configured cache value.
 On Windows, npm, pnpm, and Yarn task commands use their standard command shims
@@ -533,10 +534,12 @@ ignore rules.
 
 The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
 identity, per-user temporary state directory, atomic PID and start lock files,
-0600 Unix sockets, and stale-state cleanup. Its public transport is the
-official `turbodprotocol.Turbod` gRPC service over HTTP/2. Hello, status, and
-shutdown calls interoperate in both directions with the 2.10.12 executable;
-package and watch calls share the same bounded framing and scoped sessions.
+0600 Unix sockets on POSIX, per-user named-pipe endpoints on Windows, and
+stale-state cleanup. Named pipes skip Unix filesystem ownership and permission
+operations. Its public transport is the official `turbodprotocol.Turbod` gRPC
+service over HTTP/2. Hello, status, and shutdown calls interoperate in both
+directions with the 2.10.12 executable; package and watch calls share the same
+bounded framing and scoped sessions.
 Requests that exceed the transport queue receive an immediate protocol error
 instead of displacing an older request. Unsupported-method and queue-capacity
 responses run in the server Scope so endpoint teardown interrupts pending
@@ -565,17 +568,23 @@ After a successful health handshake, a subsequent status transport or response
 failure preserves the live daemon's PID, socket, and active-log state and is
 reported to the caller for both status and logs commands.
 Log clients follow the exact dated log reported by the running daemon until
-interrupted. Stop escalates only after a successful RPC identifies the process
-as the expected daemon; reused live PIDs without a healthy daemon RPC are
-treated as stale state and are never signaled. A failed shutdown RPC preserves
+interrupted, reading only newly available bounded byte ranges while preserving
+split UTF-8 code points. Stop escalates only after a successful RPC identifies
+the process as the expected daemon; reused live PIDs without a healthy daemon
+RPC are treated as stale state and are never signaled. A failed shutdown RPC
+preserves
 the live daemon's PID, socket, and active-log state and reports the failure so
 the operation can be retried. Forced termination must be available, succeed,
 and be confirmed before the same state is removed. A timed-out daemon start
 applies the same termination and state-retention rules to its spawned process.
+Detached daemon starts are acknowledged only after Node reports the spawn event;
+asynchronous spawn failures remain typed process errors.
 Malformed streams remain
-isolated, response transport failures are logged and isolated to their request,
-and an idle server resets its deadline after RPC or repository activity without
-expiring while an RPC is in flight. Dated daemon log paths derive their time
+isolated, every response callback error, including one reported with an HTTP/2
+`NO_ERROR` reset code, is logged and isolated to its request,
+while a received shutdown request still initiates shutdown after its response
+attempt. An idle server resets its deadline after RPC or repository activity
+without expiring while an RPC is in flight. Dated daemon log paths derive their time
 from the configured clock service. Serve startup acquires exclusive PID
 ownership, a competing server cannot unlink a live daemon endpoint, endpoint
 cleanup is limited to the owning server instance, and a post-bind endpoint
@@ -652,16 +661,20 @@ exclusions use canonical locations. Contained relative file symlinks are
 recreated without dereferencing unless their resolved target enters an
 unselected nested workspace; copied root controls include their contained
 regular-file targets at the corresponding installation paths. Absolute,
-escaping, or output-targeting links are rejected, including symlinked root
-installation controls, and an exact symlinked output root is rejected before
-replacement. The root pnpm
+escaping, or output-targeting root-control links are rejected, and an exact
+symlinked output root is rejected before replacement. Generated root manifest
+transformations, including production dependency removal, are applied to
+validated symlink targets before the links are recreated. The root pnpm
 hook `.pnpmfile.cjs` is retained in every
 installation root. Root Bun `bunfig.toml` configuration is retained in the
 ordinary output and both Docker installation roots. Root Yarn installation controls, including `.yarnrc.yml`,
 `.pnp.cjs`, releases, patches, and a repository-contained configured `yarnPath`
 executable, are retained at their repository-relative locations in applicable
 ordinary and Docker layouts. Required Yarn releases, patches, and configured
-executables are retained even when Git-ignore rules match them. Other copying
+executables are retained even when Git-ignore rules match them, including when
+their configured path descends through an otherwise ignored `node_modules`
+directory; unrelated files beneath that ignored directory remain excluded.
+Other copying
 honors repository and nested Git-ignore files unless disabled; ordinary pnpm
 pruning retains development dependency closure. Production npm, pnpm, Yarn,
 and text Bun pruning removes development dependency edges and their package
@@ -671,7 +684,10 @@ workspace manifests in the ordinary or Docker full tree. Docker JSON subsets
 contain manifests only for selected JavaScript packages; selected Cargo and uv
 package manifests remain in the full tree. Selected Cargo and uv packages also
 retain their owning workspace manifest and lockfile in the ordinary or Docker
-full tree. When
+full tree. Retained Cargo workspace manifests list exactly the selected Cargo
+members, narrow `default-members` to that set, and omit `default-members`
+when none remain. Their exclusion lists are removed after the selected member
+set is made explicit. When
 `futureFlags.pruneIncludesGlobalFiles` is enabled, ordered
 `globalDependencies` or `global.inputs` globs copy their safe, non-ignored
 matches into the ordinary output or Docker full tree before generated controls
@@ -696,7 +712,9 @@ files are likewise excluded whenever a bare profile option selects the default
 path; other `profile.*` files remain inputs. Simultaneous bare named and
 anonymous profiles use distinct generated destinations. A structured-log
 artifact may not replace a mandatory task control input or match a declared task
-output or resolved task-log path. Timestamped
+output or resolved task-log path. Every active structured-log, named-profile,
+anonymous-profile, and trace destination must also resolve to a distinct path;
+collisions fail before an artifact is written or a task starts. Timestamped
 streaming applies the timestamp
 writer to a final unterminated task line. Errors-only failure replay does
 not duplicate output already recorded while the task ran and reads the complete

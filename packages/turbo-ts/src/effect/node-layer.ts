@@ -1403,15 +1403,46 @@ const processLayer = Layer.succeed(ProcessService, {
       terminateChild,
     ),
   spawnDetached: (request) =>
-    Effect.try({
-      try: () => {
+    Effect.async<number, ProcessExecutionError>((resume) => {
+      let child: ChildProcess;
+      let settled = false;
+      const settle = (
+        result: Effect.Effect<number, ProcessExecutionError>,
+      ): void => {
+        if (settled) return;
+        settled = true;
+        resume(result);
+      };
+      const consumeLateError = (): void => undefined;
+      const onError = (cause: Error): void => {
+        child.off("spawn", onSpawn);
+        settle(Effect.fail(processExecutionError(request.command, cause)));
+      };
+      const onSpawn = (): void => {
+        child.off("error", onError);
+        child.on("error", consumeLateError);
+        if (child.pid === undefined) {
+          settle(
+            Effect.fail(
+              processExecutionError(
+                request.command,
+                new Error("detached process has no process identifier"),
+              ),
+            ),
+          );
+          return;
+        }
+        child.unref();
+        settle(Effect.succeed(child.pid));
+      };
+      try {
         const invocation = resolveSpawnInvocation(
           request.command,
           request.args,
           process.platform,
           configuredWindowsCommandInterpreter(),
         );
-        const child = spawn(invocation.command, [...invocation.args], {
+        child = spawn(invocation.command, [...invocation.args], {
           cwd: request.cwd,
           detached: true,
           env: makeChildEnvironment(
@@ -1423,13 +1454,24 @@ const processLayer = Layer.succeed(ProcessService, {
           stdio: "ignore",
           windowsVerbatimArguments: invocation.windowsVerbatimArguments,
         });
+        child.once("error", onError);
+        child.once("spawn", onSpawn);
+      } catch (cause) {
+        settle(Effect.fail(processExecutionError(request.command, cause)));
+        return;
+      }
+      return Effect.sync(() => {
+        if (settled) return;
+        settled = true;
+        child.off("error", onError);
+        child.off("spawn", onSpawn);
+        child.on("error", consumeLateError);
         if (child.pid === undefined) {
-          throw new Error("detached process has no process identifier");
+          child.once("spawn", () => child.unref());
+        } else {
+          child.unref();
         }
-        child.unref();
-        return child.pid;
-      },
-      catch: (cause) => processExecutionError(request.command, cause),
+      });
     }),
   isProcessAlive: (pid) =>
     Effect.sync(() => {
@@ -2079,15 +2121,8 @@ export const respondGrpc = (
       stream.end(
         grpcFrame(daemonResponsePayload(method, response)),
         (cause?: Error | null) => {
-          // Node can report a write error after a peer received the complete
-          // response and closed with NO_ERROR. Keep that acknowledgement, but
-          // fail real reset codes; remove this exception when Node no longer
-          // reports delivery-complete closes as callback errors.
           resume(
-            cause === undefined ||
-              cause === null ||
-              (stream.writableEnded &&
-                stream.rstCode === http2Constants.NGHTTP2_NO_ERROR)
+            cause === undefined || cause === null
               ? Effect.void
               : Effect.fail(daemonProtocolError(cause)),
           );
@@ -2108,6 +2143,7 @@ interface DaemonEndpointSetup {
   readonly metadata: (path: string) => Promise<DaemonEndpointIdentity>;
   readonly setPermissions: (path: string, mode: number) => Promise<void>;
   readonly respond: typeof respondGrpc;
+  readonly platform: NodeJS.Platform;
 }
 
 const closeBoundDaemonServer = async (
@@ -2140,6 +2176,8 @@ export const makeDaemonServe = (setup: Partial<DaemonEndpointSetup> = {}) => {
     });
   const setPermissions = setup.setPermissions ?? chmod;
   const respond = setup.respond ?? respondGrpc;
+  const platform = setup.platform ?? process.platform;
+  const fileBackedEndpoint = platform !== "win32";
   return (endpoint: string) =>
     Stream.asyncPush<DaemonConnection, BoundaryError>(
       (emit) =>
@@ -2161,7 +2199,7 @@ export const makeDaemonServe = (setup: Partial<DaemonEndpointSetup> = {}) => {
               {
                 readonly server: Http2Server;
                 readonly sessions: Set<ServerHttp2Session>;
-                readonly endpointIdentity: DaemonEndpointIdentity;
+                readonly endpointIdentity?: DaemonEndpointIdentity;
               },
               BoundaryError
             >((resume) => {
@@ -2234,15 +2272,20 @@ export const makeDaemonServe = (setup: Partial<DaemonEndpointSetup> = {}) => {
               const fail = (cause: Error) =>
                 resume(Effect.fail(daemonProtocolError(cause)));
               server.once("error", fail);
-              mkdir(dirname(endpoint), { recursive: true, mode: 0o700 })
+              (fileBackedEndpoint
+                ? mkdir(dirname(endpoint), { recursive: true, mode: 0o700 })
+                : Promise.resolve()
+              )
                 .then(() => {
                   server.listen(endpoint, () => {
                     let endpointIdentity: DaemonEndpointIdentity | undefined;
-                    metadata(endpoint)
-                      .then((endpointMetadata) => {
-                        endpointIdentity = endpointMetadata;
-                        return setPermissions(endpoint, 0o600);
-                      })
+                    (fileBackedEndpoint
+                      ? metadata(endpoint).then((endpointMetadata) => {
+                          endpointIdentity = endpointMetadata;
+                          return setPermissions(endpoint, 0o600);
+                        })
+                      : Promise.resolve()
+                    )
                       .then(() => {
                         server.off("error", fail);
                         server.on("error", (cause) =>
@@ -2252,7 +2295,7 @@ export const makeDaemonServe = (setup: Partial<DaemonEndpointSetup> = {}) => {
                           Effect.succeed({
                             server,
                             sessions,
-                            endpointIdentity: endpointIdentity!,
+                            endpointIdentity,
                           }),
                         );
                       })

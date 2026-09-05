@@ -3952,6 +3952,49 @@ export const executeRun = (
         : parsed.logFile === ""
           ? joinPath(options.root, ".turbo", "logs", `${runStartedAt}.json`)
           : configuredStructuredLogPath;
+    const defaultProfilePath = joinPath(
+      options.root,
+      defaultProfileArtifactName(runStartedAt, false),
+    );
+    const defaultAnonymousProfilePath =
+      parsed.profile === "" && parsed.anonymousProfile === ""
+        ? joinPath(options.root, defaultProfileArtifactName(runStartedAt, true))
+        : defaultProfilePath;
+    const resolvedProfilePath =
+      parsed.profile === undefined
+        ? undefined
+        : (resolveExplicitRunArtifactPath(parsed.profile) ??
+          defaultProfilePath);
+    const resolvedAnonymousProfilePath =
+      parsed.anonymousProfile === undefined
+        ? undefined
+        : (resolveExplicitRunArtifactPath(parsed.anonymousProfile) ??
+          defaultAnonymousProfilePath);
+    const resolvedTracePath =
+      parsed.trace === undefined
+        ? undefined
+        : (resolveExplicitRunArtifactPath(parsed.trace) ?? defaultProfilePath);
+    const artifactDestinations = [
+      ["--log-file", structuredLogPath],
+      ["--profile", resolvedProfilePath],
+      ["--anon-profile", resolvedAnonymousProfilePath],
+      ["--trace", resolvedTracePath],
+    ] as const;
+    const artifactOwners = new Map<string, string>();
+    for (const [owner, path] of artifactDestinations) {
+      if (path === undefined) continue;
+      const identity = comparableInputPath(path);
+      const existingOwner = artifactOwners.get(identity);
+      if (existingOwner !== undefined) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path,
+            message: `${owner} must not resolve to the same run artifact as ${existingOwner}`,
+          }),
+        );
+      }
+      artifactOwners.set(identity, owner);
+    }
     const structuredLogSemaphore = yield* Effect.makeSemaphore(1);
     if (structuredLogPath !== undefined) {
       yield* fileSystem.writeTextAtomic(structuredLogPath, "");
@@ -4218,9 +4261,18 @@ export const executeRun = (
             const scheduledForeground = scheduledCohorts.flat();
             const foregroundCompletion = foregroundSemaphore
               .withPermits(scheduledForeground.length)(
-                Effect.forEach(scheduledForeground, runNode, {
-                  concurrency: "unbounded",
-                }),
+                Effect.forEach(
+                  scheduledForeground,
+                  (id) =>
+                    runNode(id).pipe(
+                      Effect.tap((outcome) =>
+                        Effect.sync(() => {
+                          groupOutcomes.set(outcome.id, outcome);
+                        }),
+                      ),
+                    ),
+                  { concurrency: "unbounded" },
+                ),
               )
               .pipe(
                 Effect.map((outcome) => ({
@@ -4251,7 +4303,6 @@ export const executeRun = (
             }
             for (const outcome of completion.outcomes) {
               remaining.delete(outcome.id);
-              groupOutcomes.set(outcome.id, outcome);
               results.push(outcome);
             }
             if (
@@ -4500,24 +4551,12 @@ export const executeRun = (
       });
     const namedProfileEvents = profileEvents(false);
     const anonymousProfileEvents = profileEvents(true);
-    const defaultProfilePath = joinPath(
-      options.root,
-      defaultProfileArtifactName(runStartedAt, false),
-    );
-    const defaultAnonymousProfilePath =
-      parsed.profile === "" && parsed.anonymousProfile === ""
-        ? joinPath(options.root, defaultProfileArtifactName(runStartedAt, true))
-        : defaultProfilePath;
-    for (const [requestedPath, traceEvents, defaultPath] of [
-      [parsed.profile, namedProfileEvents, defaultProfilePath],
-      [
-        parsed.anonymousProfile,
-        anonymousProfileEvents,
-        defaultAnonymousProfilePath,
-      ],
-      [parsed.trace, namedProfileEvents, defaultProfilePath],
+    for (const [resolvedPath, traceEvents] of [
+      [resolvedProfilePath, namedProfileEvents],
+      [resolvedAnonymousProfilePath, anonymousProfileEvents],
+      [resolvedTracePath, namedProfileEvents],
     ] as const) {
-      if (requestedPath === undefined) continue;
+      if (resolvedPath === undefined) continue;
       if (profileService._tag === "None") {
         return yield* Effect.fail(
           new ConfigurationError({
@@ -4526,8 +4565,6 @@ export const executeRun = (
           }),
         );
       }
-      const resolvedPath =
-        resolveExplicitRunArtifactPath(requestedPath) ?? defaultPath;
       yield* profileService.value.writeTrace(resolvedPath, traceEvents);
     }
     const summaryRecord = { type: "run_summary", ...summary } as const;

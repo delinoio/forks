@@ -7739,7 +7739,7 @@ dependencies = [
           "check",
           "--cwd",
           directory,
-          "--concurrency=1",
+          "--concurrency=2",
           "--no-cache",
           "--json",
         ],

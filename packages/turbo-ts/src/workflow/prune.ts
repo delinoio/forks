@@ -1,4 +1,5 @@
 import { Effect } from "effect";
+import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { parseJsonConfiguration } from "../config/runtime.js";
 import { canMatchGlobDescendant, selectByGlobs } from "../core/glob.js";
@@ -181,6 +182,7 @@ const copyTree = (
   ignoreMatcher?: GitIgnoreMatcher,
   excludedSourceRoots: ReadonlySet<string> = new Set(),
   alwaysIncludedSourceRoots: ReadonlySet<string> = new Set(),
+  requiredOnly = false,
 ): Effect.Effect<void, unknown, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -198,9 +200,6 @@ const copyTree = (
     const entries = yield* fileSystem.list(source);
     yield* fileSystem.makeDirectory(destination);
     for (const entry of entries) {
-      if (entry.kind === "directory" && ignoredDirectoryNames.has(entry.name)) {
-        continue;
-      }
       const sourcePath = joinPath(source, entry.name);
       const destinationPath = joinPath(destination, entry.name);
       if (excludedSourceRoots.has(normalizePath(sourcePath))) continue;
@@ -209,6 +208,11 @@ const copyTree = (
           isPathContained(root, sourcePath) ||
           (entry.kind === "directory" && isPathContained(sourcePath, root)),
       );
+      const entersIgnoredDirectory =
+        entry.kind === "directory" && ignoredDirectoryNames.has(entry.name);
+      if ((requiredOnly || entersIgnoredDirectory) && !alwaysIncluded) {
+        continue;
+      }
       if (
         !alwaysIncluded &&
         ignoreMatcher?.ignores(sourcePath, entry.kind === "directory")
@@ -224,6 +228,7 @@ const copyTree = (
           ignoreMatcher,
           excludedSourceRoots,
           alwaysIncludedSourceRoots,
+          requiredOnly || entersIgnoredDirectory,
         );
       } else if (entry.kind === "file") {
         yield* fileSystem.copyFile(sourcePath, destinationPath);
@@ -303,13 +308,21 @@ const copyIfPresent = (
   repositoryRoot: string,
   excludedRoot: string,
   destinationRoot = parentPath(destination),
+  writeFile?: (
+    source: string,
+    destination: string,
+  ) => Effect.Effect<void, unknown, FileSystemService>,
 ): Effect.Effect<void, unknown, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
+    const write =
+      writeFile ??
+      ((sourcePath: string, destinationPath: string) =>
+        fileSystem.copyFile(sourcePath, destinationPath));
     if (!(yield* fileSystem.exists(source))) return;
     const metadata = yield* fileSystem.metadata(source);
     if (metadata.kind === "file") {
-      yield* fileSystem.copyFile(source, destination);
+      yield* write(source, destination);
       return;
     }
     if (metadata.kind === "symlink") {
@@ -349,7 +362,7 @@ const copyIfPresent = (
         destinationRoot,
         relativePath(repositoryRoot, resolved),
       );
-      yield* fileSystem.copyFile(resolved, destinationTarget);
+      yield* write(resolved, destinationTarget);
       yield* fileSystem.createSymlink(
         relativePath(parentPath(destination), destinationTarget),
         destination,
@@ -428,6 +441,56 @@ const writeManifest = (
     yield* fileSystem.writeTextAtomic(
       destination,
       `${JSON.stringify(manifest, undefined, 2)}\n`,
+      0o644,
+    );
+  });
+
+const writeCargoWorkspaceManifest = (
+  source: string,
+  destination: string,
+  workspaceDirectory: string,
+  retainedPackages: ReadonlyArray<RepositoryPackage>,
+): Effect.Effect<void, unknown, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const document = parseToml(yield* fileSystem.readText(source)) as Record<
+      string,
+      unknown
+    >;
+    const workspace = document.workspace;
+    if (
+      typeof workspace !== "object" ||
+      workspace === null ||
+      Array.isArray(workspace)
+    ) {
+      yield* fileSystem.copyFile(source, destination);
+      return;
+    }
+    const retainedMembers = retainedPackages
+      .map((packageModel) =>
+        relativePath(workspaceDirectory, packageModel.directory),
+      )
+      .sort();
+    const mutableWorkspace = workspace as Record<string, unknown>;
+    mutableWorkspace.members = retainedMembers;
+    delete mutableWorkspace.exclude;
+    const defaultMembers = mutableWorkspace["default-members"];
+    if (Array.isArray(defaultMembers)) {
+      const retainedDefaults = selectByGlobs(
+        retainedMembers,
+        defaultMembers.filter(
+          (member): member is string => typeof member === "string",
+        ),
+      );
+      if (retainedDefaults.length === 0) {
+        delete mutableWorkspace["default-members"];
+      } else {
+        mutableWorkspace["default-members"] = retainedDefaults;
+      }
+    }
+    yield* fileSystem.writeTextAtomic(
+      destination,
+      `${stringifyToml(document).trimEnd()}\n`,
       0o644,
     );
   });
@@ -614,16 +677,32 @@ export const executePrune = (
     for (const name of rootControlNames) {
       const source = joinPath(repository.root, name);
       if (name === "package.json") {
-        yield* writeManifest(
+        yield* copyIfPresent(
           source,
           joinPath(fullRoot, name),
-          options.production,
+          repository.root,
+          canonicalOutputRoot,
+          fullRoot,
+          (manifestSource, manifestDestination) =>
+            writeManifest(
+              manifestSource,
+              manifestDestination,
+              options.production,
+            ),
         );
         if (options.docker) {
-          yield* writeManifest(
+          yield* copyIfPresent(
             source,
             joinPath(jsonRoot, name),
-            options.production,
+            repository.root,
+            canonicalOutputRoot,
+            jsonRoot,
+            (manifestSource, manifestDestination) =>
+              writeManifest(
+                manifestSource,
+                manifestDestination,
+                options.production,
+              ),
           );
         }
       } else if (name === "turbo.json" || name === "turbo.jsonc") {
@@ -706,7 +785,14 @@ export const executePrune = (
         );
       }
     }
-    const ecosystemWorkspaceControls = new Map<string, ReadonlyArray<string>>();
+    const ecosystemWorkspaceControls = new Map<
+      string,
+      {
+        readonly manager: "cargo" | "uv";
+        readonly workspaceDirectory: string;
+        readonly paths: ReadonlyArray<string>;
+      }
+    >();
     for (const packageModel of packages) {
       if (packageModel.manager !== "cargo" && packageModel.manager !== "uv") {
         continue;
@@ -714,27 +800,43 @@ export const executePrune = (
       const workspaceDirectory =
         packageModel.workspaceDirectory ?? packageModel.directory;
       const key = `${packageModel.manager}\0${workspaceDirectory}`;
-      ecosystemWorkspaceControls.set(
-        key,
-        packageModel.manager === "cargo"
-          ? [
-              joinPath(workspaceDirectory, "Cargo.toml"),
-              joinPath(workspaceDirectory, "Cargo.lock"),
-            ]
-          : [
-              joinPath(workspaceDirectory, "pyproject.toml"),
-              joinPath(workspaceDirectory, "uv.lock"),
-            ],
-      );
+      ecosystemWorkspaceControls.set(key, {
+        manager: packageModel.manager,
+        workspaceDirectory,
+        paths:
+          packageModel.manager === "cargo"
+            ? [
+                joinPath(workspaceDirectory, "Cargo.toml"),
+                joinPath(workspaceDirectory, "Cargo.lock"),
+              ]
+            : [
+                joinPath(workspaceDirectory, "pyproject.toml"),
+                joinPath(workspaceDirectory, "uv.lock"),
+              ],
+      });
     }
     for (const controls of ecosystemWorkspaceControls.values()) {
-      for (const source of controls) {
+      for (const source of controls.paths) {
         yield* copyIfPresent(
           source,
           joinPath(fullRoot, relativePath(repository.root, source)),
           repository.root,
           canonicalOutputRoot,
           fullRoot,
+          controls.manager === "cargo" && baseName(source) === "Cargo.toml"
+            ? (manifestSource, manifestDestination) =>
+                writeCargoWorkspaceManifest(
+                  manifestSource,
+                  manifestDestination,
+                  controls.workspaceDirectory,
+                  packages.filter(
+                    (packageModel) =>
+                      packageModel.manager === "cargo" &&
+                      packageModel.workspaceDirectory ===
+                        controls.workspaceDirectory,
+                  ),
+                )
+            : undefined,
         );
       }
     }
