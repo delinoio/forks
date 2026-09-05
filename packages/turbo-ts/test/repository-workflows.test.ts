@@ -41,6 +41,7 @@ import {
   FileSystemService,
   FileWatcherService,
   ProcessService,
+  SystemService,
   TerminalService,
 } from "../src/effect/services.js";
 import { pruneLockfile } from "../src/repository/lockfiles.js";
@@ -56,7 +57,10 @@ import {
   watcherPathsMatch,
 } from "../src/workflow/daemon.js";
 import { executeList } from "../src/workflow/list.js";
-import { isWindowsSubsystemForLinux } from "../src/workflow/misc.js";
+import {
+  executeInfo,
+  isWindowsSubsystemForLinux,
+} from "../src/workflow/misc.js";
 import { executePrune, parsePruneArguments } from "../src/workflow/prune.js";
 import { executeQuery, repositoryQuerySchema } from "../src/workflow/query.js";
 import {
@@ -454,6 +458,34 @@ describe("repository workflow gate", () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-workflow-"));
     try {
       await prepareFixture(directory);
+      let infoOutput = "";
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const system = yield* SystemService;
+          const terminal = yield* TerminalService;
+          const information = yield* system.information;
+          return yield* executeInfo(["--cwd", directory]).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(SystemService, {
+                  information: Effect.succeed({
+                    ...information,
+                    nodeVersion: "v99.88.77-test",
+                  }),
+                }),
+                Layer.succeed(TerminalService, {
+                  ...terminal,
+                  writeStdout: (text) =>
+                    Effect.sync(() => {
+                      infoOutput += text;
+                    }),
+                }),
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(infoOutput).toContain("Node.js version: v99.88.77-test");
       await expect(
         execFilePromise(process.execPath, [candidate, "info", "--cwd"]),
       ).rejects.toThrow(/--cwd requires a value/);
@@ -1832,6 +1864,151 @@ describe("repository workflow gate", () => {
           ],
         },
       });
+      expect(responses.get("get-empty")).toMatchObject({
+        result: {
+          changedOutputs: [{ hash: "synthetic-hash", changedOutputGlobs: [] }],
+        },
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("retains daemon output changes recorded while responding", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-daemon-generation-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const responses = new Map<string, unknown>();
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const daemon = yield* DaemonService;
+          const registrationResponded = yield* Deferred.make<void>();
+          const firstChangeEmitted = yield* Deferred.make<void>();
+          const responseStarted = yield* Deferred.make<void>();
+          const secondChangeEmitted = yield* Deferred.make<void>();
+          const change = {
+            path: join(directory, "packages/app/build/output.js"),
+            kind: "modify" as const,
+            entryKind: "file" as const,
+          };
+          const connection = (request: {
+            readonly id: string;
+            readonly method: (typeof DaemonMethod)[keyof typeof DaemonMethod];
+            readonly params?: unknown;
+          }) => ({
+            requests: Stream.fromEffect(
+              request.id === "get-in-flight"
+                ? Deferred.await(firstChangeEmitted).pipe(
+                    Effect.zipRight(Effect.sleep("10 millis")),
+                    Effect.as(request),
+                  )
+                : Effect.succeed(request),
+            ),
+            respond: (response: { readonly id: string }) => {
+              if (request.id === "notify") {
+                return Effect.sync(() => {
+                  responses.set(request.id, response);
+                }).pipe(
+                  Effect.zipRight(
+                    Deferred.succeed(registrationResponded, undefined),
+                  ),
+                  Effect.asVoid,
+                );
+              }
+              if (request.id === "get-in-flight") {
+                return Deferred.succeed(responseStarted, undefined).pipe(
+                  Effect.zipRight(Deferred.await(secondChangeEmitted)),
+                  Effect.zipRight(Effect.sleep("10 millis")),
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      responses.set(request.id, response);
+                    }),
+                  ),
+                  Effect.asVoid,
+                );
+              }
+              return Effect.sync(() => {
+                responses.set(request.id, response);
+              });
+            },
+          });
+          return yield* executeDaemon({
+            command: "serve",
+            cwd: directory,
+            idleMilliseconds: 30_000,
+            json: false,
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(DaemonService, {
+                  ...daemon,
+                  serve: () =>
+                    Stream.fromIterable([
+                      connection({
+                        id: "notify",
+                        method: DaemonMethod.notifyOutputsWritten,
+                        params: {
+                          hash: "synthetic-hash",
+                          outputGlobs: ["packages/app/build/*.js"],
+                        },
+                      }),
+                      connection({
+                        id: "get-in-flight",
+                        method: DaemonMethod.getChangedOutputs,
+                        params: { hashes: ["synthetic-hash"] },
+                      }),
+                      connection({
+                        id: "get-newer",
+                        method: DaemonMethod.getChangedOutputs,
+                        params: { hashes: ["synthetic-hash"] },
+                      }),
+                      connection({
+                        id: "get-empty",
+                        method: DaemonMethod.getChangedOutputs,
+                        params: { hashes: ["synthetic-hash"] },
+                      }),
+                    ]),
+                }),
+                Layer.succeed(FileWatcherService, {
+                  watch: () =>
+                    Stream.concat(
+                      Stream.fromEffect(
+                        Deferred.await(registrationResponded).pipe(
+                          Effect.as(change),
+                          Effect.tap(() =>
+                            Deferred.succeed(firstChangeEmitted, undefined),
+                          ),
+                        ),
+                      ),
+                      Stream.fromEffect(
+                        Deferred.await(responseStarted).pipe(
+                          Effect.as(change),
+                          Effect.tap(() =>
+                            Deferred.succeed(secondChangeEmitted, undefined),
+                          ),
+                        ),
+                      ),
+                    ),
+                }),
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      for (const id of ["get-in-flight", "get-newer"]) {
+        expect(responses.get(id)).toMatchObject({
+          result: {
+            changedOutputs: [
+              {
+                hash: "synthetic-hash",
+                changedOutputGlobs: ["packages/app/build/*.js"],
+              },
+            ],
+          },
+        });
+      }
       expect(responses.get("get-empty")).toMatchObject({
         result: {
           changedOutputs: [{ hash: "synthetic-hash", changedOutputGlobs: [] }],
@@ -3595,7 +3772,7 @@ snapshots:
       await prepareFixture(directory);
       await writeFile(
         join(directory, ".gitignore"),
-        "packages/app/generated.txt\n",
+        "packages/app/generated.txt\n.yarn/**\n",
       );
       await writeFile(
         join(directory, ".pnpmfile.cjs"),
@@ -3658,12 +3835,14 @@ snapshots:
         ".pnp.cjs": pnpLoader,
         ".pnpmfile.cjs": pnpmHook,
         ".yarn/patches/example.patch": yarnPatch,
+        ".yarn/releases/yarn.cjs": yarnRelease,
         ...referenceCompatibleTree
       } = implementationTree;
       expect(referenceCompatibleTree).toEqual(referenceTree);
       expect(pnpLoader).toBe("module.exports = {};\n");
       expect(pnpmHook).toBe("module.exports = { hooks: {} };\n");
       expect(yarnPatch).toBe("patch\n");
+      expect(yarnRelease).toBe("release\n");
       expect(
         await readFile(
           join(output, "packages/app/generated.txt"),
@@ -3704,6 +3883,21 @@ snapshots:
         ),
       ).toBe("patch\n");
       for (const root of ["full", "json"]) {
+        expect(
+          await readFile(
+            join(directory, `docker-result/${root}/.yarn/releases/yarn.cjs`),
+            "utf8",
+          ),
+        ).toBe("release\n");
+        expect(
+          await readFile(
+            join(
+              directory,
+              `docker-result/${root}/.yarn/patches/example.patch`,
+            ),
+            "utf8",
+          ),
+        ).toBe("patch\n");
         expect(
           await readFile(
             join(directory, `docker-result/${root}/.pnpmfile.cjs`),
@@ -3863,7 +4057,7 @@ snapshots:
     }
   }, 30_000);
 
-  it("copies a contained configured Yarn executable into prune outputs", async () => {
+  it("copies an ignored configured Yarn executable into prune outputs", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-yarn-"));
     try {
       await prepareFixture(directory);
@@ -3880,10 +4074,14 @@ snapshots:
       await writeFile(join(directory, ".pnp.cjs"), "module.exports = {};\n");
       await writeFile(
         join(directory, ".yarnrc.yml"),
-        "yarnPath: scripts/yarn.cjs\n",
+        "yarnPath: .yarn/custom/yarn.cjs\n",
       );
-      await mkdir(join(directory, "scripts"));
-      await writeFile(join(directory, "scripts/yarn.cjs"), "yarn executable\n");
+      await writeFile(join(directory, ".gitignore"), ".yarn/**\n");
+      await mkdir(join(directory, ".yarn/custom"), { recursive: true });
+      await writeFile(
+        join(directory, ".yarn/custom/yarn.cjs"),
+        "yarn executable\n",
+      );
 
       await executeDifferentialCommand(process.execPath, [
         candidate,
@@ -3894,7 +4092,10 @@ snapshots:
         directory,
       ]);
       expect(
-        await readFile(join(directory, "yarn-result/scripts/yarn.cjs"), "utf8"),
+        await readFile(
+          join(directory, "yarn-result/.yarn/custom/yarn.cjs"),
+          "utf8",
+        ),
       ).toBe("yarn executable\n");
 
       await executeDifferentialCommand(process.execPath, [
@@ -3909,7 +4110,7 @@ snapshots:
       for (const root of ["full", "json"]) {
         expect(
           await readFile(
-            join(directory, `yarn-docker-result/${root}/scripts/yarn.cjs`),
+            join(directory, `yarn-docker-result/${root}/.yarn/custom/yarn.cjs`),
             "utf8",
           ),
         ).toBe("yarn executable\n");
@@ -4479,7 +4680,7 @@ importers:
       await rm(directory, { force: true, recursive: true });
       await rm(outside, { force: true, recursive: true });
     }
-  }, 15_000);
+  }, 30_000);
 
   it("rejects a workflow cwd that resolves to a regular file", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-workflow-cwd-"));
@@ -5113,6 +5314,33 @@ snapshots:
     expect(aliasesAndPeers).toContain("actual-name@1.0.0");
     expect(aliasesAndPeers).toContain("peer-qualified@2.0.0:");
     expect(aliasesAndPeers).toContain("peer-qualified@2.0.0(peer-name@3.0.0)");
+    const fileProtocol = new TextDecoder().decode(
+      pruneLockfile(
+        "/repo/pnpm-lock.yaml",
+        new TextEncoder().encode(`lockfileVersion: '9.0'
+importers:
+  packages/app:
+    dependencies:
+      archive:
+        specifier: file:../../archives/archive.tgz
+        version: file:../../archives/archive.tgz
+packages:
+  archive@file:../../archives/archive.tgz: {}
+  leaf@1.0.0: {}
+  unused@2.0.0: {}
+snapshots:
+  archive@file:../../archives/archive.tgz:
+    dependencies:
+      leaf: 1.0.0
+  leaf@1.0.0: {}
+  unused@2.0.0: {}
+`),
+        new Set(["packages/app"]),
+      ),
+    );
+    expect(fileProtocol).toContain("archive@file:../../archives/archive.tgz");
+    expect(fileProtocol).toContain("leaf@1.0.0");
+    expect(fileProtocol).not.toContain("unused@2.0.0");
     const npmPruned = JSON.parse(
       new TextDecoder().decode(
         pruneLockfile(

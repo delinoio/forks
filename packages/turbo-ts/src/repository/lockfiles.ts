@@ -714,11 +714,7 @@ const packageKeysForDependency = (
   rawVersion: string,
   specifier: string | undefined,
 ): PnpmDependencyKeys => {
-  if (
-    rawVersion.startsWith("link:") ||
-    rawVersion.startsWith("workspace:") ||
-    rawVersion.startsWith("file:")
-  ) {
+  if (rawVersion.startsWith("link:") || rawVersion.startsWith("workspace:")) {
     return {};
   }
   const aliasPattern = /^npm:((?:@[^/]+\/)?[^@]+)@(.+)$/;

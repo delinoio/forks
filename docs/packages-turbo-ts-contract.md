@@ -199,10 +199,10 @@ snapshot closure, npm workspace package indexes and version 2 legacy dependency
 trees, Yarn Classic and Berry entry closures, and text Bun workspace/package
 indexes. Binary Bun, Yarn PnP, and
 other validated formats without a safely rewritable public workspace index are
-preserved. pnpm
-aliases derive their target identity from importer specifiers and
-target-qualified resolutions, peer-qualified snapshots retain
-both the base package and qualified snapshot, and npm pruning retains only the
+preserved. pnpm aliases derive their target identity from importer specifiers
+and target-qualified resolutions, peer-qualified snapshots retain both the
+base package and qualified snapshot, and resolvable `file:` package and
+snapshot records retain their transitive closure. npm pruning retains only the
 selected workspace dependency closure and its valid workspace links. Without
 Git, explicit task
 inputs under ordinary `dist` and `target` directories remain hashable.
@@ -537,8 +537,10 @@ additions, removals, and renames are visible without a daemon restart.
 Custom root Turbo configuration paths are retained by lifecycle commands,
 forwarded to detached servers, and reused for request-time package discovery.
 Output-change registration/query calls return their protocol data rather than
-empty acknowledgments. Changed-output snapshots are consumed only after their
-response is written successfully, so a failed response remains retryable.
+empty acknowledgments. Changed-output snapshots consume only the exact glob
+generations reported after their response is written successfully. A failed
+response remains retryable, and changes recorded while a response is being
+written remain pending for the next query.
 Start-lock ownership is
 preserved across overlapping starts, stale locks are validated before removal,
 and a Hello response carrying an error is not healthy. Start, stop, restart,
@@ -632,11 +634,12 @@ installation root. Root Bun `bunfig.toml` configuration is retained in the
 ordinary output and both Docker installation roots. Root Yarn installation controls, including `.yarnrc.yml`,
 `.pnp.cjs`, releases, patches, and a repository-contained configured `yarnPath`
 executable, are retained at their repository-relative locations in applicable
-ordinary and Docker layouts. Copying honors repository and
-nested Git-ignore files unless disabled; ordinary pnpm pruning retains
-development dependency closure. Production npm, pnpm, Yarn, and text Bun
-pruning removes development dependency edges and their package closure,
-including development-marked trees in legacy npm v1 lockfiles.
+ordinary and Docker layouts. Required Yarn releases, patches, and configured
+executables are retained even when Git-ignore rules match them. Other copying
+honors repository and nested Git-ignore files unless disabled; ordinary pnpm
+pruning retains development dependency closure. Production npm, pnpm, Yarn,
+and text Bun pruning removes development dependency edges and their package
+closure, including development-marked trees in legacy npm v1 lockfiles.
 Production pruning also removes `devDependencies` from selected JavaScript
 workspace manifests in the ordinary or Docker full tree. Docker JSON subsets
 contain manifests only for selected JavaScript packages; selected Cargo and uv

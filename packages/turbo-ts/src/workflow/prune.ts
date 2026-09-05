@@ -166,6 +166,7 @@ const copyTree = (
   allowedSymlinkRoots: ReadonlyArray<string>,
   ignoreMatcher?: GitIgnoreMatcher,
   excludedSourceRoots: ReadonlySet<string> = new Set(),
+  alwaysIncludedSourceRoots: ReadonlySet<string> = new Set(),
 ): Effect.Effect<void, unknown, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
@@ -189,7 +190,15 @@ const copyTree = (
       const sourcePath = joinPath(source, entry.name);
       const destinationPath = joinPath(destination, entry.name);
       if (excludedSourceRoots.has(normalizePath(sourcePath))) continue;
-      if (ignoreMatcher?.ignores(sourcePath, entry.kind === "directory")) {
+      const alwaysIncluded = [...alwaysIncludedSourceRoots].some(
+        (root) =>
+          isPathContained(root, sourcePath) ||
+          (entry.kind === "directory" && isPathContained(sourcePath, root)),
+      );
+      if (
+        !alwaysIncluded &&
+        ignoreMatcher?.ignores(sourcePath, entry.kind === "directory")
+      ) {
         continue;
       }
       if (entry.kind === "directory") {
@@ -200,6 +209,7 @@ const copyTree = (
           allowedSymlinkRoots,
           ignoreMatcher,
           excludedSourceRoots,
+          alwaysIncludedSourceRoots,
         );
       } else if (entry.kind === "file") {
         yield* fileSystem.copyFile(sourcePath, destinationPath);
@@ -621,6 +631,15 @@ export const executePrune = (
       }
     }
     const yarnDirectory = joinPath(repository.root, ".yarn");
+    const yarnExecutable = repository.packageManagerExecutableInput;
+    const requiredYarnControls = new Set([
+      joinPath(yarnDirectory, "patches"),
+      joinPath(yarnDirectory, "releases"),
+      ...(yarnExecutable !== undefined &&
+      isPathContained(yarnDirectory, yarnExecutable)
+        ? [yarnExecutable]
+        : []),
+    ]);
     if (yield* fileSystem.exists(yarnDirectory)) {
       const metadata = yield* fileSystem.metadata(yarnDirectory);
       if (metadata.kind !== "directory") {
@@ -638,10 +657,11 @@ export const executePrune = (
           canonicalOutputRoot,
           [yarnDirectory],
           ignoreMatcher,
+          new Set(),
+          requiredYarnControls,
         );
       }
     }
-    const yarnExecutable = repository.packageManagerExecutableInput;
     if (
       yarnExecutable !== undefined &&
       !isPathContained(yarnDirectory, yarnExecutable)

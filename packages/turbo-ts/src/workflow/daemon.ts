@@ -59,6 +59,24 @@ interface DaemonPaths {
   readonly log: string;
 }
 
+interface OutputRegistration {
+  readonly outputGlobs: ReadonlyArray<string>;
+  readonly outputExclusionGlobs: ReadonlyArray<string>;
+  readonly changedOutputGenerations: Map<string, number>;
+  nextChangeGeneration: number;
+}
+
+const markOutputChanged = (
+  registration: OutputRegistration,
+  glob: string,
+): void => {
+  registration.nextChangeGeneration += 1;
+  registration.changedOutputGenerations.set(
+    glob,
+    registration.nextChangeGeneration,
+  );
+};
+
 const durationMilliseconds = (value: string): number => {
   const match = /^(\d+)(ms|s|m|h|d)?$/.exec(value);
   if (match === null) {
@@ -734,14 +752,7 @@ const serveDaemon = (
       const information = yield* system.information;
       const shutdown = yield* Deferred.make<void>();
       const activity = yield* Queue.sliding<void>(1);
-      const outputRegistrations = new Map<
-        string,
-        {
-          readonly outputGlobs: ReadonlyArray<string>;
-          readonly outputExclusionGlobs: ReadonlyArray<string>;
-          readonly changedOutputGlobs: Set<string>;
-        }
-      >();
+      const outputRegistrations = new Map<string, OutputRegistration>();
       const startedAt = yield* clock.now;
       yield* fileSystem.makeDirectory(paths.stateDirectory);
       yield* fileSystem.makeDirectory(parentPath(paths.log));
@@ -793,7 +804,7 @@ const serveDaemon = (
             if (change.kind === "unknown") {
               for (const registration of outputRegistrations.values()) {
                 for (const glob of registration.outputGlobs) {
-                  registration.changedOutputGlobs.add(glob);
+                  markOutputChanged(registration, glob);
                 }
               }
               yield* Queue.offer(activity, undefined);
@@ -813,7 +824,7 @@ const serveDaemon = (
                   (change.entryKind === "directory" &&
                     canMatchGlobsDescendantWithExclusions(relative, patterns))
                 ) {
-                  registration.changedOutputGlobs.add(glob);
+                  markOutputChanged(registration, glob);
                 }
               }
             }
@@ -835,8 +846,8 @@ const serveDaemon = (
                 )
                 .pipe(Effect.ignore);
               const changedOutputAcknowledgements = new Map<
-                Set<string>,
-                ReadonlyArray<string>
+                Map<string, number>,
+                ReadonlyMap<string, number>
               >();
               const result = yield* (() => {
                 if (request.method === DaemonMethod.status) {
@@ -897,7 +908,8 @@ const serveDaemon = (
                           (value): value is string => typeof value === "string",
                         )
                       : [],
-                    changedOutputGlobs: new Set(),
+                    changedOutputGenerations: new Map(),
+                    nextChangeGeneration: 0,
                   });
                   return Effect.succeed({});
                 }
@@ -913,12 +925,15 @@ const serveDaemon = (
                   const changedOutputs = hashes.flatMap((hash) => {
                     const registration = outputRegistrations.get(hash);
                     if (registration === undefined) return [];
+                    const acknowledgement = new Map(
+                      registration.changedOutputGenerations,
+                    );
                     const changedOutputGlobs = [
-                      ...registration.changedOutputGlobs,
+                      ...acknowledgement.keys(),
                     ].sort();
                     changedOutputAcknowledgements.set(
-                      registration.changedOutputGlobs,
-                      changedOutputGlobs,
+                      registration.changedOutputGenerations,
+                      acknowledgement,
                     );
                     return [{ hash, changedOutputGlobs }];
                   });
@@ -954,10 +969,14 @@ const serveDaemon = (
                   yield* response;
                 }
                 for (const [
-                  registration,
+                  generations,
                   acknowledged,
                 ] of changedOutputAcknowledgements) {
-                  for (const glob of acknowledged) registration.delete(glob);
+                  for (const [glob, generation] of acknowledged) {
+                    if (generations.get(glob) === generation) {
+                      generations.delete(glob);
+                    }
+                  }
                 }
               }
               if (request.method === DaemonMethod.shutdown) {

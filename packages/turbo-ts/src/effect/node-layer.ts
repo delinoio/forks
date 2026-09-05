@@ -2474,6 +2474,7 @@ const systemLayer = Layer.succeed(SystemService, {
     architecture: arch(),
     operatingSystem: operatingSystem(),
     kernelRelease: kernelRelease(),
+    nodeVersion: process.version,
     availableMemoryMegabytes: Math.floor(freemem() / 1024 / 1024),
     availableCpuCores: availableParallelism(),
     temporaryDirectory: tmpdir(),

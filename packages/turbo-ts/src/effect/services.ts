@@ -433,6 +433,7 @@ export interface SystemInformation {
   readonly architecture: string;
   readonly operatingSystem: string;
   readonly kernelRelease: string;
+  readonly nodeVersion: string;
   readonly availableMemoryMegabytes: number;
   readonly availableCpuCores: number;
   readonly temporaryDirectory: string;

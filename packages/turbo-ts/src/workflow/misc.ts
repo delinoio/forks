@@ -140,7 +140,7 @@ Environment:
    Terminal program version (TERM_PROGRAM_VERSION): ${entries.TERM_PROGRAM_VERSION ?? "unknown"}
    Shell (SHELL): ${entries.SHELL ?? "unknown"}
    stdin: ${stdin}
-   Node.js version: ${process.version}
+   Node.js version: ${information.nodeVersion}
 `);
     return 0;
   });
