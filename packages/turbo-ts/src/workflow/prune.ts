@@ -179,6 +179,7 @@ const copyTree = (
   destination: string,
   excludedRoot: string,
   allowedSymlinkRoots: ReadonlyArray<string>,
+  windowsPathSemantics: boolean,
   ignoreMatcher?: GitIgnoreMatcher,
   excludedSourceRoots: ReadonlySet<string> = new Set(),
   alwaysIncludedSourceRoots: ReadonlySet<string> = new Set(),
@@ -209,7 +210,10 @@ const copyTree = (
           (entry.kind === "directory" && isPathContained(sourcePath, root)),
       );
       const entersIgnoredDirectory =
-        entry.kind === "directory" && ignoredDirectoryNames.has(entry.name);
+        entry.kind === "directory" &&
+        ignoredDirectoryNames.has(
+          windowsPathSemantics ? entry.name.toLowerCase() : entry.name,
+        );
       if ((requiredOnly || entersIgnoredDirectory) && !alwaysIncluded) {
         continue;
       }
@@ -225,6 +229,7 @@ const copyTree = (
           destinationPath,
           excludedRoot,
           allowedSymlinkRoots,
+          windowsPathSemantics,
           ignoreMatcher,
           excludedSourceRoots,
           alwaysIncludedSourceRoots,
@@ -541,8 +546,10 @@ export const executePrune = (
   EnvironmentService | FileSystemService | ProcessService | TerminalService
 > =>
   Effect.gen(function* () {
+    const environment = yield* EnvironmentService;
     const fileSystem = yield* FileSystemService;
     const terminal = yield* TerminalService;
+    const windowsPathSemantics = (yield* environment.platform) === "win32";
     const repository = yield* loadWorkflowRepository(options);
     const packages = selectedPackages(
       repository,
@@ -785,6 +792,7 @@ export const executePrune = (
           joinPath(root, ".yarn"),
           canonicalOutputRoot,
           [yarnDirectory],
+          windowsPathSemantics,
           ignoreMatcher,
           new Set(),
           requiredYarnControls,
@@ -901,15 +909,27 @@ export const executePrune = (
       ...excludedPackageRoots,
       ...generatedControlCopyExclusions,
     ]);
+    const copiedPackageDirectories = new Set<string>();
     for (const packageModel of packages) {
-      yield* copyTree(
+      const normalizedDirectory = normalizePath(
         packageModel.directory,
-        joinPath(fullRoot, packageModel.relativeDirectory),
-        canonicalOutputRoot,
-        selectedPackageRoots,
-        ignoreMatcher,
-        packageCopyExclusions,
+        windowsPathSemantics,
       );
+      const comparableDirectory = windowsPathSemantics
+        ? normalizedDirectory.toLowerCase()
+        : normalizedDirectory;
+      if (!copiedPackageDirectories.has(comparableDirectory)) {
+        copiedPackageDirectories.add(comparableDirectory);
+        yield* copyTree(
+          packageModel.directory,
+          joinPath(fullRoot, packageModel.relativeDirectory),
+          canonicalOutputRoot,
+          selectedPackageRoots,
+          windowsPathSemantics,
+          ignoreMatcher,
+          packageCopyExclusions,
+        );
+      }
       yield* terminal.writeStdout(` - Added ${packageModel.name}\n`);
     }
     for (const packageModel of packages) {

@@ -60,6 +60,28 @@ export const loadGitIgnoreMatcher = (
     const fileSystem = yield* FileSystemService;
     const processService = yield* ProcessService;
     const normalizedRoot = normalizePath(root);
+    let current = normalizedRoot;
+    let hasGitMetadata = false;
+    while (true) {
+      const gitMetadataPath = joinPath(current, ".git");
+      if (
+        yield* fileSystem.exists(gitMetadataPath).pipe(
+          Effect.mapError(
+            (error) =>
+              new RepositoryError({
+                path: gitMetadataPath,
+                message: error.message,
+              }),
+          ),
+        )
+      ) {
+        hasGitMetadata = true;
+        break;
+      }
+      const parent = parentPath(current);
+      if (parent === current) break;
+      current = parent;
+    }
     const trackedResult = yield* Effect.scoped(
       processService.runBytes({
         command: "git",
@@ -68,6 +90,12 @@ export const loadGitIgnoreMatcher = (
         inheritEnvironment: true,
       }),
     ).pipe(Effect.either);
+    const trackedDiscoverySucceeded =
+      trackedResult._tag === "Right" && trackedResult.right.exitCode === 0;
+    const ignoreRulesReliable = trackedDiscoverySucceeded || !hasGitMetadata;
+    const trackedOutput = trackedDiscoverySucceeded
+      ? trackedResult.right.stdout
+      : new Uint8Array();
     const caseInsensitivePaths =
       /^[A-Za-z]:[\\/]/.test(normalizedRoot) ||
       /^[\\/]{2}[^\\/]+[\\/][^\\/]+/.test(normalizedRoot);
@@ -77,9 +105,9 @@ export const loadGitIgnoreMatcher = (
     };
     const trackedFiles = new Set<string>();
     const trackedDirectories = new Set<string>();
-    if (trackedResult._tag === "Right" && trackedResult.right.exitCode === 0) {
+    if (trackedDiscoverySucceeded) {
       for (const relative of new TextDecoder()
-        .decode(trackedResult.right.stdout)
+        .decode(trackedOutput)
         .split("\0")) {
         if (relative === "") continue;
         const absolute = normalizePath(
@@ -138,12 +166,16 @@ export const loadGitIgnoreMatcher = (
         const path = joinPath(directory, entry.name);
         knownDirectories.add(comparablePath(path));
         if (traversalIgnoredDirectories.has(entry.name)) continue;
-        if (!matchesRules(normalizedRoot, rules, path, true))
+        if (
+          !ignoreRulesReliable ||
+          !matchesRules(normalizedRoot, rules, path, true)
+        )
           pending.push(path);
       }
     }
     return {
       ignores: (path, directory = false) => {
+        if (!ignoreRulesReliable) return false;
         const comparable = comparablePath(path);
         if (
           trackedFiles.has(comparable) ||

@@ -60,6 +60,7 @@ import {
   TerminalService,
 } from "../src/effect/services.js";
 import { xxhash64Hex } from "../src/hash/xxhash64.js";
+import { loadGitIgnoreMatcher } from "../src/repository/git-ignore.js";
 import { pruneLockfile } from "../src/repository/lockfiles.js";
 import {
   executeRun,
@@ -2776,6 +2777,61 @@ describe("repository workflow gate", () => {
     }
   });
 
+  it("does not dispatch unary daemon requests with trailing data", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-daemon-request-suffix-"),
+    );
+    const socket = join(directory, "turbod.sock");
+    let requestDispatched = false;
+    const serveFiber = Effect.runFork(
+      Stream.runForEach(makeDaemonServe()(socket), (connection) =>
+        Stream.runForEach(connection.requests, () =>
+          Effect.sync(() => {
+            requestDispatched = true;
+          }),
+        ),
+      ),
+    );
+    try {
+      await waitUntil(() => existsSync(socket));
+      for (const suffix of [Buffer.from([1]), Buffer.alloc(5)]) {
+        await new Promise<void>((resolve, reject) => {
+          const session = connectHttp2("http://localhost", {
+            createConnection: () => createNetConnection(socket),
+          });
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            session.destroy();
+            resolve();
+          };
+          const timeout = setTimeout(
+            () => reject(new Error("malformed daemon request remained open")),
+            2_000,
+          );
+          session.once("error", finish);
+          const stream = session.request({
+            [http2Constants.HTTP2_HEADER_METHOD]: "POST",
+            [http2Constants.HTTP2_HEADER_PATH]:
+              "/turbodprotocol.Turbod/Shutdown",
+            [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+          });
+          stream.once("error", finish);
+          stream.once("close", finish);
+          stream.end(Buffer.concat([Buffer.alloc(5), suffix]));
+        });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(requestDispatched).toBe(false);
+    } finally {
+      await Effect.runPromise(Fiber.interrupt(serveFiber));
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("decodes daemon errors from headers and trailers without DATA frames", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(
@@ -5285,6 +5341,71 @@ describe("repository workflow gate", () => {
     }
   }, 30_000);
 
+  it("disables ignore suppression when tracked-file discovery fails", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-ignore-discovery-failure-"),
+    );
+    try {
+      await writeFile(join(directory, ".gitignore"), "ignored.txt\nignored/\n");
+      await writeFile(join(directory, "ignored.txt"), "tracked\n");
+      await mkdir(join(directory, "ignored"));
+      await writeFile(join(directory, "ignored/value.txt"), "visible\n");
+      await execFilePromise("/usr/bin/git", [
+        "-C",
+        directory,
+        "init",
+        "--quiet",
+      ]);
+      await execFilePromise("/usr/bin/git", [
+        "-C",
+        directory,
+        "add",
+        "-f",
+        "ignored.txt",
+      ]);
+      for (const failure of ["exit", "execution"] as const) {
+        const matcher = await Effect.runPromise(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            return yield* loadGitIgnoreMatcher(directory).pipe(
+              Effect.provide(
+                Layer.succeed(ProcessService, {
+                  ...processService,
+                  runBytes: (request) => {
+                    if (
+                      request.command !== "git" ||
+                      request.args.join("\0") !==
+                        ["ls-files", "--cached", "-z", "--"].join("\0")
+                    ) {
+                      return processService.runBytes(request);
+                    }
+                    return failure === "exit"
+                      ? Effect.succeed({
+                          exitCode: 1,
+                          stdout: new Uint8Array(),
+                          stderr: new TextEncoder().encode("synthetic failure"),
+                        })
+                      : Effect.fail(
+                          new ProcessExecutionError({
+                            command: "git",
+                            message: "synthetic execution failure",
+                          }),
+                        );
+                  },
+                }),
+              ),
+            );
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+        expect(matcher.ignores(join(directory, "ignored.txt"))).toBe(false);
+        expect(matcher.ignores(join(directory, "ignored"), true)).toBe(false);
+        expect(matcher.wasDirectory(join(directory, "ignored"))).toBe(true);
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("retains directory kinds when removals omit watcher metadata", async () => {
     for (const tracked of [false, true]) {
       const directory = await mkdtemp(
@@ -5732,6 +5853,18 @@ snapshots:
           },
         },
       });
+      const unknownCenter = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          query:
+            '{ packageGraph(center: "missing-package") { nodes { length } } }',
+        }),
+      });
+      expect(unknownCenter.status).toBe(400);
+      expect(JSON.stringify(await unknownCenter.json())).toContain(
+        "package not found: missing-package",
+      );
       const escapedFile = await fetch(endpoint, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -6485,6 +6618,48 @@ dependencies = ["external-package 2.0.0"]
     }
   }, 30_000);
 
+  it("excludes reserved prune directories with Windows path semantics", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-case-"));
+    try {
+      await prepareFixture(directory);
+      for (const name of ["Node_Modules", ".TURBO"]) {
+        const reserved = join(directory, "packages/app", name);
+        await mkdir(reserved);
+        await writeFile(join(reserved, "generated.txt"), "generated\n");
+      }
+      expect(
+        await Effect.runPromise(
+          Effect.gen(function* () {
+            const environment = yield* EnvironmentService;
+            return yield* executePrune({
+              scopes: ["synthetic-app"],
+              cwd: directory,
+              outputDirectory: "result",
+              docker: false,
+              production: false,
+              useGitignore: false,
+            }).pipe(
+              Effect.provideService(EnvironmentService, {
+                ...environment,
+                platform: Effect.succeed("win32" as const),
+              }),
+            );
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).toBe(0);
+      for (const name of ["Node_Modules", ".TURBO"]) {
+        expect(
+          await readFile(
+            join(directory, "result/packages/app", name, "generated.txt"),
+            "utf8",
+          ).catch(() => undefined),
+        ).toBeUndefined();
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("writes ordinary and Docker prune lockfiles with readable modes", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-mode-"));
@@ -6842,7 +7017,7 @@ importers:
     const cargoDirectory = join(cargoWorkspaceDirectory, "polyglot");
     const cargoDependencyDirectory = join(cargoWorkspaceDirectory, "leaf");
     const cargoUnrelatedDirectory = join(cargoWorkspaceDirectory, "unrelated");
-    const uvDirectory = join(directory, "python/polyglot");
+    const uvDirectory = javascriptDirectory;
     const cargoPackageId = `path+file://${cargoDirectory}#${packageName}@0.1.0`;
     const cargoDependencyId = `path+file://${cargoDependencyDirectory}#synthetic-cargo-leaf@0.1.0`;
     const cargoUnrelatedId = `path+file://${cargoUnrelatedDirectory}#synthetic-cargo-unrelated@0.1.0`;
@@ -6891,9 +7066,8 @@ importers:
       );
       await writeFile(
         join(directory, "pyproject.toml"),
-        '[tool.uv.workspace]\nmembers = ["python/polyglot"]\n',
+        '[tool.uv.workspace]\nmembers = ["packages/polyglot"]\n',
       );
-      await mkdir(uvDirectory, { recursive: true });
       await writeFile(
         join(uvDirectory, "pyproject.toml"),
         `[project]\nname = "${packageName}"\nversion = "0.1.0"\ndependencies = []\n`,
@@ -6902,6 +7076,13 @@ importers:
         join(directory, "uv.lock"),
         "version = 1\nrevision = 1\n",
       );
+      await writeFile(join(javascriptDirectory, "shared.txt"), "shared\n");
+      if (process.platform !== "win32") {
+        await symlink(
+          "shared.txt",
+          join(javascriptDirectory, "shared-link.txt"),
+        );
+      }
       const cargoMetadata = JSON.stringify({
         workspace_root: cargoWorkspaceDirectory,
         workspace_members: [
@@ -7084,7 +7265,7 @@ importers:
         plainAffected.output.data.affectedPackages.items
           .map((item) => item.path)
           .sort(),
-      ).toEqual(["packages/polyglot", "python/polyglot", "rust/polyglot"]);
+      ).toEqual(["packages/polyglot", "packages/polyglot", "rust/polyglot"]);
       const qualifiedAffected = await runAffected(`cargo:${packageName}`);
       expect(qualifiedAffected.exitCode).toBe(0);
       expect(qualifiedAffected.output.data.affectedPackages.items).toEqual([
@@ -7158,7 +7339,7 @@ importers:
       ).toBeUndefined();
       expect(
         await readFile(
-          join(qualifiedOutput, "python/polyglot/pyproject.toml"),
+          join(qualifiedOutput, "packages/polyglot/pyproject.toml"),
           "utf8",
         ).catch(() => undefined),
       ).toBeUndefined();
@@ -7173,9 +7354,16 @@ importers:
         "rust/leaf/Cargo.toml",
         "pyproject.toml",
         "uv.lock",
-        "python/polyglot/pyproject.toml",
+        "packages/polyglot/pyproject.toml",
       ]) {
         expect(await readFile(join(plainOutput, path), "utf8")).not.toBe("");
+      }
+      if (process.platform !== "win32") {
+        expect(
+          await readlink(
+            join(plainOutput, "packages/polyglot/shared-link.txt"),
+          ),
+        ).toBe("shared.txt");
       }
       const dockerOutput = join(directory, "docker-result");
       expect(await runPrune([packageName], dockerOutput, true)).toBe(0);
@@ -7186,7 +7374,7 @@ importers:
         "rust/leaf/Cargo.toml",
         "pyproject.toml",
         "uv.lock",
-        "python/polyglot/pyproject.toml",
+        "packages/polyglot/pyproject.toml",
       ]) {
         expect(
           await readFile(join(dockerOutput, "full", path), "utf8"),
@@ -7881,6 +8069,21 @@ importers:
         directory,
       ]);
       expect(JSON.parse(qualifiedAffected.stdout)).toMatchObject({
+        data: {
+          affectedTasks: {
+            length: 1,
+            items: [{ fullName: "synthetic-app#build" }],
+          },
+        },
+      });
+      const qualifiedGraphql = await execFilePromise(process.execPath, [
+        candidate,
+        "query",
+        '{ affectedTasks(base: "HEAD~1", head: "HEAD", tasks: ["synthetic-app#build"]) { length items { fullName } } }',
+        "--cwd",
+        directory,
+      ]);
+      expect(JSON.parse(qualifiedGraphql.stdout)).toEqual({
         data: {
           affectedTasks: {
             length: 1,

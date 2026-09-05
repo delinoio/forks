@@ -667,7 +667,7 @@ describe("core CLI execution", () => {
 
   it("separates logs and cached replay for co-located package scopes", async () => {
     if (process.platform === "win32") return;
-    const directory = await makeFixture();
+    const directory = await makeGitFixture();
     const packageDirectory = `${directory}/packages/polyglot`;
     const commandDirectory = `${directory}/commands`;
     const packageName = "polyglot-scope";
@@ -850,6 +850,57 @@ describe("core CLI execution", () => {
           }
         }
       }
+      const git = (...args: ReadonlyArray<string>) =>
+        run(
+          "/usr/bin/git",
+          [
+            "-c",
+            "user.email=synthetic@example.test",
+            "-c",
+            "user.name=Synthetic Fixture",
+            ...args,
+          ],
+          directory,
+        );
+      expect((await git("init", "--quiet")).exitCode).toBe(0);
+      expect((await git("add", "packages/polyglot/src/lib.rs")).exitCode).toBe(
+        0,
+      );
+      expect((await git("commit", "--quiet", "-m", "base")).exitCode).toBe(0);
+      await writeFile(
+        `${packageDirectory}/src/lib.rs`,
+        'pub fn value() { println!("changed"); }\n',
+      );
+      expect((await git("add", "packages/polyglot/src/lib.rs")).exitCode).toBe(
+        0,
+      );
+      expect(
+        (await git("commit", "--quiet", "-m", "change source")).exitCode,
+      ).toBe(0);
+      const qualifiedAffected = await run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "query",
+          `{ affectedTasks(base: "HEAD~1", head: "HEAD", tasks: ["cargo:${packageName}#build"]) { length items { fullName } } }`,
+          "--cwd",
+          directory,
+        ],
+        repositoryRoot,
+        env,
+      );
+      expect(
+        qualifiedAffected.exitCode,
+        `${qualifiedAffected.stderr}\n${qualifiedAffected.stdout}`,
+      ).toBe(0);
+      expect(JSON.parse(qualifiedAffected.stdout)).toEqual({
+        data: {
+          affectedTasks: {
+            length: 1,
+            items: [{ fullName: `${packageName}#build` }],
+          },
+        },
+      });
       const packageGraph = await run(
         process.execPath,
         [

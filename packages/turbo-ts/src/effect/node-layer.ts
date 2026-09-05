@@ -1884,8 +1884,11 @@ const grpcPayload = (contents: Uint8Array): Buffer => {
     throw new TypeError("malformed gRPC daemon frame");
   }
   const length = Buffer.from(contents).readUInt32BE(1);
-  if (length > maximumDaemonPayloadBytes || length + 5 > contents.length) {
+  if (length > maximumDaemonPayloadBytes) {
     throw new TypeError("daemon frame exceeds its declared size");
+  }
+  if (length + 5 !== contents.length) {
+    throw new TypeError("daemon frame length does not match its declared size");
   }
   return Buffer.from(contents.subarray(5, length + 5));
 };

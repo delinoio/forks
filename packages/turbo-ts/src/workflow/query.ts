@@ -832,6 +832,13 @@ const repositoryQueryRoot = (
     });
   }
   const packageViews = models.map(packageView);
+  const resolvePackage = (name: string): RepositoryPackage => {
+    const model = models.find(
+      (entry) => entry.name === name || entry.identity === name,
+    );
+    if (model === undefined) throw new Error(`package not found: ${name}`);
+    return model;
+  };
   const graphEdges = models.flatMap((model) =>
     model.internalDependencies.map((target) => ({
       source: model.identity,
@@ -855,13 +862,8 @@ const repositoryQueryRoot = (
       list(
         packageViews.filter((view) => packageMatchesPredicate(view, filter)),
       ),
-    package: ({ name }: { readonly name: string }) => {
-      const model = models.find(
-        (entry) => entry.name === name || entry.identity === name,
-      );
-      if (model === undefined) throw new Error(`package not found: ${name}`);
-      return packageView(model);
-    },
+    package: ({ name }: { readonly name: string }) =>
+      packageView(resolvePackage(name)),
     packageGraph: ({
       center,
       filter,
@@ -869,11 +871,10 @@ const repositoryQueryRoot = (
       readonly center?: string;
       readonly filter?: PackagePredicate;
     }) => {
-      const centerModel = models.find(
-        (model) => model.name === center || model.identity === center,
-      );
+      const centerModel =
+        center === undefined ? undefined : resolvePackage(center);
       const centeredIdentities =
-        center === undefined || centerModel === undefined
+        centerModel === undefined
           ? undefined
           : new Set([
               centerModel.identity,
@@ -955,7 +956,14 @@ const repositoryQueryRoot = (
       const selected =
         requested.size === 0
           ? allTasks
-          : allTasks.filter((task) => requested.has(task.name));
+          : allTasks.filter((task) => {
+              const node = taskNodesByView.get(task)!;
+              return (
+                requested.has(task.name) ||
+                requested.has(task.fullName) ||
+                requested.has(`${node.package.identity}#${task.name}`)
+              );
+            });
       return list(
         selected.map((task) => {
           const node = taskNodesByView.get(task)!;

@@ -510,6 +510,9 @@ user-visible triggers.
 Git-ignore matching does not suppress files already tracked in the Git index or
 directory events whose subtree contains tracked files. `.venv` trees remain
 internally ignored even when the repository root does not list them.
+When tracked-file discovery fails inside a detected Git repository, Git-ignore
+suppression is disabled conservatively so tracked inputs remain observable and
+copyable. Non-Git repositories continue to apply their configured ignore rules.
 Declared-output ignore files written by an active run remain suppressed to
 prevent generated-output loops. Root, custom, and workspace Turbo configuration
 changes and active JavaScript, Cargo, or uv workspace manifest changes refresh
@@ -553,8 +556,10 @@ skips Unix filesystem ownership and permission operations. Its public transport
 is the official `turbodprotocol.Turbod` gRPC
 service over HTTP/2. Hello, status, and shutdown calls interoperate in both
 directions with the 2.10.12 executable; package and watch calls share the same
-bounded framing and scoped sessions. Clients terminate a response as soon as
-its accumulated frame exceeds the 1 MiB payload limit plus framing bytes.
+bounded framing and scoped sessions. Unary request and response bodies contain
+exactly one complete frame with no trailing data. Clients terminate a response
+as soon as its accumulated frame exceeds the 1 MiB payload limit plus framing
+bytes.
 Oversized request streams discard retained frame data and are never dispatched
 to a daemon handler after cancellation. Nonzero `grpc-message` diagnostics in
 response headers or trailers are percent-decoded; malformed encodings fail with
@@ -628,8 +633,10 @@ introspection, and a GraphQL server that binds and advertises IPv4 loopback.
 Task relationship collections
 come from the resolved task graph. GraphQL affected collections calculate the
 requested base/head range, include dependent packages, and apply package and
-task filters. The `query affected --tasks` shortcut uses the same resolved task
-graph for task reasons in both filtered and unfiltered forms. Explicitly
+task filters. Task filters accept bare task names, package-qualified names, and
+collision-qualified ecosystem package identities. The `query affected --tasks`
+shortcut uses the same resolved task graph for task reasons in both filtered and
+unfiltered forms. Explicitly
 requested bare and package-qualified names include root tasks and configured
 commandless tasks and propagate dependency-task reasons through transitive
 affected package chains, while the unfiltered form retains script-backed task
@@ -640,8 +647,9 @@ in its own dependency or dependent relationship collections.
 Boundary diagnostics evaluate root, package, and tag dependency and dependent
 permissions against manifest and configured implicit package dependencies. Package-graph
 center selection retains the named package and its
-direct dependencies, package predicates narrow the returned nodes, and graph
-edges retain the selected nodes' dependency context. Graph filtering uses
+direct dependencies, rejects unknown centers, package predicates narrow the
+returned nodes, and graph edges retain the selected nodes' dependency context.
+Graph filtering uses
 package identities, and same-named cross-ecosystem edge endpoints use qualified
 identities. Affected collections include the root package for root changes and
 when it depends on an affected workspace without allowing the root path to
@@ -686,7 +694,7 @@ roots also cannot replace or be nested within repository metadata, root control
 paths, the active lockfile or configuration, package-manager controls, or a
 non-root package or workspace-control directory.
 Selected package copies stop at nested workspace roots outside the selected
-closure.
+closure. Co-located ecosystem scopes copy each distinct package directory once.
 Generated installation manifests, configuration files, and reduced lockfiles
 use readable `0644` modes. It
 never follows workspace symlinks into a prune output. Output safety and traversal
@@ -713,9 +721,10 @@ their configured path descends through an otherwise ignored `node_modules`
 directory; unrelated files beneath that ignored directory remain excluded.
 Other copying
 honors repository and nested Git-ignore files unless disabled; ordinary pnpm
-pruning retains development dependency closure. Production npm, pnpm, Yarn,
-and text Bun pruning removes development dependency edges and their package
-closure, including development-marked trees in legacy npm v1 lockfiles.
+pruning retains development dependency closure. Reserved package-tree
+directories use case-insensitive name matching on Windows. Production npm,
+pnpm, Yarn, and text Bun pruning removes development dependency edges and their
+package closure, including development-marked trees in legacy npm v1 lockfiles.
 Production pruning also removes `devDependencies` from selected JavaScript
 workspace manifests in the ordinary or Docker full tree. A contained relative
 workspace-manifest symlink remains a symlink in ordinary, Docker full, and
