@@ -1,11 +1,13 @@
 import { Deferred, Effect, Queue, Ref, Stream } from "effect";
 import {
-  canMatchGlobsDescendantWithExclusions,
+  canMatchGlobDescendant,
   matchesGlobsWithExclusions,
 } from "../core/glob.js";
 import {
+  isAbsolutePath,
   isPathContained,
   joinPath,
+  joinPathWithSeparators,
   normalizePath,
   parentPath,
   relativePath,
@@ -26,8 +28,8 @@ import {
   SystemService,
   TerminalService,
 } from "../effect/services.js";
+import { configuredEnvironmentValue } from "../repository/model.js";
 import {
-  isInternalRepositoryPath,
   loadWorkflowRepository,
   repositoryPackageManagerLabel,
 } from "./repository.js";
@@ -752,10 +754,43 @@ const serveDaemon = (
     Effect.gen(function* () {
       const clock = yield* ClockService;
       const daemon = yield* DaemonService;
+      const environmentService = yield* EnvironmentService;
       const fileSystem = yield* FileSystemService;
       const fileWatcher = yield* FileWatcherService;
       const system = yield* SystemService;
       const information = yield* system.information;
+      const environment = yield* environmentService.entries;
+      const platform = yield* environmentService.platform;
+      const windowsPathSeparators = platform === "win32";
+      const cacheDirectoryValue =
+        configuredEnvironmentValue(
+          environment,
+          "TURBO_CACHE_DIR",
+          windowsPathSeparators,
+        ) ??
+        repository.rootConfiguration.value.cacheDir ??
+        repository.rootConfiguration.value.global?.cacheDir ??
+        ".turbo/cache";
+      const cacheDirectory = isAbsolutePath(
+        cacheDirectoryValue,
+        windowsPathSeparators,
+      )
+        ? normalizePath(cacheDirectoryValue, windowsPathSeparators)
+        : joinPathWithSeparators(
+            windowsPathSeparators,
+            repository.root,
+            cacheDirectoryValue,
+          );
+      const ignoredRepositoryPath = (path: string): boolean =>
+        [
+          joinPathWithSeparators(
+            windowsPathSeparators,
+            repository.root,
+            ".git",
+          ),
+          parentPath(paths.log, windowsPathSeparators),
+          cacheDirectory,
+        ].some((root) => isPathContained(root, path, windowsPathSeparators));
       const shutdown = yield* Deferred.make<void>();
       const activity = yield* Queue.sliding<void>(1);
       const activityState = yield* Ref.make({
@@ -816,9 +851,6 @@ const serveDaemon = (
         }),
       );
       const repositoryChanges = fileWatcher.watch(repository.root).pipe(
-        Stream.filter(
-          (change) => !isInternalRepositoryPath(repository.root, change.path),
-        ),
         Stream.runForEach((change) =>
           Effect.gen(function* () {
             if (change.kind === "unknown") {
@@ -830,6 +862,7 @@ const serveDaemon = (
               yield* recordActivity();
               return;
             }
+            if (ignoredRepositoryPath(change.path)) return;
             const relative = relativePath(repository.root, change.path);
             for (const registration of outputRegistrations.values()) {
               for (const glob of registration.outputGlobs) {
@@ -842,7 +875,7 @@ const serveDaemon = (
                 if (
                   matchesGlobsWithExclusions([relative], patterns) ||
                   (change.entryKind === "directory" &&
-                    canMatchGlobsDescendantWithExclusions(relative, patterns))
+                    canMatchGlobDescendant(relative, glob))
                 ) {
                   markOutputChanged(registration, glob);
                 }

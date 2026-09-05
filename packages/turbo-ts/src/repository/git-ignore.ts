@@ -4,10 +4,11 @@ import {
   isPathContained,
   joinPath,
   normalizePath,
+  parentPath,
   relativePath,
 } from "../core/path.js";
 import { RepositoryError } from "../effect/errors.js";
-import { FileSystemService } from "../effect/services.js";
+import { FileSystemService, ProcessService } from "../effect/services.js";
 
 interface IgnoreRules {
   readonly directory: string;
@@ -49,10 +50,54 @@ const matchesRules = (
 
 export const loadGitIgnoreMatcher = (
   root: string,
-): Effect.Effect<GitIgnoreMatcher, RepositoryError, FileSystemService> =>
+): Effect.Effect<
+  GitIgnoreMatcher,
+  RepositoryError,
+  FileSystemService | ProcessService
+> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
+    const processService = yield* ProcessService;
     const normalizedRoot = normalizePath(root);
+    const trackedResult = yield* Effect.scoped(
+      processService.runBytes({
+        command: "git",
+        args: ["ls-files", "--cached", "-z", "--"],
+        cwd: normalizedRoot,
+        inheritEnvironment: true,
+      }),
+    ).pipe(Effect.either);
+    const caseInsensitivePaths =
+      /^[A-Za-z]:[\\/]/.test(normalizedRoot) ||
+      /^[\\/]{2}[^\\/]+[\\/][^\\/]+/.test(normalizedRoot);
+    const comparablePath = (path: string): string => {
+      const normalized = normalizePath(path, caseInsensitivePaths);
+      return caseInsensitivePaths ? normalized.toLowerCase() : normalized;
+    };
+    const trackedFiles = new Set<string>();
+    const trackedDirectories = new Set<string>();
+    if (trackedResult._tag === "Right" && trackedResult.right.exitCode === 0) {
+      for (const relative of new TextDecoder()
+        .decode(trackedResult.right.stdout)
+        .split("\0")) {
+        if (relative === "") continue;
+        const absolute = normalizePath(
+          joinPath(normalizedRoot, relative),
+          caseInsensitivePaths,
+        );
+        trackedFiles.add(comparablePath(absolute));
+        let directory = parentPath(absolute, caseInsensitivePaths);
+        while (
+          isPathContained(normalizedRoot, directory, caseInsensitivePaths)
+        ) {
+          trackedDirectories.add(comparablePath(directory));
+          if (comparablePath(directory) === comparablePath(normalizedRoot)) {
+            break;
+          }
+          directory = parentPath(directory, caseInsensitivePaths);
+        }
+      }
+    }
     const rules: Array<IgnoreRules> = [];
     const pending = [normalizedRoot];
     while (pending.length > 0) {
@@ -99,7 +144,15 @@ export const loadGitIgnoreMatcher = (
       }
     }
     return {
-      ignores: (path, directory = false) =>
-        matchesRules(normalizedRoot, rules, path, directory),
+      ignores: (path, directory = false) => {
+        const comparable = comparablePath(path);
+        if (
+          trackedFiles.has(comparable) ||
+          (directory && trackedDirectories.has(comparable))
+        ) {
+          return false;
+        }
+        return matchesRules(normalizedRoot, rules, path, directory);
+      },
     };
   });

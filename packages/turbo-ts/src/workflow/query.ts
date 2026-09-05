@@ -36,9 +36,10 @@ import {
   type LockfilePackage,
   resolveLockfilePackageClosure,
 } from "../repository/lockfiles.js";
-import type {
-  RepositoryModel,
-  RepositoryPackage,
+import {
+  internalPackageNames,
+  type RepositoryModel,
+  type RepositoryPackage,
 } from "../repository/model.js";
 import {
   loadWorkflowRepository,
@@ -1034,16 +1035,10 @@ const executeGraphql = (
                 try: () => {
                   const dependencies = new Map<string, LockfilePackage>();
                   for (const model of models) {
-                    const internalNames = new Set([
-                      model.name,
-                      ...model.internalDependencies.flatMap((identity) => {
-                        const dependency =
-                          repository.packagesByIdentity.get(identity);
-                        return dependency === undefined
-                          ? []
-                          : [dependency.name];
-                      }),
-                    ]);
+                    const internalNames = internalPackageNames(
+                      repository,
+                      model,
+                    );
                     const manifestReferences = new Map(
                       [
                         model.manifest.dependencies,

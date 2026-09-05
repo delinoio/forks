@@ -502,6 +502,9 @@ limited to directory events. Ignore and output filtering occurs before manifest
 or configuration refresh classification, so generated manifests cannot cause a
 watch loop. Changes to an ignore file reload the matcher before stale ignore
 rules are applied and remain user-visible triggers.
+Git-ignore matching does not suppress files already tracked in the Git index or
+directory events whose subtree contains tracked files. `.venv` trees remain
+internally ignored even when the repository root does not list them.
 Declared-output ignore files written by an active run remain suppressed to
 prevent generated-output loops. Root, custom, and workspace Turbo configuration
 changes and active JavaScript, Cargo, or uv workspace manifest changes refresh
@@ -542,6 +545,11 @@ Package discovery reloads the repository model for each request so workspace
 additions, removals, and renames are visible without a daemon restart.
 Custom root Turbo configuration paths are retained by lifecycle commands,
 forwarded to detached servers, and reused for request-time package discovery.
+Registered outputs beneath `.turbo` outside the resolved cache directory and
+beneath `node_modules` remain observable. Directory events conservatively mark
+positive output globs when descendants can match, even when an exclusion can
+match only part of that subtree. Git metadata, the resolved cache directory,
+and daemon-owned logs remain excluded.
 Output-change registration/query calls return their protocol data rather than
 empty acknowledgments. Changed-output snapshots consume only the exact glob
 generations reported after their response is written successfully. A failed
@@ -606,7 +614,9 @@ server shutdown interrupt in-flight resolver effects and their subprocesses.
 Top-level package predicates are
 applied, external dependencies come from manifest references resolved against
 the parsed lockfile, including npm v2/v3 package locations whose entries omit
-the package name. npm root, workspace, and workspace-link records are excluded
+the package name. Internal workspaces are excluded across the complete
+transitive workspace dependency closure for both query results and external
+dependency hashes. npm root, workspace, and workspace-link records are excluded
 from external package results. Yarn Berry entries report their installed
 `version` rather than descriptor ranges. Lockfile reading and parsing are
 deferred until the `externalDependencies` field is selected, so independent

@@ -2011,18 +2011,54 @@ const decodedDaemonResponse = (
   method: string,
   payload: Uint8Array,
 ): unknown => {
-  if (method !== "Status") return {};
   const outer = protocolFields(payload);
-  const status = outer.get(1)?.[0];
-  if (!(status instanceof Buffer)) return {};
-  const fields = protocolFields(status);
-  const logFile = fields.get(1)?.[0];
-  const uptimeMilliseconds = fields.get(2)?.[0];
-  return {
-    logFile: logFile instanceof Buffer ? logFile.toString("utf8") : "",
-    uptimeMilliseconds:
-      typeof uptimeMilliseconds === "number" ? uptimeMilliseconds : 0,
-  };
+  if (method === DaemonMethod.status) {
+    const status = outer.get(1)?.[0];
+    if (!(status instanceof Buffer)) return {};
+    const fields = protocolFields(status);
+    const logFile = fields.get(1)?.[0];
+    const uptimeMilliseconds = fields.get(2)?.[0];
+    return {
+      logFile: logFile instanceof Buffer ? logFile.toString("utf8") : "",
+      uptimeMilliseconds:
+        typeof uptimeMilliseconds === "number" ? uptimeMilliseconds : 0,
+    };
+  }
+  if (method === DaemonMethod.discoverPackages) {
+    const packageManager = outer.get(2)?.[0];
+    return {
+      packages: (outer.get(1) ?? []).flatMap((package_) => {
+        if (!(package_ instanceof Buffer)) return [];
+        const fields = protocolFields(package_);
+        const name = fields.get(1)?.[0];
+        const path = fields.get(2)?.[0];
+        return [
+          {
+            name: name instanceof Buffer ? name.toString("utf8") : "",
+            path: path instanceof Buffer ? path.toString("utf8") : "",
+          },
+        ];
+      }),
+      packageManager:
+        packageManager instanceof Buffer ? packageManager.toString("utf8") : "",
+    };
+  }
+  if (method === DaemonMethod.getChangedOutputs) {
+    return {
+      changedOutputs: (outer.get(1) ?? []).flatMap((changedOutput) => {
+        if (!(changedOutput instanceof Buffer)) return [];
+        const fields = protocolFields(changedOutput);
+        const hash = fields.get(1)?.[0];
+        return [
+          {
+            hash: hash instanceof Buffer ? hash.toString("utf8") : "",
+            changedOutputGlobs: protocolStrings(fields, 2),
+          },
+        ];
+      }),
+    };
+  }
+  return {};
 };
 
 export const respondGrpc = (

@@ -86,6 +86,7 @@ import {
   cargoHomeConfigurationPresent,
   configuredEnvironmentValue,
   discoverRepository,
+  internalPackageNames,
   listRepositoryFiles,
   npmUserConfigurationPresent,
   type PackageManagerRuntimeIdentity,
@@ -1855,14 +1856,10 @@ const packagesExternalDependenciesHash = (
         [
           ...new Set(
             packageModels.flatMap((packageModel) => {
-              const internalNames = new Set([
-                packageModel.name,
-                ...packageModel.internalDependencies.flatMap((identity) => {
-                  const dependency =
-                    repository.packagesByIdentity.get(identity);
-                  return dependency === undefined ? [] : [dependency.name];
-                }),
-              ]);
+              const internalNames = internalPackageNames(
+                repository,
+                packageModel,
+              );
               const manifestDependencyReferences = new Map(
                 [
                   packageModel.manifest.dependencies,

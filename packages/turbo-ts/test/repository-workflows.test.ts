@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
+  chmod,
   cp,
   mkdir,
   mkdtemp,
@@ -20,7 +21,7 @@ import {
 } from "node:http2";
 import { createConnection as createNetConnection } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { delimiter, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "@rstest/core";
@@ -338,6 +339,12 @@ describe("repository workflow gate", () => {
       isInternalRepositoryPath(
         nestedRepository,
         join(nestedRepository, ".turbo", "cache"),
+      ),
+    ).toBe(true);
+    expect(
+      isInternalRepositoryPath(
+        nestedRepository,
+        join(nestedRepository, ".venv", "lib", "generated.py"),
       ),
     ).toBe(true);
     expect(
@@ -1975,6 +1982,72 @@ describe("repository workflow gate", () => {
     ).rejects.toThrow(/synthetic asynchronous response failure/);
   });
 
+  it("decodes package and changed-output daemon responses", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-client-"));
+    const socket = join(directory, "turbod.sock");
+    try {
+      const responses = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const daemon = yield* DaemonService;
+            yield* daemon.serve(socket).pipe(
+              Stream.runForEach((connection) =>
+                Stream.runForEach(connection.requests, (request) =>
+                  connection.respond({
+                    id: request.id,
+                    result:
+                      request.method === DaemonMethod.discoverPackages
+                        ? {
+                            packages: [
+                              { name: "synthetic-app", path: "packages/app" },
+                            ],
+                            packageManager: "pnpm9",
+                          }
+                        : {
+                            changedOutputs: [
+                              {
+                                hash: "synthetic-hash",
+                                changedOutputGlobs: ["dist/*.js"],
+                              },
+                            ],
+                          },
+                  }),
+                ),
+              ),
+              Effect.forkScoped,
+            );
+            yield* Effect.promise(() => waitUntil(() => existsSync(socket)));
+            const discovered = yield* daemon.request(socket, {
+              id: "discover",
+              method: DaemonMethod.discoverPackages,
+            });
+            const changed = yield* daemon.request(socket, {
+              id: "changed",
+              method: DaemonMethod.getChangedOutputs,
+              params: { hashes: ["synthetic-hash"] },
+            });
+            return { discovered, changed };
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(responses.discovered.result).toEqual({
+        packages: [{ name: "synthetic-app", path: "packages/app" }],
+        packageManager: "pnpm9",
+      });
+      expect(responses.changed.result).toEqual({
+        changedOutputs: [
+          {
+            hash: "synthetic-hash",
+            changedOutputGlobs: ["dist/*.js"],
+          },
+        ],
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("interrupts rejected daemon responses with the server scope", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-scope-"));
@@ -2297,6 +2370,133 @@ describe("repository workflow gate", () => {
       expect(responses.get("get-empty")).toMatchObject({
         result: {
           changedOutputs: [{ hash: "synthetic-hash", changedOutputGlobs: [] }],
+        },
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("tracks registered internal outputs and partial directory exclusions", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-output-"));
+    try {
+      await prepareFixture(directory);
+      const responses = new Map<string, unknown>();
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const daemon = yield* DaemonService;
+          const registered = yield* Deferred.make<void>();
+          const connection = (request: {
+            readonly id: string;
+            readonly method: (typeof DaemonMethod)[keyof typeof DaemonMethod];
+            readonly params?: unknown;
+          }) => ({
+            requests: Stream.fromEffect(
+              request.id === "get"
+                ? Deferred.await(registered).pipe(
+                    Effect.zipRight(Effect.sleep("50 millis")),
+                    Effect.as(request),
+                  )
+                : Effect.succeed(request),
+            ),
+            respond: (response: { readonly id: string }) =>
+              Effect.sync(() => {
+                responses.set(request.id, response);
+              }).pipe(
+                request.id === "notify"
+                  ? Effect.zipRight(Deferred.succeed(registered, undefined))
+                  : (effect) => effect,
+                Effect.asVoid,
+              ),
+          });
+          return yield* executeDaemon({
+            command: "serve",
+            cwd: directory,
+            idleMilliseconds: 100,
+            json: false,
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(DaemonService, {
+                  ...daemon,
+                  serve: () =>
+                    Stream.fromIterable([
+                      connection({
+                        id: "notify",
+                        method: DaemonMethod.notifyOutputsWritten,
+                        params: {
+                          hash: "synthetic-hash",
+                          outputGlobs: [
+                            ".turbo/cache/*.js",
+                            ".turbo/daemon/*.log",
+                            ".turbo/generated/*.js",
+                            "dist/*.js",
+                            "node_modules/generated/*.js",
+                          ],
+                          outputExclusionGlobs: ["dist/ignore.js"],
+                        },
+                      }),
+                      connection({
+                        id: "get",
+                        method: DaemonMethod.getChangedOutputs,
+                        params: { hashes: ["synthetic-hash"] },
+                      }),
+                    ]),
+                }),
+                Layer.succeed(FileWatcherService, {
+                  watch: (root) =>
+                    Stream.fromEffect(Deferred.await(registered)).pipe(
+                      Stream.flatMap(() =>
+                        Stream.fromIterable([
+                          {
+                            path: join(root, ".turbo/generated/output.js"),
+                            kind: "modify" as const,
+                            entryKind: "file" as const,
+                          },
+                          {
+                            path: join(
+                              root,
+                              "node_modules/generated/output.js",
+                            ),
+                            kind: "modify" as const,
+                            entryKind: "file" as const,
+                          },
+                          {
+                            path: join(root, "dist"),
+                            kind: "rename" as const,
+                            entryKind: "directory" as const,
+                          },
+                          {
+                            path: join(root, ".turbo/cache/output.js"),
+                            kind: "modify" as const,
+                            entryKind: "file" as const,
+                          },
+                          {
+                            path: join(root, ".turbo/daemon/synthetic.log"),
+                            kind: "modify" as const,
+                            entryKind: "file" as const,
+                          },
+                        ]),
+                      ),
+                    ),
+                }),
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(responses.get("get")).toMatchObject({
+        result: {
+          changedOutputs: [
+            {
+              hash: "synthetic-hash",
+              changedOutputGlobs: [
+                ".turbo/generated/*.js",
+                "dist/*.js",
+                "node_modules/generated/*.js",
+              ],
+            },
+          ],
         },
       });
     } finally {
@@ -3703,6 +3903,86 @@ describe("repository workflow gate", () => {
     }
   }, 45_000);
 
+  it("watches tracked task inputs that also match ignore rules", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-tracked-"));
+    await prepareFixture(directory);
+    const configurationPath = join(directory, "turbo.json");
+    const configuration = JSON.parse(
+      await readFile(configurationPath, "utf8"),
+    ) as Record<string, unknown>;
+    configuration.futureFlags = {
+      watchUsingTaskInputs: true,
+      strictTaskEntrypointSelection: true,
+    };
+    configuration.tasks = {
+      tracked: { cache: false, inputs: ["tracked.txt"] },
+    };
+    await writeFile(
+      configurationPath,
+      `${JSON.stringify(configuration, undefined, 2)}\n`,
+    );
+    const applicationDirectory = join(directory, "packages/app");
+    const applicationManifestPath = join(applicationDirectory, "package.json");
+    const applicationManifest = JSON.parse(
+      await readFile(applicationManifestPath, "utf8"),
+    ) as { scripts: Record<string, string> };
+    applicationManifest.scripts.tracked =
+      "node -e \"console.log('tracked input run')\"";
+    await writeFile(
+      applicationManifestPath,
+      `${JSON.stringify(applicationManifest, undefined, 2)}\n`,
+    );
+    const trackedInput = join(applicationDirectory, "tracked.txt");
+    await writeFile(trackedInput, "initial\n");
+    await writeFile(join(applicationDirectory, ".gitignore"), "tracked.txt\n");
+    await execFilePromise("/usr/bin/git", ["-C", directory, "init"]);
+    await execFilePromise("/usr/bin/git", [
+      "-C",
+      directory,
+      "add",
+      "-f",
+      "packages/app/tracked.txt",
+    ]);
+    const child = spawn(
+      process.execPath,
+      [
+        candidate,
+        "watch",
+        "tracked",
+        "--filter=synthetic-app",
+        "--cwd",
+        directory,
+        "--no-cache",
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    const closed = new Promise<void>((resolve) => child.once("close", resolve));
+    try {
+      await waitUntil(() => stdout.includes("tracked input run"));
+      const initialRuns = (stdout.match(/tracked input run/g) ?? []).length;
+      await writeFile(trackedInput, "changed\n");
+      await waitUntil(
+        () => (stdout.match(/tracked input run/g) ?? []).length > initialRuns,
+      );
+    } finally {
+      child.kill();
+      await Promise.race([
+        closed,
+        new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await closed;
+      }
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("uses task inputs and file entry types for watch changes", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-inputs-"));
     await prepareFixture(directory);
@@ -4117,6 +4397,191 @@ snapshots:
       }
       await rm(directory, { force: true, recursive: true });
       await rm(outside, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("excludes transitive Cargo workspaces from query external dependencies", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-query-cargo-"));
+    const commandDirectory = join(directory, "commands");
+    const cargoWorkspaceDirectory = join(directory, "rust");
+    const packages = ["a", "b", "c"].map((name) => {
+      const packageDirectory = join(cargoWorkspaceDirectory, name);
+      return {
+        id: `path+file://${packageDirectory}#rust-${name}@0.1.0`,
+        name: `rust-${name}`,
+        packageDirectory,
+      };
+    });
+    try {
+      await mkdir(commandDirectory, { recursive: true });
+      await mkdir(cargoWorkspaceDirectory, { recursive: true });
+      await writeFile(
+        join(cargoWorkspaceDirectory, "package.json"),
+        `${JSON.stringify({
+          name: "synthetic-cargo-root",
+          private: true,
+          packageManager: "cargo@1.96.0",
+        })}\n`,
+      );
+      await writeFile(
+        join(cargoWorkspaceDirectory, "turbo.json"),
+        `${JSON.stringify({
+          futureFlags: { experimentalCargoWorkspaces: true },
+          tasks: {},
+        })}\n`,
+      );
+      await writeFile(
+        join(cargoWorkspaceDirectory, "Cargo.toml"),
+        '[workspace]\nmembers = ["a", "b", "c"]\nresolver = "3"\n',
+      );
+      for (const package_ of packages) {
+        await mkdir(join(package_.packageDirectory, "src"), {
+          recursive: true,
+        });
+        await writeFile(
+          join(package_.packageDirectory, "Cargo.toml"),
+          `[package]\nname = "${package_.name}"\nversion = "0.1.0"\nedition = "2024"\n`,
+        );
+        await writeFile(join(package_.packageDirectory, "src/lib.rs"), "");
+      }
+      await writeFile(
+        join(cargoWorkspaceDirectory, "Cargo.lock"),
+        `version = 4
+
+[[package]]
+name = "external-package"
+version = "2.0.0"
+source = "registry+https://example.test/index"
+
+[[package]]
+name = "rust-a"
+version = "0.1.0"
+dependencies = ["rust-b 0.1.0"]
+
+[[package]]
+name = "rust-b"
+version = "0.1.0"
+dependencies = ["rust-c 0.1.0"]
+
+[[package]]
+name = "rust-c"
+version = "0.1.0"
+dependencies = ["external-package 2.0.0"]
+`,
+      );
+      const cargoMetadata = JSON.stringify({
+        workspace_root: cargoWorkspaceDirectory,
+        workspace_members: packages.map(({ id }) => id),
+        target_directory: join(cargoWorkspaceDirectory, "target"),
+        packages: packages.map(({ id, name, packageDirectory }) => ({
+          id,
+          name,
+          version: "0.1.0",
+          manifest_path: join(packageDirectory, "Cargo.toml"),
+          dependencies:
+            name === "rust-a"
+              ? [
+                  {
+                    name: "rust-b",
+                    path: join(cargoWorkspaceDirectory, "b"),
+                    source: null,
+                  },
+                ]
+              : name === "rust-b"
+                ? [
+                    {
+                      name: "rust-c",
+                      path: join(cargoWorkspaceDirectory, "c"),
+                      source: null,
+                    },
+                  ]
+                : [
+                    {
+                      name: "external-package",
+                      source: "registry+https://example.test/index",
+                    },
+                  ],
+          targets: [{ kind: ["lib"], name: name.replaceAll("-", "_") }],
+        })),
+      });
+      const cargoCommand = join(commandDirectory, "cargo");
+      const rustcCommand = join(commandDirectory, "rustc");
+      await writeFile(
+        cargoCommand,
+        `#!/usr/bin/env node\nif (process.argv.includes("metadata")) process.stdout.write(${JSON.stringify(cargoMetadata)}); else console.log("cargo 1.96.0-nightly");\n`,
+      );
+      await writeFile(
+        rustcCommand,
+        '#!/usr/bin/env node\nconsole.log("rustc 1.96.0-nightly");\nconsole.log("host: synthetic-target-triple");\n',
+      );
+      await Promise.all([
+        chmod(cargoCommand, 0o755),
+        chmod(rustcCommand, 0o755),
+      ]);
+      const child = spawn(
+        process.execPath,
+        [candidate, "query", "--port=0", "--cwd", cargoWorkspaceDirectory],
+        {
+          env: {
+            ...process.env,
+            PATH: `${commandDirectory}${delimiter}${process.env.PATH ?? ""}`,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      const closed = new Promise<void>((resolve) =>
+        child.once("close", resolve),
+      );
+      try {
+        await Promise.race([
+          waitUntil(() =>
+            /GraphQL endpoint: http:\/\/localhost:\d+/.test(stdout),
+          ),
+          closed,
+        ]);
+        const port = /GraphQL endpoint: http:\/\/localhost:(\d+)/.exec(
+          stdout,
+        )?.[1];
+        expect(port, stderr).toBeDefined();
+        const response = await fetch(`http://127.0.0.1:${port}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            query: "{ externalDependencies { items } }",
+          }),
+        });
+        const body = await response.json();
+        expect(response.status, `${JSON.stringify(body)}\n${stderr}`).toBe(200);
+        expect(body).toEqual({
+          data: {
+            externalDependencies: {
+              items: [{ name: "external-package", version: "2.0.0" }],
+            },
+          },
+        });
+      } finally {
+        child.kill();
+        await Promise.race([
+          closed,
+          new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+        ]);
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+          await closed;
+        }
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
     }
   }, 30_000);
 

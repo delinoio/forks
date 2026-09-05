@@ -119,7 +119,7 @@ export const isInternalRepositoryPath = (
   const relative = windowsPathSeparators
     ? normalized.toLowerCase()
     : normalized;
-  return ["/.git/", "/.turbo/", "/node_modules/"].some((component) =>
+  return ["/.git/", "/.turbo/", "/.venv/", "/node_modules/"].some((component) =>
     relative.includes(component),
   );
 };

@@ -4293,7 +4293,7 @@ describe("core CLI execution", () => {
     }
   }, 60_000);
 
-  it("summarizes external dependencies from every grouped Cargo member", async () => {
+  it("excludes transitive Cargo workspaces from grouped external dependencies", async () => {
     const directory = await makeFixture();
     const commandDirectory = `${directory}/commands`;
     const cargoWorkspaceDirectory = `${directory}/rust`;
@@ -4313,7 +4313,7 @@ describe("core CLI execution", () => {
           2,
         )}\n`,
       );
-      const cargoPackages = ["a", "b"].map((name) => {
+      const cargoPackages = ["a", "b", "c"].map((name) => {
         const packageDirectory = `${cargoWorkspaceDirectory}/${name}`;
         const packageName = `rust-${name}`;
         return {
@@ -4337,7 +4337,7 @@ describe("core CLI execution", () => {
       }
       await writeFile(
         `${cargoWorkspaceDirectory}/Cargo.toml`,
-        '[workspace]\nmembers = ["a", "b"]\nresolver = "3"\n',
+        '[workspace]\nmembers = ["a", "b", "c"]\nresolver = "3"\n',
       );
       await writeFile(
         `${cargoWorkspaceDirectory}/Cargo.lock`,
@@ -4351,9 +4351,19 @@ source = "registry+https://example.test/index"
 [[package]]
 name = "rust-a"
 version = "0.1.0"
+dependencies = [
+ "rust-b 0.1.0",
+]
 
 [[package]]
 name = "rust-b"
+version = "0.1.0"
+dependencies = [
+ "rust-c 0.1.0",
+]
+
+[[package]]
+name = "rust-c"
 version = "0.1.0"
 dependencies = [
  "external-only-for-b 2.0.0",
@@ -4371,14 +4381,28 @@ dependencies = [
           version: "0.1.0",
           manifest_path: `${packageDirectory}/Cargo.toml`,
           dependencies:
-            name === "rust-b"
+            name === "rust-a"
               ? [
                   {
-                    name: "external-only-for-b",
-                    source: "registry+https://example.test/index",
+                    name: "rust-b",
+                    path: `${cargoWorkspaceDirectory}/b`,
+                    source: null,
                   },
                 ]
-              : [],
+              : name === "rust-b"
+                ? [
+                    {
+                      name: "rust-c",
+                      path: `${cargoWorkspaceDirectory}/c`,
+                      source: null,
+                    },
+                  ]
+                : [
+                    {
+                      name: "external-only-for-b",
+                      source: "registry+https://example.test/index",
+                    },
+                  ],
           targets: [{ kind: ["lib"], name: name.replaceAll("-", "_") }],
         })),
       });

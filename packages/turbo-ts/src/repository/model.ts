@@ -108,6 +108,26 @@ export interface RepositoryDiscoveryOptions {
   readonly singlePackage?: boolean;
 }
 
+export const internalPackageNames = (
+  repository: Pick<RepositoryModel, "packagesByIdentity">,
+  packageModel: RepositoryPackage,
+): ReadonlySet<string> => {
+  const names = new Set<string>();
+  const visited = new Set<string>();
+  const pending = [packageModel];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (visited.has(current.identity)) continue;
+    visited.add(current.identity);
+    names.add(current.name);
+    for (const identity of current.internalDependencies) {
+      const dependency = repository.packagesByIdentity.get(identity);
+      if (dependency !== undefined) pending.push(dependency);
+    }
+  }
+  return names;
+};
+
 type PackageEcosystem = "javascript" | "cargo" | "uv";
 
 const packageEcosystem = (manager: PackageManagerName): PackageEcosystem =>
