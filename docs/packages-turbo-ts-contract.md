@@ -624,10 +624,11 @@ failure preserves the live daemon's PID, socket, and active-log state and is
 reported to the caller for both status and logs commands.
 Log clients follow the exact dated log reported by the running daemon until
 interrupted, reading only newly available bounded byte ranges while preserving
-split UTF-8 code points. Stop escalates only after a successful RPC identifies
-the process as the expected daemon; live PIDs without a healthy daemon RPC
-retain their lifecycle state and are never signaled. A failed shutdown RPC
-preserves
+split UTF-8 code points. Watcher path equality normalizes separators and follows
+case-insensitive filesystem semantics on Windows. Stop escalates only after a
+successful RPC identifies the process as the expected daemon; live PIDs without
+a healthy daemon RPC retain their lifecycle state and are never signaled. A
+failed shutdown RPC preserves
 the live daemon's PID, socket, and active-log state and reports the failure so
 the operation can be retried. Forced termination must be available, succeed,
 and be confirmed before the same state is removed. A timed-out daemon start

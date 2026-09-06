@@ -686,11 +686,18 @@ describe("repository workflow gate", () => {
     );
     expect(
       watcherPathsMatch(
-        "C:\\repo\\.turbo\\daemon\\turbo.log",
+        "C:\\Repo\\.Turbo\\Daemon\\Turbo.LOG",
         "C:/repo/.turbo/daemon/turbo.log",
         true,
       ),
     ).toBe(true);
+    expect(
+      watcherPathsMatch(
+        "C:/Repo/.turbo/daemon/turbo.log",
+        "C:/repo/.turbo/daemon/turbo.log",
+        false,
+      ),
+    ).toBe(false);
     expect(isWindowsSubsystemForLinux("linux", "6.8.0-generic")).toBe(false);
     expect(isWindowsSubsystemForLinux("win32", "10.0.26100-Microsoft")).toBe(
       false,

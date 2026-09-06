@@ -397,10 +397,14 @@ const daemonStartupPollMilliseconds = 50;
 export const watcherPathsMatch = (
   left: string,
   right: string,
-  windowsPathSeparators?: boolean,
-): boolean =>
-  normalizePath(left, windowsPathSeparators) ===
-  normalizePath(right, windowsPathSeparators);
+  windowsPathSeparators = process.platform === "win32",
+): boolean => {
+  const comparablePath = (path: string): string => {
+    const normalized = normalizePath(path, windowsPathSeparators);
+    return windowsPathSeparators ? normalized.toLowerCase() : normalized;
+  };
+  return comparablePath(left) === comparablePath(right);
+};
 
 const acquireStartLock = (
   paths: DaemonPaths,
