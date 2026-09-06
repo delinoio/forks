@@ -893,7 +893,7 @@ const resolveAffectedPackages = (
     };
   });
 
-const taskMatchesChangedFiles = (
+export const taskMatchesChangedFiles = (
   repository: RepositoryModel,
   node: TaskNode,
   changedFiles: ReadonlyArray<string>,
@@ -903,13 +903,21 @@ const taskMatchesChangedFiles = (
   const rootRelativeInputPrefix = "$TURBO_ROOT$/";
   const isRootPackage = node.package.relativeDirectory === ".";
   const inputs = effectiveTaskInputs(repository, node);
+  const inputPathIdentity = (path: string): string => {
+    const normalized = normalizePath(path, windowsPathSeparators);
+    return windowsPathSeparators ? normalized.toLowerCase() : normalized;
+  };
   const implicitInputs = new Set(
     implicitTaskInputCandidates(
       repository,
       node,
       runtimeEnvironment,
       windowsPathSeparators,
-    ).map((path) => relativePath(repository.root, path)),
+    ).map((path) =>
+      inputPathIdentity(
+        relativePath(repository.root, path, windowsPathSeparators),
+      ),
+    ),
   );
   return changedFiles.some((repositoryRelativeFile) => {
     const packageRelativeFile = packageRelativeChangedFile(
@@ -923,8 +931,8 @@ const taskMatchesChangedFiles = (
           ? node.package.relativeDirectory
           : joinPath(node.package.relativeDirectory, packageRelativeFile);
     if (
-      implicitInputs.has(repositoryRelativeFile) ||
-      implicitInputs.has(logicalRepositoryRelativeFile)
+      implicitInputs.has(inputPathIdentity(repositoryRelativeFile)) ||
+      implicitInputs.has(inputPathIdentity(logicalRepositoryRelativeFile))
     ) {
       return true;
     }

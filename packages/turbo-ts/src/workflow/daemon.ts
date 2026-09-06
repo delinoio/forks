@@ -33,6 +33,7 @@ import { canonicalExistingAncestorPath } from "../run/engine.js";
 import {
   loadWorkflowRepository,
   repositoryPackageManagerLabel,
+  resolveWorkflowRepositoryRoot,
 } from "./repository.js";
 
 type DaemonCommand =
@@ -1230,10 +1231,10 @@ export const executeDaemon = (
 > =>
   Effect.gen(function* () {
     const terminal = yield* TerminalService;
-    const fileSystem = yield* FileSystemService;
-    const repository = yield* loadWorkflowRepository(options);
-    const paths = yield* daemonPaths(repository.root);
+    const root = yield* resolveWorkflowRepositoryRoot(options);
+    const paths = yield* daemonPaths(root);
     if (options.command === "serve") {
+      const repository = yield* loadWorkflowRepository(options);
       return yield* serveDaemon(options, paths, repository);
     }
     if (options.command === "stop") {
@@ -1246,11 +1247,11 @@ export const executeDaemon = (
     }
     if (options.command === "restart") {
       yield* stopDaemon(paths);
-      yield* startDaemon(options, repository.root, paths);
+      yield* startDaemon(options, root, paths);
       return 0;
     }
     if (options.command === "start") {
-      yield* startDaemon(options, repository.root, paths);
+      yield* startDaemon(options, root, paths);
       return 0;
     }
     if (options.command === "logs") {

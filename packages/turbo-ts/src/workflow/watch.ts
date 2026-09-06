@@ -8,16 +8,19 @@ import {
   isAbsolutePath,
   isPathContained,
   joinPath,
+  joinPathWithSeparators,
   normalizePath,
   parentPath,
   relativePath,
 } from "../core/path.js";
 import { ConfigurationError } from "../effect/errors.js";
 import {
+  ClockService,
   ConcurrencyService,
   EnvironmentService,
   FileSystemService,
   FileWatcherService,
+  ProcessService,
   TerminalService,
 } from "../effect/services.js";
 import {
@@ -333,20 +336,47 @@ export const takePendingWatchChanges = (
   ];
 };
 
-const isGitIgnorePath = (path: string): boolean =>
-  normalizePath(path).split("/").at(-1) === ".gitignore";
+const watchPathIdentity = (
+  path: string,
+  windowsPathSeparators: boolean,
+): string => {
+  const normalized = normalizePath(path, windowsPathSeparators);
+  return windowsPathSeparators ? normalized.toLowerCase() : normalized;
+};
 
-const isTurboConfigurationPath = (
+export const isGitIgnorePath = (
+  path: string,
+  windowsPathSeparators: boolean,
+): boolean =>
+  (windowsPathSeparators
+    ? baseName(path, windowsPathSeparators).toLowerCase()
+    : baseName(path, windowsPathSeparators)) === ".gitignore";
+
+export const isTurboConfigurationPath = (
   root: string,
   configuredRootPath: string | undefined,
   path: string,
+  windowsPathSeparators: boolean,
 ): boolean => {
-  if (["turbo.json", "turbo.jsonc"].includes(baseName(path))) return true;
+  const name = baseName(path, windowsPathSeparators);
+  if (
+    ["turbo.json", "turbo.jsonc"].includes(
+      windowsPathSeparators ? name.toLowerCase() : name,
+    )
+  ) {
+    return true;
+  }
   if (configuredRootPath === undefined) return false;
-  const absoluteConfiguredPath = isAbsolutePath(configuredRootPath)
+  const absoluteConfiguredPath = isAbsolutePath(
+    configuredRootPath,
+    windowsPathSeparators,
+  )
     ? configuredRootPath
-    : joinPath(root, configuredRootPath);
-  return normalizePath(path) === normalizePath(absoluteConfiguredPath);
+    : joinPathWithSeparators(windowsPathSeparators, root, configuredRootPath);
+  return (
+    watchPathIdentity(path, windowsPathSeparators) ===
+    watchPathIdentity(absoluteConfiguredPath, windowsPathSeparators)
+  );
 };
 
 const workspaceManifestNames = [
@@ -380,19 +410,104 @@ export const isWorkspaceDiscoveryPath = (
     : normalized === workspaceConfiguration;
 };
 
-const isGitIndexPath = (
+export const resolveGitIndexPath = (
   root: string,
-  path: string,
   windowsPathSeparators: boolean,
-): boolean => {
-  const relative = normalizePath(
-    relativePath(root, path, windowsPathSeparators),
-    windowsPathSeparators,
-  );
-  return windowsPathSeparators
-    ? relative.toLowerCase() === ".git/index"
-    : relative === ".git/index";
+): Effect.Effect<string, never, ProcessService> =>
+  Effect.gen(function* () {
+    const processService = yield* ProcessService;
+    const fallback = joinPathWithSeparators(
+      windowsPathSeparators,
+      root,
+      ".git",
+      "index",
+    );
+    const result = yield* Effect.scoped(
+      processService.run({
+        command: "git",
+        args: ["rev-parse", "--git-path", "index"],
+        cwd: root,
+        inheritEnvironment: true,
+        maxCapturedOutputCharacters: 4_096,
+      }),
+    ).pipe(Effect.either);
+    if (result._tag === "Left" || result.right.exitCode !== 0) return fallback;
+    const reported = result.right.stdout.trim();
+    if (reported === "") return fallback;
+    return normalizePath(
+      isAbsolutePath(reported, windowsPathSeparators)
+        ? reported
+        : joinPathWithSeparators(windowsPathSeparators, root, reported),
+      windowsPathSeparators,
+    );
+  });
+
+interface WatchRunGeneration {
+  readonly generation: number;
+  readonly startedAtMilliseconds: number;
+  readonly completedAtMilliseconds?: number;
+}
+
+interface WatchRunGenerations {
+  readonly nextGeneration: number;
+  readonly generations: ReadonlyArray<WatchRunGeneration>;
+}
+
+const maximumRetainedWatchRunGenerations = 64;
+
+const beginWatchRunGeneration = (
+  state: WatchRunGenerations,
+  startedAtMilliseconds: number,
+): readonly [number, WatchRunGenerations] => {
+  const generation = state.nextGeneration;
+  return [
+    generation,
+    {
+      nextGeneration: generation + 1,
+      generations: [
+        ...state.generations,
+        { generation, startedAtMilliseconds },
+      ],
+    },
+  ];
 };
+
+const completeWatchRunGeneration = (
+  state: WatchRunGenerations,
+  generation: number,
+  completedAtMilliseconds: number,
+): WatchRunGenerations => {
+  const updated = state.generations.map((entry) =>
+    entry.generation === generation
+      ? {
+          ...entry,
+          completedAtMilliseconds: Math.max(
+            completedAtMilliseconds,
+            entry.startedAtMilliseconds,
+          ),
+        }
+      : entry,
+  );
+  const active = updated.filter(
+    (entry) => entry.completedAtMilliseconds === undefined,
+  );
+  const completed = updated
+    .filter((entry) => entry.completedAtMilliseconds !== undefined)
+    .slice(-maximumRetainedWatchRunGenerations);
+  return { ...state, generations: [...completed, ...active] };
+};
+
+const modifiedByWatchRun = (
+  state: WatchRunGenerations,
+  modifiedAtMilliseconds: number | undefined,
+): boolean =>
+  state.generations.some((generation) =>
+    modifiedAtMilliseconds === undefined
+      ? generation.completedAtMilliseconds === undefined
+      : modifiedAtMilliseconds >= generation.startedAtMilliseconds &&
+        (generation.completedAtMilliseconds === undefined ||
+          modifiedAtMilliseconds <= generation.completedAtMilliseconds),
+  );
 
 export const executeWatch = (
   options: WatchOptions,
@@ -400,8 +515,10 @@ export const executeWatch = (
   Effect.gen(function* () {
     const watcher = yield* FileWatcherService;
     const terminal = yield* TerminalService;
+    const clock = yield* ClockService;
     const environmentService = yield* EnvironmentService;
     const concurrencyService = yield* ConcurrencyService;
+    const fileSystem = yield* FileSystemService;
     const environment = yield* environmentService.entries;
     const platform = yield* environmentService.platform;
     const availableParallelism = yield* concurrencyService.availableParallelism;
@@ -416,12 +533,13 @@ export const executeWatch = (
       yield* loadGitIgnoreMatcher(repository.root),
     );
     const pendingChanges = yield* Ref.make(initialPendingWatchChanges());
-    const activeRuns = yield* Ref.make(0);
+    const runGenerations = yield* Ref.make<WatchRunGenerations>({
+      nextGeneration: 0,
+      generations: [],
+    });
     const observedDirectories = yield* Ref.make<ReadonlySet<string>>(new Set());
-    const comparableWatchPath = (path: string): string => {
-      const normalized = normalizePath(path, windowsPathSeparators);
-      return windowsPathSeparators ? normalized.toLowerCase() : normalized;
-    };
+    const comparableWatchPath = (path: string): string =>
+      watchPathIdentity(path, windowsPathSeparators);
     const absoluteRootTurboJson =
       options.run.rootTurboJson === undefined
         ? undefined
@@ -430,34 +548,64 @@ export const executeWatch = (
           : joinPath(repository.root, options.run.rootTurboJson);
     const externalConfigurationChanges =
       absoluteRootTurboJson !== undefined &&
-      !isPathContained(repository.root, absoluteRootTurboJson)
-        ? watcher.watch(parentPath(absoluteRootTurboJson)).pipe(
-            Stream.filter(
-              (change) =>
-                change.kind === "unknown" ||
-                normalizePath(change.path) ===
-                  normalizePath(absoluteRootTurboJson),
-            ),
-            Stream.map((change) =>
-              change.kind === "unknown"
-                ? { ...change, path: absoluteRootTurboJson }
-                : change,
-            ),
-          )
+      !isPathContained(
+        repository.root,
+        absoluteRootTurboJson,
+        windowsPathSeparators,
+      )
+        ? watcher
+            .watch(parentPath(absoluteRootTurboJson, windowsPathSeparators))
+            .pipe(
+              Stream.filter(
+                (change) =>
+                  change.kind === "unknown" ||
+                  comparableWatchPath(change.path) ===
+                    comparableWatchPath(absoluteRootTurboJson),
+              ),
+              Stream.map((change) =>
+                change.kind === "unknown"
+                  ? { ...change, path: absoluteRootTurboJson }
+                  : change,
+              ),
+            )
         : Stream.empty;
+    const gitIndexPath = yield* resolveGitIndexPath(
+      repository.root,
+      windowsPathSeparators,
+    );
+    const externalGitIndexChanges = !isPathContained(
+      repository.root,
+      gitIndexPath,
+      windowsPathSeparators,
+    )
+      ? watcher.watch(parentPath(gitIndexPath, windowsPathSeparators)).pipe(
+          Stream.filter(
+            (change) =>
+              change.kind === "unknown" ||
+              comparableWatchPath(change.path) ===
+                comparableWatchPath(gitIndexPath),
+          ),
+          Stream.map((change) => ({ ...change, path: gitIndexPath })),
+        )
+      : Stream.empty;
     const watchedChanges = Stream.merge(
-      watcher.watch(repository.root),
-      externalConfigurationChanges,
+      Stream.merge(
+        watcher.watch(repository.root),
+        externalConfigurationChanges,
+      ),
+      externalGitIndexChanges,
     );
     const changes = watchedChanges.pipe(
       Stream.filterEffect((change) =>
         Effect.gen(function* () {
           const isExternalRootTurboJsonChange =
             absoluteRootTurboJson !== undefined &&
-            normalizePath(change.path) === normalizePath(absoluteRootTurboJson);
+            comparableWatchPath(change.path) ===
+              comparableWatchPath(absoluteRootTurboJson);
           if (
             !isExternalRootTurboJsonChange &&
-            isGitIndexPath(repository.root, change.path, windowsPathSeparators)
+            comparableWatchPath(change.path) ===
+              comparableWatchPath(gitIndexPath)
           ) {
             yield* Ref.set(
               ignoreMatcher,
@@ -533,14 +681,24 @@ export const executeWatch = (
             change.path,
             entryIsDirectory ? "directory" : change.entryKind,
           );
-          if (isGitIgnorePath(change.path)) {
+          if (isGitIgnorePath(change.path, windowsPathSeparators)) {
             yield* Ref.set(
               ignoreMatcher,
               yield* loadGitIgnoreMatcher(repository.root),
             );
+            const metadata = isConfiguredOutputPath
+              ? yield* fileSystem
+                  .metadata(change.path)
+                  .pipe(Effect.orElseSucceed(() => undefined))
+              : undefined;
+            const runOwnsChange =
+              isConfiguredOutputPath &&
+              modifiedByWatchRun(
+                yield* Ref.get(runGenerations),
+                metadata?.modifiedMilliseconds,
+              );
             return (
-              !isRunOwnedPath &&
-              (!isConfiguredOutputPath || (yield* Ref.get(activeRuns)) === 0)
+              !isRunOwnedPath && (!isConfiguredOutputPath || !runOwnsChange)
             );
           }
           if (isRunOwnedPath) return false;
@@ -561,6 +719,7 @@ export const executeWatch = (
               repository.root,
               options.run.rootTurboJson,
               change.path,
+              windowsPathSeparators,
             )
           ) {
             const refreshed = yield* Effect.either(
@@ -624,7 +783,12 @@ export const executeWatch = (
                 windowsPathSeparators,
               );
               return yield* Effect.acquireUseRelease(
-                Ref.update(activeRuns, (count) => count + 1),
+                Effect.gen(function* () {
+                  const startedAtMilliseconds = yield* clock.now;
+                  return yield* Ref.modify(runGenerations, (state) =>
+                    beginWatchRunGeneration(state, startedAtMilliseconds),
+                  );
+                }),
                 () =>
                   executeRun(
                     currentRunOptions,
@@ -640,7 +804,17 @@ export const executeWatch = (
                         .pipe(Effect.as(1)),
                     ),
                   ),
-                () => Ref.update(activeRuns, (count) => Math.max(0, count - 1)),
+                (generation) =>
+                  Effect.gen(function* () {
+                    const completedAtMilliseconds = yield* clock.now;
+                    yield* Ref.update(runGenerations, (state) =>
+                      completeWatchRunGeneration(
+                        state,
+                        generation,
+                        completedAtMilliseconds,
+                      ),
+                    );
+                  }),
               );
             }),
           ),

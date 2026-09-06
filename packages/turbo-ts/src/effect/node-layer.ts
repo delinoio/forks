@@ -50,6 +50,7 @@ import {
   release as kernelRelease,
   platform as operatingSystem,
   tmpdir,
+  userInfo,
 } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable, Transform, type Writable } from "node:stream";
@@ -2706,6 +2707,20 @@ const runtimeProfileLayer = Layer.succeed(RuntimeProfileService, {
     }),
 });
 
+export const deriveSystemUserIdentifier = (
+  uid: number | undefined,
+  user: { readonly username: string; readonly homedir: string } | undefined,
+): string => {
+  if (uid !== undefined) return String(uid);
+  if (user === undefined) {
+    throw new Error("operating system user information is unavailable");
+  }
+  const identity = `${user.username.toLowerCase()}\0${user.homedir
+    .replaceAll("\\", "/")
+    .toLowerCase()}`;
+  return `win-${createHash("sha256").update(identity).digest("hex").slice(0, 32)}`;
+};
+
 const systemLayer = Layer.succeed(SystemService, {
   information: Effect.sync(() => ({
     architecture: arch(),
@@ -2715,8 +2730,10 @@ const systemLayer = Layer.succeed(SystemService, {
     availableMemoryMegabytes: Math.floor(freemem() / 1024 / 1024),
     availableCpuCores: availableParallelism(),
     temporaryDirectory: tmpdir(),
-    userIdentifier:
-      typeof process.getuid === "function" ? String(process.getuid()) : "user",
+    userIdentifier: deriveSystemUserIdentifier(
+      typeof process.getuid === "function" ? process.getuid() : undefined,
+      typeof process.getuid === "function" ? undefined : userInfo(),
+    ),
     processIdentifier: process.pid,
   })),
 });

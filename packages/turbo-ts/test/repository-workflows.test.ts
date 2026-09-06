@@ -43,6 +43,7 @@ import { evidenceId } from "../src/compatibility/ledger.js";
 import { normalizeOutput } from "../src/compatibility/normalizers.js";
 import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import {
+  deriveSystemUserIdentifier,
   makeDaemonServe,
   nodeFoundationLayer,
   respondGrpc,
@@ -96,6 +97,8 @@ import {
   appendPendingWatchChange,
   executeWatch,
   initialPendingWatchChanges,
+  isGitIgnorePath,
+  isTurboConfigurationPath,
   isWorkspaceDiscoveryPath,
   parseWatchArguments,
   resolvedWatchRunOptions,
@@ -332,6 +335,27 @@ describe("repository workflow gate", () => {
     ).toBe("/tmp/turbod-user/repository/turbod.sock");
   });
 
+  it("derives stable account-specific Windows daemon identities", () => {
+    const first = deriveSystemUserIdentifier(undefined, {
+      username: "SyntheticUser",
+      homedir: "C:\\Users\\SyntheticUser",
+    });
+    expect(first).toBe(
+      deriveSystemUserIdentifier(undefined, {
+        username: "syntheticuser",
+        homedir: "c:/users/syntheticuser",
+      }),
+    );
+    expect(first).toMatch(/^win-[0-9a-f]{32}$/);
+    expect(first).not.toBe(
+      deriveSystemUserIdentifier(undefined, {
+        username: "OtherUser",
+        homedir: "C:\\Users\\OtherUser",
+      }),
+    );
+    expect(deriveSystemUserIdentifier(1_234, undefined)).toBe("1234");
+  });
+
   it("secures the daemon state parent before accessing repository state", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-parent-"));
@@ -403,6 +427,44 @@ describe("repository workflow gate", () => {
       await rm(directory, { force: true, recursive: true });
       await rm(temporaryDirectory, { force: true, recursive: true });
       await rm(outside, { force: true, recursive: true });
+    }
+  });
+
+  it("keeps daemon lifecycle commands available when discovery fails", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-daemon-discovery-failure-"),
+    );
+    try {
+      await prepareFixture(directory);
+      await writeFile(join(directory, "packages/app/package.json"), "{");
+      const runDaemon = (command: "clean" | "logs" | "status" | "stop") =>
+        Effect.runPromise(
+          executeDaemon({
+            command,
+            cwd: directory,
+            idleMilliseconds: 30_000,
+            json: command === "status",
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+      await expect(runDaemon("status")).resolves.toBe(1);
+      await expect(runDaemon("logs")).resolves.toBe(1);
+      await expect(runDaemon("stop")).resolves.toBe(0);
+      await expect(runDaemon("clean")).resolves.toBe(0);
+
+      const serve = await Effect.runPromise(
+        executeDaemon({
+          command: "serve",
+          cwd: directory,
+          idleMilliseconds: 30_000,
+          json: false,
+        }).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
+      );
+      expect(serve).toMatchObject({
+        _tag: "Left",
+        left: { path: join(directory, "packages/app/package.json") },
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
     }
   });
 
@@ -550,6 +612,34 @@ describe("repository workflow gate", () => {
         true,
       ),
     ).toBe(true);
+    expect(
+      isGitIgnorePath("C:\\repository\\packages\\app\\.GITIGNORE", true),
+    ).toBe(true);
+    expect(isGitIgnorePath("/repository/.GITIGNORE", false)).toBe(false);
+    expect(
+      isTurboConfigurationPath(
+        "C:\\repository",
+        undefined,
+        "c:\\repository\\Turbo.json",
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      isTurboConfigurationPath(
+        "C:\\repository",
+        "config\\custom.json",
+        "c:\\REPOSITORY\\CONFIG\\CUSTOM.JSON",
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      isTurboConfigurationPath(
+        "/repository",
+        "config/custom.json",
+        "/repository/config/CUSTOM.JSON",
+        false,
+      ),
+    ).toBe(false);
     for (const [manager, label] of [
       ["npm", "npm"],
       ["pnpm", "pnpm9"],
@@ -4857,6 +4947,92 @@ describe("repository workflow gate", () => {
     }
   }, 30_000);
 
+  it("watches the effective Git index outside a linked worktree", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "turbo-ts-watch-worktree-"));
+    const directory = join(parent, "linked");
+    const gitDirectory = join(parent, "main.git/worktrees/linked");
+    const gitIndexPath = join(gitDirectory, "index");
+    const watchedRoots: Array<string> = [];
+    let trackedFileLoads = 0;
+    try {
+      await prepareFixture(directory);
+      const manifestPath = join(directory, "packages/app/package.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"require('node:fs').appendFileSync('.watch-runs','run\\n')\"";
+      await writeFile(
+        manifestPath,
+        `${JSON.stringify(manifest, undefined, 2)}\n`,
+      );
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const processService = yield* ProcessService;
+          return yield* executeWatch(
+            parseWatchArguments([
+              "build",
+              "--filter=synthetic-app",
+              "--cwd",
+              directory,
+              "--no-cache",
+            ]),
+          ).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(FileWatcherService, {
+                  watch: (root) => {
+                    watchedRoots.push(root);
+                    return root === gitDirectory
+                      ? Stream.succeed({
+                          path: gitIndexPath,
+                          kind: "modify" as const,
+                          entryKind: "file" as const,
+                        })
+                      : Stream.empty;
+                  },
+                }),
+                Layer.succeed(ProcessService, {
+                  ...processService,
+                  run: (request) =>
+                    request.command === "git" &&
+                    request.args.join("\0") ===
+                      ["rev-parse", "--git-path", "index"].join("\0")
+                      ? Effect.succeed({
+                          exitCode: 0,
+                          stdout: `${gitIndexPath}\n`,
+                          stderr: "",
+                          combinedOutput: `${gitIndexPath}\n`,
+                        })
+                      : processService.run(request),
+                  runBytes: (request) => {
+                    if (
+                      request.command === "git" &&
+                      request.args.join("\0") ===
+                        ["ls-files", "--cached", "-z", "--"].join("\0")
+                    ) {
+                      trackedFileLoads += 1;
+                    }
+                    return processService.runBytes(request);
+                  },
+                }),
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(new Set(watchedRoots)).toEqual(new Set([directory, gitDirectory]));
+      expect(trackedFileLoads).toBeGreaterThanOrEqual(2);
+      expect(
+        (await readFile(join(directory, "packages/app/.watch-runs"), "utf8"))
+          .trim()
+          .split("\n"),
+      ).toHaveLength(1);
+    } finally {
+      await rm(parent, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("coalesces file storms, restarts watch runs, and closes on interruption", async () => {
     const parent = await mkdtemp(join(tmpdir(), "turbo-ts-watch-parent-"));
     const reservedParent = join(parent, ".turbo");
@@ -5041,6 +5217,86 @@ describe("repository workflow gate", () => {
         child.kill("SIGKILL");
         await closed;
       }
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("attributes delayed ignore-file output events to completed watch runs", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-watch-late-ignore-output-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const configurationPath = join(directory, "packages/app/turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: { build: { outputs: Array<string> } } };
+      configuration.tasks.build.outputs = ["generated/.gitignore"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      const applicationDirectory = join(directory, "packages/app");
+      const manifestPath = join(applicationDirectory, "package.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs');fs.mkdirSync('generated',{recursive:true});fs.writeFileSync('generated/.gitignore','task output\\n');fs.appendFileSync('.watch-runs','run\\n')\"";
+      await writeFile(
+        manifestPath,
+        `${JSON.stringify(manifest, undefined, 2)}\n`,
+      );
+      const ignorePath = join(applicationDirectory, "generated/.gitignore");
+      const delayedTaskEvent = Stream.fromEffect(
+        Effect.promise(async () => {
+          await waitUntil(() => existsSync(ignorePath));
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          return {
+            path: ignorePath,
+            kind: "modify" as const,
+            entryKind: "file" as const,
+          };
+        }),
+      );
+      const userEvent = Stream.fromEffect(
+        Effect.promise(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          await writeFile(ignorePath, "user edit\n");
+          return {
+            path: ignorePath,
+            kind: "modify" as const,
+            entryKind: "file" as const,
+          };
+        }),
+      );
+      await Effect.runPromise(
+        executeWatch(
+          parseWatchArguments([
+            "build",
+            "--filter=synthetic-app",
+            "--cwd",
+            directory,
+            "--no-cache",
+          ]),
+        ).pipe(
+          Effect.provide(
+            Layer.succeed(FileWatcherService, {
+              watch: (root) =>
+                root === directory
+                  ? Stream.concat(delayedTaskEvent, userEvent)
+                  : Stream.empty,
+            }),
+          ),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(
+        (await readFile(join(applicationDirectory, ".watch-runs"), "utf8"))
+          .trim()
+          .split("\n"),
+      ).toHaveLength(2);
+    } finally {
       await rm(directory, { force: true, recursive: true });
     }
   }, 30_000);

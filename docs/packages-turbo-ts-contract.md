@@ -125,8 +125,10 @@ Task-input selection uses the same effective global and task inputs as hashing,
 evaluates task owners before Git-range package narrowing, applies negative Git
 ranges after positive task matches, and includes `with` companions. Owning
 manifests participate in task-aware selection and hashing independently of user
-input globs. Symlinked owning control manifests retain their link identity and
-also hash the resolved file contents consumed by discovery and execution.
+input globs. Their implicit input identities follow case-insensitive filesystem
+semantics on Windows. Symlinked owning control manifests retain their link
+identity and also hash the resolved file contents consumed by discovery and
+execution.
 Package task configurations participate independently in task-aware selection.
 Owning lockfiles, repository-controlled JavaScript package-manager
 configuration, workspace-local Bun `bunfig.toml` files, and Cargo control or
@@ -510,17 +512,20 @@ user-visible triggers.
 Git-ignore matching does not suppress files already tracked in the Git index or
 directory events whose subtree contains tracked files. `.venv` trees remain
 internally ignored even when the repository root does not list them.
-Repository-root Git index changes refresh tracked-file state without triggering
+Changes to the effective Git index refresh tracked-file state without triggering
 a run by themselves, so later edits to newly tracked ignored files remain
-observable.
+observable. Linked worktrees watch the index in their resolved external Git
+directory.
 When tracked-file discovery fails inside a detected Git repository, Git-ignore
 suppression is disabled conservatively so tracked inputs remain observable and
 copyable. Non-Git repositories continue to apply their configured ignore rules.
-Declared-output ignore files written by an active run remain suppressed to
-prevent generated-output loops. Root, custom, and workspace Turbo configuration
-changes and active JavaScript, Cargo, or uv workspace manifest changes refresh
-package discovery and output patterns before the next run. Workspace manifest
-classification follows case-insensitive filesystem semantics on Windows.
+Declared-output ignore files whose modification belongs to an active or recently
+completed run generation remain suppressed to prevent delayed watcher events
+from creating generated-output loops. Root, custom, and workspace Turbo
+configuration changes and active JavaScript, Cargo, or uv workspace manifest
+changes refresh package discovery and output patterns before the next run. Git
+ignore, Turbo configuration, and workspace manifest classification follows
+case-insensitive filesystem semantics on Windows.
 Explicit graph,
 structured-log, profile, trace, and heap artifacts, default profile artifacts,
 and write-enabled local cache directories are treated as run-owned paths and
@@ -555,7 +560,9 @@ The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
 identity, per-user temporary state directory, atomic PID files, and a lifecycle
 lock beside rather than inside the removable repository state directory. It
 uses 0600 Unix sockets on POSIX, per-user named-pipe endpoints on Windows, and
-stale-state cleanup. Before any state path is accessed, the predictable
+stale-state cleanup. Windows identities derive from the effective account's
+operating-system user record rather than a shared fallback value. Before any
+state path is accessed, the predictable
 per-user parent is created without following existing paths and validated as a
 real current-user-owned directory. POSIX parents writable by another user are
 rejected; safe legacy modes are tightened to `0700` and revalidated. Windows
@@ -600,7 +607,9 @@ Start-lock ownership is
 preserved across overlapping starts, stale locks are validated before removal,
 and future-dated lock timestamps are stale rather than live. A Hello response
 carrying an error is not healthy. Start, stop, restart, status, logs, and clean
-are race-safe; `info` reports the live daemon state.
+are race-safe; `info` reports the live daemon state. Lifecycle commands resolve
+daemon state from the repository root without requiring package or lockfile
+discovery; the serving process retains full discovery validation.
 Failed health checks clean stale PID and socket state even when the recorded
 PID has been reused by an unrelated live process.
 After a successful health handshake, a subsequent status transport or response

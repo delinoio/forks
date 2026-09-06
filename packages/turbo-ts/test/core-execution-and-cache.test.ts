@@ -89,6 +89,7 @@ import {
   packageManagerCommand,
   planCargoWorkspaceTasks,
   taskIdsWithUnrestorableCacheInputs,
+  taskMatchesChangedFiles,
 } from "../src/run/engine.js";
 import { parseRunArguments } from "../src/run/options.js";
 
@@ -10162,6 +10163,40 @@ dependencies = [
       await rm(directory, { force: true, recursive: true });
     }
   }, 15_000);
+
+  it("matches case-variant implicit task inputs on Windows", async () => {
+    const directory = await makeFixture();
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, { inputs?: Array<string> }> };
+      configuration.tasks.build!.inputs = ["src/**"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const library = model.packagesByName.get("synthetic-library")!;
+      const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
+        "synthetic-library#build",
+      )!;
+      const changedFiles = ["packages/library/Package.json"];
+      expect(taskMatchesChangedFiles(model, node, changedFiles, {}, true)).toBe(
+        true,
+      );
+      expect(
+        taskMatchesChangedFiles(model, node, changedFiles, {}, false),
+      ).toBe(false);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("treats root Git ignore changes as task-aware inputs", async () => {
     const directory = await makeGitFixture();

@@ -24,13 +24,9 @@ export interface WorkflowRepositoryOptions {
   readonly singlePackage?: boolean;
 }
 
-export const loadWorkflowRepository = (
+export const resolveWorkflowRepositoryRoot = (
   options: WorkflowRepositoryOptions,
-): Effect.Effect<
-  RepositoryModel,
-  unknown,
-  EnvironmentService | FileSystemService | ProcessService
-> =>
+): Effect.Effect<string, unknown, EnvironmentService | FileSystemService> =>
   Effect.gen(function* () {
     const environment = yield* EnvironmentService;
     const fileSystem = yield* FileSystemService;
@@ -81,7 +77,18 @@ export const loadWorkflowRepository = (
         }),
       );
     }
-    const root = yield* discoverRepositoryRoot(canonical);
+    return yield* discoverRepositoryRoot(canonical);
+  });
+
+export const loadWorkflowRepository = (
+  options: WorkflowRepositoryOptions,
+): Effect.Effect<
+  RepositoryModel,
+  unknown,
+  EnvironmentService | FileSystemService | ProcessService
+> =>
+  Effect.gen(function* () {
+    const root = yield* resolveWorkflowRepositoryRoot(options);
     const configuration = yield* loadRootConfiguration(
       root,
       options.rootTurboJson === undefined
