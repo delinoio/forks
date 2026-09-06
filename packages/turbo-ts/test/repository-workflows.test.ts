@@ -4801,6 +4801,17 @@ describe("repository workflow gate", () => {
       if (sentinel.pid === undefined) throw new Error("sentinel did not start");
       await writeFile(running.pid_file, `${sentinel.pid}\n`);
       await writeFile(running.sock_file, "stale socket\n");
+      await expect(runCandidate("daemon", "stop")).rejects.toThrow(
+        /daemon process is alive but did not become healthy/,
+      );
+      expect(await readFile(running.pid_file, "utf8")).toBe(
+        `${sentinel.pid}\n`,
+      );
+      expect(await readFile(running.sock_file, "utf8")).toBe("stale socket\n");
+      expect(sentinel.exitCode).toBeNull();
+      sentinel.kill();
+      await new Promise<void>((resolve) => sentinel?.once("close", resolve));
+      sentinel = undefined;
       await runCandidate("daemon", "stop");
       expect(
         await readFile(running.pid_file, "utf8").catch(() => undefined),
@@ -4808,14 +4819,6 @@ describe("repository workflow gate", () => {
       expect(
         await readFile(running.sock_file, "utf8").catch(() => undefined),
       ).toBeUndefined();
-      expect(sentinel.exitCode).toBeNull();
-      await expect(runCandidate("daemon", "status", "--json")).rejects.toThrow(
-        /daemon is not running/,
-      );
-      expect(sentinel.exitCode).toBeNull();
-      sentinel.kill();
-      await new Promise<void>((resolve) => sentinel?.once("close", resolve));
-      sentinel = undefined;
 
       await mkdir(dirname(running.pid_file), { recursive: true });
       await writeFile(running.pid_file, "99999999\n");
@@ -5776,6 +5779,58 @@ describe("repository workflow gate", () => {
       }
     } finally {
       await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("does not traverse mixed-case reserved directories on Windows", async () => {
+    const listedPaths: Array<string> = [];
+    const matcher = await Effect.runPromise(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystemService;
+        const processService = yield* ProcessService;
+        return yield* loadGitIgnoreMatcher("C:\\repository").pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.succeed(FileSystemService, {
+                ...fileSystem,
+                exists: () => Effect.succeed(false),
+                list: (path) => {
+                  listedPaths.push(path);
+                  return Effect.succeed(
+                    path.replaceAll("\\", "/").toLowerCase() === "c:/repository"
+                      ? [
+                          { name: ".GIT", kind: "directory" as const },
+                          { name: ".TURBO", kind: "directory" as const },
+                          { name: ".VENV", kind: "directory" as const },
+                          {
+                            name: "Node_Modules",
+                            kind: "directory" as const,
+                          },
+                          { name: "source", kind: "directory" as const },
+                        ]
+                      : [],
+                  );
+                },
+              }),
+              Layer.succeed(ProcessService, {
+                ...processService,
+                runBytes: () =>
+                  Effect.succeed({
+                    exitCode: 1,
+                    stdout: new Uint8Array(),
+                    stderr: new Uint8Array(),
+                  }),
+              }),
+            ),
+          ),
+        );
+      }).pipe(Effect.provide(nodeFoundationLayer)),
+    );
+    expect(
+      listedPaths.map((path) => path.replaceAll("\\", "/").toLowerCase()),
+    ).toEqual(["c:/repository", "c:/repository/source"]);
+    for (const name of [".git", ".turbo", ".venv", "node_modules"]) {
+      expect(matcher.wasDirectory(`c:\\repository\\${name}`)).toBe(true);
     }
   });
 
@@ -7259,10 +7314,15 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
           "plugins:",
           "  - path: .yarn/plugins/@yarnpkg/plugin-synthetic.cjs",
           "    spec: '@yarnpkg/plugin-synthetic'",
+          "  - path: node_modules/@yarnpkg/plugin-external.cjs",
+          "    spec: '@yarnpkg/plugin-external'",
           "",
         ].join("\n"),
       );
-      await writeFile(join(directory, ".gitignore"), ".yarn/**\n");
+      await writeFile(
+        join(directory, ".gitignore"),
+        ".yarn/**\nnode_modules/**\n",
+      );
       await mkdir(join(directory, ".yarn/plugins/@yarnpkg"), {
         recursive: true,
       });
@@ -7282,6 +7342,20 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
       });
       await writeFile(
         join(directory, ".yarn/node_modules/unrelated/secret.txt"),
+        "not required\n",
+      );
+      await mkdir(join(directory, "node_modules/@yarnpkg"), {
+        recursive: true,
+      });
+      await writeFile(
+        join(directory, "node_modules/@yarnpkg/plugin-external.cjs"),
+        "external plugin\n",
+      );
+      await mkdir(join(directory, "node_modules/unrelated"), {
+        recursive: true,
+      });
+      await writeFile(
+        join(directory, "node_modules/unrelated/secret.txt"),
         "not required\n",
       );
 
@@ -7315,8 +7389,23 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
         await readFile(
           join(
             directory,
+            "yarn-result/node_modules/@yarnpkg/plugin-external.cjs",
+          ),
+          "utf8",
+        ),
+      ).toBe("external plugin\n");
+      expect(
+        await readFile(
+          join(
+            directory,
             "yarn-result/.yarn/node_modules/unrelated/secret.txt",
           ),
+          "utf8",
+        ).catch(() => undefined),
+      ).toBeUndefined();
+      expect(
+        await readFile(
+          join(directory, "yarn-result/node_modules/unrelated/secret.txt"),
           "utf8",
         ).catch(() => undefined),
       ).toBeUndefined();
@@ -7349,6 +7438,24 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
             "utf8",
           ),
         ).toBe("yarn plugin\n");
+        expect(
+          await readFile(
+            join(
+              directory,
+              `yarn-docker-result/${root}/node_modules/@yarnpkg/plugin-external.cjs`,
+            ),
+            "utf8",
+          ),
+        ).toBe("external plugin\n");
+        expect(
+          await readFile(
+            join(
+              directory,
+              `yarn-docker-result/${root}/node_modules/unrelated/secret.txt`,
+            ),
+            "utf8",
+          ).catch(() => undefined),
+        ).toBeUndefined();
       }
     } finally {
       await rm(directory, { force: true, recursive: true });

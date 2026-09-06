@@ -183,6 +183,62 @@ const prunePathIdentity = (
   return windowsPathSemantics ? normalized.toLowerCase() : normalized;
 };
 
+const configuredYarnPluginPaths = (
+  repository: RepositoryModel,
+  windowsPathSemantics: boolean,
+): Effect.Effect<ReadonlyArray<string>, unknown, FileSystemService> =>
+  Effect.gen(function* () {
+    if (repository.manager !== "yarn") return [];
+    const fileSystem = yield* FileSystemService;
+    const configurationPath = joinPath(repository.root, ".yarnrc.yml");
+    if (!(yield* fileSystem.exists(configurationPath))) return [];
+    const document = parseYaml(yield* fileSystem.readText(configurationPath));
+    if (
+      typeof document !== "object" ||
+      document === null ||
+      Array.isArray(document) ||
+      !("plugins" in document) ||
+      !Array.isArray(document.plugins)
+    ) {
+      return [];
+    }
+    const canonicalRoot = normalizePath(
+      yield* fileSystem.realPath(repository.root),
+      windowsPathSemantics,
+    );
+    const paths = new Map<string, string>();
+    for (const plugin of document.plugins) {
+      if (
+        typeof plugin !== "object" ||
+        plugin === null ||
+        Array.isArray(plugin) ||
+        !("path" in plugin) ||
+        typeof plugin.path !== "string" ||
+        plugin.path === ""
+      ) {
+        continue;
+      }
+      const path = isAbsolutePath(plugin.path)
+        ? normalizePath(plugin.path, windowsPathSemantics)
+        : joinPath(repository.root, plugin.path);
+      if (!isPathContained(repository.root, path, windowsPathSemantics)) {
+        continue;
+      }
+      const resolved = yield* fileSystem.realPath(path).pipe(Effect.either);
+      if (
+        resolved._tag === "Right" &&
+        isPathContained(
+          canonicalRoot,
+          normalizePath(resolved.right, windowsPathSemantics),
+          windowsPathSemantics,
+        )
+      ) {
+        paths.set(prunePathIdentity(path, windowsPathSemantics), path);
+      }
+    }
+    return [...paths.values()];
+  });
+
 const copyTree = (
   source: string,
   destination: string,
@@ -608,6 +664,10 @@ export const executePrune = (
         : joinPath(repository.root, options.outputDirectory),
     );
     const canonicalOutputRoot = yield* canonicalOutputPath(outputRoot);
+    const yarnPluginPaths = yield* configuredYarnPluginPaths(
+      repository,
+      windowsPathSemantics,
+    );
     const ignoreMatcher = options.useGitignore
       ? yield* loadGitIgnoreMatcher(repository.root)
       : undefined;
@@ -632,6 +692,7 @@ export const executePrune = (
         ...(repository.packageManagerExecutableInput === undefined
           ? []
           : [repository.packageManagerExecutableInput]),
+        ...yarnPluginPaths,
       ],
       canonicalOutputPath,
     );
@@ -799,6 +860,9 @@ export const executePrune = (
       isPathContained(yarnDirectory, yarnExecutable)
         ? [yarnExecutable]
         : []),
+      ...yarnPluginPaths.filter((path) =>
+        isPathContained(yarnDirectory, path, windowsPathSemantics),
+      ),
     ]);
     if (yield* fileSystem.exists(yarnDirectory)) {
       const metadata = yield* fileSystem.metadata(yarnDirectory);
@@ -823,14 +887,23 @@ export const executePrune = (
         );
       }
     }
-    if (
-      yarnExecutable !== undefined &&
-      !isPathContained(yarnDirectory, yarnExecutable)
-    ) {
+    const externalYarnControls = new Map<string, string>();
+    for (const source of [
+      ...(yarnExecutable === undefined ? [] : [yarnExecutable]),
+      ...yarnPluginPaths,
+    ]) {
+      if (!isPathContained(yarnDirectory, source, windowsPathSemantics)) {
+        externalYarnControls.set(
+          prunePathIdentity(source, windowsPathSemantics),
+          source,
+        );
+      }
+    }
+    for (const source of externalYarnControls.values()) {
       for (const root of installationRoots) {
         yield* copyIfPresent(
-          yarnExecutable,
-          joinPath(root, relativePath(repository.root, yarnExecutable)),
+          source,
+          joinPath(root, relativePath(repository.root, source)),
           repository.root,
           canonicalOutputRoot,
           root,
@@ -929,6 +1002,8 @@ export const executePrune = (
     );
     const generatedControlSources = [
       ...rootControlNames.map((name) => joinPath(repository.root, name)),
+      ...(yarnExecutable === undefined ? [] : [yarnExecutable]),
+      ...yarnPluginPaths,
       ...[...ecosystemWorkspaceControls.values()].flatMap(
         (controls) => controls.paths,
       ),

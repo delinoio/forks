@@ -757,9 +757,13 @@ const stopDaemonWithLock = (
           }),
         );
       }
-      yield* cleanStaleStateIfOwned(paths, pid);
-      yield* terminal.writeStdout("✓ stopped daemon\n").pipe(Effect.ignore);
-      return;
+      return yield* Effect.fail(
+        new BoundaryError({
+          boundary: "daemon",
+          message: "daemon process is alive but did not become healthy",
+          retryable: true,
+        }),
+      );
     }
     const shutdown = yield* daemonRequest(paths, DaemonMethod.shutdown);
     if (shutdown.error !== undefined) {

@@ -542,8 +542,9 @@ inputs. Watch-time discovery honors `--single-package` for both initial and
 refreshed repository models.
 Internal-directory exclusions are matched relative to the watched repository,
 so reserved names in ancestor directories do not suppress repository events.
-Windows-originated `.git`, `.turbo`, and `node_modules` components are matched
-case-insensitively. The bounded native watcher transport converts overflow into
+Git-ignore discovery and Windows-originated watcher paths match `.git`,
+`.turbo`, `.venv`, and `node_modules` components case-insensitively on Windows.
+The bounded native watcher transport converts overflow into
 a retried repository-wide invalidation; watch refreshes discovery and reruns all
 requested tasks, while the daemon marks every registered output glob changed.
 Run arguments after `--` remain task pass-through arguments, including text
@@ -612,16 +613,18 @@ carrying an error is not healthy. Start, stop, restart, status, logs, and clean
 are race-safe; `info` reports the live daemon state. Lifecycle commands resolve
 daemon state from the repository root without requiring package or lockfile
 discovery; the serving process retains full discovery validation.
-Failed health checks clean stale PID and socket state even when the recorded
-PID has been reused by an unrelated live process.
+Start, status, and logs health checks clean stale PID and socket state even
+when the recorded PID has been reused by an unrelated live process. Stop,
+clean, and restart preserve lifecycle state and fail retryably when the
+recorded PID remains alive but never completes a health handshake.
 After a successful health handshake, a subsequent status transport or response
 failure preserves the live daemon's PID, socket, and active-log state and is
 reported to the caller for both status and logs commands.
 Log clients follow the exact dated log reported by the running daemon until
 interrupted, reading only newly available bounded byte ranges while preserving
 split UTF-8 code points. Stop escalates only after a successful RPC identifies
-the process as the expected daemon; reused live PIDs without a healthy daemon
-RPC are treated as stale state and are never signaled. A failed shutdown RPC
+the process as the expected daemon; live PIDs without a healthy daemon RPC
+retain their lifecycle state and are never signaled. A failed shutdown RPC
 preserves
 the live daemon's PID, socket, and active-log state and reports the failure so
 the operation can be retried. Forced termination must be available, succeed,

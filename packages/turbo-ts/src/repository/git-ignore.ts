@@ -165,7 +165,10 @@ export const loadGitIgnoreMatcher = (
         if (entry.kind !== "directory") continue;
         const path = joinPath(directory, entry.name);
         knownDirectories.add(comparablePath(path));
-        if (traversalIgnoredDirectories.has(entry.name)) continue;
+        const traversalName = caseInsensitivePaths
+          ? entry.name.toLowerCase()
+          : entry.name;
+        if (traversalIgnoredDirectories.has(traversalName)) continue;
         if (
           !ignoreRulesReliable ||
           !matchesRules(normalizedRoot, rules, path, true)
