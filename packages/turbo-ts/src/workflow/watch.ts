@@ -454,6 +454,7 @@ interface WatchRunGenerations {
 }
 
 const maximumRetainedWatchRunGenerations = 64;
+const completedWatchRunRemovalOwnershipMilliseconds = 1_000;
 
 const beginWatchRunGeneration = (
   state: WatchRunGenerations,
@@ -501,10 +502,16 @@ const modifiedByWatchRun = (
   state: WatchRunGenerations,
   modifiedAtMilliseconds: number | undefined,
   removed: boolean,
+  observedAtMilliseconds: number,
 ): boolean =>
   state.generations.some((generation) =>
     modifiedAtMilliseconds === undefined
-      ? removed || generation.completedAtMilliseconds === undefined
+      ? generation.completedAtMilliseconds === undefined ||
+        (removed &&
+          observedAtMilliseconds >= generation.completedAtMilliseconds &&
+          observedAtMilliseconds <=
+            generation.completedAtMilliseconds +
+              completedWatchRunRemovalOwnershipMilliseconds)
       : modifiedAtMilliseconds >= generation.startedAtMilliseconds &&
         (generation.completedAtMilliseconds === undefined ||
           modifiedAtMilliseconds <= generation.completedAtMilliseconds),
@@ -687,6 +694,7 @@ export const executeWatch = (
               ignoreMatcher,
               yield* loadGitIgnoreMatcher(repository.root),
             );
+            const observedAtMilliseconds = yield* clock.now;
             const metadata = isConfiguredOutputPath
               ? yield* fileSystem
                   .metadata(change.path)
@@ -698,6 +706,7 @@ export const executeWatch = (
                 yield* Ref.get(runGenerations),
                 metadata?.modifiedMilliseconds,
                 change.kind === "remove",
+                observedAtMilliseconds,
               );
             return (
               !isRunOwnedPath && (!isConfiguredOutputPath || !runOwnsChange)

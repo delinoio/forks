@@ -5301,11 +5301,12 @@ describe("repository workflow gate", () => {
     }
   }, 30_000);
 
-  it("attributes delayed ignore-file removals to completed watch runs", async () => {
+  it("bounds delayed ignore-file removal ownership", async () => {
     const directory = await mkdtemp(
       join(tmpdir(), "turbo-ts-watch-late-ignore-removal-"),
     );
     try {
+      let nowMilliseconds = 0;
       await prepareFixture(directory);
       const configurationPath = join(directory, "packages/app/turbo.json");
       const configuration = JSON.parse(
@@ -5328,38 +5329,60 @@ describe("repository workflow gate", () => {
         `${JSON.stringify(manifest, undefined, 2)}\n`,
       );
       const runsPath = join(applicationDirectory, ".watch-runs");
+      const ignorePath = join(applicationDirectory, "generated/.gitignore");
       const delayedTaskEvent = Stream.fromEffect(
         Effect.promise(async () => {
           await waitUntil(() => existsSync(runsPath));
           await new Promise((resolve) => setTimeout(resolve, 250));
+          nowMilliseconds = 1_000;
           return {
-            path: join(applicationDirectory, "generated/.gitignore"),
+            path: ignorePath,
+            kind: "remove" as const,
+          };
+        }),
+      );
+      const userEvent = Stream.fromEffect(
+        Effect.promise(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          await writeFile(ignorePath, "user edit\n");
+          await rm(ignorePath);
+          nowMilliseconds = 1_001;
+          return {
+            path: ignorePath,
             kind: "remove" as const,
           };
         }),
       );
       await Effect.runPromise(
-        executeWatch(
-          parseWatchArguments([
-            "build",
-            "--filter=synthetic-app",
-            "--cwd",
-            directory,
-            "--no-cache",
-          ]),
-        ).pipe(
-          Effect.provide(
-            Layer.succeed(FileWatcherService, {
-              watch: (root) =>
-                root === directory ? delayedTaskEvent : Stream.empty,
+        Effect.gen(function* () {
+          const clock = yield* ClockService;
+          return yield* executeWatch(
+            parseWatchArguments([
+              "build",
+              "--filter=synthetic-app",
+              "--cwd",
+              directory,
+              "--no-cache",
+            ]),
+          ).pipe(
+            Effect.provide(
+              Layer.succeed(FileWatcherService, {
+                watch: (root) =>
+                  root === directory
+                    ? Stream.concat(delayedTaskEvent, userEvent)
+                    : Stream.empty,
+              }),
+            ),
+            Effect.provideService(ClockService, {
+              ...clock,
+              now: Effect.sync(() => nowMilliseconds),
             }),
-          ),
-          Effect.provide(nodeFoundationLayer),
-        ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
       );
       expect(
         (await readFile(runsPath, "utf8")).trim().split("\n"),
-      ).toHaveLength(1);
+      ).toHaveLength(2);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

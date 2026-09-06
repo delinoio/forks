@@ -521,8 +521,9 @@ suppression is disabled conservatively so tracked inputs remain observable and
 copyable. Non-Git repositories continue to apply their configured ignore rules.
 Declared-output ignore files whose modification belongs to an active or recently
 completed run generation remain suppressed to prevent delayed watcher events
-from creating generated-output loops. Metadata-less removal events retain that
-generation ownership. Root, custom, and workspace Turbo
+from creating generated-output loops. Metadata-less removal events retain
+completed-generation ownership for one second; later removals remain
+user-visible triggers. Root, custom, and workspace Turbo
 configuration changes and active JavaScript, Cargo, or uv workspace manifest
 changes refresh package discovery and output patterns before the next run. Git
 ignore, Turbo configuration, and workspace manifest classification follows
