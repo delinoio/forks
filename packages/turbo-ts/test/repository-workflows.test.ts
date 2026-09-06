@@ -96,6 +96,7 @@ import {
   appendPendingWatchChange,
   executeWatch,
   initialPendingWatchChanges,
+  isWorkspaceDiscoveryPath,
   parseWatchArguments,
   resolvedWatchRunOptions,
   runOwnedPath,
@@ -526,6 +527,29 @@ describe("repository workflow gate", () => {
         "/repository/.TURBO/logs/task.log",
       ),
     ).toBe(false);
+    for (const manifest of ["Package.json", "cargo.toml", "PYPROJECT.TOML"]) {
+      expect(
+        isWorkspaceDiscoveryPath(
+          "C:\\repository",
+          `c:\\repository\\packages\\app\\${manifest}`,
+          true,
+        ),
+      ).toBe(true);
+      expect(
+        isWorkspaceDiscoveryPath(
+          "/repository",
+          `/repository/packages/app/${manifest}`,
+          false,
+        ),
+      ).toBe(false);
+    }
+    expect(
+      isWorkspaceDiscoveryPath(
+        "C:\\repository",
+        "c:\\REPOSITORY\\PNPM-WORKSPACE.YAML",
+        true,
+      ),
+    ).toBe(true);
     for (const [manager, label] of [
       ["npm", "npm"],
       ["pnpm", "pnpm9"],
@@ -5261,7 +5285,7 @@ describe("repository workflow gate", () => {
     }
   }, 45_000);
 
-  it("watches tracked task inputs that also match ignore rules", async () => {
+  it("refreshes tracked ignored inputs after the Git index changes", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-tracked-"));
     await prepareFixture(directory);
     const configurationPath = join(directory, "turbo.json");
@@ -5294,13 +5318,6 @@ describe("repository workflow gate", () => {
     await writeFile(trackedInput, "initial\n");
     await writeFile(join(applicationDirectory, ".gitignore"), "tracked.txt\n");
     await execFilePromise("/usr/bin/git", ["-C", directory, "init"]);
-    await execFilePromise("/usr/bin/git", [
-      "-C",
-      directory,
-      "add",
-      "-f",
-      "packages/app/tracked.txt",
-    ]);
     const child = spawn(
       process.execPath,
       [
@@ -5323,10 +5340,23 @@ describe("repository workflow gate", () => {
     try {
       await waitUntil(() => stdout.includes("tracked input run"));
       const initialRuns = (stdout.match(/tracked input run/g) ?? []).length;
-      await writeFile(trackedInput, "changed\n");
-      await waitUntil(
-        () => (stdout.match(/tracked input run/g) ?? []).length > initialRuns,
-      );
+      await execFilePromise("/usr/bin/git", [
+        "-C",
+        directory,
+        "add",
+        "-f",
+        "packages/app/tracked.txt",
+      ]);
+      const deadline = Date.now() + 15_000;
+      let revision = 0;
+      while ((stdout.match(/tracked input run/g) ?? []).length <= initialRuns) {
+        if (Date.now() >= deadline) {
+          throw new Error("timed out waiting for tracked input refresh");
+        }
+        revision += 1;
+        await writeFile(trackedInput, `changed ${revision}\n`);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
     } finally {
       child.kill();
       await Promise.race([
@@ -6765,7 +6795,7 @@ dependencies = ["external-package 2.0.0"]
     }
   }, 30_000);
 
-  it("copies an ignored configured Yarn executable into prune outputs", async () => {
+  it("copies ignored required Yarn controls into prune outputs", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-yarn-"));
     try {
       await prepareFixture(directory);
@@ -6782,9 +6812,22 @@ dependencies = ["external-package 2.0.0"]
       await writeFile(join(directory, ".pnp.cjs"), "module.exports = {};\n");
       await writeFile(
         join(directory, ".yarnrc.yml"),
-        "yarnPath: .yarn/node_modules/@yarnpkg/cli-dist/bin/yarn.js\n",
+        [
+          "yarnPath: .yarn/node_modules/@yarnpkg/cli-dist/bin/yarn.js",
+          "plugins:",
+          "  - path: .yarn/plugins/@yarnpkg/plugin-synthetic.cjs",
+          "    spec: '@yarnpkg/plugin-synthetic'",
+          "",
+        ].join("\n"),
       );
       await writeFile(join(directory, ".gitignore"), ".yarn/**\n");
+      await mkdir(join(directory, ".yarn/plugins/@yarnpkg"), {
+        recursive: true,
+      });
+      await writeFile(
+        join(directory, ".yarn/plugins/@yarnpkg/plugin-synthetic.cjs"),
+        "yarn plugin\n",
+      );
       await mkdir(join(directory, ".yarn/node_modules/@yarnpkg/cli-dist/bin"), {
         recursive: true,
       });
@@ -6821,6 +6864,15 @@ dependencies = ["external-package 2.0.0"]
         await readFile(
           join(
             directory,
+            "yarn-result/.yarn/plugins/@yarnpkg/plugin-synthetic.cjs",
+          ),
+          "utf8",
+        ),
+      ).toBe("yarn plugin\n");
+      expect(
+        await readFile(
+          join(
+            directory,
             "yarn-result/.yarn/node_modules/unrelated/secret.txt",
           ),
           "utf8",
@@ -6846,6 +6898,15 @@ dependencies = ["external-package 2.0.0"]
             "utf8",
           ),
         ).toBe("yarn executable\n");
+        expect(
+          await readFile(
+            join(
+              directory,
+              `yarn-docker-result/${root}/.yarn/plugins/@yarnpkg/plugin-synthetic.cjs`,
+            ),
+            "utf8",
+          ),
+        ).toBe("yarn plugin\n");
       }
     } finally {
       await rm(directory, { force: true, recursive: true });

@@ -770,6 +770,7 @@ export const executePrune = (
     const yarnExecutable = repository.packageManagerExecutableInput;
     const requiredYarnControls = new Set([
       joinPath(yarnDirectory, "patches"),
+      joinPath(yarnDirectory, "plugins"),
       joinPath(yarnDirectory, "releases"),
       ...(yarnExecutable !== undefined &&
       isPathContained(yarnDirectory, yarnExecutable)

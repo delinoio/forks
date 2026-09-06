@@ -4135,9 +4135,6 @@ export const executeRun = (
         .withPermits(1)(terminal.writeStdout(renderRunTui(tuiStatuses)))
         .pipe(Effect.ignore);
     };
-    if (options.ui === "tui") {
-      yield* terminal.writeStdout(`\u001b[?25l${renderRunTui(tuiStatuses)}`);
-    }
     const runGroup = ([, members]: readonly [
       string,
       ReadonlyArray<string>,
@@ -4419,6 +4416,12 @@ export const executeRun = (
     };
     yield* Effect.scoped(
       Effect.gen(function* () {
+        if (options.ui === "tui") {
+          yield* Effect.acquireRelease(
+            terminal.writeStdout(`\u001b[?25l${renderRunTui(tuiStatuses)}`),
+            () => terminal.writeStdout("\u001b[?25h").pipe(Effect.ignore),
+          );
+        }
         const completions = yield* Queue.unbounded<string>();
         const running = new Map<
           string,
@@ -4484,12 +4487,6 @@ export const executeRun = (
           }
         }
       }),
-    ).pipe(
-      Effect.ensuring(
-        options.ui === "tui"
-          ? terminal.writeStdout("\u001b[?25h").pipe(Effect.ignore)
-          : Effect.void,
-      ),
     );
     const runFinishedAt = yield* (yield* ClockService).now;
     const exitCode = [...outcomes.values()].some(

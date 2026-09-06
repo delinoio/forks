@@ -510,13 +510,18 @@ user-visible triggers.
 Git-ignore matching does not suppress files already tracked in the Git index or
 directory events whose subtree contains tracked files. `.venv` trees remain
 internally ignored even when the repository root does not list them.
+Repository-root Git index changes refresh tracked-file state without triggering
+a run by themselves, so later edits to newly tracked ignored files remain
+observable.
 When tracked-file discovery fails inside a detected Git repository, Git-ignore
 suppression is disabled conservatively so tracked inputs remain observable and
 copyable. Non-Git repositories continue to apply their configured ignore rules.
 Declared-output ignore files written by an active run remain suppressed to
 prevent generated-output loops. Root, custom, and workspace Turbo configuration
 changes and active JavaScript, Cargo, or uv workspace manifest changes refresh
-package discovery and output patterns before the next run. Explicit graph,
+package discovery and output patterns before the next run. Workspace manifest
+classification follows case-insensitive filesystem semantics on Windows.
+Explicit graph,
 structured-log, profile, trace, and heap artifacts, default profile artifacts,
 and write-enabled local cache directories are treated as run-owned paths and
 never trigger another watch run. Explicit artifact paths are resolved through
@@ -535,7 +540,9 @@ case-insensitively. The bounded native watcher transport converts overflow into
 a retried repository-wide invalidation; watch refreshes discovery and reruns all
 requested tasks, while the daemon marks every registered output glob changed.
 Run arguments after `--` remain task pass-through arguments, including text
-equal to the watch-only cache-publication flag.
+equal to the watch-only cache-publication flag. Interactive TUI cursor hiding is
+scope-owned and restores the cursor after success, failure, or interruption,
+including when a switching watch run cancels its predecessor.
 When `futureFlags.watchUsingTaskInputs` is enabled, file-triggered runs retain
 only requested task entrypoints whose effective inputs match the changed paths,
 plus their dependency and `with` closure. Root configuration, `.gitignore`, and
@@ -713,10 +720,10 @@ reduced Cargo workspace manifests. The root pnpm
 hook `.pnpmfile.cjs` is retained in every
 installation root. Root Bun `bunfig.toml` configuration is retained in the
 ordinary output and both Docker installation roots. Root Yarn installation controls, including `.yarnrc.yml`,
-`.pnp.cjs`, releases, patches, and a repository-contained configured `yarnPath`
+`.pnp.cjs`, releases, patches, plugins, and a repository-contained configured `yarnPath`
 executable, are retained at their repository-relative locations in applicable
 ordinary and Docker layouts. Required Yarn releases, patches, and configured
-executables are retained even when Git-ignore rules match them, including when
+plugins or executables are retained even when Git-ignore rules match them, including when
 their configured path descends through an otherwise ignored `node_modules`
 directory; unrelated files beneath that ignored directory remain excluded.
 Other copying

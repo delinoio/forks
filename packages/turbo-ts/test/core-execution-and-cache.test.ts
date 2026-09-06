@@ -171,6 +171,67 @@ describe("core CLI execution", () => {
     }
   }, 10_000);
 
+  it("restores the TUI cursor when cursor hiding is interrupted", async () => {
+    const directory = await makeFixture();
+    const stdout: Array<string> = [];
+    let markHideStarted: (() => void) | undefined;
+    const hideStarted = new Promise<void>((resolve) => {
+      markHideStarted = resolve;
+    });
+    let completeHide = (): void => undefined;
+    const runFiber = Effect.runFork(
+      Effect.gen(function* () {
+        const terminal = yield* TerminalService;
+        return yield* executeRun(
+          parseRunArguments([
+            "run",
+            "build",
+            "--cwd",
+            directory,
+            "--filter=synthetic-library",
+            "--no-cache",
+            "--ui=tui",
+          ]),
+        ).pipe(
+          Effect.provide(
+            Layer.succeed(TerminalService, {
+              ...terminal,
+              writeStdout: (text) =>
+                Effect.sync(() => {
+                  stdout.push(text);
+                }).pipe(
+                  Effect.zipRight(
+                    text.startsWith("\u001b[?25l")
+                      ? Effect.async<void>((resume) => {
+                          completeHide = () => resume(Effect.void);
+                          markHideStarted?.();
+                        })
+                      : Effect.void,
+                  ),
+                ),
+              stdoutColorEnabled: Effect.succeed(false),
+              stdinIsTerminal: Effect.succeed(true),
+              stdoutIsTerminal: Effect.succeed(true),
+            }),
+          ),
+        );
+      }).pipe(Effect.provide(nodeFoundationLayer)),
+    );
+    try {
+      await hideStarted;
+      const interrupted = Effect.runPromise(Fiber.interrupt(runFiber));
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      completeHide();
+      await interrupted;
+      expect(stdout[0]?.startsWith("\u001b[?25l")).toBe(true);
+      expect(stdout.at(-1)).toBe("\u001b[?25h");
+    } finally {
+      completeHide();
+      await Effect.runPromise(Fiber.interrupt(runFiber));
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("rejects a nonexistent explicit working directory", async () => {
     const directory = await makeFixture();
     try {

@@ -349,15 +349,50 @@ const isTurboConfigurationPath = (
   return normalizePath(path) === normalizePath(absoluteConfiguredPath);
 };
 
-const workspaceManifestNames = new Set([
+const workspaceManifestNames = [
   "Cargo.toml",
   "package.json",
   "pyproject.toml",
-]);
+] as const;
 
-const isWorkspaceDiscoveryPath = (root: string, path: string): boolean =>
-  workspaceManifestNames.has(baseName(path)) ||
-  normalizePath(path) === normalizePath(joinPath(root, "pnpm-workspace.yaml"));
+export const isWorkspaceDiscoveryPath = (
+  root: string,
+  path: string,
+  windowsPathSeparators: boolean,
+): boolean => {
+  const manifestName = baseName(path, windowsPathSeparators);
+  if (
+    workspaceManifestNames.some((candidate) =>
+      windowsPathSeparators
+        ? candidate.toLowerCase() === manifestName.toLowerCase()
+        : candidate === manifestName,
+    )
+  ) {
+    return true;
+  }
+  const normalized = normalizePath(path, windowsPathSeparators);
+  const workspaceConfiguration = normalizePath(
+    joinPath(root, "pnpm-workspace.yaml"),
+    windowsPathSeparators,
+  );
+  return windowsPathSeparators
+    ? normalized.toLowerCase() === workspaceConfiguration.toLowerCase()
+    : normalized === workspaceConfiguration;
+};
+
+const isGitIndexPath = (
+  root: string,
+  path: string,
+  windowsPathSeparators: boolean,
+): boolean => {
+  const relative = normalizePath(
+    relativePath(root, path, windowsPathSeparators),
+    windowsPathSeparators,
+  );
+  return windowsPathSeparators
+    ? relative.toLowerCase() === ".git/index"
+    : relative === ".git/index";
+};
 
 export const executeWatch = (
   options: WatchOptions,
@@ -420,6 +455,16 @@ export const executeWatch = (
           const isExternalRootTurboJsonChange =
             absoluteRootTurboJson !== undefined &&
             normalizePath(change.path) === normalizePath(absoluteRootTurboJson);
+          if (
+            !isExternalRootTurboJsonChange &&
+            isGitIndexPath(repository.root, change.path, windowsPathSeparators)
+          ) {
+            yield* Ref.set(
+              ignoreMatcher,
+              yield* loadGitIgnoreMatcher(repository.root),
+            );
+            return false;
+          }
           if (
             !isExternalRootTurboJsonChange &&
             isInternalRepositoryPath(repository.root, change.path)
@@ -507,7 +552,11 @@ export const executeWatch = (
             return false;
           }
           if (
-            isWorkspaceDiscoveryPath(repository.root, change.path) ||
+            isWorkspaceDiscoveryPath(
+              repository.root,
+              change.path,
+              windowsPathSeparators,
+            ) ||
             isTurboConfigurationPath(
               repository.root,
               options.run.rootTurboJson,
