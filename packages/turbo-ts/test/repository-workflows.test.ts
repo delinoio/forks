@@ -5301,6 +5301,70 @@ describe("repository workflow gate", () => {
     }
   }, 30_000);
 
+  it("attributes delayed ignore-file removals to completed watch runs", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-watch-late-ignore-removal-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const configurationPath = join(directory, "packages/app/turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: { build: { outputs: Array<string> } } };
+      configuration.tasks.build.outputs = ["generated/.gitignore"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      const applicationDirectory = join(directory, "packages/app");
+      const manifestPath = join(applicationDirectory, "package.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"const fs=require('node:fs');fs.mkdirSync('generated',{recursive:true});fs.writeFileSync('generated/.gitignore','task output\\n');fs.unlinkSync('generated/.gitignore');fs.appendFileSync('.watch-runs','run\\n')\"";
+      await writeFile(
+        manifestPath,
+        `${JSON.stringify(manifest, undefined, 2)}\n`,
+      );
+      const runsPath = join(applicationDirectory, ".watch-runs");
+      const delayedTaskEvent = Stream.fromEffect(
+        Effect.promise(async () => {
+          await waitUntil(() => existsSync(runsPath));
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          return {
+            path: join(applicationDirectory, "generated/.gitignore"),
+            kind: "remove" as const,
+          };
+        }),
+      );
+      await Effect.runPromise(
+        executeWatch(
+          parseWatchArguments([
+            "build",
+            "--filter=synthetic-app",
+            "--cwd",
+            directory,
+            "--no-cache",
+          ]),
+        ).pipe(
+          Effect.provide(
+            Layer.succeed(FileWatcherService, {
+              watch: (root) =>
+                root === directory ? delayedTaskEvent : Stream.empty,
+            }),
+          ),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(
+        (await readFile(runsPath, "utf8")).trim().split("\n"),
+      ).toHaveLength(1);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("uses single-package discovery when filtering watch changes", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-watch-single-"));
     await prepareFixture(directory);
@@ -6389,6 +6453,11 @@ version = "2.0.0"
 source = "registry+https://example.test/index"
 
 [[package]]
+name = "external-package"
+version = "2.0.0"
+source = "git+https://example.test/external-package"
+
+[[package]]
 name = "rust-a"
 version = "0.1.0"
 dependencies = ["rust-b 0.1.0"]
@@ -6401,7 +6470,7 @@ dependencies = ["rust-c 0.1.0"]
 [[package]]
 name = "rust-c"
 version = "0.1.0"
-dependencies = ["external-package 2.0.0"]
+dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
 `,
       );
       const cargoMetadata = JSON.stringify({
@@ -6453,14 +6522,44 @@ dependencies = ["external-package 2.0.0"]
         chmod(cargoCommand, 0o755),
         chmod(rustcCommand, 0o755),
       ]);
+      const cargoEnvironment = {
+        ...process.env,
+        PATH: `${commandDirectory}${delimiter}${process.env.PATH ?? ""}`,
+      };
+      const dryRun = await execFilePromise(
+        process.execPath,
+        [
+          candidate,
+          "run",
+          "build",
+          "--filter=rust-a",
+          "--dry=json",
+          "--cwd",
+          cargoWorkspaceDirectory,
+        ],
+        { env: cargoEnvironment },
+      );
+      const summary = JSON.parse(dryRun.stdout) as {
+        readonly tasks: ReadonlyArray<{
+          readonly taskId: string;
+          readonly hashOfExternalDependencies: string;
+        }>;
+      };
+      expect(
+        summary.tasks.find((task) => task.taskId === "rust-a#build")
+          ?.hashOfExternalDependencies,
+      ).toBe(
+        xxhash64Hex(
+          JSON.stringify([
+            "external-package@2.0.0 (registry+https://example.test/index)",
+          ]),
+        ),
+      );
       const child = spawn(
         process.execPath,
         [candidate, "query", "--port=0", "--cwd", cargoWorkspaceDirectory],
         {
-          env: {
-            ...process.env,
-            PATH: `${commandDirectory}${delimiter}${process.env.PATH ?? ""}`,
-          },
+          env: cargoEnvironment,
           stdio: ["ignore", "pipe", "pipe"],
         },
       );
@@ -6908,26 +7007,82 @@ dependencies = ["external-package 2.0.0"]
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-case-"));
     try {
       await prepareFixture(directory);
+      const configurationPath = join(directory, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.futureFlags = { experimentalCargoWorkspaces: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      await writeFile(
+        join(directory, "Cargo.toml"),
+        '[workspace]\nmembers = []\nresolver = "3"\n\n[package]\nname = "synthetic-root-cargo"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      await writeFile(
+        join(directory, "Cargo.lock"),
+        'version = 4\n\n[[package]]\nname = "synthetic-root-cargo"\nversion = "0.1.0"\n',
+      );
+      await mkdir(join(directory, "src"));
+      await writeFile(join(directory, "src/lib.rs"), "");
+      await writeFile(
+        join(directory, "Package.json"),
+        `${JSON.stringify({ devDependencies: { restored: "1.0.0" } })}\n`,
+      );
+      await mkdir(join(directory, ".yarn/releases"), { recursive: true });
+      await writeFile(join(directory, ".yarn/releases/yarn.cjs"), "release\n");
+      await symlink("yarn.cjs", join(directory, ".yarn/releases/current.cjs"));
       for (const name of ["Node_Modules", ".TURBO"]) {
-        const reserved = join(directory, "packages/app", name);
+        const reserved = join(directory, name);
         await mkdir(reserved);
         await writeFile(join(reserved, "generated.txt"), "generated\n");
       }
+      const cargoPackageId = `path+file://${directory}#synthetic-root-cargo@0.1.0`;
+      const cargoMetadata = JSON.stringify({
+        workspace_root: directory,
+        workspace_members: [cargoPackageId],
+        target_directory: join(directory, "target"),
+        packages: [
+          {
+            id: cargoPackageId,
+            name: "synthetic-root-cargo",
+            version: "0.1.0",
+            manifest_path: join(directory, "Cargo.toml"),
+            dependencies: [],
+            targets: [{ kind: ["lib"], name: "synthetic_root_cargo" }],
+          },
+        ],
+      });
       expect(
         await Effect.runPromise(
           Effect.gen(function* () {
             const environment = yield* EnvironmentService;
+            const processService = yield* ProcessService;
             return yield* executePrune({
-              scopes: ["synthetic-app"],
+              scopes: ["synthetic-root-cargo"],
               cwd: directory,
               outputDirectory: "result",
               docker: false,
-              production: false,
+              production: true,
               useGitignore: false,
             }).pipe(
               Effect.provideService(EnvironmentService, {
                 ...environment,
                 platform: Effect.succeed("win32" as const),
+              }),
+              Effect.provideService(ProcessService, {
+                ...processService,
+                run: (request) =>
+                  request.command === "cargo" &&
+                  request.args.includes("metadata")
+                    ? Effect.succeed({
+                        exitCode: 0,
+                        stdout: cargoMetadata,
+                        stderr: "",
+                        combinedOutput: cargoMetadata,
+                      })
+                    : processService.run(request),
               }),
             );
           }).pipe(Effect.provide(nodeFoundationLayer)),
@@ -6936,11 +7091,19 @@ dependencies = ["external-package 2.0.0"]
       for (const name of ["Node_Modules", ".TURBO"]) {
         expect(
           await readFile(
-            join(directory, "result/packages/app", name, "generated.txt"),
+            join(directory, "result", name, "generated.txt"),
             "utf8",
           ).catch(() => undefined),
         ).toBeUndefined();
       }
+      expect(
+        await readFile(join(directory, "result/Package.json"), "utf8").catch(
+          () => undefined,
+        ),
+      ).toBeUndefined();
+      expect(
+        await readlink(join(directory, "result/.yarn/releases/current.cjs")),
+      ).toBe("yarn.cjs");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -8042,19 +8205,21 @@ importers:
     try {
       await prepareFixture(directory);
       const manifestPath = join(directory, "packages/app/package.json");
-      const manifestTarget = join(directory, "packages/app/manifest.json");
+      const manifestDirectory = join(directory, "manifests");
+      const manifestTarget = join(manifestDirectory, "app.json");
       const manifest = JSON.parse(
         await readFile(manifestPath, "utf8"),
       ) as Record<string, unknown>;
       manifest.devDependencies = {
         "synthetic-development-only": "1.0.0",
       };
+      await mkdir(manifestDirectory);
       await writeFile(
         manifestTarget,
         `${JSON.stringify(manifest, undefined, 2)}\n`,
       );
       await rm(manifestPath);
-      await symlink("manifest.json", manifestPath);
+      await symlink("../../manifests/app.json", manifestPath);
 
       await execFilePromise(process.execPath, [
         candidate,
@@ -8083,13 +8248,10 @@ importers:
       ]) {
         expect(
           await readlink(join(outputRoot, "packages/app/package.json")),
-        ).toBe("manifest.json");
+        ).toBe("../../manifests/app.json");
         expect(
           JSON.parse(
-            await readFile(
-              join(outputRoot, "packages/app/manifest.json"),
-              "utf8",
-            ),
+            await readFile(join(outputRoot, "manifests/app.json"), "utf8"),
           ),
         ).not.toHaveProperty("devDependencies");
       }

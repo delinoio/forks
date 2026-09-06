@@ -4634,7 +4634,9 @@ dependencies = [
         TURBO_TELEMETRY_DISABLED: "1",
       };
       const expectedHash = xxhash64Hex(
-        JSON.stringify(["external-only-for-b@2.0.0"]),
+        JSON.stringify([
+          "external-only-for-b@2.0.0 (registry+https://example.test/index)",
+        ]),
       );
       const dry = await run(
         process.execPath,

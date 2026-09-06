@@ -521,7 +521,8 @@ suppression is disabled conservatively so tracked inputs remain observable and
 copyable. Non-Git repositories continue to apply their configured ignore rules.
 Declared-output ignore files whose modification belongs to an active or recently
 completed run generation remain suppressed to prevent delayed watcher events
-from creating generated-output loops. Root, custom, and workspace Turbo
+from creating generated-output loops. Metadata-less removal events retain that
+generation ownership. Root, custom, and workspace Turbo
 configuration changes and active JavaScript, Cargo, or uv workspace manifest
 changes refresh package discovery and output patterns before the next run. Git
 ignore, Turbo configuration, and workspace manifest classification follows
@@ -722,10 +723,14 @@ escaping, or output-targeting root-control links are rejected, and an exact
 symlinked output root is rejected before replacement. Generated root manifest,
 Turbo configuration, and pnpm workspace configuration transformations are
 applied to validated symlink targets before the links are recreated; this
-includes production dependency removal from root manifests. Selected package
+includes production dependency removal from root manifests. Recreated control
+links use portable relative targets even when the link and target occupy
+different directories. Selected package
 tree copies, including packages located at a workspace or repository root, do
 not overwrite generated root controls, their validated symlink targets, or
-reduced Cargo workspace manifests. The root pnpm
+reduced Cargo workspace manifests; their exclusion identities follow
+case-insensitive filesystem semantics on Windows. The dedicated root `.yarn`
+copy is likewise excluded from repository-root package copies. The root pnpm
 hook `.pnpmfile.cjs` is retained in every
 installation root. Root Bun `bunfig.toml` configuration is retained in the
 ordinary output and both Docker installation roots. Root Yarn installation controls, including `.yarnrc.yml`,

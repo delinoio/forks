@@ -115,6 +115,69 @@ export const relativePath = (
       : normalizedValue;
 };
 
+const normalizedPathRoot = (
+  value: string,
+  windowsPathSeparators: boolean,
+): string => {
+  if (windowsPathSeparators) {
+    const uncRoot = /^\/\/[^/]+\/[^/]+/.exec(value)?.[0];
+    if (uncRoot !== undefined) return uncRoot;
+    const driveRoot = /^[A-Za-z]:\//.exec(value)?.[0];
+    if (driveRoot !== undefined) return driveRoot;
+  }
+  return value.startsWith("/") ? "/" : "";
+};
+
+export const relativePathBetween = (
+  directory: string,
+  value: string,
+  windowsPathSeparators = nativeWindowsPathSeparators,
+): string => {
+  const normalizedDirectory = normalizePath(directory, windowsPathSeparators);
+  const normalizedValue = normalizePath(value, windowsPathSeparators);
+  const directoryRoot = normalizedPathRoot(
+    normalizedDirectory,
+    windowsPathSeparators,
+  );
+  const valueRoot = normalizedPathRoot(normalizedValue, windowsPathSeparators);
+  const comparable = (path: string): string =>
+    windowsPathSeparators ? path.toLowerCase() : path;
+  if (comparable(directoryRoot) !== comparable(valueRoot)) {
+    return normalizedValue;
+  }
+  const segmentsAfterRoot = (
+    path: string,
+    root: string,
+  ): ReadonlyArray<string> =>
+    path
+      .slice(root.length)
+      .replace(/^\//, "")
+      .split("/")
+      .filter((segment) => segment !== "");
+  const directorySegments = segmentsAfterRoot(
+    normalizedDirectory,
+    directoryRoot,
+  );
+  const valueSegments = segmentsAfterRoot(normalizedValue, valueRoot);
+  let commonSegments = 0;
+  while (
+    commonSegments < directorySegments.length &&
+    commonSegments < valueSegments.length &&
+    comparable(directorySegments[commonSegments]!) ===
+      comparable(valueSegments[commonSegments]!)
+  ) {
+    commonSegments += 1;
+  }
+  const relative = [
+    ...Array.from(
+      { length: directorySegments.length - commonSegments },
+      () => "..",
+    ),
+    ...valueSegments.slice(commonSegments),
+  ].join("/");
+  return relative === "" ? "." : relative;
+};
+
 export const isPathContained = (
   root: string,
   value: string,

@@ -11,6 +11,7 @@ import {
   normalizePath,
   parentPath,
   relativePath,
+  relativePathBetween,
 } from "../core/path.js";
 import { ConfigurationError } from "../effect/errors.js";
 import {
@@ -174,6 +175,14 @@ const ignoredDirectoryNames = new Set([
   "node_modules",
 ]);
 
+const prunePathIdentity = (
+  path: string,
+  windowsPathSemantics: boolean,
+): string => {
+  const normalized = normalizePath(path, windowsPathSemantics);
+  return windowsPathSemantics ? normalized.toLowerCase() : normalized;
+};
+
 const copyTree = (
   source: string,
   destination: string,
@@ -187,8 +196,12 @@ const copyTree = (
 ): Effect.Effect<void, unknown, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
-    if (isPathContained(excludedRoot, source)) return;
-    if (excludedSourceRoots.has(normalizePath(source))) return;
+    if (isPathContained(excludedRoot, source, windowsPathSemantics)) return;
+    if (
+      excludedSourceRoots.has(prunePathIdentity(source, windowsPathSemantics))
+    ) {
+      return;
+    }
     const sourceMetadata = yield* fileSystem.metadata(source);
     if (sourceMetadata.kind !== "directory") {
       return yield* Effect.fail(
@@ -203,11 +216,18 @@ const copyTree = (
     for (const entry of entries) {
       const sourcePath = joinPath(source, entry.name);
       const destinationPath = joinPath(destination, entry.name);
-      if (excludedSourceRoots.has(normalizePath(sourcePath))) continue;
+      if (
+        excludedSourceRoots.has(
+          prunePathIdentity(sourcePath, windowsPathSemantics),
+        )
+      ) {
+        continue;
+      }
       const alwaysIncluded = [...alwaysIncludedSourceRoots].some(
         (root) =>
-          isPathContained(root, sourcePath) ||
-          (entry.kind === "directory" && isPathContained(sourcePath, root)),
+          isPathContained(root, sourcePath, windowsPathSemantics) ||
+          (entry.kind === "directory" &&
+            isPathContained(sourcePath, root, windowsPathSemantics)),
       );
       const entersIgnoredDirectory =
         entry.kind === "directory" &&
@@ -250,11 +270,13 @@ const copyTree = (
         );
         if (
           isAbsolutePath(target) ||
-          isPathContained(excludedRoot, resolved) ||
+          isPathContained(excludedRoot, resolved, windowsPathSemantics) ||
           [...excludedSourceRoots].some((root) =>
-            isPathContained(root, resolved),
+            isPathContained(root, resolved, windowsPathSemantics),
           ) ||
-          !allowedSymlinkRoots.some((root) => isPathContained(root, resolved))
+          !allowedSymlinkRoots.some((root) =>
+            isPathContained(root, resolved, windowsPathSemantics),
+          )
         ) {
           return yield* Effect.fail(
             new ConfigurationError({
@@ -368,9 +390,10 @@ const copyIfPresent = (
         relativePath(repositoryRoot, resolved),
       );
       yield* write(resolved, destinationTarget);
+      yield* fileSystem.makeDirectory(parentPath(destination));
       yield* fileSystem.remove(destination);
       yield* fileSystem.createSymlink(
-        relativePath(parentPath(destination), destinationTarget),
+        relativePathBetween(parentPath(destination), destinationTarget),
         destination,
       );
       return;
@@ -874,16 +897,21 @@ export const executePrune = (
     );
     const selectedCanonicalPackageRoots = new Set(
       packages.map((packageModel) =>
-        normalizePath(
+        prunePathIdentity(
           joinPath(repository.root, packageModel.canonicalRelativeDirectory),
+          windowsPathSemantics,
         ),
       ),
     );
     const excludedPackageRoots = new Set(
       repository.packages.flatMap((packageModel) => {
-        const logicalRoot = normalizePath(packageModel.directory);
-        const canonicalRoot = normalizePath(
+        const logicalRoot = prunePathIdentity(
+          packageModel.directory,
+          windowsPathSemantics,
+        );
+        const canonicalRoot = prunePathIdentity(
           joinPath(repository.root, packageModel.canonicalRelativeDirectory),
+          windowsPathSemantics,
         );
         return selectedCanonicalPackageRoots.has(canonicalRoot)
           ? []
@@ -895,13 +923,18 @@ export const executePrune = (
       ...[...ecosystemWorkspaceControls.values()].flatMap(
         (controls) => controls.paths,
       ),
+      ...packages.flatMap((packageModel) =>
+        packageModel.manager === "cargo" || packageModel.manager === "uv"
+          ? []
+          : [joinPath(packageModel.directory, "package.json")],
+      ),
     ];
     const generatedControlCopyExclusions = new Set(
       (yield* Effect.forEach(generatedControlSources, (source) =>
         canonicalOutputPath(source).pipe(
           Effect.map((canonicalSource) => [
-            normalizePath(source),
-            canonicalSource,
+            prunePathIdentity(source, windowsPathSemantics),
+            prunePathIdentity(canonicalSource, windowsPathSemantics),
           ]),
         ),
       )).flat(),
@@ -909,16 +942,14 @@ export const executePrune = (
     const packageCopyExclusions = new Set([
       ...excludedPackageRoots,
       ...generatedControlCopyExclusions,
+      prunePathIdentity(yarnDirectory, windowsPathSemantics),
     ]);
     const copiedPackageDirectories = new Set<string>();
     for (const packageModel of packages) {
-      const normalizedDirectory = normalizePath(
+      const comparableDirectory = prunePathIdentity(
         packageModel.directory,
         windowsPathSemantics,
       );
-      const comparableDirectory = windowsPathSemantics
-        ? normalizedDirectory.toLowerCase()
-        : normalizedDirectory;
       if (!copiedPackageDirectories.has(comparableDirectory)) {
         copiedPackageDirectories.add(comparableDirectory);
         yield* copyTree(

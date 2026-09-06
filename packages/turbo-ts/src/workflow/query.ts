@@ -985,7 +985,13 @@ const repositoryQueryRoot = (
       errors: boundaryDiagnostics(repository),
       warnings: [],
     }),
-    externalDependencies: async () => list(await loadExternalDependencies()),
+    externalDependencies: async () =>
+      list(
+        (await loadExternalDependencies()).map(({ name, version }) => ({
+          name,
+          version,
+        })),
+      ),
     file: async ({ path }: { readonly path: string }) => {
       const normalized = normalizePath(path);
       const absolutePath = joinPath(repository.root, normalized);

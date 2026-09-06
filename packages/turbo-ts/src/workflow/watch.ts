@@ -500,10 +500,11 @@ const completeWatchRunGeneration = (
 const modifiedByWatchRun = (
   state: WatchRunGenerations,
   modifiedAtMilliseconds: number | undefined,
+  removed: boolean,
 ): boolean =>
   state.generations.some((generation) =>
     modifiedAtMilliseconds === undefined
-      ? generation.completedAtMilliseconds === undefined
+      ? removed || generation.completedAtMilliseconds === undefined
       : modifiedAtMilliseconds >= generation.startedAtMilliseconds &&
         (generation.completedAtMilliseconds === undefined ||
           modifiedAtMilliseconds <= generation.completedAtMilliseconds),
@@ -696,6 +697,7 @@ export const executeWatch = (
               modifiedByWatchRun(
                 yield* Ref.get(runGenerations),
                 metadata?.modifiedMilliseconds,
+                change.kind === "remove",
               );
             return (
               !isRunOwnedPath && (!isConfiguredOutputPath || !runOwnsChange)

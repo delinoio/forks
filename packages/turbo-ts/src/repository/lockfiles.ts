@@ -5,7 +5,13 @@ import { baseName } from "../core/path.js";
 export interface LockfilePackage {
   readonly name: string;
   readonly version: string;
+  readonly source?: string;
 }
+
+export const lockfilePackageIdentity = (value: LockfilePackage): string =>
+  `${value.name}@${value.version}${
+    value.source === undefined ? "" : ` (${value.source})`
+  }`;
 
 export interface ParsedLockfile {
   readonly format:
@@ -203,11 +209,14 @@ const parseCargo = (source: string): ReadonlyArray<LockfilePackage> => {
   for (const block of source.split(/\n\s*\[\[package\]\]\s*\n/).slice(1)) {
     const name = /^name\s*=\s*"([^"]+)"/m.exec(block)?.[1];
     const version = /^version\s*=\s*"([^"]+)"/m.exec(block)?.[1];
+    const packageSource = /^source\s*=\s*"([^"]+)"/m.exec(block)?.[1];
     if (name !== undefined && version !== undefined) {
-      packages.push({ name, version });
+      packages.push({ name, version, source: packageSource });
     }
   }
-  return packages.sort((left, right) => left.name.localeCompare(right.name));
+  return packages.sort((left, right) =>
+    lockfilePackageIdentity(left).localeCompare(lockfilePackageIdentity(right)),
+  );
 };
 
 const parseYarnClassic = (source: string): ReadonlyArray<LockfilePackage> => {
@@ -330,9 +339,6 @@ export interface LockfilePackageClosureContext {
   readonly directDependencies: ReadonlyArray<LockfileDependencyReference>;
   readonly workspacePackages?: ReadonlyArray<LockfilePackage>;
 }
-
-const lockfilePackageIdentity = (value: LockfilePackage): string =>
-  `${value.name}@${value.version}`;
 
 const dependencyObjectEntries = (
   value: unknown,
@@ -591,7 +597,13 @@ const parseCargoGraph = (source: string): ReadonlyArray<LockfileGraphEntry> => {
     const versionAlias = `${package_.name}@${package_.version}`;
     return [
       {
-        packages: [{ name: package_.name, version: package_.version }],
+        packages: [
+          {
+            name: package_.name,
+            version: package_.version,
+            source: packageSource,
+          },
+        ],
         aliases: [
           versionAlias,
           ...(packageSource === undefined

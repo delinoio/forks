@@ -81,7 +81,10 @@ import {
   renderLogEvent,
   renderTaskOutputChunk,
 } from "../logging/events.js";
-import { resolveLockfilePackageClosure } from "../repository/lockfiles.js";
+import {
+  lockfilePackageIdentity,
+  resolveLockfilePackageClosure,
+} from "../repository/lockfiles.js";
 import {
   cargoHomeConfigurationPresent,
   configuredEnvironmentValue,
@@ -1900,9 +1903,7 @@ const packagesExternalDependenciesHash = (
                 packageVersion: packageModel.manifest.version,
                 directDependencies: directExternalDependencies,
                 workspacePackages,
-              }).map(
-                (dependency) => `${dependency.name}@${dependency.version}`,
-              );
+              }).map(lockfilePackageIdentity);
             }),
           ),
         ].sort();

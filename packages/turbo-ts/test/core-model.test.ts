@@ -23,6 +23,7 @@ import {
   normalizePath,
   parentPath,
   relativePath,
+  relativePathBetween,
 } from "../src/core/path.js";
 import { GraphError } from "../src/effect/errors.js";
 import {
@@ -45,6 +46,7 @@ import {
   renderTaskOutputChunk,
 } from "../src/logging/events.js";
 import {
+  lockfilePackageIdentity,
   parseLockfile,
   resolveLockfilePackageClosure,
 } from "../src/repository/lockfiles.js";
@@ -206,6 +208,9 @@ describe("core repository model", () => {
     expect(normalizePath("/repo/packages/../apps/web")).toBe("/repo/apps/web");
     expect(joinPath("/repo", "packages", "app")).toBe("/repo/packages/app");
     expect(relativePath("/repo", "/repo/packages/app")).toBe("packages/app");
+    expect(
+      relativePathBetween("/repo/packages/app", "/repo/manifests/app.json"),
+    ).toBe("../../manifests/app.json");
     expect(isPathContained("/repo", "/repo/packages/app")).toBe(true);
     expect(isPathContained("/repo", "/outside")).toBe(false);
     expect(isAbsolutePath("C:\\repo", true)).toBe(true);
@@ -229,6 +234,13 @@ describe("core repository model", () => {
     expect(
       relativePath("//server/share/repo", "//server/share/repo/app", true),
     ).toBe("app");
+    expect(
+      relativePathBetween(
+        "C:\\Repo\\packages\\app",
+        "c:\\repo\\manifests\\app.json",
+        true,
+      ),
+    ).toBe("../../manifests/app.json");
     expect(isPathContained("//SERVER/Share", "//server/share/repo", true)).toBe(
       true,
     );
@@ -779,8 +791,11 @@ version = "1.0.0"
           packageVersion: "0.1.0",
           directDependencies: [],
         },
-      ).map((dependency) => `${dependency.name}@${dependency.version}`),
-    ).toEqual(["selected-leaf@1.0.0", "shared@1.0.0"]);
+      ).map(lockfilePackageIdentity),
+    ).toEqual([
+      "selected-leaf@1.0.0",
+      "shared@1.0.0 (registry+https://selected.example/index)",
+    ]);
   });
 
   it("accepts the complete core package-manager version matrix", () => {
