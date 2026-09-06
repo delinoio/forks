@@ -612,7 +612,9 @@ and future-dated lock timestamps are stale rather than live. A Hello response
 carrying an error is not healthy. Start, stop, restart, status, logs, and clean
 are race-safe; `info` reports the live daemon state. Lifecycle commands resolve
 daemon state from the repository root without requiring package or lockfile
-discovery; the serving process retains full discovery validation.
+discovery; the serving process retains full discovery validation. A missing PID
+file is treated as absent, while filesystem failures checking or reading it are
+propagated without cleaning lifecycle state.
 Start, status, and logs health checks clean stale PID and socket state even
 when the recorded PID has been reused by an unrelated live process. Stop,
 clean, and restart preserve lifecycle state and fail retryably when the

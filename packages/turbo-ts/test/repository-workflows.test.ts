@@ -4467,6 +4467,92 @@ describe("repository workflow gate", () => {
     }
   }, 15_000);
 
+  it("preserves daemon lifecycle state when PID reads fail", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-daemon-pid-read-"),
+    );
+    try {
+      await prepareFixture(directory);
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const processService = yield* ProcessService;
+          const failure = new BoundaryError({
+            boundary: "filesystem",
+            message: "synthetic PID read failure",
+            retryable: false,
+          });
+          const removedPaths = new Set<string>();
+          let pidPath: string | undefined;
+          let spawnAttempts = 0;
+          const overrides = Layer.mergeAll(
+            Layer.succeed(FileSystemService, {
+              ...fileSystem,
+              exists: (path) =>
+                path.endsWith("turbod.pid")
+                  ? Effect.succeed(true)
+                  : fileSystem.exists(path),
+              readText: (path) => {
+                if (path.endsWith("turbod.pid")) {
+                  pidPath = path;
+                  return Effect.fail(failure);
+                }
+                return fileSystem.readText(path);
+              },
+              remove: (path) =>
+                Effect.sync(() => removedPaths.add(path)).pipe(
+                  Effect.zipRight(fileSystem.remove(path)),
+                ),
+            }),
+            Layer.succeed(ProcessService, {
+              ...processService,
+              spawnDetached: () =>
+                Effect.sync(() => {
+                  spawnAttempts += 1;
+                  return 9_000_001;
+                }),
+            }),
+          );
+          for (const command of [
+            "start",
+            "stop",
+            "clean",
+            "restart",
+            "status",
+            "logs",
+          ] as const) {
+            const result = yield* executeDaemon({
+              command,
+              cwd: directory,
+              idleMilliseconds: 30_000,
+              json: command === "status",
+            }).pipe(Effect.provide(overrides), Effect.either);
+            expect(result).toMatchObject({
+              _tag: "Left",
+              left: {
+                boundary: "filesystem",
+                message: "synthetic PID read failure",
+              },
+            });
+          }
+          expect(pidPath).toBeDefined();
+          expect(
+            [...removedPaths].filter(
+              (path) =>
+                path === dirname(pidPath!) ||
+                path.endsWith("turbod.pid") ||
+                path.endsWith("turbod.sock") ||
+                path.endsWith("turbod.log-path"),
+            ),
+          ).toEqual([]);
+          expect(spawnAttempts).toBe(0);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("preserves startup state until a timed-out daemon exits", async () => {
     const runScenario = async (
       behavior: "fails" | "ineffective" | "succeeds" | "unavailable",

@@ -276,17 +276,16 @@ const daemonPaths = (
 
 const readPid = (
   path: string,
-): Effect.Effect<number | undefined, never, FileSystemService> =>
+): Effect.Effect<number | undefined, BoundaryError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
-    const exists = yield* fileSystem
-      .exists(path)
-      .pipe(Effect.orElseSucceed(() => false));
-    if (!exists) return undefined;
-    const source = yield* fileSystem
-      .readText(path)
-      .pipe(Effect.orElseSucceed(() => ""));
-    const pid = Number(source.trim());
+    if (!(yield* fileSystem.exists(path))) return undefined;
+    const source = yield* fileSystem.readText(path).pipe(Effect.either);
+    if (source._tag === "Left") {
+      if (!(yield* fileSystem.exists(path))) return undefined;
+      return yield* Effect.fail(source.left);
+    }
+    const pid = Number(source.right.trim());
     return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
   });
 
@@ -362,7 +361,7 @@ const daemonHealthy = (
   paths: DaemonPaths,
 ): Effect.Effect<
   boolean,
-  never,
+  BoundaryError,
   DaemonService | FileSystemService | ProcessService
 > =>
   Effect.gen(function* () {
@@ -483,7 +482,7 @@ const waitForDaemonHealthy = (
   expectedPid: number,
 ): Effect.Effect<
   boolean,
-  never,
+  BoundaryError,
   ClockService | DaemonService | FileSystemService | ProcessService
 > =>
   Effect.gen(function* () {
@@ -503,7 +502,7 @@ const waitForDaemonHealthy = (
 const waitForDaemonExit = (
   paths: DaemonPaths,
   pid: number,
-): Effect.Effect<boolean, never, FileSystemService | ProcessService> =>
+): Effect.Effect<boolean, BoundaryError, FileSystemService | ProcessService> =>
   Effect.gen(function* () {
     for (let attempt = 0; attempt < 40; attempt += 1) {
       if ((yield* readPid(paths.pid)) !== pid) return true;
@@ -556,7 +555,7 @@ const terminateStartedDaemon = (
 const cleanStaleStateIfOwned = (
   paths: DaemonPaths,
   expectedPid: number | undefined,
-): Effect.Effect<void, never, FileSystemService> =>
+): Effect.Effect<void, BoundaryError, FileSystemService> =>
   Effect.gen(function* () {
     if ((yield* readPid(paths.pid)) !== expectedPid) return;
     yield* cleanStaleState(paths);
