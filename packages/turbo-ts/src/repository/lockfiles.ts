@@ -1047,6 +1047,7 @@ const pruneNpmLockfile = (
 };
 
 export interface LockfilePruneManifest {
+  readonly workspacePath: string;
   readonly dependencies?: Readonly<Record<string, string>>;
   readonly devDependencies?: Readonly<Record<string, string>>;
   readonly optionalDependencies?: Readonly<Record<string, string>>;
@@ -1077,6 +1078,53 @@ const pruneDependencySeeds = (
   (options.manifests ?? []).flatMap((manifest) =>
     dependencyObjectEntries(manifest, options.production !== true),
   );
+
+const dependencyNames = (
+  manifest: LockfilePruneManifest,
+): ReadonlySet<string> =>
+  new Set(dependencyObjectEntries(manifest, false).map(([name]) => name));
+
+const filterDependencyRecord = (
+  value: unknown,
+  retainedNames: ReadonlySet<string>,
+): unknown => {
+  const object = objectValue(value);
+  return object === undefined
+    ? value
+    : Object.fromEntries(
+        Object.entries(object).filter(([name]) => retainedNames.has(name)),
+      );
+};
+
+const yarnBerryProductionDependencyFields: ReadonlySet<string> = new Set([
+  "dependencies",
+  "optionalDependencies",
+  "peerDependencies",
+  "dependenciesMeta",
+  "peerDependenciesMeta",
+]);
+
+const productionYarnBerryWorkspaceEntry = (
+  value: unknown,
+  manifest: LockfilePruneManifest,
+): unknown => {
+  const object = objectValue(value);
+  if (object === undefined) return value;
+  const retainedNames = dependencyNames(manifest);
+  return Object.fromEntries(
+    Object.entries(object).flatMap(([field, fieldValue]) => {
+      if (field === "devDependencies") return [];
+      return [
+        [
+          field,
+          yarnBerryProductionDependencyFields.has(field)
+            ? filterDependencyRecord(fieldValue, retainedNames)
+            : fieldValue,
+        ],
+      ];
+    }),
+  );
+};
 
 const yarnClassicBlocks = (
   source: string,
@@ -1143,17 +1191,40 @@ const pruneYarnBerryLockfile = (
   workspacePaths: ReadonlySet<string>,
   dependencies: ReadonlyArray<LockfileDependencyReference>,
   production: boolean,
+  manifests: ReadonlyArray<LockfilePruneManifest>,
 ): string => {
   const document = objectValue(parseYamlDocument(source));
   if (document === undefined)
     throw new TypeError("Yarn Berry lockfile is not an object");
   const selectedPaths = selectedWorkspacePaths(workspacePaths);
-  const graph = parseYarnBerryGraph(source, !production);
+  const manifestsByWorkspacePath = new Map(
+    manifests.map((manifest) => [
+      normalizeWorkspacePath(manifest.workspacePath),
+      manifest,
+    ]),
+  );
+  const workspacePath = (entry: LockfileGraphEntry): string | undefined =>
+    entry.aliases
+      .map(workspaceReferencePath)
+      .find((path): path is string => path !== undefined);
+  const sourceGraph = parseYarnBerryGraph(source, !production);
+  const graph = production
+    ? sourceGraph.map((entry) => {
+        const path = workspacePath(entry);
+        const manifest =
+          path === undefined ? undefined : manifestsByWorkspacePath.get(path);
+        return manifest === undefined
+          ? entry
+          : {
+              ...entry,
+              dependencies: entry.dependencies.filter(([name]) =>
+                dependencyNames(manifest).has(name),
+              ),
+            };
+      })
+    : sourceGraph;
   const workspaceEntries = graph.filter((entry) =>
-    entry.aliases.some((alias) => {
-      const path = workspaceReferencePath(alias);
-      return path !== undefined && selectedPaths.has(path);
-    }),
+    selectedPaths.has(workspacePath(entry) ?? ""),
   );
   const closure = resolveGraphEntryClosure(
     graph,
@@ -1165,13 +1236,31 @@ const pruneYarnBerryLockfile = (
       entry.sourceKey === undefined ? [] : [entry.sourceKey],
     ),
   );
+  const workspaceManifestsBySourceKey = new Map(
+    graph.flatMap((entry) => {
+      const path = workspacePath(entry);
+      const manifest =
+        path === undefined ? undefined : manifestsByWorkspacePath.get(path);
+      return entry.sourceKey === undefined || manifest === undefined
+        ? []
+        : [[entry.sourceKey, manifest] as const];
+    }),
+  );
   return stringifyYaml(
     Object.fromEntries(
-      Object.entries(document).flatMap(([key, value]) =>
-        key === "__metadata" || retainedKeys.has(key)
-          ? [[key, production ? withoutDevelopmentDependencies(value) : value]]
-          : [],
-      ),
+      Object.entries(document).flatMap(([key, value]) => {
+        if (key !== "__metadata" && !retainedKeys.has(key)) return [];
+        if (!production) return [[key, value]];
+        const manifest = workspaceManifestsBySourceKey.get(key);
+        return [
+          [
+            key,
+            manifest === undefined
+              ? withoutDevelopmentDependencies(value)
+              : productionYarnBerryWorkspaceEntry(value, manifest),
+          ],
+        ];
+      }),
     ),
     { lineWidth: 0, singleQuote: true },
   );
@@ -1262,6 +1351,7 @@ export const pruneLockfile = (
                 workspacePaths,
                 dependencies,
                 options.production === true,
+                options.manifests ?? [],
               )
             : parsed.format === "bun-text"
               ? pruneBunLockfile(

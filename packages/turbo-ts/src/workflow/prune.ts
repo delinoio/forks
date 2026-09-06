@@ -895,6 +895,15 @@ export const executePrune = (
     const selectedPackageRoots = packages.map(
       (packageModel) => packageModel.directory,
     );
+    const selectedPackageTraversalRoots = new Set(
+      packages.flatMap((packageModel) => [
+        prunePathIdentity(packageModel.directory, windowsPathSemantics),
+        prunePathIdentity(
+          joinPath(repository.root, packageModel.canonicalRelativeDirectory),
+          windowsPathSemantics,
+        ),
+      ]),
+    );
     const selectedCanonicalPackageRoots = new Set(
       packages.map((packageModel) =>
         prunePathIdentity(
@@ -952,6 +961,13 @@ export const executePrune = (
       );
       if (!copiedPackageDirectories.has(comparableDirectory)) {
         copiedPackageDirectories.add(comparableDirectory);
+        const currentPackageRoots = new Set([
+          comparableDirectory,
+          prunePathIdentity(
+            joinPath(repository.root, packageModel.canonicalRelativeDirectory),
+            windowsPathSemantics,
+          ),
+        ]);
         yield* copyTree(
           packageModel.directory,
           joinPath(fullRoot, packageModel.relativeDirectory),
@@ -959,7 +975,16 @@ export const executePrune = (
           selectedPackageRoots,
           windowsPathSemantics,
           ignoreMatcher,
-          packageCopyExclusions,
+          new Set([
+            ...packageCopyExclusions,
+            ...[...selectedPackageTraversalRoots].filter(
+              (root) =>
+                !currentPackageRoots.has(root) &&
+                [...currentPackageRoots].some((currentRoot) =>
+                  isPathContained(currentRoot, root, windowsPathSemantics),
+                ),
+            ),
+          ]),
         );
       }
       yield* terminal.writeStdout(` - Added ${packageModel.name}\n`);
@@ -1008,8 +1033,17 @@ export const executePrune = (
       {
         production: options.production,
         manifests: [
-          repository.rootManifest,
-          ...packages.map((packageModel) => packageModel.manifest),
+          { ...repository.rootManifest, workspacePath: "." },
+          ...packages.flatMap((packageModel) =>
+            packageModel.manager === "cargo" || packageModel.manager === "uv"
+              ? []
+              : [
+                  {
+                    ...packageModel.manifest,
+                    workspacePath: packageModel.relativeDirectory,
+                  },
+                ],
+          ),
         ],
       },
     );

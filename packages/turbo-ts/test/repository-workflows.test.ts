@@ -7439,7 +7439,7 @@ importers:
     }
   }, 30_000);
 
-  it("omits unselected workspaces nested below selected prune roots", async () => {
+  it("copies selected nested workspaces once and omits unselected ones", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-nested-"));
     try {
       await prepareFixture(directory);
@@ -7456,6 +7456,7 @@ importers:
         `${JSON.stringify({ name: "synthetic-nested", private: true })}\n`,
       );
       await writeFile(join(nestedDirectory, "source.txt"), "nested\n");
+      await symlink("source.txt", join(nestedDirectory, "source-link.txt"));
       await writeFile(
         join(directory, "pnpm-workspace.yaml"),
         'packages:\n  - "packages/*"\n  - "packages/parent/nested"\n',
@@ -7464,6 +7465,29 @@ importers:
         join(directory, "pnpm-lock.yaml"),
         `${workflowLockfile.trimEnd()}\n  packages/parent: {}\n  packages/parent/nested: {}\n`,
       );
+      await execFilePromise(process.execPath, [
+        candidate,
+        "prune",
+        "synthetic-parent",
+        "synthetic-nested",
+        "--out-dir=selected-result",
+        "--cwd",
+        directory,
+      ]);
+      expect(
+        await readFile(
+          join(directory, "selected-result/packages/parent/nested/source.txt"),
+          "utf8",
+        ),
+      ).toBe("nested\n");
+      expect(
+        await readlink(
+          join(
+            directory,
+            "selected-result/packages/parent/nested/source-link.txt",
+          ),
+        ),
+      ).toBe("source.txt");
       await execFilePromise(process.execPath, [
         candidate,
         "prune",
@@ -9481,6 +9505,7 @@ snapshots:
     ).not.toContain("build-tool");
     const pruneManifests = [
       {
+        workspacePath: "packages/app",
         dependencies: { a: "^1.0.0" },
         devDependencies: { "build-tool": "^5.0.0" },
       },
@@ -9526,7 +9551,6 @@ unused@^4.0.0:
   resolution: "app@workspace:packages/app"
   dependencies:
     a: "npm:^1.0.0"
-  devDependencies:
     build-tool: "npm:^5.0.0"
 "unused-workspace@workspace:packages/unused":
   version: 0.0.0-use.local
@@ -9559,6 +9583,7 @@ unused@^4.0.0:
     expect(yarnBerry).toContain("app@workspace:packages/app");
     expect(yarnBerry).toContain("a@npm:^1.0.0");
     expect(yarnBerry).toContain("b@npm:^2.0.0");
+    expect(yarnBerry).toContain("build-tool@npm:^5.0.0");
     expect(yarnBerry).not.toContain("unused-workspace");
     expect(yarnBerry).not.toContain("unused@npm:^4.0.0");
     const yarnBerryProduction = new TextDecoder().decode(
@@ -9569,8 +9594,9 @@ unused@^4.0.0:
         { manifests: pruneManifests, production: true },
       ),
     );
-    expect(yarnBerryProduction).not.toContain("devDependencies");
-    expect(yarnBerryProduction).not.toContain("build-tool@npm:^5.0.0");
+    expect(yarnBerryProduction).toContain("a@npm:^1.0.0");
+    expect(yarnBerryProduction).toContain("b@npm:^2.0.0");
+    expect(yarnBerryProduction).not.toContain("build-tool");
     const bunSource = new TextEncoder().encode(
       JSON.stringify({
         lockfileVersion: 1,
