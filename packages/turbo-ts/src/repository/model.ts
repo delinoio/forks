@@ -834,6 +834,7 @@ interface CargoDependencyMetadata {
   readonly name: string;
   readonly path?: string;
   readonly source?: string;
+  readonly production: boolean;
 }
 
 interface RepositoryPackageDraft
@@ -846,6 +847,7 @@ interface RepositoryPackageDraft
     string,
     ReadonlyArray<PythonDependencySource>
   >;
+  readonly uvProductionDependencyNames?: ReadonlyArray<string>;
 }
 
 type IdentifiedRepositoryPackageDraft = RepositoryPackageDraft &
@@ -866,6 +868,7 @@ export const parseCargoMetadata = (
       readonly manifest_path?: unknown;
       readonly dependencies?: ReadonlyArray<{
         readonly name?: unknown;
+        readonly kind?: unknown;
         readonly path?: unknown;
         readonly source?: unknown;
       }>;
@@ -894,31 +897,31 @@ export const parseCargoMetadata = (
     ) {
       return [];
     }
-    const dependencies = [
-      ...new Map(
-        (packageMetadata.dependencies ?? []).flatMap((dependency) => {
-          if (typeof dependency.name !== "string") return [];
-          const value: CargoDependencyMetadata = {
-            name: dependency.name,
-            ...(typeof dependency.path === "string"
-              ? { path: normalizePath(dependency.path) }
-              : {}),
-            ...(typeof dependency.source === "string"
-              ? { source: dependency.source }
-              : {}),
-          };
-          return [
-            [
-              `${value.name}\0${value.source ?? ""}\0${value.path ?? ""}`,
-              value,
-            ] as const,
-          ];
-        }),
-      ).values(),
-    ].sort((left, right) =>
-      `${left.name}\0${left.source ?? ""}\0${left.path ?? ""}`.localeCompare(
-        `${right.name}\0${right.source ?? ""}\0${right.path ?? ""}`,
-      ),
+    const dependenciesByIdentity = new Map<string, CargoDependencyMetadata>();
+    for (const dependency of packageMetadata.dependencies ?? []) {
+      if (typeof dependency.name !== "string") continue;
+      const value: CargoDependencyMetadata = {
+        name: dependency.name,
+        ...(typeof dependency.path === "string"
+          ? { path: normalizePath(dependency.path) }
+          : {}),
+        ...(typeof dependency.source === "string"
+          ? { source: dependency.source }
+          : {}),
+        production: dependency.kind !== "dev",
+      };
+      const identity = `${value.name}\0${value.source ?? ""}\0${value.path ?? ""}`;
+      const existing = dependenciesByIdentity.get(identity);
+      dependenciesByIdentity.set(identity, {
+        ...value,
+        production: value.production || existing?.production === true,
+      });
+    }
+    const dependencies = [...dependenciesByIdentity.values()].sort(
+      (left, right) =>
+        `${left.name}\0${left.source ?? ""}\0${left.path ?? ""}`.localeCompare(
+          `${right.name}\0${right.source ?? ""}\0${right.path ?? ""}`,
+        ),
     );
     return [
       {
@@ -1077,6 +1080,7 @@ interface PythonProjectMetadata {
   readonly version?: string;
   readonly cacheInputsComplete: boolean;
   readonly dependencyNames: ReadonlyArray<string>;
+  readonly productionDependencyNames: ReadonlyArray<string>;
   readonly dependencySources: ReadonlyMap<
     string,
     ReadonlyArray<PythonDependencySource>
@@ -1901,18 +1905,28 @@ const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
   const uv = recordValue(tool?.uv);
   const workspace = recordValue(uv?.workspace);
   const sources = recordValue(uv?.sources);
-  const requirements = [
+  const productionRequirements = [
     ...stringArrayValue(project?.dependencies),
     ...Object.values(optionalDependencies ?? {}).flatMap(stringArrayValue),
+  ];
+  const developmentRequirements = [
     ...Object.values(dependencyGroups ?? {}).flatMap(stringArrayValue),
     ...stringArrayValue(uv?.["dev-dependencies"]),
   ];
   const names = new Set<string>();
+  const productionNames = new Set<string>();
   const directRequirementNames = new Set<string>();
-  for (const requirement of requirements) {
+  for (const [requirement, production] of [
+    ...productionRequirements.map((value) => [value, true] as const),
+    ...developmentRequirements.map((value) => [value, false] as const),
+  ]) {
     const trimmed = requirement.trim();
     const name = /^([A-Za-z0-9][A-Za-z0-9_.-]*)/.exec(trimmed)?.[1];
-    if (name !== undefined) names.add(normalizePythonPackageName(name));
+    if (name !== undefined) {
+      const normalizedName = normalizePythonPackageName(name);
+      names.add(normalizedName);
+      if (production) productionNames.add(normalizedName);
+    }
     const directName =
       /^([A-Za-z0-9][A-Za-z0-9_.-]*)(?:\s*\[[^\]]*\])?\s*@\s*\S+/.exec(
         trimmed,
@@ -1946,6 +1960,7 @@ const parsePythonProjectMetadata = (source: string): PythonProjectMetadata => {
       dependencySources.has(name),
     ),
     dependencyNames: [...names].sort(),
+    productionDependencyNames: [...productionNames].sort(),
     dependencySources,
     ...(workspace === undefined
       ? {}
@@ -2628,6 +2643,7 @@ export const discoverRepository = (
             dependencyNames: metadata.dependencyNames,
             excludedTasks: packageConfiguration.excludedTasks,
             uvDependencySources: metadata.dependencySources,
+            uvProductionDependencyNames: metadata.productionDependencyNames,
             tasks: uvTasks(
               metadata.name,
               packageConfiguration.tasks,
@@ -2816,7 +2832,13 @@ export const discoverRepository = (
                     (targetIdentity !== undefined &&
                       sourceIdentities[index] === targetIdentity),
                 );
-                return { internalDependency, cacheInputsComplete };
+                return {
+                  internalDependency,
+                  production:
+                    packageDraft.uvProductionDependencyNames?.includes(name) ===
+                    true,
+                  cacheInputsComplete,
+                };
               }),
             { concurrency: 8 },
           ).pipe(
@@ -2828,6 +2850,12 @@ export const discoverRepository = (
                     internalDependencies: dependencies.flatMap(
                       ({ internalDependency }) =>
                         internalDependency === undefined
+                          ? []
+                          : [internalDependency],
+                    ),
+                    productionInternalDependencies: dependencies.flatMap(
+                      ({ internalDependency, production }) =>
+                        internalDependency === undefined || !production
                           ? []
                           : [internalDependency],
                     ),
@@ -2862,7 +2890,10 @@ export const discoverRepository = (
               target === undefined ? [] : [target.identity],
             ),
             productionInternalDependencies: resolvedDependencies.flatMap(
-              ({ target }) => (target === undefined ? [] : [target.identity]),
+              ({ dependency, target }) =>
+                target === undefined || !dependency.production
+                  ? []
+                  : [target.identity],
             ),
           };
         }
@@ -2877,7 +2908,7 @@ export const discoverRepository = (
               (resolution?.cacheInputsComplete ?? true),
             internalDependencies: resolution?.internalDependencies ?? [],
             productionInternalDependencies:
-              resolution?.internalDependencies ?? [],
+              resolution?.productionInternalDependencies ?? [],
           };
         }
         const resolution = javascriptDependencyResolutionByDirectory.get(

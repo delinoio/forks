@@ -69,6 +69,7 @@ import {
 import { buildTaskGraph, type TaskNode } from "../src/graph/task-graph.js";
 import {
   decodeNullDelimitedGitOutput,
+  hashGlobalInputFiles,
   hashTask,
   implicitTaskInputCandidates,
 } from "../src/hash/task-hash.js";
@@ -5004,7 +5005,9 @@ dependencies = [
           `exclude = ["python/excluded"]\n`,
       );
       await mkdir(`${directory}/python/app`, { recursive: true });
+      await mkdir(`${directory}/python/dev-helper`, { recursive: true });
       await mkdir(`${directory}/python/helper`, { recursive: true });
+      await mkdir(`${directory}/python/legacy-helper`, { recursive: true });
       await mkdir(`${directory}/python/library`, { recursive: true });
       await mkdir(`${directory}/python/registry`, { recursive: true });
       await mkdir(`${directory}/python/excluded`, { recursive: true });
@@ -5021,13 +5024,15 @@ dependencies = [
       const appManifestPath = `${directory}/python/app/pyproject.toml`;
       const appManifestSource =
         `[tool.uv]\n` +
-        `dev-dependencies = ["types-requests>=2"]\n` +
+        `dev-dependencies = ["legacy-helper>=1"]\n` +
         `\n` +
         `[[tool.uv.index]]\n` +
         `name = "internal"\n` +
         `url = "https://example.test/simple"\n` +
         `\n` +
         `[tool.uv.sources]\n` +
+        `dev-helper = { workspace = true }\n` +
+        `legacy-helper = { workspace = true }\n` +
         `my-util = { workspace = true }\n` +
         `local-helper = { path = ${JSON.stringify(localHelperPath)}, editable = true }\n` +
         `requests = { index = "internal" }\n` +
@@ -5040,12 +5045,20 @@ dependencies = [
         `test = ["pytest>=8"]\n` +
         `\n` +
         `[dependency-groups]\n` +
-        `dev = ["ruff>=1", { include-group = "lint" }]\n` +
+        `dev = ["dev-helper>=1", "ruff>=1", { include-group = "lint" }]\n` +
         `lint = ["mypy>=1"]\n`;
       await writeFile(appManifestPath, appManifestSource);
       await writeFile(
+        `${directory}/python/dev-helper/pyproject.toml`,
+        `[project]\nname = "dev_helper"\ndependencies = []\n`,
+      );
+      await writeFile(
         `${directory}/python/helper/pyproject.toml`,
         `[project]\nname = "local_helper"\ndependencies = []\n`,
+      );
+      await writeFile(
+        `${directory}/python/legacy-helper/pyproject.toml`,
+        `[project]\nname = "legacy_helper"\ndependencies = []\n`,
       );
       await writeFile(
         `${directory}/python/library/pyproject.toml`,
@@ -5071,15 +5084,25 @@ dependencies = [
       );
       const app = model.packagesByName.get("app");
       expect(app?.dependencyNames).toEqual([
+        "dev-helper",
+        "legacy-helper",
         "local-helper",
         "my-util",
         "mypy",
         "pytest",
         "requests",
         "ruff",
-        "types-requests",
       ]);
-      expect(app?.internalDependencies).toEqual(["local_helper", "my_util"]);
+      expect(app?.internalDependencies).toEqual([
+        "dev_helper",
+        "legacy_helper",
+        "local_helper",
+        "my_util",
+      ]);
+      expect(app?.productionInternalDependencies).toEqual([
+        "local_helper",
+        "my_util",
+      ]);
       expect(app?.cacheInputsComplete).toBe(true);
       expect(model.packagesByName.has("internal")).toBe(false);
       expect(model.packagesByName.has("python-root")).toBe(true);
@@ -5091,7 +5114,13 @@ dependencies = [
         [
           ...buildTaskGraph(model, [app!], ["build"], false).nodes.keys(),
         ].sort(),
-      ).toEqual(["app#build", "local_helper#build", "my_util#build"]);
+      ).toEqual([
+        "app#build",
+        "dev_helper#build",
+        "legacy_helper#build",
+        "local_helper#build",
+        "my_util#build",
+      ]);
 
       await writeFile(
         appManifestPath,
@@ -9597,6 +9626,85 @@ dependencies = [
       expect(
         await readFile(`${directory}/packages/library/dist/value.txt`, "utf8"),
       ).toBe("second\n");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("matches global dependency globs case-insensitively on Windows", async () => {
+    const directory = await makeFixture();
+    const globalPath = `${directory}/packages/app/global.txt`;
+    try {
+      await writeFile(globalPath, "first\n");
+      const model = await Effect.runPromise(
+        Effect.gen(function* () {
+          const rootConfiguration = yield* loadRootConfiguration(directory);
+          return yield* discoverRepository(directory, rootConfiguration);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const compute = () =>
+        Effect.runPromise(
+          hashGlobalInputFiles(model, `${directory}/.turbo/cache`, [
+            "PACKAGES/APP/GLOBAL.TXT",
+          ]).pipe(
+            Effect.provideService(EnvironmentService, {
+              argv: Effect.succeed([]),
+              cwd: Effect.succeed(directory),
+              platform: Effect.succeed("win32" as const),
+              get: () => Effect.succeed(undefined),
+              entries: Effect.succeed({}),
+            }),
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+
+      const first = await compute();
+      expect(Object.keys(first)).toEqual(["packages/app/global.txt"]);
+      await writeFile(globalPath, "second\n");
+      expect(await compute()).not.toEqual(first);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("never captures a linked-worktree Git metadata file as an output", async () => {
+    const directory = await makeFixture();
+    const gitMetadataPath = `${directory}/.git`;
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: { build: { outputs: Array<string> } } };
+      configuration.tasks.build.outputs.push("$TURBO_ROOT$/**");
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      await writeFile(gitMetadataPath, "gitdir: /synthetic/first\n");
+      const args = [
+        candidateEntrypoint,
+        "run",
+        "build",
+        "--cwd",
+        directory,
+        "--filter=synthetic-library",
+        "--output-logs=hash-only",
+      ];
+      const first = await run(process.execPath, args, repositoryRoot);
+      expect(first.exitCode, first.stderr).toBe(0);
+      expect(first.stdout).toContain("cache miss");
+
+      await writeFile(gitMetadataPath, "gitdir: /synthetic/second\n");
+      await rm(`${directory}/packages/library/.turbo`, {
+        force: true,
+        recursive: true,
+      });
+      const second = await run(process.execPath, args, repositoryRoot);
+      expect(second.exitCode, second.stderr).toBe(0);
+      expect(second.stdout).toContain("cache hit");
+      expect(await readFile(gitMetadataPath, "utf8")).toBe(
+        "gitdir: /synthetic/second\n",
+      );
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

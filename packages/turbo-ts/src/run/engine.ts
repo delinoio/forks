@@ -1336,6 +1336,13 @@ const collectOutputPaths = (
   Effect.gen(function* () {
     const selected = new Set<string>();
     const rootOutputPrefix = "$TURBO_ROOT$/";
+    const outputPathIdentity = (path: string): string => {
+      const normalized = normalizePath(path, windowsPathSeparators);
+      return windowsPathSeparators ? normalized.toLowerCase() : normalized;
+    };
+    const repositoryGitMetadataIdentity = outputPathIdentity(
+      joinPath(repository.root, ".git"),
+    );
     const collectOutputs = (
       directory: string,
       patterns: ReadonlyArray<string>,
@@ -1358,6 +1365,7 @@ const collectOutputPaths = (
               windowsPathSeparators,
             );
             return (
+              outputPathIdentity(path) !== repositoryGitMetadataIdentity &&
               !isPathContained(cacheDirectory, path, windowsPathSeparators) &&
               positivePatterns.some((pattern) =>
                 canMatchGlobDescendant(
@@ -1371,7 +1379,10 @@ const collectOutputPaths = (
           windowsPathSeparators,
         });
         for (const path of files) {
-          if (isPathContained(cacheDirectory, path, windowsPathSeparators)) {
+          if (
+            outputPathIdentity(path) === repositoryGitMetadataIdentity ||
+            isPathContained(cacheDirectory, path, windowsPathSeparators)
+          ) {
             continue;
           }
           const relative = relativePath(directory, path, windowsPathSeparators);

@@ -376,7 +376,7 @@ const cargoControlInputCandidates = (
         ),
       ];
 
-const owningLockfileCandidates = (
+export const owningLockfileCandidates = (
   repository: RepositoryModel,
   packageModel: RepositoryPackage,
 ): ReadonlyArray<string> => {
@@ -916,16 +916,26 @@ const hashGlobalInputs = (
       excludeDefaultProfileArtifacts,
       windowsPathSeparators,
     );
-    const globalInputFiles = selectByGlobs(
-      [...globalInputFilesByRelativePath.keys()],
-      globalDependencyPatterns,
-      windowsPathSeparators,
-    ).filter(
-      (relative) =>
-        !isExcludedInput(
-          globalInputFilesByRelativePath.get(relative)!.absolutePath,
-        ),
+    const comparablePath = (path: string): string =>
+      windowsPathSeparators ? path.toLowerCase() : path;
+    const selectedGlobalInputPaths = new Set(
+      selectByGlobs(
+        [...globalInputFilesByRelativePath.keys()].map(comparablePath),
+        globalDependencyPatterns.map(comparablePath),
+        windowsPathSeparators,
+      ),
     );
+    const globalInputFiles = [...globalInputFilesByRelativePath.keys()]
+      .filter((relative) =>
+        selectedGlobalInputPaths.has(comparablePath(relative)),
+      )
+      .filter(
+        (relative) =>
+          !isExcludedInput(
+            globalInputFilesByRelativePath.get(relative)!.absolutePath,
+          ),
+      )
+      .sort(compareCodeUnits);
     return (yield* Effect.forEach(
       globalInputFiles,
       (relative) => {

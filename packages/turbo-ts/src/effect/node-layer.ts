@@ -1873,6 +1873,7 @@ const protocolInteger = (field: number, value: number): Buffer =>
 
 const maximumDaemonPayloadBytes = 1024 * 1024;
 const maximumDaemonFrameBytes = maximumDaemonPayloadBytes + 5;
+const maximumConcurrentDaemonStreams = 64;
 
 const grpcFrame = (payload: Uint8Array): Buffer => {
   const header = Buffer.alloc(5);
@@ -2318,6 +2319,7 @@ export const makeDaemonServe = (setup: Partial<DaemonEndpointSetup> = {}) => {
               BoundaryError
             >((resume) => {
               const sessions = new Set<ServerHttp2Session>();
+              let activeStreams = 0;
               const server = createHttp2Server();
               server.on("session", (session) => {
                 sessions.add(session);
@@ -2328,6 +2330,32 @@ export const makeDaemonServe = (setup: Partial<DaemonEndpointSetup> = {}) => {
                 // consume its error event so Node does not promote a hostile
                 // client frame into an uncaught process-level exception.
                 stream.on("error", () => undefined);
+                const path = String(
+                  headers[http2Constants.HTTP2_HEADER_PATH] ?? "",
+                );
+                const method = path.slice(path.lastIndexOf("/") + 1);
+                const supportedMethod = Object.values(DaemonMethod).includes(
+                  method as DaemonMethodType,
+                );
+                if (activeStreams >= maximumConcurrentDaemonStreams) {
+                  stream.resume();
+                  respondRejectedRequest(
+                    stream,
+                    supportedMethod ? method : DaemonMethod.status,
+                    {
+                      id: String(stream.id),
+                      error: "daemon request queue is full",
+                    },
+                  );
+                  return;
+                }
+                activeStreams += 1;
+                let streamReleased = false;
+                stream.once("close", () => {
+                  if (streamReleased) return;
+                  streamReleased = true;
+                  activeStreams -= 1;
+                });
                 const chunks: Array<Buffer> = [];
                 let length = 0;
                 let overflowed = false;
@@ -2345,15 +2373,7 @@ export const makeDaemonServe = (setup: Partial<DaemonEndpointSetup> = {}) => {
                 stream.on("end", () => {
                   if (overflowed) return;
                   try {
-                    const path = String(
-                      headers[http2Constants.HTTP2_HEADER_PATH] ?? "",
-                    );
-                    const method = path.slice(path.lastIndexOf("/") + 1);
-                    if (
-                      !Object.values(DaemonMethod).includes(
-                        method as DaemonMethodType,
-                      )
-                    ) {
+                    if (!supportedMethod) {
                       respondRejectedRequest(stream, DaemonMethod.status, {
                         id: String(stream.id),
                         error: `unsupported daemon method: ${method}`,
@@ -2446,7 +2466,7 @@ export const makeDaemonServe = (setup: Partial<DaemonEndpointSetup> = {}) => {
               ),
           );
         }),
-      { bufferSize: 64, strategy: "dropping" },
+      { bufferSize: maximumConcurrentDaemonStreams, strategy: "dropping" },
     );
 };
 
@@ -2579,20 +2599,34 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
             let size = 0;
             let oversized = false;
             let connectionClosed = false;
+            let requestEnded = false;
+            let responseEnded = false;
             let handlerFiber:
               | Fiber.RuntimeFiber<LoopbackHttpResponse, BoundaryError>
               | undefined;
             const interruptHandler = (): void => {
               connectionClosed = true;
-              releaseRequest();
               if (handlerFiber !== undefined) {
                 Effect.runFork(Fiber.interrupt(handlerFiber));
               }
             };
-            request.once("aborted", interruptHandler);
-            request.once("error", interruptHandler);
-            response.once("close", interruptHandler);
-            response.once("finish", releaseRequest);
+            const interruptAndReleaseRequest = (): void => {
+              releaseRequest();
+              interruptHandler();
+            };
+            const responseFinishHandler = (): void => {
+              responseEnded = true;
+              if (requestEnded) releaseRequest();
+            };
+            const responseCloseHandler = (): void => {
+              responseEnded = true;
+              if (requestEnded) releaseRequest();
+              interruptHandler();
+            };
+            request.once("aborted", interruptAndReleaseRequest);
+            request.once("error", interruptAndReleaseRequest);
+            response.once("finish", responseFinishHandler);
+            response.once("close", responseCloseHandler);
             request.on("data", (chunk: Buffer) => {
               if (oversized || connectionClosed) return;
               size += chunk.length;
@@ -2606,6 +2640,8 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
               chunks.push(chunk);
             });
             request.on("end", () => {
+              requestEnded = true;
+              if (responseEnded) releaseRequest();
               if (oversized || connectionClosed) return;
               const headers = Object.fromEntries(
                 Object.entries(request.headers).flatMap(([key, value]) =>
@@ -2632,9 +2668,8 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
                 Effect.flatMap(Fiber.join),
               );
               Effect.runPromiseExit(requestEffect).then((exit) => {
-                request.off("aborted", interruptHandler);
-                request.off("error", interruptHandler);
-                response.off("close", interruptHandler);
+                request.off("aborted", interruptAndReleaseRequest);
+                request.off("error", interruptAndReleaseRequest);
                 if (
                   connectionClosed ||
                   response.destroyed ||

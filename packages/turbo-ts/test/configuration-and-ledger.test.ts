@@ -507,10 +507,19 @@ describe("configuration generation and compatibility ledger", () => {
       ledger.rows.find((row) => row.id === "cli.run-options")?.variants,
     ).not.toContain("--cache-workers");
     expect(
+      ledger.rows.find((row) => row.id === "cli.run-options")?.variants,
+    ).not.toContain("--daemon");
+    expect(
       ledger.rows.find((row) => row.id === "cli.run-cache-workers"),
     ).toMatchObject({
       status: "planned",
       variants: ["--cache-workers"],
+    });
+    expect(
+      ledger.rows.find((row) => row.id === "cli.run-daemon-options"),
+    ).toMatchObject({
+      status: "planned",
+      variants: ["--daemon", "--no-daemon"],
     });
     expect(() =>
       parseCompatibilityLedger(

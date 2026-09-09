@@ -23,6 +23,7 @@ import {
   ProcessService,
   TerminalService,
 } from "../effect/services.js";
+import { owningLockfileCandidates } from "../hash/task-hash.js";
 import {
   type GitIgnoreMatcher,
   loadGitIgnoreMatcher,
@@ -425,7 +426,7 @@ export const isWorkspaceDiscoveryPath = (
     : normalized === workspaceConfiguration;
 };
 
-const isActiveRepositoryControlPath = (
+export const isActiveRepositoryControlPath = (
   repository: RepositoryModel,
   path: string,
   windowsPathSeparators: boolean,
@@ -439,6 +440,7 @@ const isActiveRepositoryControlPath = (
   ];
   const controlPaths = new Set([
     repository.rootConfiguration.path,
+    ...(repository.lockfile === undefined ? [] : [repository.lockfile]),
     ...(repository.manager === "pnpm"
       ? [
           joinPathWithSeparators(
@@ -462,6 +464,7 @@ const isActiveRepositoryControlPath = (
           : [packageModel.workspaceDirectory]),
       ]);
       return [
+        ...owningLockfileCandidates(repository, packageModel),
         ...(packageModel.configurationPath === undefined
           ? []
           : [packageModel.configurationPath]),

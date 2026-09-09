@@ -69,6 +69,7 @@ import {
   taskScopeEnvironment,
 } from "../src/run/engine.js";
 import { parseConcurrency, parseRunArguments } from "../src/run/options.js";
+import { isActiveRepositoryControlPath } from "../src/workflow/watch.js";
 
 const encoder = new TextEncoder();
 
@@ -142,6 +143,35 @@ const repository = (
 };
 
 describe("core repository model", () => {
+  it("keeps ignored owning lockfiles active for watch invalidation", () => {
+    const cargoPackage = {
+      ...packageModel("cargo:app", []),
+      directory: "/repo/rust/app",
+      manager: "cargo" as const,
+      workspaceDirectory: "/repo/rust",
+    };
+    const uvPackage = {
+      ...packageModel("uv:app", []),
+      directory: "/repo/python/nested/app",
+      manager: "uv" as const,
+      workspaceDirectory: "/repo",
+    };
+    const model = {
+      ...repository([cargoPackage, uvPackage]),
+      lockfile: "/repo/pnpm-lock.yaml",
+    };
+    for (const path of [
+      "/repo/pnpm-lock.yaml",
+      "/repo/rust/Cargo.lock",
+      "/repo/python/nested/app/uv.lock",
+      "/repo/python/nested/uv.lock",
+      "/repo/python/uv.lock",
+      "/repo/uv.lock",
+    ]) {
+      expect(isActiveRepositoryControlPath(model, path, false)).toBe(true);
+    }
+  });
+
   it("renders streamed task output identically with bounded chunks", () => {
     const output = `${"🙂value".repeat(20_000)}\nsecond line`;
     const inputChunks = [
@@ -1096,7 +1126,12 @@ version = "1.0.0"
               name: "app",
               version: "0.1.0",
               manifest_path: "/repo/crates/app/Cargo.toml",
-              dependencies: [{ name: "util", rename: "util_alias" }],
+              dependencies: [
+                { kind: "build", name: "builder" },
+                { kind: "dev", name: "testsupport" },
+                { kind: "dev", name: "util", rename: "util_alias" },
+                { kind: null, name: "util", rename: "util_alias" },
+              ],
               targets: [
                 { kind: ["bin"], name: "app" },
                 { kind: ["custom-build"], name: "build-script-build" },
@@ -1110,8 +1145,12 @@ version = "1.0.0"
     ).toEqual({
       name: "app",
       version: "0.1.0",
-      dependencies: [{ name: "util" }],
-      dependencyNames: ["util"],
+      dependencies: [
+        { name: "builder", production: true },
+        { name: "testsupport", production: false },
+        { name: "util", production: true },
+      ],
+      dependencyNames: ["builder", "testsupport", "util"],
       entrypointNames: ["app"],
       hasLibraryTarget: false,
       targetDirectory: "/repo/target",

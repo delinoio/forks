@@ -3614,6 +3614,67 @@ describe("repository workflow gate", () => {
     }
   });
 
+  it("bounds unfinished daemon request streams before buffering", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-daemon-incomplete-limit-"),
+    );
+    const socket = join(directory, "turbod.sock");
+    let dispatchedRequests = 0;
+    const serveFiber = Effect.runFork(
+      Stream.runForEach(makeDaemonServe()(socket), (connection) =>
+        Stream.runForEach(connection.requests, (request) => {
+          dispatchedRequests += 1;
+          return connection.respond({ id: request.id, result: {} });
+        }),
+      ),
+    );
+    let session: ReturnType<typeof connectHttp2> | undefined;
+    const streams: Array<ReturnType<NonNullable<typeof session>["request"]>> =
+      [];
+    try {
+      await waitUntil(() => existsSync(socket));
+      session = connectHttp2("http://localhost", {
+        createConnection: () => createNetConnection(socket),
+      });
+      session.on("error", () => undefined);
+      for (let index = 0; index < 64; index += 1) {
+        const stream = session.request({
+          [http2Constants.HTTP2_HEADER_METHOD]: "POST",
+          [http2Constants.HTTP2_HEADER_PATH]: "/turbodprotocol.Turbod/Hello",
+          [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+        });
+        stream.on("error", () => undefined);
+        stream.write(Buffer.from([0]));
+        streams.push(stream);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const rejected = await sendDaemonRequestResult(
+        socket,
+        "Hello",
+        protobufString(1, "2.0.0"),
+      );
+      expect(rejected.error).toBe("daemon request queue is full");
+      expect(dispatchedRequests).toBe(0);
+
+      streams.pop()!.close(http2Constants.NGHTTP2_CANCEL);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const recovered = await sendDaemonRequestResult(
+        socket,
+        "Hello",
+        protobufString(1, "2.0.0"),
+      );
+      expect(recovered.error).toBeUndefined();
+      expect(dispatchedRequests).toBe(1);
+    } finally {
+      for (const stream of streams) stream.close(http2Constants.NGHTTP2_CANCEL);
+      session?.destroy();
+      await Effect.runPromise(Fiber.interrupt(serveFiber));
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("does not dispatch unary daemon requests with trailing data", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(
@@ -5551,10 +5612,16 @@ describe("repository workflow gate", () => {
               const processService = yield* ProcessService;
               const childPid = 9_000_001;
               let alive = true;
+              let now = 0;
               let terminationAttempts = 0;
+              const requestTimeouts: Array<number | undefined> = [];
               const clockLayer = Layer.succeed(ClockService, {
                 ...clock,
-                sleep: () => Effect.yieldNow(),
+                now: Effect.sync(() => now),
+                sleep: (milliseconds) =>
+                  Effect.sync(() => {
+                    now += milliseconds;
+                  }),
               });
               const fileSystemLayer = Layer.succeed(FileSystemService, {
                 ...fileSystem,
@@ -5567,10 +5634,14 @@ describe("repository workflow gate", () => {
               });
               const daemonLayer = Layer.succeed(DaemonService, {
                 ...daemon,
-                request: (_endpoint, request) =>
-                  Effect.succeed({
-                    id: request.id,
-                    error: "synthetic daemon is not ready",
+                request: (_endpoint, request, timeoutMilliseconds) =>
+                  Effect.sync(() => {
+                    requestTimeouts.push(timeoutMilliseconds);
+                    now += timeoutMilliseconds ?? 5_000;
+                    return {
+                      id: request.id,
+                      error: "synthetic daemon is not ready",
+                    };
                   }),
               });
               const environmentLayer = Layer.succeed(EnvironmentService, {
@@ -5662,6 +5733,8 @@ describe("repository workflow gate", () => {
               expect(terminationAttempts).toBe(
                 behavior === "unavailable" ? 0 : 1,
               );
+              expect(requestTimeouts).toEqual([5_000]);
+              expect(now).toBeLessThan(30_000);
               expect(stateDirectory).toBeDefined();
               for (const name of [
                 "turbod.pid",
@@ -7766,7 +7839,15 @@ snapshots:
 [[package]]
 name = "cargo-app"
 version = "0.1.0"
-dependencies = ["cargo-external 2.0.0 (registry+https://example.test/index)"]
+dependencies = [
+ "cargo-external 2.0.0 (git+https://example.test/repository#abcdef0)",
+ "cargo-external 2.0.0 (registry+https://example.test/index)",
+]
+
+[[package]]
+name = "cargo-external"
+version = "2.0.0"
+source = "git+https://example.test/repository#abcdef0"
 
 [[package]]
 name = "cargo-external"
@@ -7811,6 +7892,10 @@ source = { registry = "https://example.test/simple" }
             version: "0.1.0",
             manifest_path: join(cargoDirectory, "Cargo.toml"),
             dependencies: [
+              {
+                name: "cargo-external",
+                source: "git+https://example.test/repository#abcdef0",
+              },
               {
                 name: "cargo-external",
                 source: "registry+https://example.test/index",
@@ -7903,7 +7988,16 @@ source = { registry = "https://example.test/simple" }
         data: {
           externalDependencies: {
             items: [
-              { name: "cargo-external", version: "2.0.0" },
+              {
+                name: "cargo-external",
+                source: "git+https://example.test/repository#abcdef0",
+                version: "2.0.0",
+              },
+              {
+                name: "cargo-external",
+                source: "registry+https://example.test/index",
+                version: "2.0.0",
+              },
               { name: "js-external", version: "1.0.0" },
               { name: "uv-external", version: "3.0.0" },
             ],
@@ -8662,7 +8756,13 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
         expect(body).toEqual({
           data: {
             externalDependencies: {
-              items: [{ name: "external-package", version: "2.0.0" }],
+              items: [
+                {
+                  name: "external-package",
+                  source: "registry+https://example.test/index",
+                  version: "2.0.0",
+                },
+              ],
             },
           },
         });

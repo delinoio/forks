@@ -107,8 +107,6 @@ rows:
       - --no-cache
       - --dry-run
       - --graph
-      - --daemon
-      - --no-daemon
       - --profile
       - --anon-profile
       - --summarize
@@ -140,6 +138,15 @@ rows:
     status: planned
     variants:
       - --cache-workers
+    source: black-box-help-and-issue-3
+  - id: cli.run-daemon-options
+    category: option
+    subject: run daemon preference switches
+    targetGate: 3
+    status: planned
+    variants:
+      - --daemon
+      - --no-daemon
     source: black-box-help-and-issue-3
   - id: cli.core-run-options
     category: option

@@ -428,14 +428,19 @@ const daemonRequest = (
   paths: DaemonPaths,
   method: DaemonMethodType,
   params?: unknown,
+  timeoutMilliseconds?: number,
 ) =>
   Effect.gen(function* () {
     const daemon = yield* DaemonService;
-    return yield* daemon.request(paths.socket, {
-      id: `${method}-0`,
-      method,
-      params,
-    });
+    return yield* daemon.request(
+      paths.socket,
+      {
+        id: `${method}-0`,
+        method,
+        params,
+      },
+      timeoutMilliseconds,
+    );
   });
 
 const daemonStatus = (paths: DaemonPaths) =>
@@ -455,6 +460,7 @@ const daemonStatus = (paths: DaemonPaths) =>
 
 const daemonHealthy = (
   paths: DaemonPaths,
+  timeoutMilliseconds?: number,
 ): Effect.Effect<
   boolean,
   BoundaryError,
@@ -463,9 +469,12 @@ const daemonHealthy = (
   Effect.gen(function* () {
     const pid = yield* readPid(paths.pid);
     if (!(yield* isAlive(pid))) return false;
-    const hello = yield* daemonRequest(paths, DaemonMethod.hello, {
-      version: "2.0.0",
-    }).pipe(Effect.either);
+    const hello = yield* daemonRequest(
+      paths,
+      DaemonMethod.hello,
+      { version: "2.0.0" },
+      timeoutMilliseconds,
+    ).pipe(Effect.either);
     return hello._tag === "Right" && hello.right.error === undefined;
   });
 
@@ -489,6 +498,7 @@ export const daemonIsRunning = (
 const staleStartLockMilliseconds = 30_000;
 const daemonStartupAttempts = 100;
 const daemonStartupPollMilliseconds = 50;
+const daemonStartupTimeoutMilliseconds = 5_000;
 
 export const watcherPathsMatch = (
   left: string,
@@ -587,14 +597,21 @@ const waitForDaemonHealthy = (
 > =>
   Effect.gen(function* () {
     const clock = yield* ClockService;
+    const deadline = (yield* clock.now) + daemonStartupTimeoutMilliseconds;
     for (let attempt = 0; attempt < daemonStartupAttempts; attempt += 1) {
+      const now = yield* clock.now;
+      if (now >= deadline) return false;
       const currentPid = yield* readPid(paths.pid);
       if (currentPid !== undefined && currentPid !== expectedPid) return false;
       if (currentPid === expectedPid) {
         if (!(yield* isAlive(currentPid))) return false;
-        if (yield* daemonHealthy(paths)) return true;
+        if (yield* daemonHealthy(paths, Math.max(1, deadline - now))) {
+          return true;
+        }
       }
-      yield* clock.sleep(daemonStartupPollMilliseconds);
+      const remaining = deadline - (yield* clock.now);
+      if (remaining <= 0) return false;
+      yield* clock.sleep(Math.min(daemonStartupPollMilliseconds, remaining));
     }
     return false;
   });

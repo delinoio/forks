@@ -44,6 +44,7 @@ import {
 } from "../hash/task-hash.js";
 import {
   type LockfilePackage,
+  lockfilePackageIdentity,
   maximumLockfileBytes,
   prepareLockfilePackageClosure,
 } from "../repository/lockfiles.js";
@@ -1191,9 +1192,10 @@ const repositoryQueryRoot = (
     }),
     externalDependencies: async () =>
       list(
-        (await loadExternalDependencies()).map(({ name, version }) => ({
+        (await loadExternalDependencies()).map(({ name, version, source }) => ({
           name,
           version,
+          ...(source === undefined ? {} : { source }),
         })),
       ),
     file: async ({ path }: { readonly path: string }) => {
@@ -1383,14 +1385,14 @@ const executeGraphql = (
                 });
                 for (const dependency of resolved) {
                   dependencies.set(
-                    `${dependency.name}@${dependency.version}`,
+                    lockfilePackageIdentity(dependency),
                     dependency,
                   );
                 }
               }
               return [...dependencies.values()].sort((left, right) =>
-                `${left.name}@${left.version}`.localeCompare(
-                  `${right.name}@${right.version}`,
+                lockfilePackageIdentity(left).localeCompare(
+                  lockfilePackageIdentity(right),
                 ),
               );
             }).pipe(Effect.provideService(FileSystemService, fileSystem)),

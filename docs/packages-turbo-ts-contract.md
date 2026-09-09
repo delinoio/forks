@@ -198,6 +198,8 @@ compiler identity is not modeled. Effective `RUSTC_WRAPPER` and
 the wrapper executables are not repository hash inputs.
 Environment-name selection follows Windows case-insensitive semantics for run
 options, affected-range controls, hashing, and strict task execution.
+Global dependency globs likewise match repository paths case-insensitively on
+Windows while retaining the discovered path spelling in hash inputs.
 Repository discovery records the resolved root lockfile path. Gate 3 validates
 all modeled lockfile formats before prune, rewrites pnpm importer/package/
 snapshot closure, npm workspace package indexes and version 2 legacy dependency
@@ -371,6 +373,9 @@ other unsupported filesystem entry skips cache publication without changing a
 successful task result. A symlink that is an untraversed ancestor of a positive
 output pattern also skips publication so a log-only artifact cannot represent
 missing declared outputs.
+The repository-root `.git` entry is never collected as a task output, whether
+it is a directory or a linked-worktree metadata file selected by a broad root
+output glob.
 uv packages are discovered from the root
 `pyproject.toml` workspace root and member globs after applying workspace
 exclusions; unrelated Python projects and `.venv` trees are ignored.
@@ -424,6 +429,10 @@ repository-contained member exposes the requested verification task and their
 interactive, output-log, and persistent runtime settings are compatible;
 otherwise participating members retain package targeting so task exclusions
 and runtime overrides are honored.
+Cargo production dependency closure includes normal and build dependencies but
+not development-only dependencies. uv production closure includes project and
+optional dependencies but excludes PEP 735 dependency groups and legacy
+`tool.uv.dev-dependencies`; ordinary dependency graphs retain all of them.
 Members of an enclosing Cargo workspace outside
 the repository always retain package targeting and bypass caching, as do task
 scopes whose hashes depend on them, because their external Cargo controls are
@@ -523,6 +532,9 @@ refresh the repository model before ordinary ignore and output suppression,
 including when the control is intentionally untracked and ignored. Other ignore
 and output filtering still occurs before broad manifest or configuration refresh
 classification, so unrelated generated manifests cannot cause a watch loop.
+The active JavaScript lockfile, each Cargo package's owning workspace
+`Cargo.lock`, and each uv package's ancestor `uv.lock` candidates are active
+controls under the same rule.
 Changes to an ignore file reload the matcher before stale ignore rules are
 applied and remain user-visible triggers.
 Git-ignore matching does not suppress files already tracked in the Git index or
@@ -612,9 +624,9 @@ responses still require valid gRPC framing.
 Requests that exceed the transport queue receive an immediate protocol error
 instead of displacing an older request. Unsupported-method and queue-capacity
 responses run in the server Scope so endpoint teardown interrupts pending
-response work. The server processes up to 64 client connections concurrently,
-so a slow request or response does not block health and lifecycle calls on
-other connections.
+response work. The server admits at most 64 active HTTP/2 request streams before
+buffering their bodies, including streams whose request body has not ended, so
+slow request or response work cannot create unbounded pending stream state.
 Package discovery reloads the repository model for each request so workspace
 additions, removals, and renames are visible without a daemon restart.
 Custom root Turbo configuration paths are retained by lifecycle commands,
@@ -653,6 +665,9 @@ Status and logs health checks clean stale PID and socket state even when the
 recorded PID has been reused by an unrelated live process. Start, stop, clean,
 and restart preserve lifecycle state and fail retryably when the recorded PID
 remains alive but never completes a health handshake.
+Daemon startup health polling has a five-second aggregate deadline and passes
+the remaining budget to each transport request, keeping the lifecycle lock hold
+well below its 30-second stale lease.
 After a successful health handshake, a subsequent status transport or response
 failure preserves the live daemon's PID, socket, and active-log state and is
 reported to the caller for both status and logs commands.
@@ -735,7 +750,8 @@ selection. Package-predicate variables are limited to 512 nodes and a depth of
 64 active requests, rejects excess requests with HTTP 503 without buffering
 their bodies, and closes HTTP handles in Scope;
 oversized requests receive
-HTTP 413 without resetting the connection. Client resets and request errors
+HTTP 413 without resetting the connection and retain their active-request slot
+until the request body ends or aborts. Client resets and request errors
 during body upload are isolated before handler execution, and disconnects or
 server shutdown interrupt in-flight resolver effects and their subprocesses.
 Top-level package predicates are
@@ -748,7 +764,9 @@ transitive workspace dependency closure for both query results and external
 dependency hashes by their lockfile workspace identity rather than their bare
 package name, so same-named registry packages remain external. npm root,
 workspace, and workspace-link records are excluded from external package
-results. Yarn Berry entries report their installed
+results. External dependency identity and query results preserve lockfile
+source when present, so equal names and versions from different Cargo sources
+remain distinct. Yarn Berry entries report their installed
 `version` rather than descriptor ranges. Lockfile reading and parsing are
 deferred until the `externalDependencies` field is selected, so independent
 fields remain available if the discovered lockfile later becomes unavailable
@@ -824,6 +842,10 @@ pruning retains development dependency closure. Reserved package-tree
 directories use case-insensitive name matching on Windows. Production npm,
 pnpm, Yarn, and text Bun pruning removes development dependency edges and their
 package closure, including development-marked trees in legacy npm v1 lockfiles.
+Production Cargo and uv pruning uses the corresponding production closures:
+Cargo development-only edges and uv dependency-group or legacy development
+edges are omitted, while Cargo build dependencies and uv project or optional
+dependencies remain selected.
 Production pruning also removes `devDependencies` from selected JavaScript
 workspace manifests in the ordinary or Docker full tree. A contained relative
 workspace-manifest symlink remains a symlink in ordinary, Docker full, and
