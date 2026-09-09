@@ -2546,6 +2546,8 @@ const daemonLayer = Layer.succeed(DaemonService, {
     }),
 });
 
+const maximumLoopbackHttpRequests = 64;
+
 const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
   serve: (requestedPort, handler) =>
     Effect.gen(function* () {
@@ -2558,7 +2560,21 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
           },
           BoundaryError
         >((resume) => {
+          let activeRequests = 0;
           const server = createHttpServer((request, response) => {
+            if (activeRequests >= maximumLoopbackHttpRequests) {
+              request.resume();
+              response.writeHead(503, { connection: "close" });
+              response.end();
+              return;
+            }
+            activeRequests += 1;
+            let requestReleased = false;
+            const releaseRequest = (): void => {
+              if (requestReleased) return;
+              requestReleased = true;
+              activeRequests -= 1;
+            };
             const chunks: Array<Buffer> = [];
             let size = 0;
             let oversized = false;
@@ -2568,6 +2584,7 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
               | undefined;
             const interruptHandler = (): void => {
               connectionClosed = true;
+              releaseRequest();
               if (handlerFiber !== undefined) {
                 Effect.runFork(Fiber.interrupt(handlerFiber));
               }
@@ -2575,6 +2592,7 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
             request.once("aborted", interruptHandler);
             request.once("error", interruptHandler);
             response.once("close", interruptHandler);
+            response.once("finish", releaseRequest);
             request.on("data", (chunk: Buffer) => {
               if (oversized || connectionClosed) return;
               size += chunk.length;
@@ -2691,7 +2709,14 @@ const runtimeProfileLayer = Layer.succeed(RuntimeProfileService, {
     Effect.tryPromise({
       try: async () => {
         await mkdir(dirname(path), { recursive: true });
-        writeHeapSnapshot(path);
+        const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+        try {
+          writeHeapSnapshot(temporary);
+          await rename(temporary, path);
+        } catch (cause) {
+          await rm(temporary, { force: true }).catch(() => undefined);
+          throw cause;
+        }
       },
       catch: filesystemError,
     }),

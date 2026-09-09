@@ -466,7 +466,9 @@ not probe excluded or unrelated nested manifests. Combined workspace task
 hashes are propagated into every downstream task hash using the same effective
 task environment as the initial hash computation. JSON dry-run and run summary
 input maps for a grouped task include hashes from every workspace member under
-member-qualified paths relative to the Cargo workspace.
+member-qualified paths relative to the Cargo workspace. Text dry-runs count
+those inputs only after the same qualification, so distinct member files are
+not deduplicated by their package-relative names.
 Cargo builds with colliding synthesized binary destinations bypass caching,
 including when task configuration explicitly enables it.
 Synthesized Cargo binary outputs cover the extensionless executable plus
@@ -712,7 +714,9 @@ plain names that retain every matching ecosystem scope and qualified identities
 that select one scope. Cyclic package graphs never include the starting package
 in its own dependency or dependent relationship collections.
 Boundary diagnostics evaluate root, package, and tag dependency and dependent
-permissions against manifest and configured implicit package dependencies. Package-graph
+permissions against manifest and configured implicit package dependencies.
+When a package has no local Turbo configuration, diagnostics point to its
+owning `package.json`, `Cargo.toml`, or `pyproject.toml` manifest. Package-graph
 center selection retains the named package and its
 direct dependencies, rejects unknown centers, package predicates narrow the
 returned nodes, and graph edges retain the selected nodes' dependency context.
@@ -727,8 +731,9 @@ ls`, and `ls` share repository discovery and stable ordering. GraphQL documents
 are limited to 4,096 lexer tokens, 512 expanded selections, and a field depth
 of 16 before resolver execution; fragment spreads count each expanded
 selection. Package-predicate variables are limited to 512 nodes and a depth of
-16 before resolver execution. The server limits request bodies and closes HTTP
-handles in Scope;
+16 before resolver execution. The server limits request bodies, admits at most
+64 active requests, rejects excess requests with HTTP 503 without buffering
+their bodies, and closes HTTP handles in Scope;
 oversized requests receive
 HTTP 413 without resetting the connection. Client resets and request errors
 during body upload are isolated before handler execution, and disconnects or
@@ -885,10 +890,11 @@ applies to live and cached output. Summaries record
 the actual local or remote cache source and saved duration, and summaries and
 profiles use each task's scheduling timestamps. Generated profiles omit tasks
 that were never scheduled, while summary task entries represent them with a
-null `execution` value. Requested heap snapshots are written
-before task input hashes are computed so repository-contained snapshots cannot
-invalidate a cache key after hashing, and missing destination parent directories
-are created. Task summaries record the
+null `execution` value. Requested heap snapshots are published through a
+sibling temporary file and atomic rename before task input hashes are computed
+so repository-contained snapshots cannot invalidate a cache key after hashing,
+hard-linked destinations cannot redirect truncation into task controls, and
+missing destination parent directories are created. Task summaries record the
 resolved transitive external-dependency closure hash for graph-bearing npm,
 pnpm, Yarn, Cargo, uv, Bun, Aube, and Nub lockfiles and the actual encoded log
 path, including collision-qualified identifiers and alternate execution scopes.

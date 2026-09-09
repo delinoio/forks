@@ -4,6 +4,7 @@ import {
   appendFile,
   chmod,
   cp,
+  link,
   mkdir,
   mkdtemp,
   readdir,
@@ -1553,6 +1554,88 @@ describe("repository workflow gate", () => {
     }
   });
 
+  it("reruns task-aware watch entrypoints for mixed-case Git ignore paths on Windows", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-watch-gitignore-case-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const configurationPath = join(directory, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.futureFlags = {
+        watchUsingTaskInputs: true,
+        strictTaskEntrypointSelection: true,
+      };
+      configuration.tasks = {
+        alpha: { cache: false, inputs: ["alpha.txt"] },
+        beta: { cache: false, inputs: ["beta.txt"] },
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      const manifestPath = join(directory, "packages/app/package.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.alpha = "node -e \"console.log('alpha')\"";
+      manifest.scripts.beta = "node -e \"console.log('beta')\"";
+      await writeFile(
+        manifestPath,
+        `${JSON.stringify(manifest, undefined, 2)}\n`,
+      );
+
+      let stdout = "";
+      const exitCode = await Effect.runPromise(
+        Effect.gen(function* () {
+          const environment = yield* EnvironmentService;
+          const terminal = yield* TerminalService;
+          return yield* executeRun(
+            parseRunArguments([
+              "run",
+              "alpha",
+              "beta",
+              "--filter=synthetic-app",
+              "--no-cache",
+              "--dry=json",
+              "--cwd",
+              directory,
+            ]),
+            { changedPaths: [join(directory, ".GITIGNORE")] },
+          ).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(EnvironmentService, {
+                  ...environment,
+                  platform: Effect.succeed("win32" as const),
+                }),
+                Layer.succeed(TerminalService, {
+                  ...terminal,
+                  writeStdout: (text) =>
+                    Effect.sync(() => {
+                      stdout += text;
+                    }),
+                }),
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(exitCode).toBe(0);
+      expect(
+        (
+          JSON.parse(stdout) as {
+            readonly tasks: ReadonlyArray<{ readonly taskId: string }>;
+          }
+        ).tasks.map(({ taskId }) => taskId),
+      ).toEqual(["synthetic-app#alpha", "synthetic-app#beta"]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("matches configured watch outputs case-insensitively on Windows", async () => {
     const directory = await mkdtemp(
       join(tmpdir(), "turbo-ts-watch-output-case-"),
@@ -2226,6 +2309,36 @@ describe("repository workflow gate", () => {
     }
   }, 30_000);
 
+  it("publishes heap snapshots without truncating hard-linked task controls", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-heap-link-"));
+    try {
+      await prepareFixture(directory);
+      const manifestPath = join(directory, "packages/app/package.json");
+      const heapPath = join(directory, "packages/app/run.heapsnapshot");
+      const originalManifest = await readFile(manifestPath, "utf8");
+      await link(manifestPath, heapPath);
+
+      await execFilePromise(process.execPath, [
+        candidate,
+        "run",
+        "build",
+        "--filter=synthetic-app",
+        "--no-cache",
+        "--heap=packages/app/run.heapsnapshot",
+        "--cwd",
+        directory,
+      ]);
+
+      expect(await readFile(manifestPath, "utf8")).toBe(originalManifest);
+      expect((await stat(heapPath)).ino).not.toBe(
+        (await stat(manifestPath)).ino,
+      );
+      expect((await stat(heapPath)).size).toBeGreaterThan(0);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("marks a repository with one child workspace as a monorepo", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-monorepo-"));
     try {
@@ -2890,6 +3003,187 @@ describe("repository workflow gate", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 20_000);
+
+  it("reports polyglot boundary errors against owning manifests", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-polyglot-boundaries-"),
+    );
+    const cargoWorkspaceDirectory = join(directory, "rust");
+    const cargoOwnerDirectory = join(cargoWorkspaceDirectory, "owner");
+    const cargoSubjectDirectory = join(cargoWorkspaceDirectory, "subject");
+    const uvOwnerDirectory = join(directory, "python/owner");
+    const uvSubjectDirectory = join(directory, "python/subject");
+    const cargoOwnerId = `path+file://${cargoOwnerDirectory}#cargo-owner@0.1.0`;
+    const cargoSubjectId = `path+file://${cargoSubjectDirectory}#cargo-subject@0.1.0`;
+    try {
+      await prepareFixture(directory);
+      await writeFile(
+        join(directory, "turbo.json"),
+        `${JSON.stringify(
+          {
+            futureFlags: {
+              experimentalCargoWorkspaces: true,
+              experimentalPythonWorkspaces: true,
+            },
+            tasks: {},
+          },
+          undefined,
+          2,
+        )}\n`,
+      );
+      await mkdir(cargoOwnerDirectory, { recursive: true });
+      await mkdir(cargoSubjectDirectory, { recursive: true });
+      await writeFile(
+        join(cargoWorkspaceDirectory, "Cargo.toml"),
+        '[workspace]\nmembers = ["owner", "subject"]\nresolver = "3"\n',
+      );
+      await writeFile(
+        join(cargoWorkspaceDirectory, "Cargo.lock"),
+        "version = 4\n",
+      );
+      await writeFile(
+        join(cargoOwnerDirectory, "Cargo.toml"),
+        '[package]\nname = "cargo-owner"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\ncargo-subject = { path = "../subject" }\n',
+      );
+      await writeFile(
+        join(cargoOwnerDirectory, "turbo.json"),
+        `${JSON.stringify({
+          extends: ["//"],
+          boundaries: { dependencies: { allow: ["approved"] } },
+          tasks: {},
+        })}\n`,
+      );
+      await writeFile(
+        join(cargoSubjectDirectory, "Cargo.toml"),
+        '[package]\nname = "cargo-subject"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+
+      await mkdir(uvOwnerDirectory, { recursive: true });
+      await mkdir(uvSubjectDirectory, { recursive: true });
+      await writeFile(
+        join(directory, "pyproject.toml"),
+        '[tool.uv.workspace]\nmembers = ["python/*"]\n',
+      );
+      await writeFile(
+        join(uvOwnerDirectory, "pyproject.toml"),
+        '[project]\nname = "uv-owner"\nversion = "0.1.0"\ndependencies = ["uv-subject"]\n\n[tool.uv.sources]\nuv-subject = { workspace = true }\n',
+      );
+      await writeFile(
+        join(uvOwnerDirectory, "turbo.json"),
+        `${JSON.stringify({
+          extends: ["//"],
+          boundaries: { dependencies: { allow: ["approved"] } },
+          tasks: {},
+        })}\n`,
+      );
+      await writeFile(
+        join(uvSubjectDirectory, "pyproject.toml"),
+        '[project]\nname = "uv-subject"\nversion = "0.1.0"\ndependencies = []\n',
+      );
+
+      const cargoMetadata = JSON.stringify({
+        workspace_root: cargoWorkspaceDirectory,
+        workspace_members: [cargoOwnerId, cargoSubjectId],
+        target_directory: join(cargoWorkspaceDirectory, "target"),
+        packages: [
+          {
+            id: cargoOwnerId,
+            name: "cargo-owner",
+            version: "0.1.0",
+            manifest_path: join(cargoOwnerDirectory, "Cargo.toml"),
+            dependencies: [
+              {
+                name: "cargo-subject",
+                path: cargoSubjectDirectory,
+              },
+            ],
+            targets: [{ kind: ["lib"], name: "cargo_owner" }],
+          },
+          {
+            id: cargoSubjectId,
+            name: "cargo-subject",
+            version: "0.1.0",
+            manifest_path: join(cargoSubjectDirectory, "Cargo.toml"),
+            dependencies: [],
+            targets: [{ kind: ["lib"], name: "cargo_subject" }],
+          },
+        ],
+      });
+      let output = "";
+      const exitCode = await Effect.runPromise(
+        Effect.gen(function* () {
+          const processService = yield* ProcessService;
+          const terminal = yield* TerminalService;
+          return yield* executeQuery({
+            cwd: directory,
+            query: "{ boundaries { errors } }",
+            schema: false,
+            port: 8000,
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(ProcessService, {
+                  ...processService,
+                  run: (request) => {
+                    if (
+                      request.command === "cargo" &&
+                      request.args[0] === "metadata"
+                    ) {
+                      return Effect.succeed({
+                        exitCode: 0,
+                        stdout: cargoMetadata,
+                        stderr: "",
+                        combinedOutput: cargoMetadata,
+                      });
+                    }
+                    if (request.command === "rustc") {
+                      const identity =
+                        "rustc 1.96.0-nightly\nhost: synthetic-target-triple\n";
+                      return Effect.succeed({
+                        exitCode: 0,
+                        stdout: identity,
+                        stderr: "",
+                        combinedOutput: identity,
+                      });
+                    }
+                    return processService.run(request);
+                  },
+                }),
+                Layer.succeed(TerminalService, {
+                  ...terminal,
+                  writeStdout: (text) =>
+                    Effect.sync(() => {
+                      output += text;
+                    }),
+                }),
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(exitCode).toBe(0);
+      const errors = (
+        JSON.parse(output) as {
+          readonly data: {
+            readonly boundaries: {
+              readonly errors: ReadonlyArray<{
+                readonly import: string;
+                readonly path: string;
+              }>;
+            };
+          };
+        }
+      ).data.boundaries.errors;
+      expect(
+        Object.fromEntries(errors.map((error) => [error.import, error.path])),
+      ).toMatchObject({
+        "cargo-subject": "rust/subject/Cargo.toml",
+        "uv-subject": "python/subject/pyproject.toml",
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
 
   it(evidenceId.repositoryProtocol, async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-"));
@@ -8473,8 +8767,10 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
   }, 15_000);
 
   it("defers GraphQL task-graph validation until task data is selected", async () => {
+    const fixtureParent = join(repositoryRoot, ".turbo");
+    await mkdir(fixtureParent, { recursive: true });
     const directory = await mkdtemp(
-      join(tmpdir(), "turbo-ts-query-task-cycle-"),
+      join(fixtureParent, "turbo-ts-query-task-cycle-"),
     );
     try {
       await prepareFixture(directory);
@@ -8488,6 +8784,20 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
         configurationPath,
         `${JSON.stringify(configuration, undefined, 2)}\n`,
       );
+      const git = (...arguments_: ReadonlyArray<string>) =>
+        execFilePromise("/usr/bin/git", [
+          "-C",
+          directory,
+          "-c",
+          "user.email=synthetic@example.test",
+          "-c",
+          "user.name=Synthetic Fixture",
+          ...arguments_,
+        ]);
+      await git("init", "--quiet");
+      await git("add", ".");
+      await git("commit", "--quiet", "-m", "fixture");
+      await git("branch", "-M", "main");
 
       const independent = await execFilePromise(process.execPath, [
         candidate,
@@ -8519,10 +8829,44 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
       );
       expect(taskQuery.failed).toBe(true);
       expect(taskQuery.stdout).toContain("cycle detected at");
+
+      const affectedPackages = await execFilePromise(process.execPath, [
+        candidate,
+        "query",
+        "affected",
+        "--packages",
+        "--cwd",
+        directory,
+      ]).catch(
+        (error: { readonly stdout?: string; readonly stderr?: string }) => {
+          throw new Error(`${error.stdout ?? ""}${error.stderr ?? ""}`);
+        },
+      );
+      expect(JSON.parse(affectedPackages.stdout)).toMatchObject({
+        data: { affectedPackages: { length: 0 } },
+      });
+
+      const affectedTasks = await execFilePromise(process.execPath, [
+        candidate,
+        "query",
+        "affected",
+        "--tasks",
+        "build",
+        "--cwd",
+        directory,
+      ]).then(
+        (result) => ({ failed: false, output: result.stdout }),
+        (error: { readonly stdout?: string; readonly stderr?: string }) => ({
+          failed: true,
+          output: `${error.stdout ?? ""}${error.stderr ?? ""}`,
+        }),
+      );
+      expect(affectedTasks.failed).toBe(true);
+      expect(affectedTasks.output).toContain("cycle detected at");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  });
+  }, 15_000);
 
   it("excludes packages from their own cyclic relationship closures", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-query-cycle-"));

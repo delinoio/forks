@@ -4604,6 +4604,13 @@ describe("core CLI execution", () => {
       });
       expect(groupedTask?.inputs).not.toHaveProperty("Cargo.toml");
       expect(groupedTask?.inputs).not.toHaveProperty("src/lib.rs");
+      const textDryRun = await run(
+        process.execPath,
+        [candidateEntrypoint, "run", "test", "--cwd", directory, "--dry=text"],
+        repositoryRoot,
+      );
+      expect(textDryRun.exitCode, textDryRun.stderr).toBe(0);
+      expect(textDryRun.stdout).toContain("Inputs Files Considered = 7");
       const args = [
         candidateEntrypoint,
         "run",

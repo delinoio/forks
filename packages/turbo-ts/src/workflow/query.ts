@@ -727,12 +727,18 @@ const boundaryRuleDiagnostics = (
   subjectTags: ReadonlyArray<string>,
   permissions: Permissions,
 ): ReadonlyArray<BoundaryDiagnostic> => {
+  const manifestName =
+    subject.manager === "cargo"
+      ? "Cargo.toml"
+      : subject.manager === "uv"
+        ? "pyproject.toml"
+        : "package.json";
   const path = relativePath(
     repository.root,
     subject === repository.rootPackage
       ? repository.rootConfiguration.path
       : (subject.configurationPath ??
-          joinPath(subject.directory, "package.json")),
+          joinPath(subject.directory, manifestName)),
   );
   const deniedTags = subjectTags.filter((tag) =>
     permissions.deny?.includes(tag),
@@ -1788,44 +1794,46 @@ export const executeQueryAffected = (
       package: { name: packageModel.name },
       reason: taskReason(packageModel, name, dependsOn, node, graph),
     });
-    const requestedTaskGraph = repositoryTaskGraph(
-      repository,
-      requested.size === 0 ? undefined : [...requested],
-    );
-    const requestedTaskIds = new Set(requestedTaskGraph.entrypoints);
     const taskItems = (
       options.packages
         ? []
-        : requested.size === 0
-          ? [...affected.values()].flatMap((packageModel) =>
-              Object.keys(packageModel.scripts).map((name) => {
-                const node = requestedTaskGraph.nodes.get(
-                  `${packageModel.identity}#${name}`,
-                );
-                return taskItem(
-                  packageModel,
-                  name,
-                  node?.definition.dependsOn ?? [],
-                  node,
-                  requestedTaskGraph,
-                );
-              }),
-            )
-          : [...requestedTaskGraph.nodes.values()]
-              .filter(
-                (node) =>
-                  affected.has(node.package.identity) &&
-                  requestedTaskIds.has(node.id),
-              )
-              .map((node) =>
-                taskItem(
-                  node.package,
-                  node.task,
-                  node.definition.dependsOn ?? [],
-                  node,
-                  requestedTaskGraph,
-                ),
-              )
+        : (() => {
+            const requestedTaskGraph = repositoryTaskGraph(
+              repository,
+              requested.size === 0 ? undefined : [...requested],
+            );
+            const requestedTaskIds = new Set(requestedTaskGraph.entrypoints);
+            return requested.size === 0
+              ? [...affected.values()].flatMap((packageModel) =>
+                  Object.keys(packageModel.scripts).map((name) => {
+                    const node = requestedTaskGraph.nodes.get(
+                      `${packageModel.identity}#${name}`,
+                    );
+                    return taskItem(
+                      packageModel,
+                      name,
+                      node?.definition.dependsOn ?? [],
+                      node,
+                      requestedTaskGraph,
+                    );
+                  }),
+                )
+              : [...requestedTaskGraph.nodes.values()]
+                  .filter(
+                    (node) =>
+                      affected.has(node.package.identity) &&
+                      requestedTaskIds.has(node.id),
+                  )
+                  .map((node) =>
+                    taskItem(
+                      node.package,
+                      node.task,
+                      node.definition.dependsOn ?? [],
+                      node,
+                      requestedTaskGraph,
+                    ),
+                  );
+          })()
     ).sort((left, right) => left.fullName.localeCompare(right.fullName));
     const items = options.packages ? packageItems : taskItems;
     const key = options.packages ? "affectedPackages" : "affectedTasks";

@@ -548,6 +548,69 @@ describe("Effect foundation", () => {
     }
   });
 
+  it("bounds concurrent loopback request buffering", async () => {
+    let publishPort: ((port: number) => void) | undefined;
+    const port = new Promise<number>((resolve) => {
+      publishPort = resolve;
+    });
+    let handledRequests = 0;
+    const serverFiber = Effect.runFork(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const http = yield* LoopbackHttpService;
+          const server = yield* http.serve(0, () =>
+            Effect.sync(() => {
+              handledRequests += 1;
+              return { status: 200, body: "ok" };
+            }),
+          );
+          publishPort?.(server.port);
+          yield* Effect.never;
+        }),
+      ).pipe(Effect.provide(nodeFoundationLayer)),
+    );
+    const serverPort = await port;
+    const sockets: Array<ReturnType<typeof createConnection>> = [];
+    const openPartialRequest = () =>
+      new Promise<ReturnType<typeof createConnection>>((resolve, reject) => {
+        const socket = createConnection(
+          { host: "127.0.0.1", port: serverPort },
+          () => {
+            socket.write(
+              "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048576\r\n\r\nx",
+              () => resolve(socket),
+            );
+          },
+        );
+        socket.once("error", reject);
+      });
+    try {
+      for (let index = 0; index < 64; index += 1) {
+        sockets.push(await openPartialRequest());
+      }
+      await delay(100);
+      const rejected = await fetch(`http://127.0.0.1:${serverPort}`, {
+        method: "POST",
+        body: "complete",
+      });
+      expect(rejected.status).toBe(503);
+      expect(handledRequests).toBe(0);
+
+      sockets.pop()!.destroy();
+      await delay(100);
+      const recovered = await fetch(`http://127.0.0.1:${serverPort}`, {
+        method: "POST",
+        body: "complete",
+      });
+      expect(recovered.status).toBe(200);
+      expect(await recovered.text()).toBe("ok");
+      expect(handledRequests).toBe(1);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await Effect.runPromise(Fiber.interrupt(serverFiber));
+    }
+  });
+
   it("removes undefined environment overrides before spawning", async () => {
     const environmentName = "TURBO_TS_UNDEFINED_OVERRIDE_TEST";
     const previousValue = process.env[environmentName];

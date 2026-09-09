@@ -705,9 +705,14 @@ const affectedPackagesFromChangedFiles = (
   const rootConfigurationChanged = changedFiles.includes(
     relativePath(repository.root, repository.rootConfiguration.path),
   );
-  const gitIgnoreChanged = changedFiles.some(
-    (path) => path === ".gitignore" || path.endsWith("/.gitignore"),
-  );
+  const gitIgnoreChanged = changedFiles.some((path) => {
+    const comparablePath = windowsPathSeparators
+      ? normalizePath(path, true).toLowerCase()
+      : path;
+    return (
+      comparablePath === ".gitignore" || comparablePath.endsWith("/.gitignore")
+    );
+  });
   const rootChanged =
     globalDependencyChanged ||
     rootConfigurationChanged ||
@@ -3162,6 +3167,15 @@ const applyCargoWorkspaceHashes = (
     for (const [id, scope] of scopes) {
       if (scope.kind !== "cargo-workspace") continue;
       const representative = hashes.get(id)!;
+      const qualifyInputPath = (member: TaskNode, path: string): string => {
+        const memberDirectory = relativePath(
+          scope.directory,
+          member.package.directory,
+        );
+        return memberDirectory === "." || path.startsWith("$TURBO_ROOT$/")
+          ? path
+          : joinPath(memberDirectory, path);
+      };
       const members = scope.members.map((member) => {
         const result = hashes.get(member.id)!;
         return [member.id, result.hash] as const;
@@ -3171,25 +3185,18 @@ const applyCargoWorkspaceHashes = (
         hash: cargoWorkspaceHash(members),
         inputFiles: [
           ...new Set(
-            scope.members.flatMap(
-              (member) => hashes.get(member.id)?.inputFiles ?? [],
+            scope.members.flatMap((member) =>
+              (hashes.get(member.id)?.inputFiles ?? []).map((path) =>
+                qualifyInputPath(member, path),
+              ),
             ),
           ),
         ].sort(),
         inputFileHashes: Object.fromEntries(
           scope.members.flatMap((member) => {
-            const memberDirectory = relativePath(
-              scope.directory,
-              member.package.directory,
-            );
             return Object.entries(
               hashes.get(member.id)?.inputFileHashes ?? {},
-            ).map(([path, hash]) => [
-              memberDirectory === "." || path.startsWith("$TURBO_ROOT$/")
-                ? path
-                : joinPath(memberDirectory, path),
-              hash,
-            ]);
+            ).map(([path, hash]) => [qualifyInputPath(member, path), hash]);
           }),
         ),
       });
