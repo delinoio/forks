@@ -733,6 +733,15 @@ describe("repository workflow gate", () => {
       json: true,
     });
     expect(
+      parseDaemonArguments(["start", "--idle-time=2147483647ms"])
+        .idleMilliseconds,
+    ).toBe(2_147_483_647);
+    for (const idleTime of ["30d", "2147483648ms", `${"9".repeat(400)}ms`]) {
+      expect(() =>
+        parseDaemonArguments(["start", `--idle-time=${idleTime}`]),
+      ).toThrow(`invalid idle time: ${idleTime}`);
+    }
+    expect(
       parsePruneArguments(["app", "--docker", "--production"]),
     ).toMatchObject({ scopes: ["app"], docker: true, production: true });
 
@@ -1721,6 +1730,46 @@ describe("repository workflow gate", () => {
         "structured log path must not replace a task log",
       );
       expect(await readFile(taskLogPath, "utf8")).toBe("existing task log\n");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("rejects structured-log output collisions case-insensitively on Windows", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-log-output-case-"),
+    );
+    const logPath = join(directory, "packages/app/Build/run.ndjson");
+    try {
+      await prepareFixture(directory);
+      await expect(
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const environment = yield* EnvironmentService;
+            return yield* executeRun(
+              parseRunArguments([
+                "run",
+                "build",
+                "--filter=synthetic-app",
+                "--no-cache",
+                "--log-file=packages/app/Build/run.ndjson",
+                "--cwd",
+                directory,
+              ]),
+            ).pipe(
+              Effect.provideService(EnvironmentService, {
+                ...environment,
+                platform: Effect.succeed("win32" as const),
+              }),
+            );
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).rejects.toThrow(
+        /structured log path must not match a declared task output/,
+      );
+      expect(
+        await readFile(logPath, "utf8").catch(() => undefined),
+      ).toBeUndefined();
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -5546,6 +5595,97 @@ describe("repository workflow gate", () => {
     }
   }, 30_000);
 
+  it("refreshes an ignored active workspace configuration", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-watch-ignored-config-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const configurationPath = join(directory, "packages/app/turbo.json");
+      await writeFile(
+        join(directory, ".gitignore"),
+        "packages/app/turbo.json\n",
+      );
+      const manifestPath = join(directory, "packages/app/package.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"require('node:fs').appendFileSync('build-runs.txt','build\\n')\"";
+      manifest.scripts.prepare =
+        "node -e \"require('node:fs').appendFileSync('prepare-runs.txt','prepare\\n')\"";
+      await writeFile(
+        manifestPath,
+        `${JSON.stringify(manifest, undefined, 2)}\n`,
+      );
+      const configurationChanges = Stream.fromEffect(
+        Effect.sleep("250 millis").pipe(
+          Effect.zipRight(
+            Effect.promise(async () => {
+              const configuration = JSON.parse(
+                await readFile(configurationPath, "utf8"),
+              ) as {
+                tasks: Record<
+                  string,
+                  {
+                    dependsOn?: ReadonlyArray<string>;
+                    outputs?: ReadonlyArray<string>;
+                  }
+                >;
+              };
+              configuration.tasks.build = {
+                ...configuration.tasks.build,
+                dependsOn: ["prepare"],
+              };
+              configuration.tasks.prepare = {};
+              await writeFile(
+                configurationPath,
+                `${JSON.stringify(configuration, undefined, 2)}\n`,
+              );
+            }),
+          ),
+          Effect.as({
+            path: configurationPath,
+            kind: "modify" as const,
+            entryKind: "file" as const,
+          }),
+        ),
+      );
+      await Effect.runPromise(
+        executeWatch(
+          parseWatchArguments([
+            "build",
+            "--filter=synthetic-app",
+            "--cwd",
+            directory,
+            "--no-cache",
+          ]),
+        ).pipe(
+          Effect.provide(
+            Layer.succeed(FileWatcherService, {
+              watch: (root) =>
+                root === directory ? configurationChanges : Stream.empty,
+            }),
+          ),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(
+        (await readFile(join(directory, "packages/app/build-runs.txt"), "utf8"))
+          .trim()
+          .split("\n"),
+      ).toEqual(["build", "build"]);
+      expect(
+        await readFile(
+          join(directory, "packages/app/prepare-runs.txt"),
+          "utf8",
+        ),
+      ).toBe("prepare\n");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("watches the effective Git index outside a linked worktree", async () => {
     const parent = await mkdtemp(join(tmpdir(), "turbo-ts-watch-worktree-"));
     const directory = join(parent, "linked");
@@ -6812,6 +6952,7 @@ describe("repository workflow gate", () => {
       const runQuery = async (
         query: string,
         metadataSize?: number,
+        metadataKind?: "directory" | "file" | "symlink" | "other",
       ): Promise<{
         readonly exitCode: number;
         readonly output: string;
@@ -6834,15 +6975,23 @@ describe("repository workflow gate", () => {
                   Layer.succeed(FileSystemService, {
                     ...fileSystem,
                     metadata: (path) =>
-                      fileSystem
-                        .metadata(path)
-                        .pipe(
-                          Effect.map((metadata) =>
-                            path === filePath && metadataSize !== undefined
-                              ? { ...metadata, size: metadataSize }
-                              : metadata,
-                          ),
+                      fileSystem.metadata(path).pipe(
+                        Effect.map((metadata) =>
+                          path === filePath &&
+                          (metadataSize !== undefined ||
+                            metadataKind !== undefined)
+                            ? {
+                                ...metadata,
+                                ...(metadataSize === undefined
+                                  ? {}
+                                  : { size: metadataSize }),
+                                ...(metadataKind === undefined
+                                  ? {}
+                                  : { kind: metadataKind }),
+                              }
+                            : metadata,
                         ),
+                      ),
                     readBytesRange: (path, offset, length) => {
                       if (path === filePath) rangeReads += 1;
                       return fileSystem.readBytesRange(path, offset, length);
@@ -6867,6 +7016,15 @@ describe("repository workflow gate", () => {
       expect(preflight.exitCode).toBe(1);
       expect(preflight.output).toContain("file exceeds the 1 MiB safety limit");
       expect(preflight.rangeReads).toBe(0);
+
+      const special = await runQuery(
+        '{ file(path: "large.txt") { path } }',
+        0,
+        "other",
+      );
+      expect(special.exitCode).toBe(1);
+      expect(special.output).toContain("file path is not a regular file");
+      expect(special.rangeReads).toBe(0);
 
       const growthRace = await runQuery(
         '{ file(path: "large.txt") { path } }',
@@ -6960,6 +7118,231 @@ describe("repository workflow gate", () => {
       await rm(directory, { force: true, recursive: true });
     }
   });
+
+  it("resolves GraphQL dependencies from each ecosystem's owning lockfile", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-query-owning-lockfiles-"),
+    );
+    const cargoWorkspaceDirectory = join(directory, "rust");
+    const cargoDirectory = join(cargoWorkspaceDirectory, "app");
+    const uvDirectory = join(directory, "python/app");
+    const cargoPackageId = `path+file://${cargoDirectory}#cargo-app@0.1.0`;
+    try {
+      await prepareFixture(directory);
+      const configurationPath = join(directory, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { futureFlags?: Record<string, boolean> };
+      configuration.futureFlags = {
+        ...configuration.futureFlags,
+        experimentalCargoWorkspaces: true,
+        experimentalPythonWorkspaces: true,
+      };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      const javascriptManifestPath = join(
+        directory,
+        "packages/app/package.json",
+      );
+      const javascriptManifest = JSON.parse(
+        await readFile(javascriptManifestPath, "utf8"),
+      ) as { dependencies: Record<string, string> };
+      javascriptManifest.dependencies["js-external"] = "1.0.0";
+      await writeFile(
+        javascriptManifestPath,
+        `${JSON.stringify(javascriptManifest, undefined, 2)}\n`,
+      );
+      const javascriptLockfile = join(directory, "pnpm-lock.yaml");
+      await writeFile(
+        javascriptLockfile,
+        `lockfileVersion: '9.0'
+importers:
+  .: {}
+  packages/app:
+    dependencies:
+      synthetic-library:
+        specifier: workspace:*
+        version: link:../library
+      js-external:
+        specifier: 1.0.0
+        version: 1.0.0
+  packages/library: {}
+packages:
+  js-external@1.0.0: {}
+snapshots:
+  js-external@1.0.0: {}
+`,
+      );
+      await mkdir(cargoDirectory, { recursive: true });
+      await writeFile(
+        join(cargoWorkspaceDirectory, "Cargo.toml"),
+        '[workspace]\nmembers = ["app"]\nresolver = "3"\n',
+      );
+      await writeFile(
+        join(cargoDirectory, "Cargo.toml"),
+        '[package]\nname = "cargo-app"\nversion = "0.1.0"\nedition = "2024"\n',
+      );
+      const cargoLockfile = join(cargoWorkspaceDirectory, "Cargo.lock");
+      await writeFile(
+        cargoLockfile,
+        `version = 4
+
+[[package]]
+name = "cargo-app"
+version = "0.1.0"
+dependencies = ["cargo-external 2.0.0 (registry+https://example.test/index)"]
+
+[[package]]
+name = "cargo-external"
+version = "2.0.0"
+source = "registry+https://example.test/index"
+`,
+      );
+      await mkdir(uvDirectory, { recursive: true });
+      await writeFile(
+        join(directory, "pyproject.toml"),
+        '[tool.uv.workspace]\nmembers = ["python/app"]\n',
+      );
+      await writeFile(
+        join(uvDirectory, "pyproject.toml"),
+        '[project]\nname = "uv-app"\nversion = "0.1.0"\ndependencies = ["uv-external==3.0.0"]\n',
+      );
+      const uvLockfile = join(directory, "uv.lock");
+      await writeFile(
+        uvLockfile,
+        `version = 1
+
+[[package]]
+name = "uv-app"
+version = "0.1.0"
+source = { editable = "python/app" }
+dependencies = [{ name = "uv-external", version = "3.0.0" }]
+
+[[package]]
+name = "uv-external"
+version = "3.0.0"
+source = { registry = "https://example.test/simple" }
+`,
+      );
+      const cargoMetadata = JSON.stringify({
+        workspace_root: cargoWorkspaceDirectory,
+        workspace_members: [cargoPackageId],
+        target_directory: join(cargoWorkspaceDirectory, "target"),
+        packages: [
+          {
+            id: cargoPackageId,
+            name: "cargo-app",
+            version: "0.1.0",
+            manifest_path: join(cargoDirectory, "Cargo.toml"),
+            dependencies: [
+              {
+                name: "cargo-external",
+                source: "registry+https://example.test/index",
+              },
+            ],
+            targets: [{ kind: ["lib"], name: "cargo_app" }],
+          },
+        ],
+      });
+      const lockfileReads = new Map<string, number>();
+      let output = "";
+      const exitCode = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const processService = yield* ProcessService;
+          const terminal = yield* TerminalService;
+          return yield* executeQuery({
+            cwd: directory,
+            query: "{ externalDependencies { items } }",
+            schema: false,
+            port: 8000,
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(FileSystemService, {
+                  ...fileSystem,
+                  readBytesRange: (path, offset, length) => {
+                    if (
+                      path === javascriptLockfile ||
+                      path === cargoLockfile ||
+                      path === uvLockfile
+                    ) {
+                      lockfileReads.set(
+                        path,
+                        (lockfileReads.get(path) ?? 0) + 1,
+                      );
+                    }
+                    return fileSystem.readBytesRange(path, offset, length);
+                  },
+                }),
+                Layer.succeed(ProcessService, {
+                  ...processService,
+                  run: (request) => {
+                    if (
+                      request.command === "cargo" &&
+                      request.args[0] === "metadata"
+                    ) {
+                      return Effect.succeed({
+                        exitCode: 0,
+                        stdout: cargoMetadata,
+                        stderr: "",
+                        combinedOutput: cargoMetadata,
+                      });
+                    }
+                    if (request.command === "cargo") {
+                      return Effect.succeed({
+                        exitCode: 0,
+                        stdout: "cargo 1.96.0-nightly\n",
+                        stderr: "",
+                        combinedOutput: "cargo 1.96.0-nightly\n",
+                      });
+                    }
+                    if (request.command === "rustc") {
+                      const identity =
+                        "rustc 1.96.0-nightly\nhost: synthetic-target-triple\n";
+                      return Effect.succeed({
+                        exitCode: 0,
+                        stdout: identity,
+                        stderr: "",
+                        combinedOutput: identity,
+                      });
+                    }
+                    return processService.run(request);
+                  },
+                }),
+                Layer.succeed(TerminalService, {
+                  ...terminal,
+                  writeStdout: (text) =>
+                    Effect.sync(() => {
+                      output += text;
+                    }),
+                }),
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(exitCode, output).toBe(0);
+      expect(JSON.parse(output)).toEqual({
+        data: {
+          externalDependencies: {
+            items: [
+              { name: "cargo-external", version: "2.0.0" },
+              { name: "js-external", version: "1.0.0" },
+              { name: "uv-external", version: "3.0.0" },
+            ],
+          },
+        },
+      });
+      for (const lockfile of [javascriptLockfile, cargoLockfile, uvLockfile]) {
+        expect(lockfileReads.get(lockfile)).toBe(1);
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
 
   it("bounds and deduplicates GraphQL affected ranges", async () => {
     const directory = await mkdtemp(
@@ -10208,6 +10591,215 @@ importers:
           },
         },
       });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("preserves leading dots in affected workspace owner paths", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-dot-workspace-affected-"),
+    );
+    try {
+      await prepareFixture(directory);
+      await rename(join(directory, "packages"), join(directory, ".packages"));
+      await writeFile(
+        join(directory, "pnpm-workspace.yaml"),
+        "packages:\n  - .packages/*\n",
+      );
+      const changedPaths = new TextEncoder().encode(
+        ".packages/app/source.txt\0",
+      );
+      let listOutput = "";
+      let queryOutput = "";
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const processService = yield* ProcessService;
+          const terminal = yield* TerminalService;
+          const processLayer = Layer.succeed(ProcessService, {
+            ...processService,
+            runBytes: (request) =>
+              request.command === "git" && request.args[0] === "diff"
+                ? Effect.succeed({
+                    exitCode: 0,
+                    stdout: changedPaths,
+                    stderr: new Uint8Array(),
+                  })
+                : processService.runBytes(request),
+          });
+          expect(
+            yield* executeList({
+              cwd: directory,
+              filters: [],
+              output: "json",
+              affected: true,
+            }).pipe(
+              Effect.provide(
+                Layer.merge(
+                  processLayer,
+                  Layer.succeed(TerminalService, {
+                    ...terminal,
+                    writeStdout: (text) =>
+                      Effect.sync(() => {
+                        listOutput += text;
+                      }),
+                  }),
+                ),
+              ),
+            ),
+          ).toBe(0);
+          expect(
+            yield* executeQuery({
+              cwd: directory,
+              query:
+                '{ affectedPackages { items { name path } } affectedTasks(tasks: ["build"]) { items { fullName } } }',
+              schema: false,
+              port: 8000,
+            }).pipe(
+              Effect.provide(
+                Layer.merge(
+                  processLayer,
+                  Layer.succeed(TerminalService, {
+                    ...terminal,
+                    writeStdout: (text) =>
+                      Effect.sync(() => {
+                        queryOutput += text;
+                      }),
+                  }),
+                ),
+              ),
+            ),
+          ).toBe(0);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(JSON.parse(listOutput)).toMatchObject({
+        packages: {
+          count: 1,
+          items: [{ name: "synthetic-app", path: ".packages/app" }],
+        },
+      });
+      expect(JSON.parse(queryOutput)).toEqual({
+        data: {
+          affectedPackages: {
+            items: [{ name: "synthetic-app", path: ".packages/app" }],
+          },
+          affectedTasks: {
+            items: [{ fullName: "synthetic-app#build" }],
+          },
+        },
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("matches repository-global affected inputs case-insensitively on Windows", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-global-input-case-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const configurationPath = join(directory, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { globalDependencies?: ReadonlyArray<string> };
+      configuration.globalDependencies = ["PACKAGES/APP/shared.json"];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      await writeFile(join(directory, "packages/app/shared.json"), "changed\n");
+      const changedPaths = new TextEncoder().encode(
+        "packages/app/shared.json\0",
+      );
+      let listOutput = "";
+      let queryOutput = "";
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const environment = yield* EnvironmentService;
+          const processService = yield* ProcessService;
+          const terminal = yield* TerminalService;
+          const windowsLayer = Layer.succeed(EnvironmentService, {
+            ...environment,
+            platform: Effect.succeed("win32" as const),
+          });
+          const processLayer = Layer.succeed(ProcessService, {
+            ...processService,
+            runBytes: (request) =>
+              request.command === "git" && request.args[0] === "diff"
+                ? Effect.succeed({
+                    exitCode: 0,
+                    stdout: changedPaths,
+                    stderr: new Uint8Array(),
+                  })
+                : processService.runBytes(request),
+          });
+          expect(
+            yield* executeList({
+              cwd: directory,
+              filters: [],
+              output: "json",
+              affected: true,
+            }).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  windowsLayer,
+                  processLayer,
+                  Layer.succeed(TerminalService, {
+                    ...terminal,
+                    writeStdout: (text) =>
+                      Effect.sync(() => {
+                        listOutput += text;
+                      }),
+                  }),
+                ),
+              ),
+            ),
+          ).toBe(0);
+          expect(
+            yield* executeQuery({
+              cwd: directory,
+              query: "{ affectedPackages { items { name } } }",
+              schema: false,
+              port: 8000,
+            }).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  windowsLayer,
+                  processLayer,
+                  Layer.succeed(TerminalService, {
+                    ...terminal,
+                    writeStdout: (text) =>
+                      Effect.sync(() => {
+                        queryOutput += text;
+                      }),
+                  }),
+                ),
+              ),
+            ),
+          ).toBe(0);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(
+        (
+          JSON.parse(listOutput) as {
+            packages: { items: ReadonlyArray<{ name: string }> };
+          }
+        ).packages.items.map(({ name }) => name),
+      ).toEqual(["synthetic-app", "synthetic-library"]);
+      expect(
+        (
+          JSON.parse(queryOutput) as {
+            data: {
+              affectedPackages: {
+                items: ReadonlyArray<{ name: string }>;
+              };
+            };
+          }
+        ).data.affectedPackages.items
+          .map(({ name }) => name)
+          .sort(),
+      ).toEqual(["//", "synthetic-app", "synthetic-library"]);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

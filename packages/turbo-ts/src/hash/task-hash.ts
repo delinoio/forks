@@ -21,6 +21,7 @@ import type {
   PackageManagerName,
   PackageManagerRuntimeIdentity,
   RepositoryModel,
+  RepositoryPackage,
   UvRuntimeIdentity,
 } from "../repository/model.js";
 import {
@@ -377,16 +378,16 @@ const cargoControlInputCandidates = (
 
 const owningLockfileCandidates = (
   repository: RepositoryModel,
-  node: TaskNode,
+  packageModel: RepositoryPackage,
 ): ReadonlyArray<string> => {
-  if (node.package.manager === "cargo") {
-    const directory = node.package.workspaceDirectory ?? node.package.directory;
+  if (packageModel.manager === "cargo") {
+    const directory = packageModel.workspaceDirectory ?? packageModel.directory;
     return isPathContained(repository.root, directory)
       ? [joinPath(directory, "Cargo.lock")]
       : [];
   }
-  if (node.package.manager === "uv") {
-    return ancestorDirectories(repository, node.package.directory).map(
+  if (packageModel.manager === "uv") {
+    return ancestorDirectories(repository, packageModel.directory).map(
       (directory) => joinPath(directory, "uv.lock"),
     );
   }
@@ -501,7 +502,7 @@ export const implicitTaskInputCandidates = (
           joinPath(node.package.directory, "turbo.json"),
           joinPath(node.package.directory, "turbo.jsonc"),
         ]),
-    ...owningLockfileCandidates(repository, node),
+    ...owningLockfileCandidates(repository, node.package),
     ...cargoControlInputCandidates(repository, node),
     ...repositoryPackageManagerControlInputCandidates(repository, node),
     ...(node.package.cacheControlInputPaths ?? []),
@@ -826,12 +827,12 @@ const hashInputFile = (
     return [relative, mode, hash] as const;
   });
 
-export const owningLockfile = (
+export const owningPackageLockfile = (
   repository: RepositoryModel,
-  node: TaskNode,
+  packageModel: RepositoryPackage,
 ): Effect.Effect<string | undefined, RepositoryError, FileSystemService> =>
   Effect.gen(function* () {
-    if (node.package.manager !== "cargo" && node.package.manager !== "uv") {
+    if (packageModel.manager !== "cargo" && packageModel.manager !== "uv") {
       return repository.lockfile;
     }
     const fileSystem = yield* FileSystemService;
@@ -843,11 +844,17 @@ export const owningLockfile = (
             (error) => new RepositoryError({ path, message: error.message }),
           ),
         );
-    for (const path of owningLockfileCandidates(repository, node)) {
+    for (const path of owningLockfileCandidates(repository, packageModel)) {
       if (yield* exists(path)) return path;
     }
     return undefined;
   });
+
+export const owningLockfile = (
+  repository: RepositoryModel,
+  node: TaskNode,
+): Effect.Effect<string | undefined, RepositoryError, FileSystemService> =>
+  owningPackageLockfile(repository, node.package);
 
 const activeGlobalSettings = (repository: RepositoryModel) => {
   const root = repository.rootConfiguration.value;

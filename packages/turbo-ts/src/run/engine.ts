@@ -1446,17 +1446,30 @@ const taskOutputContainsPath = (
 ): boolean => {
   const rootOutputPrefix = "$TURBO_ROOT$/";
   const outputPatterns = node.definition.outputs ?? [];
+  const matchesOutputPatterns = (
+    directory: string,
+    patterns: ReadonlyArray<string>,
+  ): boolean => {
+    const relative = relativePath(directory, path, windowsPathSeparators);
+    const comparableRelative = windowsPathSeparators
+      ? relative.toLowerCase()
+      : relative;
+    const comparablePatterns = windowsPathSeparators
+      ? patterns.map((pattern) => pattern.toLowerCase())
+      : patterns;
+    return matchesGlobsWithExclusions(
+      [comparableRelative],
+      comparablePatterns,
+      windowsPathSeparators,
+    );
+  };
   const packagePatterns = outputPatterns.filter(
     (pattern) => !pattern.replace(/^!/, "").startsWith(rootOutputPrefix),
   );
   if (
     packagePatterns.length > 0 &&
     isPathContained(packageDirectory, path, windowsPathSeparators) &&
-    matchesGlobsWithExclusions(
-      [relativePath(packageDirectory, path, windowsPathSeparators)],
-      packagePatterns,
-      windowsPathSeparators,
-    )
+    matchesOutputPatterns(packageDirectory, packagePatterns)
   ) {
     return true;
   }
@@ -1472,11 +1485,7 @@ const taskOutputContainsPath = (
   });
   return (
     rootPatterns.length > 0 &&
-    matchesGlobsWithExclusions(
-      [relativePath(repositoryRoot, path, windowsPathSeparators)],
-      rootPatterns,
-      windowsPathSeparators,
-    )
+    matchesOutputPatterns(repositoryRoot, rootPatterns)
   );
 };
 

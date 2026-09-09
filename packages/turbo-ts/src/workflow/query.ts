@@ -13,7 +13,6 @@ import {
   type TypeNode,
   validate,
 } from "graphql";
-import { selectByGlobs } from "../core/glob.js";
 import {
   isAbsolutePath,
   isPathContained,
@@ -39,11 +38,14 @@ import {
   type TaskGraph,
   type TaskNode,
 } from "../graph/task-graph.js";
-import { decodeNullDelimitedGitOutput } from "../hash/task-hash.js";
+import {
+  decodeNullDelimitedGitOutput,
+  owningPackageLockfile,
+} from "../hash/task-hash.js";
 import {
   type LockfilePackage,
   maximumLockfileBytes,
-  resolveLockfilePackageClosure,
+  prepareLockfilePackageClosure,
 } from "../repository/lockfiles.js";
 import type {
   RepositoryModel,
@@ -52,7 +54,7 @@ import type {
 import {
   loadWorkflowRepository,
   packagesOwningRepositoryPath,
-  repositoryGlobalInputPatterns,
+  repositoryGlobalInputsChanged,
 } from "./repository.js";
 
 const schemaSource = `
@@ -531,6 +533,7 @@ const calculateAffectedRepository = (
   repository: RepositoryModel,
   base: string,
   head: string,
+  windowsPathSeparators: boolean,
 ): Effect.Effect<AffectedRepository, ConfigurationError, ProcessService> =>
   Effect.gen(function* () {
     const processService = yield* ProcessService;
@@ -579,9 +582,11 @@ const calculateAffectedRepository = (
         packageModel.identity !== repository.rootPackage.identity,
     );
     const directlyAffected = new Map<string, RepositoryPackage>();
-    let globalChange =
-      selectByGlobs(changedPaths, repositoryGlobalInputPatterns(repository))
-        .length > 0;
+    let globalChange = repositoryGlobalInputsChanged(
+      repository,
+      changedPaths,
+      windowsPathSeparators,
+    );
     for (const path of changedPaths) {
       const owners = packagesOwningRepositoryPath(childPackages, path);
       if (owners.length === 0) globalChange = true;
@@ -1181,6 +1186,7 @@ const repositoryQueryRoot = (
 
 const executeGraphql = (
   repository: RepositoryModel,
+  windowsPathSeparators: boolean,
   source: string,
   variables?: Readonly<Record<string, unknown>>,
 ): Effect.Effect<
@@ -1236,79 +1242,117 @@ const executeGraphql = (
         const loadExternalDependencies = () => {
           externalDependenciesPromise ??= runResolverEffect(
             Effect.gen(function* () {
-              if (repository.lockfile === undefined) return [];
-              const lockfileContents = yield* fileSystem
-                .readBytesRange(
-                  repository.lockfile,
-                  0,
-                  maximumLockfileBytes + 1,
-                )
-                .pipe(
-                  Effect.mapError(
-                    (error) =>
-                      new ConfigurationError({
-                        path: repository.lockfile!,
-                        message: error.message,
-                      }),
-                  ),
-                );
               const models = repositoryModels(repository);
-              return yield* Effect.try({
-                try: () => {
-                  const dependencies = new Map<string, LockfilePackage>();
-                  const workspacePackages = repository.packages.flatMap(
-                    (packageModel) =>
-                      packageModel.manifest.version === undefined
-                        ? []
-                        : [
-                            {
-                              name: packageModel.name,
-                              version: packageModel.manifest.version,
-                            },
-                          ],
-                  );
-                  for (const model of models) {
-                    const manifestReferences = new Map(
-                      [
-                        model.manifest.dependencies,
-                        model.manifest.devDependencies,
-                        model.manifest.optionalDependencies,
-                        model.manifest.peerDependencies,
-                      ].flatMap((entries) => Object.entries(entries ?? {})),
-                    );
-                    const directDependencies = model.dependencyNames.map(
-                      (name) => [name, manifestReferences.get(name)] as const,
-                    );
-                    for (const dependency of resolveLockfilePackageClosure(
-                      repository.lockfile!,
-                      lockfileContents,
-                      {
-                        workspacePath: model.relativeDirectory,
-                        packageName: model.name,
-                        packageVersion: model.manifest.version,
-                        directDependencies,
-                        workspacePackages,
-                      },
-                    )) {
-                      dependencies.set(
-                        `${dependency.name}@${dependency.version}`,
-                        dependency,
-                      );
-                    }
-                  }
-                  return [...dependencies.values()].sort((left, right) =>
-                    `${left.name}@${left.version}`.localeCompare(
-                      `${right.name}@${right.version}`,
+              const owningLockfiles = new Map(
+                yield* Effect.forEach(
+                  models,
+                  (model) =>
+                    owningPackageLockfile(repository, model).pipe(
+                      Effect.mapError(
+                        (error) =>
+                          new ConfigurationError({
+                            path: error.path,
+                            message: error.message,
+                          }),
+                      ),
+                      Effect.map(
+                        (lockfile) => [model.identity, lockfile] as const,
+                      ),
                     ),
+                  { concurrency: 8 },
+                ),
+              );
+              const lockfilePaths = [
+                ...new Set(
+                  [...owningLockfiles.values()].filter(
+                    (path): path is string => path !== undefined,
+                  ),
+                ),
+              ];
+              const preparedLockfiles = new Map(
+                yield* Effect.forEach(
+                  lockfilePaths,
+                  (lockfile) =>
+                    fileSystem
+                      .readBytesRange(lockfile, 0, maximumLockfileBytes + 1)
+                      .pipe(
+                        Effect.mapError(
+                          (error) =>
+                            new ConfigurationError({
+                              path: lockfile,
+                              message: error.message,
+                            }),
+                        ),
+                        Effect.flatMap((contents) =>
+                          Effect.try({
+                            try: () =>
+                              prepareLockfilePackageClosure(lockfile, contents),
+                            catch: (cause) =>
+                              new ConfigurationError({
+                                path: lockfile,
+                                message: String(cause),
+                              }),
+                          }),
+                        ),
+                        Effect.map((resolver) => [lockfile, resolver] as const),
+                      ),
+                  { concurrency: 8 },
+                ),
+              );
+              const dependencies = new Map<string, LockfilePackage>();
+              const workspacePackages = repository.packages.flatMap(
+                (packageModel) =>
+                  packageModel.manifest.version === undefined
+                    ? []
+                    : [
+                        {
+                          name: packageModel.name,
+                          version: packageModel.manifest.version,
+                        },
+                      ],
+              );
+              for (const model of models) {
+                const lockfile = owningLockfiles.get(model.identity);
+                if (lockfile === undefined) continue;
+                const manifestReferences = new Map(
+                  [
+                    model.manifest.dependencies,
+                    model.manifest.devDependencies,
+                    model.manifest.optionalDependencies,
+                    model.manifest.peerDependencies,
+                  ].flatMap((entries) => Object.entries(entries ?? {})),
+                );
+                const directDependencies = model.dependencyNames.map(
+                  (name) => [name, manifestReferences.get(name)] as const,
+                );
+                const resolved = yield* Effect.try({
+                  try: () =>
+                    preparedLockfiles.get(lockfile)!.resolve({
+                      workspacePath: model.relativeDirectory,
+                      packageName: model.name,
+                      packageVersion: model.manifest.version,
+                      directDependencies,
+                      workspacePackages,
+                    }),
+                  catch: (cause) =>
+                    new ConfigurationError({
+                      path: lockfile,
+                      message: String(cause),
+                    }),
+                });
+                for (const dependency of resolved) {
+                  dependencies.set(
+                    `${dependency.name}@${dependency.version}`,
+                    dependency,
                   );
-                },
-                catch: (cause) =>
-                  new ConfigurationError({
-                    path: repository.lockfile!,
-                    message: String(cause),
-                  }),
-              });
-            }),
+                }
+              }
+              return [...dependencies.values()].sort((left, right) =>
+                `${left.name}@${left.version}`.localeCompare(
+                  `${right.name}@${right.version}`,
+                ),
+              );
+            }).pipe(Effect.provideService(FileSystemService, fileSystem)),
           );
           return externalDependenciesPromise;
         };
@@ -1327,9 +1371,12 @@ const executeGraphql = (
             );
           }
           const loaded = runResolverEffect(
-            calculateAffectedRepository(repository, base, head).pipe(
-              Effect.provideService(ProcessService, processService),
-            ),
+            calculateAffectedRepository(
+              repository,
+              base,
+              head,
+              windowsPathSeparators,
+            ).pipe(Effect.provideService(ProcessService, processService)),
           );
           affectedRepositoryPromises.set(key, loaded);
           return loaded;
@@ -1372,6 +1419,14 @@ const executeGraphql = (
                         }),
                     ),
                   );
+                  if (metadata.kind !== "file") {
+                    return yield* Effect.fail(
+                      new ConfigurationError({
+                        path,
+                        message: "file path is not a regular file",
+                      }),
+                    );
+                  }
                   if (metadata.size > maximumRepositoryFileBytes) {
                     return yield* Effect.fail(
                       new ConfigurationError({
@@ -1435,6 +1490,8 @@ export const executeQuery = (
     const terminal = yield* TerminalService;
     const fileSystem = yield* FileSystemService;
     const processService = yield* ProcessService;
+    const environment = yield* EnvironmentService;
+    const windowsPathSeparators = (yield* environment.platform) === "win32";
     const repository = yield* loadWorkflowRepository(options);
     if (options.schema) {
       yield* terminal.writeStdout(
@@ -1445,6 +1502,7 @@ export const executeQuery = (
     if (options.query !== undefined) {
       const result = yield* executeGraphql(
         repository,
+        windowsPathSeparators,
         options.query,
         options.variables,
       );
@@ -1492,6 +1550,7 @@ export const executeQuery = (
             }
             const result = yield* executeGraphql(
               repository,
+              windowsPathSeparators,
               input.query,
               typeof input.variables === "object" &&
                 input.variables !== null &&
@@ -1605,11 +1664,14 @@ export const executeQueryAffected = (
   Effect.gen(function* () {
     const options = parseAffectedArguments(arguments_);
     const terminal = yield* TerminalService;
+    const environment = yield* EnvironmentService;
+    const windowsPathSeparators = (yield* environment.platform) === "win32";
     const repository = yield* loadWorkflowRepository(options);
     const calculation = yield* calculateAffectedRepository(
       repository,
       options.base,
       options.head,
+      windowsPathSeparators,
     ).pipe(Effect.either);
     if (calculation._tag === "Left") {
       yield* terminal.writeStdout(

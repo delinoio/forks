@@ -227,7 +227,14 @@ const durationMilliseconds = (value: string): number => {
           : match[2] === "d"
             ? 86_400_000
             : 3_600_000;
-  return Number(match[1]) * multiplier;
+  const milliseconds = Number(match[1]) * multiplier;
+  if (!Number.isFinite(milliseconds) || milliseconds > 2_147_483_647) {
+    throw new ConfigurationError({
+      path: "<arguments>",
+      message: `invalid idle time: ${value}`,
+    });
+  }
+  return milliseconds;
 };
 
 export const parseDaemonArguments = (

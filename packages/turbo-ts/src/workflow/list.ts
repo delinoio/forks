@@ -1,5 +1,4 @@
 import { Effect } from "effect";
-import { selectByGlobs } from "../core/glob.js";
 import { ConfigurationError } from "../effect/errors.js";
 import {
   EnvironmentService,
@@ -12,7 +11,7 @@ import { configuredEnvironmentValue } from "../repository/model.js";
 import {
   loadWorkflowRepository,
   packagesOwningRepositoryPath,
-  repositoryGlobalInputPatterns,
+  repositoryGlobalInputsChanged,
   repositoryPackageManagerLabel,
 } from "./repository.js";
 
@@ -139,12 +138,11 @@ export const executeList = (
         .split("\0")
         .filter(Boolean);
       const selected = new Set<string>();
-      let rootChanged =
-        selectByGlobs(
-          paths,
-          repositoryGlobalInputPatterns(repository),
-          platform === "win32",
-        ).length > 0;
+      let rootChanged = repositoryGlobalInputsChanged(
+        repository,
+        paths,
+        platform === "win32",
+      );
       for (const path of paths) {
         const owners = packagesOwningRepositoryPath(repository.packages, path);
         if (owners.length === 0) rootChanged = true;

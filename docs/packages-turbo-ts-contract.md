@@ -509,11 +509,14 @@ outputs are matched from their package directory, while `$TURBO_ROOT$/` outputs
 and exclusions are matched from the repository root. Partial output matching is
 limited to directory events. A directory event at the root of a fully excluded
 output subtree remains an input event, while an exclusion that covers only part
-of the directory's descendants does not cancel a positive partial match. Ignore
-and output filtering occurs before manifest or configuration refresh
-classification, so generated manifests cannot cause a watch loop. Changes to an
-ignore file reload the matcher before stale ignore rules are applied and remain
-user-visible triggers.
+of the directory's descendants does not cancel a positive partial match.
+Already-active Turbo configuration and package or workspace discovery controls
+refresh the repository model before ordinary ignore and output suppression,
+including when the control is intentionally untracked and ignored. Other ignore
+and output filtering still occurs before broad manifest or configuration refresh
+classification, so unrelated generated manifests cannot cause a watch loop.
+Changes to an ignore file reload the matcher before stale ignore rules are
+applied and remain user-visible triggers.
 Git-ignore matching does not suppress files already tracked in the Git index or
 directory events whose subtree contains tracked files. `.venv` trees remain
 internally ignored even when the repository root does not list them.
@@ -664,8 +667,10 @@ isolated, every response callback error, including one reported with an HTTP/2
 `NO_ERROR` reset code, is logged and isolated to its request,
 while a received shutdown request still initiates shutdown after its response
 attempt. An idle server resets its deadline after RPC or repository activity
-without expiring while an RPC is in flight. Dated daemon log paths derive their time
-from the configured clock service. Serve startup acquires exclusive PID
+without expiring while an RPC is in flight. Idle durations above Node's
+2,147,483,647-millisecond timer limit are rejected during argument parsing.
+Dated daemon log paths derive their time from the configured clock service.
+Serve startup acquires exclusive PID
 ownership, a competing server cannot unlink a live daemon endpoint, endpoint
 cleanup is limited to the owning server instance, and a post-bind endpoint
 setup failure closes the server and all sessions. Repository watcher failure
@@ -714,8 +719,10 @@ during body upload are isolated before handler execution, and disconnects or
 server shutdown interrupt in-flight resolver effects and their subprocesses.
 Top-level package predicates are
 applied, external dependencies come from manifest references resolved against
-the parsed lockfile, including npm v2/v3 package locations whose entries omit
-the package name. Internal workspaces are excluded across the complete
+each package model's owning JavaScript, Cargo, or uv lockfile, including npm
+v2/v3 package locations whose entries omit the package name. Each distinct
+owning lockfile is read and parsed once per GraphQL operation. Internal
+workspaces are excluded across the complete
 transitive workspace dependency closure for both query results and external
 dependency hashes by their lockfile workspace identity rather than their bare
 package name, so same-named registry packages remain external. npm root,
@@ -729,8 +736,8 @@ parsing. Affected package and task fields reuse each distinct base/head
 calculation within one GraphQL operation and accept at most 64 distinct ranges.
 Package-manager fields use protocol identifiers;
 only pnpm's compatibility family uses the versioned `pnpm9` label. File queries
-enforce repository containment
-after resolving symlinks, read at most 1 MiB per canonical file, reuse canonical
+enforce repository containment after resolving symlinks, reject non-regular
+targets before reading, read at most 1 MiB per canonical file, reuse canonical
 reads within an operation, and enforce an 8 MiB aggregate result budget that
 counts aliases independently. The startup message describes the static page as
 a GraphQL endpoint rather than an IDE.
@@ -739,8 +746,11 @@ Affected package listing disables Git rename detection so moves between
 workspaces select both the source and destination owners before dependent
 closure is applied. Nested workspace changes are owned directly only by the
 co-located scopes at the longest matching logical or canonical workspace path;
-ancestor workspaces are not directly affected. Environment-provided revisions
-are separated from Git options and pathspecs before the affected diff executes.
+ancestor workspaces are not directly affected, and dot-prefixed workspace paths
+retain their leading dot during ownership matching. Repository-global input
+patterns use case-insensitive path matching on Windows in both list and query
+affected calculations. Environment-provided revisions are separated from Git
+options and pathspecs before the affected diff executes.
 
 `prune` selects the transitive internal package closure of both requested
 packages and workspace dependencies retained by the copied root manifest,
@@ -832,7 +842,8 @@ path; other `profile.*` files remain inputs. Simultaneous bare named and
 anonymous profiles use distinct generated destinations. A bare structured-log
 option resolves its generated destination before validation. No structured-log
 artifact may replace a mandatory task control input or match a declared task
-output or resolved task-log path. Every active structured-log, named-profile,
+output or resolved task-log path; output collision matching is case-insensitive
+on Windows. Every active structured-log, named-profile,
 anonymous-profile, heap-snapshot, and trace destination must also resolve to a
 distinct path; collisions fail before an artifact is written or a task starts.
 Timestamped streaming applies the timestamp writer to a final unterminated task

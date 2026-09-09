@@ -425,6 +425,63 @@ export const isWorkspaceDiscoveryPath = (
     : normalized === workspaceConfiguration;
 };
 
+const isActiveRepositoryControlPath = (
+  repository: RepositoryModel,
+  path: string,
+  windowsPathSeparators: boolean,
+): boolean => {
+  const packageModels = [
+    repository.rootPackage,
+    ...repository.packages.filter(
+      (packageModel) =>
+        packageModel.identity !== repository.rootPackage.identity,
+    ),
+  ];
+  const controlPaths = new Set([
+    repository.rootConfiguration.path,
+    ...(repository.manager === "pnpm"
+      ? [
+          joinPathWithSeparators(
+            windowsPathSeparators,
+            repository.root,
+            "pnpm-workspace.yaml",
+          ),
+        ]
+      : []),
+    ...packageModels.flatMap((packageModel) => {
+      const manifestName =
+        packageModel.manager === "cargo"
+          ? "Cargo.toml"
+          : packageModel.manager === "uv"
+            ? "pyproject.toml"
+            : "package.json";
+      const manifestDirectories = new Set([
+        packageModel.directory,
+        ...(packageModel.workspaceDirectory === undefined
+          ? []
+          : [packageModel.workspaceDirectory]),
+      ]);
+      return [
+        ...(packageModel.configurationPath === undefined
+          ? []
+          : [packageModel.configurationPath]),
+        ...[...manifestDirectories].map((directory) =>
+          joinPathWithSeparators(
+            windowsPathSeparators,
+            directory,
+            manifestName,
+          ),
+        ),
+      ];
+    }),
+  ]);
+  const identity = watchPathIdentity(path, windowsPathSeparators);
+  return [...controlPaths].some(
+    (controlPath) =>
+      watchPathIdentity(controlPath, windowsPathSeparators) === identity,
+  );
+};
+
 export const resolveGitIndexPath = (
   root: string,
   windowsPathSeparators: boolean,
@@ -731,14 +788,7 @@ export const executeWatch = (
             );
           }
           if (isRunOwnedPath) return false;
-          const ignored = currentIgnoreMatcher.ignores(
-            change.path,
-            entryIsDirectory,
-          );
-          if (ignored || isConfiguredOutputPath) {
-            return false;
-          }
-          if (
+          const refreshRepositoryModel =
             isWorkspaceDiscoveryPath(
               repository.root,
               change.path,
@@ -749,8 +799,20 @@ export const executeWatch = (
               options.run.rootTurboJson,
               change.path,
               windowsPathSeparators,
-            )
-          ) {
+            );
+          const activeRepositoryControl = isActiveRepositoryControlPath(
+            currentRepository,
+            change.path,
+            windowsPathSeparators,
+          );
+          const ignored = currentIgnoreMatcher.ignores(
+            change.path,
+            entryIsDirectory,
+          );
+          if ((ignored || isConfiguredOutputPath) && !activeRepositoryControl) {
+            return false;
+          }
+          if (refreshRepositoryModel) {
             const refreshed = yield* Effect.either(
               loadWorkflowRepository({
                 cwd: options.run.cwd,

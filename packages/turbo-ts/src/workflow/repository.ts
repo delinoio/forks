@@ -1,5 +1,6 @@
 import { Effect } from "effect";
 import { loadRootConfiguration } from "../config/runtime.js";
+import { selectByGlobs } from "../core/glob.js";
 import {
   isAbsolutePath,
   joinPath,
@@ -114,6 +115,22 @@ export const repositoryGlobalInputPatterns = (
     ? (repository.rootConfiguration.value.global?.inputs ?? [])
     : (repository.rootConfiguration.value.globalDependencies ?? []);
 
+export const repositoryGlobalInputsChanged = (
+  repository: Pick<RepositoryModel, "rootConfiguration">,
+  paths: ReadonlyArray<string>,
+  windowsPathSeparators = false,
+): boolean => {
+  const comparable = (value: string): string =>
+    windowsPathSeparators ? value.toLowerCase() : value;
+  return (
+    selectByGlobs(
+      paths.map(comparable),
+      repositoryGlobalInputPatterns(repository).map(comparable),
+      windowsPathSeparators,
+    ).length > 0
+  );
+};
+
 export const packagesOwningRepositoryPath = (
   packages: ReadonlyArray<RepositoryPackage>,
   path: string,
@@ -124,7 +141,9 @@ export const packagesOwningRepositoryPath = (
         [
           packageModel.relativeDirectory,
           packageModel.canonicalRelativeDirectory,
-        ].map((directory) => directory.replace(/^\.\/?/, "")),
+        ].map((directory) =>
+          directory === "." ? "" : directory.replace(/^\.\//, ""),
+        ),
       ),
     ].flatMap((directory) =>
       directory !== "" &&
