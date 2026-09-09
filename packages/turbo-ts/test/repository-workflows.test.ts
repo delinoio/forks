@@ -2182,7 +2182,8 @@ describe("repository workflow gate", () => {
       const lockfilePath = join(directory, "pnpm-lock.yaml");
       await writeFile(lockfilePath, dependencyWorkflowLockfile);
 
-      let summaryLockfileReads = 0;
+      let unboundedSummaryLockfileRead = false;
+      const summaryLockfileRanges: Array<readonly [number, number]> = [];
       expect(
         await Effect.runPromise(
           Effect.gen(function* () {
@@ -2202,8 +2203,16 @@ describe("repository workflow gate", () => {
                   Layer.succeed(FileSystemService, {
                     ...fileSystem,
                     readBytes: (path) => {
-                      if (path === lockfilePath) summaryLockfileReads += 1;
+                      if (path === lockfilePath) {
+                        unboundedSummaryLockfileRead = true;
+                      }
                       return fileSystem.readBytes(path);
+                    },
+                    readBytesRange: (path, offset, length) => {
+                      if (path === lockfilePath) {
+                        summaryLockfileRanges.push([offset, length]);
+                      }
+                      return fileSystem.readBytesRange(path, offset, length);
                     },
                   }),
                   Layer.succeed(TerminalService, {
@@ -2217,7 +2226,50 @@ describe("repository workflow gate", () => {
           }).pipe(Effect.provide(nodeFoundationLayer)),
         ),
       ).toBe(0);
-      expect(summaryLockfileReads).toBe(1);
+      expect(unboundedSummaryLockfileRead).toBe(false);
+      expect(summaryLockfileRanges).toEqual([[0, maximumLockfileBytes + 1]]);
+
+      let oversizedLockfileRange: readonly [number, number] | undefined;
+      await expect(
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const fileSystem = yield* FileSystemService;
+            const terminal = yield* TerminalService;
+            return yield* executeRun(
+              parseRunArguments([
+                "run",
+                "lint:types",
+                "--dry=json",
+                "--cwd",
+                directory,
+              ]),
+            ).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  Layer.succeed(FileSystemService, {
+                    ...fileSystem,
+                    readBytesRange: (path, offset, length) => {
+                      if (path !== lockfilePath) {
+                        return fileSystem.readBytesRange(path, offset, length);
+                      }
+                      oversizedLockfileRange = [offset, length];
+                      return Effect.succeed(
+                        new Uint8Array(maximumLockfileBytes + 1),
+                      );
+                    },
+                  }),
+                  Layer.succeed(TerminalService, {
+                    ...terminal,
+                    writeStdout: () => Effect.void,
+                    writeStderr: () => Effect.void,
+                  }),
+                ),
+              ),
+            );
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).rejects.toThrow(/lockfile exceeds the 32 MiB safety limit/);
+      expect(oversizedLockfileRange).toEqual([0, maximumLockfileBytes + 1]);
 
       const dryResult = await execFilePromise(process.execPath, [
         candidate,
@@ -4453,6 +4505,7 @@ describe("repository workflow gate", () => {
             const pidCreated = yield* Deferred.make<void>();
             let shutdownFailure: "response" | "transport" | undefined;
             let statusFailure: "response" | "transport" | undefined;
+            let activeLogReadFailure = false;
             let pidPath: string | undefined;
             let socketPath: string | undefined;
             let terminationAttempts = 0;
@@ -4468,6 +4521,11 @@ describe("repository workflow gate", () => {
             const statusTransportFailure = new BoundaryError({
               boundary: "daemon",
               message: "synthetic status transport failure",
+              retryable: true,
+            });
+            const activeLogFailure = new BoundaryError({
+              boundary: "filesystem",
+              message: "synthetic active-log read failure",
               retryable: true,
             });
             const overrides = Layer.mergeAll(
@@ -4520,6 +4578,10 @@ describe("repository workflow gate", () => {
               }),
               Layer.succeed(FileSystemService, {
                 ...fileSystem,
+                readText: (path) =>
+                  activeLogReadFailure && path.endsWith("turbod.log-path")
+                    ? Effect.fail(activeLogFailure)
+                    : fileSystem.readText(path),
                 createExclusiveFile: (path, contents) =>
                   fileSystem.createExclusiveFile(path, contents).pipe(
                     Effect.tap((created) => {
@@ -4611,6 +4673,28 @@ describe("repository workflow gate", () => {
                 expect(yield* runDaemon("status")).toBe(0);
               }
             }
+            activeLogReadFailure = true;
+            for (const command of ["status", "logs"] as const) {
+              const result = yield* runDaemon(command).pipe(Effect.either);
+              expect(result).toMatchObject({
+                _tag: "Left",
+                left: {
+                  boundary: "filesystem",
+                  message: "synthetic active-log read failure",
+                },
+              });
+              expect(pidPath).toBeDefined();
+              expect(socketPath).toBeDefined();
+              expect(yield* fileSystem.exists(pidPath!)).toBe(true);
+              expect(yield* fileSystem.exists(socketPath!)).toBe(true);
+              expect(
+                yield* fileSystem.exists(
+                  join(dirname(pidPath!), "turbod.log-path"),
+                ),
+              ).toBe(true);
+            }
+            activeLogReadFailure = false;
+            expect(yield* runDaemon("status")).toBe(0);
             shutdownLeavesDaemonAlive = true;
             terminationBehavior = "fails";
             const failedTermination = yield* runDaemon("stop").pipe(
@@ -6581,6 +6665,143 @@ describe("repository workflow gate", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 30_000);
+
+  it("bounds GraphQL external dependency lockfile reads", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-query-lockfile-limit-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const lockfilePath = join(directory, "pnpm-lock.yaml");
+      let output = "";
+      let unboundedRead = false;
+      let boundedRead: readonly [number, number] | undefined;
+      const exitCode = await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const terminal = yield* TerminalService;
+          return yield* executeQuery({
+            cwd: directory,
+            query: "{ externalDependencies { length } }",
+            schema: false,
+            port: 8000,
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(FileSystemService, {
+                  ...fileSystem,
+                  readBytes: (path) => {
+                    if (path === lockfilePath) unboundedRead = true;
+                    return fileSystem.readBytes(path);
+                  },
+                  readBytesRange: (path, offset, length) => {
+                    if (path !== lockfilePath) {
+                      return fileSystem.readBytesRange(path, offset, length);
+                    }
+                    boundedRead = [offset, length];
+                    return Effect.succeed(
+                      new Uint8Array(maximumLockfileBytes + 1),
+                    );
+                  },
+                }),
+                Layer.succeed(TerminalService, {
+                  ...terminal,
+                  writeStdout: (text) =>
+                    Effect.sync(() => {
+                      output += text;
+                    }),
+                }),
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(exitCode).toBe(1);
+      expect(unboundedRead).toBe(false);
+      expect(boundedRead).toEqual([0, maximumLockfileBytes + 1]);
+      expect(output).toContain("lockfile exceeds the 32 MiB safety limit");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("bounds and deduplicates GraphQL affected ranges", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-query-affected-limit-"),
+    );
+    try {
+      await prepareFixture(directory);
+      let gitDiffs = 0;
+      const runQuery = async (query: string) => {
+        let output = "";
+        const exitCode = await Effect.runPromise(
+          Effect.gen(function* () {
+            const processService = yield* ProcessService;
+            const terminal = yield* TerminalService;
+            return yield* executeQuery({
+              cwd: directory,
+              query,
+              schema: false,
+              port: 8000,
+            }).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  Layer.succeed(ProcessService, {
+                    ...processService,
+                    runBytes: (request) => {
+                      if (
+                        request.command === "git" &&
+                        request.args[0] === "diff"
+                      ) {
+                        gitDiffs += 1;
+                        return Effect.succeed({
+                          exitCode: 0,
+                          stdout: new TextEncoder().encode(
+                            "packages/app/source.txt\0",
+                          ),
+                          stderr: new Uint8Array(),
+                        });
+                      }
+                      return processService.runBytes(request);
+                    },
+                  }),
+                  Layer.succeed(TerminalService, {
+                    ...terminal,
+                    writeStdout: (text) =>
+                      Effect.sync(() => {
+                        output += text;
+                      }),
+                  }),
+                ),
+              ),
+            );
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+        return { exitCode, output };
+      };
+
+      const deduplicated = await runQuery(
+        '{ packages: affectedPackages(base: "base", head: "head") { length } tasks: affectedTasks(base: "base", head: "head") { length } }',
+      );
+      expect(deduplicated.exitCode).toBe(0);
+      expect(gitDiffs).toBe(1);
+
+      gitDiffs = 0;
+      const ranges = Array.from(
+        { length: 65 },
+        (_, index) =>
+          `range${index}: affectedPackages(base: "base-${index}", head: "head") { length }`,
+      ).join(" ");
+      const bounded = await runQuery(`{ ${ranges} }`);
+      expect(bounded.exitCode).toBe(1);
+      expect(gitDiffs).toBe(64);
+      expect(bounded.output).toContain(
+        "affected collections support at most 64 distinct ranges per query",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("serves GraphQL queries and isolates malformed HTTP requests", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-query-server-"));

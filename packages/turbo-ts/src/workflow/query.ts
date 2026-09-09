@@ -34,6 +34,7 @@ import {
 import { decodeNullDelimitedGitOutput } from "../hash/task-hash.js";
 import {
   type LockfilePackage,
+  maximumLockfileBytes,
   resolveLockfilePackageClosure,
 } from "../repository/lockfiles.js";
 import type {
@@ -137,6 +138,7 @@ export const repositoryQuerySchema: GraphQLSchema = buildSchema(schemaSource);
 
 const maximumRepositoryFileBytes = 1024 * 1024;
 const maximumRepositoryFileQueryBytes = 8 * 1024 * 1024;
+const maximumAffectedRangesPerQuery = 64;
 
 interface RepositoryFileContents {
   readonly contents: string;
@@ -1042,12 +1044,20 @@ const executeGraphql = (
           string,
           Promise<RepositoryFileContents>
         >();
+        const affectedRepositoryPromises = new Map<
+          string,
+          Promise<AffectedRepository>
+        >();
         const loadExternalDependencies = () => {
           externalDependenciesPromise ??= runResolverEffect(
             Effect.gen(function* () {
               if (repository.lockfile === undefined) return [];
               const lockfileContents = yield* fileSystem
-                .readBytes(repository.lockfile)
+                .readBytesRange(
+                  repository.lockfile,
+                  0,
+                  maximumLockfileBytes + 1,
+                )
                 .pipe(
                   Effect.mapError(
                     (error) =>
@@ -1116,6 +1126,28 @@ const executeGraphql = (
             }),
           );
           return externalDependenciesPromise;
+        };
+        const loadAffectedRepository = (base: string, head: string) => {
+          const key = JSON.stringify([base, head]);
+          const cached = affectedRepositoryPromises.get(key);
+          if (cached !== undefined) return cached;
+          if (
+            affectedRepositoryPromises.size >= maximumAffectedRangesPerQuery
+          ) {
+            return Promise.reject(
+              new ConfigurationError({
+                path: "<query>",
+                message: `affected collections support at most ${maximumAffectedRangesPerQuery} distinct ranges per query`,
+              }),
+            );
+          }
+          const loaded = runResolverEffect(
+            calculateAffectedRepository(repository, base, head).pipe(
+              Effect.provideService(ProcessService, processService),
+            ),
+          );
+          affectedRepositoryPromises.set(key, loaded);
+          return loaded;
         };
         return graphql({
           schema: repositoryQuerySchema,
@@ -1192,12 +1224,7 @@ const executeGraphql = (
               return loaded;
             },
             loadExternalDependencies,
-            (base, head) =>
-              runResolverEffect(
-                calculateAffectedRepository(repository, base, head).pipe(
-                  Effect.provideService(ProcessService, processService),
-                ),
-              ),
+            loadAffectedRepository,
           ),
           variableValues: variables,
         });

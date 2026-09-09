@@ -317,13 +317,18 @@ const cleanStaleState = (
 
 const readActiveLogPath = (
   paths: DaemonPaths,
-): Effect.Effect<string | undefined, never, FileSystemService> =>
+): Effect.Effect<string | undefined, BoundaryError, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
+    if (!(yield* fileSystem.exists(paths.activeLog))) return undefined;
     const source = yield* fileSystem
       .readText(paths.activeLog)
-      .pipe(Effect.orElseSucceed(() => ""));
-    const candidate = normalizePath(source.trim());
+      .pipe(Effect.either);
+    if (source._tag === "Left") {
+      if (!(yield* fileSystem.exists(paths.activeLog))) return undefined;
+      return yield* Effect.fail(source.left);
+    }
+    const candidate = normalizePath(source.right.trim());
     return candidate !== "" && isPathContained(parentPath(paths.log), candidate)
       ? candidate
       : undefined;

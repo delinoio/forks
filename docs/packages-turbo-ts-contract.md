@@ -628,6 +628,9 @@ recorded PID remains alive but never completes a health handshake.
 After a successful health handshake, a subsequent status transport or response
 failure preserves the live daemon's PID, socket, and active-log state and is
 reported to the caller for both status and logs commands.
+An absent active-log pointer falls back to the client's dated log path; a
+filesystem failure checking or reading an existing pointer is propagated
+without cleaning live daemon state.
 Log clients follow the exact dated log reported by the running daemon until
 interrupted, reading only newly available bounded byte ranges while preserving
 split UTF-8 code points. Watcher path equality normalizes separators and follows
@@ -701,7 +704,9 @@ results. Yarn Berry entries report their installed
 `version` rather than descriptor ranges. Lockfile reading and parsing are
 deferred until the `externalDependencies` field is selected, so independent
 fields remain available if the discovered lockfile later becomes unavailable
-or invalid.
+or invalid. Selected lockfiles are read with the 32 MiB safety bound before
+parsing. Affected package and task fields reuse each distinct base/head
+calculation within one GraphQL operation and accept at most 64 distinct ranges.
 Package-manager fields use protocol identifiers;
 only pnpm's compatibility family uses the versioned `pnpm9` label. File queries
 enforce repository containment
@@ -839,7 +844,8 @@ path, including collision-qualified identifiers and alternate execution scopes.
 Global summary inputs record the corresponding root-manifest external-dependency
 closure hash instead of the empty-closure hash when root dependencies resolve.
 Summary preparation reads and parses each distinct owning lockfile once per run
-and reuses its package closures for task and global hashes.
+with the 32 MiB safety bound and reuses its package closures for task and global
+hashes.
 The equals form of `--summarize` accepts only `true` or `false`; other explicit
 values fail argument parsing without creating a summary.
 Graph-bearing closures retain the declaring manifest reference or resolved

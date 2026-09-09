@@ -83,6 +83,7 @@ import {
 } from "../logging/events.js";
 import {
   lockfilePackageIdentity,
+  maximumLockfileBytes,
   prepareLockfilePackageClosure,
 } from "../repository/lockfiles.js";
 import {
@@ -1895,7 +1896,7 @@ const summaryExternalDependencyHashes = (
       yield* Effect.forEach(
         lockfilePaths,
         (lockfile) =>
-          fileSystem.readBytes(lockfile).pipe(
+          fileSystem.readBytesRange(lockfile, 0, maximumLockfileBytes + 1).pipe(
             Effect.mapError(
               (error) =>
                 new RepositoryError({
