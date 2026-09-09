@@ -2215,16 +2215,25 @@ export const respondGrpc = (
 ): Effect.Effect<void, BoundaryError> =>
   Effect.async((resume) => {
     try {
+      const payload = daemonResponsePayload(method, response);
+      const responseError =
+        payload.length > maximumDaemonPayloadBytes
+          ? `daemon response exceeds the ${maximumDaemonPayloadBytes} byte payload limit`
+          : response.error;
       stream.respond({
         [http2Constants.HTTP2_HEADER_STATUS]: 200,
         [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
-        "grpc-status": response.error === undefined ? "0" : "13",
-        ...(response.error === undefined
+        "grpc-status": responseError === undefined ? "0" : "13",
+        ...(responseError === undefined
           ? {}
-          : { "grpc-message": encodeURIComponent(response.error) }),
+          : { "grpc-message": encodeURIComponent(responseError) }),
       });
       stream.end(
-        grpcFrame(daemonResponsePayload(method, response)),
+        grpcFrame(
+          payload.length > maximumDaemonPayloadBytes
+            ? Buffer.alloc(0)
+            : payload,
+        ),
         (cause?: Error | null) => {
           resume(
             cause === undefined || cause === null

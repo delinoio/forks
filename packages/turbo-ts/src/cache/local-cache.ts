@@ -12,6 +12,7 @@ import { parseTarArchiveFile } from "./archive-file.js";
 import {
   maximumCacheArchiveBytes,
   maximumCacheArtifactBytes,
+  maximumCacheMetadataBytes,
 } from "./limits.js";
 import { type CacheRestoreScope, restoreArchiveEntries } from "./restore.js";
 
@@ -51,6 +52,31 @@ const parseCacheDuration = (contents: string): number => {
     return 0;
   }
 };
+
+const readCacheDuration = (
+  path: string,
+): Effect.Effect<number, never, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const metadata = yield* fileSystem.metadata(path).pipe(Effect.either);
+    if (
+      metadata._tag === "Left" ||
+      metadata.right.kind !== "file" ||
+      metadata.right.size > maximumCacheMetadataBytes
+    ) {
+      return 0;
+    }
+    const contents = yield* fileSystem
+      .readBytesRange(path, 0, maximumCacheMetadataBytes + 1)
+      .pipe(Effect.either);
+    if (
+      contents._tag === "Left" ||
+      contents.right.length > maximumCacheMetadataBytes
+    ) {
+      return 0;
+    }
+    return parseCacheDuration(new TextDecoder().decode(contents.right));
+  });
 
 const cachePaths = (directory: string, hash: string) => ({
   archive: joinPath(directory, `${hash}.tar.zst`),
@@ -317,10 +343,7 @@ export const restoreLocalCache = (
           }
           return yield* Effect.fail(outcome.left);
         }
-        const duration = yield* fileSystem.readText(paths.metadata).pipe(
-          Effect.map(parseCacheDuration),
-          Effect.catchAll(() => Effect.succeed(0)),
-        );
+        const duration = yield* readCacheDuration(paths.metadata);
         yield* Effect.sync(() => onHit?.(duration));
         return true;
       }),

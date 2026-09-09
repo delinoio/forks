@@ -93,22 +93,37 @@ export const resolvedWatchRunOptions = (
   };
 };
 
-const configuredOutputPath = (
+export const configuredOutputPath = (
   repository: RepositoryModel,
   path: string,
   entryKind: "directory" | "file" | "symlink" | "other" | undefined,
+  windowsPathSeparators = false,
 ): boolean => {
   const rootOutputPrefix = "$TURBO_ROOT$/";
   const matchesOutput = (
     directory: string,
     patterns: ReadonlyArray<string>,
   ): boolean => {
-    if (!isPathContained(directory, path)) return false;
-    const relative = relativePath(directory, path);
+    if (!isPathContained(directory, path, windowsPathSeparators)) return false;
+    const relative = relativePath(directory, path, windowsPathSeparators);
+    const comparableRelative = windowsPathSeparators
+      ? relative.toLowerCase()
+      : relative;
+    const comparablePatterns = windowsPathSeparators
+      ? patterns.map((pattern) => pattern.toLowerCase())
+      : patterns;
     return (
-      matchesGlobsWithExclusions([relative], patterns) ||
+      matchesGlobsWithExclusions(
+        [comparableRelative],
+        comparablePatterns,
+        windowsPathSeparators,
+      ) ||
       (entryKind === "directory" &&
-        canMatchGlobsDescendantWithExclusions(relative, patterns))
+        canMatchGlobsDescendantWithExclusions(
+          comparableRelative,
+          comparablePatterns,
+          windowsPathSeparators,
+        ))
     );
   };
   return [repository.rootPackage, ...repository.packages].some((packageModel) =>
@@ -690,6 +705,7 @@ export const executeWatch = (
             change.kind === "remove" || entryIsDirectory
               ? "directory"
               : change.entryKind,
+            windowsPathSeparators,
           );
           if (isGitIgnorePath(change.path, windowsPathSeparators)) {
             yield* Ref.set(

@@ -90,7 +90,90 @@ interface OutputRegistration {
 }
 
 const maximumOutputRegistrations = 1_024;
+const maximumOutputRegistrationHashCharacters = 128;
+const maximumOutputRegistrationGlobs = 256;
+const maximumOutputRegistrationGlobCharacters = 1_024;
+const maximumOutputRegistrationTotalGlobCharacters = 64 * 1_024;
 const maximumConcurrentDaemonConnections = 64;
+
+interface OutputRegistrationParameters {
+  readonly hash: string;
+  readonly outputGlobs: ReadonlyArray<string>;
+  readonly outputExclusionGlobs: ReadonlyArray<string>;
+}
+
+const outputRegistrationError = (message: string): BoundaryError =>
+  new BoundaryError({
+    boundary: "daemon",
+    message,
+    retryable: false,
+  });
+
+const validateOutputRegistration = (
+  params: Readonly<Record<string, unknown>>,
+): Effect.Effect<OutputRegistrationParameters, BoundaryError> =>
+  Effect.gen(function* () {
+    if (typeof params.hash !== "string" || params.hash === "") {
+      return yield* Effect.fail(
+        outputRegistrationError("NotifyOutputsWritten requires a hash"),
+      );
+    }
+    if (params.hash.length > maximumOutputRegistrationHashCharacters) {
+      return yield* Effect.fail(
+        outputRegistrationError(
+          `NotifyOutputsWritten hash exceeds the ${maximumOutputRegistrationHashCharacters} character limit`,
+        ),
+      );
+    }
+    const outputGlobs = params.outputGlobs ?? [];
+    const outputExclusionGlobs = params.outputExclusionGlobs ?? [];
+    if (
+      !Array.isArray(outputGlobs) ||
+      !outputGlobs.every(
+        (value): value is string => typeof value === "string",
+      ) ||
+      !Array.isArray(outputExclusionGlobs) ||
+      !outputExclusionGlobs.every(
+        (value): value is string => typeof value === "string",
+      )
+    ) {
+      return yield* Effect.fail(
+        outputRegistrationError(
+          "NotifyOutputsWritten output globs must be string arrays",
+        ),
+      );
+    }
+    const globs = [...outputGlobs, ...outputExclusionGlobs];
+    if (globs.length > maximumOutputRegistrationGlobs) {
+      return yield* Effect.fail(
+        outputRegistrationError(
+          `NotifyOutputsWritten supports at most ${maximumOutputRegistrationGlobs} output globs`,
+        ),
+      );
+    }
+    if (
+      globs.some(
+        (glob) => glob.length > maximumOutputRegistrationGlobCharacters,
+      )
+    ) {
+      return yield* Effect.fail(
+        outputRegistrationError(
+          `NotifyOutputsWritten output glob exceeds the ${maximumOutputRegistrationGlobCharacters} character limit`,
+        ),
+      );
+    }
+    if (
+      globs.reduce((length, glob) => length + glob.length, 0) >
+      maximumOutputRegistrationTotalGlobCharacters
+    ) {
+      return yield* Effect.fail(
+        outputRegistrationError(
+          `NotifyOutputsWritten output globs exceed the ${maximumOutputRegistrationTotalGlobCharacters} aggregate character limit`,
+        ),
+      );
+    }
+    return { hash: params.hash, outputGlobs, outputExclusionGlobs };
+  });
 
 const retainOutputRegistration = (
   registrations: Map<string, OutputRegistration>,
@@ -646,7 +729,33 @@ const startDaemon = (
             yield* terminal.writeStdout("✓ daemon is running\n");
             return;
           }
-          yield* cleanStaleState(paths);
+          const recordedPid = yield* readPid(paths.pid);
+          if (recordedPid !== undefined && (yield* isAlive(recordedPid))) {
+            if (yield* waitForDaemonHealthy(paths, recordedPid)) {
+              yield* terminal.writeStdout("✓ daemon is running\n");
+              return;
+            }
+            const currentPid = yield* readPid(paths.pid);
+            if (currentPid !== recordedPid) {
+              return yield* Effect.fail(
+                new BoundaryError({
+                  boundary: "daemon",
+                  message: "daemon lifecycle state changed while starting",
+                  retryable: true,
+                }),
+              );
+            }
+            if (yield* isAlive(recordedPid)) {
+              return yield* Effect.fail(
+                new BoundaryError({
+                  boundary: "daemon",
+                  message: "daemon process is alive but did not become healthy",
+                  retryable: true,
+                }),
+              );
+            }
+          }
+          yield* cleanStaleStateIfOwned(paths, recordedPid);
           const argv = yield* environment.argv;
           const executable =
             environment.executablePath === undefined
@@ -1027,46 +1136,25 @@ const serveDaemon = (
                       if (
                         request.method === DaemonMethod.notifyOutputsWritten
                       ) {
-                        const params = request.params as {
-                          readonly hash?: unknown;
-                          readonly outputGlobs?: unknown;
-                          readonly outputExclusionGlobs?: unknown;
-                        };
-                        if (
-                          typeof params.hash !== "string" ||
-                          params.hash === ""
-                        ) {
-                          return Effect.fail(
-                            new BoundaryError({
-                              boundary: "daemon",
-                              message: "NotifyOutputsWritten requires a hash",
-                              retryable: false,
-                            }),
+                        return Effect.gen(function* () {
+                          const params = yield* validateOutputRegistration(
+                            request.params !== null &&
+                              typeof request.params === "object"
+                              ? (request.params as Record<string, unknown>)
+                              : {},
                           );
-                        }
-                        retainOutputRegistration(
-                          outputRegistrations,
-                          params.hash,
-                          {
-                            outputGlobs: Array.isArray(params.outputGlobs)
-                              ? params.outputGlobs.filter(
-                                  (value): value is string =>
-                                    typeof value === "string",
-                                )
-                              : [],
-                            outputExclusionGlobs: Array.isArray(
-                              params.outputExclusionGlobs,
-                            )
-                              ? params.outputExclusionGlobs.filter(
-                                  (value): value is string =>
-                                    typeof value === "string",
-                                )
-                              : [],
-                            changedOutputGenerations: new Map(),
-                            nextChangeGeneration: 0,
-                          },
-                        );
-                        return Effect.succeed({});
+                          retainOutputRegistration(
+                            outputRegistrations,
+                            params.hash,
+                            {
+                              outputGlobs: params.outputGlobs,
+                              outputExclusionGlobs: params.outputExclusionGlobs,
+                              changedOutputGenerations: new Map(),
+                              nextChangeGeneration: 0,
+                            },
+                          );
+                          return {};
+                        });
                       }
                       if (request.method === DaemonMethod.getChangedOutputs) {
                         const params = request.params as {

@@ -266,7 +266,9 @@ does not suppress a configured remote upload. Local and remote cache restoration
 is limited to 256 MiB compressed and 1 GiB after decompression; preflight and
 upload response bodies have an independent 64 KiB limit.
 Missing or malformed local cache duration metadata reports zero saved time
-without invalidating an otherwise successful restoration.
+without invalidating an otherwise successful restoration. Duration metadata is
+preflighted and read through a 64 KiB bounded range; oversized metadata and
+files that grow beyond the bound during the read also report zero saved time.
 Restored task logs replay through scoped, bounded text chunks with terminal
 backpressure instead of loading the complete log into another string. A task-log
 replay I/O failure warns without changing the successful cache-hit outcome.
@@ -528,6 +530,9 @@ configuration changes and active JavaScript, Cargo, or uv workspace manifest
 changes refresh package discovery and output patterns before the next run. Git
 ignore, Turbo configuration, and workspace manifest classification follows
 case-insensitive filesystem semantics on Windows.
+Configured package-relative and `$TURBO_ROOT$/` output paths, patterns, and
+exclusions use the same case-insensitive Windows semantics when watch events
+are filtered.
 Explicit graph,
 structured-log, profile, trace, and heap artifacts, default profile artifacts,
 and write-enabled local cache directories are treated as run-owned paths and
@@ -579,7 +584,8 @@ directions with the 2.10.12 executable; package and watch calls share the same
 bounded framing and scoped sessions. Unary request and response bodies contain
 exactly one complete frame with no trailing data. Clients terminate a response
 as soon as its accumulated frame exceeds the 1 MiB payload limit plus framing
-bytes.
+bytes. A server result that would exceed the 1 MiB payload limit is replaced by
+a bounded protocol error before the response is written.
 Oversized request streams discard retained frame data and are never dispatched
 to a daemon handler after cancellation. Nonzero `grpc-message` diagnostics in
 response headers or trailers are percent-decoded; malformed encodings fail with
@@ -611,6 +617,9 @@ generations reported after their response is written successfully. A failed
 response remains retryable, and changes recorded while a response is being
 written remain pending for the next query. The daemon retains at most 1,024
 output registrations and evicts the least recently registered or queried hash.
+Each registration accepts a non-empty hash of at most 128 characters, at most
+256 combined output and exclusion globs, at most 1,024 characters per glob, and
+at most 64 KiB of aggregate glob text.
 Start-lock ownership is
 preserved across overlapping starts, stale locks are validated before removal,
 and future-dated lock timestamps are stale rather than live. A Hello response
@@ -621,10 +630,10 @@ discovery; the serving process retains full discovery validation. A missing PID
 file is treated as absent, while filesystem failures checking or reading it are
 propagated without cleaning lifecycle state. `clean` likewise propagates a
 failure to remove the daemon state directory.
-Start, status, and logs health checks clean stale PID and socket state even
-when the recorded PID has been reused by an unrelated live process. Stop,
-clean, and restart preserve lifecycle state and fail retryably when the
-recorded PID remains alive but never completes a health handshake.
+Status and logs health checks clean stale PID and socket state even when the
+recorded PID has been reused by an unrelated live process. Start, stop, clean,
+and restart preserve lifecycle state and fail retryably when the recorded PID
+remains alive but never completes a health handshake.
 After a successful health handshake, a subsequent status transport or response
 failure preserves the live daemon's PID, socket, and active-log state and is
 reported to the caller for both status and logs commands.
@@ -687,8 +696,11 @@ package identities, and same-named cross-ecosystem edge endpoints use qualified
 identities. Affected collections include the root package for root changes and
 when it depends on an affected workspace without allowing the root path to
 claim workspace-owned files. `query affected`, `query
-ls`, and `ls` share repository discovery and stable ordering. The server limits
-request bodies and closes HTTP handles in Scope; oversized requests receive
+ls`, and `ls` share repository discovery and stable ordering. GraphQL documents
+are limited to 4,096 lexer tokens, 512 expanded selections, and a field depth
+of 16 before resolver execution; fragment spreads count each expanded
+selection. The server limits request bodies and closes HTTP handles in Scope;
+oversized requests receive
 HTTP 413 without resetting the connection. Client resets and request errors
 during body upload are isolated before handler execution, and disconnects or
 server shutdown interrupt in-flight resolver effects and their subprocesses.

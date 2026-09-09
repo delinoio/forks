@@ -98,6 +98,7 @@ import {
 } from "../src/workflow/repository.js";
 import {
   appendPendingWatchChange,
+  configuredOutputPath,
   executeWatch,
   initialPendingWatchChanges,
   isGitIgnorePath,
@@ -1469,6 +1470,64 @@ describe("repository workflow gate", () => {
     }
   });
 
+  it("matches configured watch outputs case-insensitively on Windows", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-watch-output-case-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const configurationPath = join(directory, "packages/app/turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: { build: { outputs: Array<string> } } };
+      configuration.tasks.build.outputs = [
+        "dist/**",
+        "!dist/private/**",
+        "$TURBO_ROOT$/generated/**",
+      ];
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      const repository = await Effect.runPromise(
+        loadWorkflowRepository({ cwd: directory }).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      const output = join(directory, "packages/app/Dist/result.js");
+      expect(configuredOutputPath(repository, output, "file", true)).toBe(true);
+      expect(configuredOutputPath(repository, output, "file", false)).toBe(
+        false,
+      );
+      expect(
+        configuredOutputPath(
+          repository,
+          join(directory, "packages/app/DIST/PRIVATE/result.js"),
+          "file",
+          true,
+        ),
+      ).toBe(false);
+      expect(
+        configuredOutputPath(
+          repository,
+          join(directory, "packages/app/DIST"),
+          "directory",
+          true,
+        ),
+      ).toBe(true);
+      expect(
+        configuredOutputPath(
+          repository,
+          join(directory, "Generated/result.js"),
+          "file",
+          true,
+        ),
+      ).toBe(true);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("matches run-owned watch artifacts through symlinked directories", async () => {
     const directory = await mkdtemp(
       join(tmpdir(), "turbo-ts-watch-artifact-link-"),
@@ -2835,6 +2894,43 @@ describe("repository workflow gate", () => {
     }
   });
 
+  it("returns a bounded protocol error for oversized daemon responses", async () => {
+    let headers: Record<string, unknown> | undefined;
+    let payload: Buffer | undefined;
+    const stream = {
+      respond: (value: Record<string, unknown>) => {
+        headers = value;
+      },
+      end: (value: Uint8Array, callback: (cause?: Error | null) => void) => {
+        payload = Buffer.from(value);
+        callback();
+      },
+      close: () => undefined,
+      writableEnded: true,
+      rstCode: http2Constants.NGHTTP2_NO_ERROR,
+    } as unknown as ServerHttp2Stream;
+    await Effect.runPromise(
+      respondGrpc(stream, DaemonMethod.discoverPackages, {
+        id: "oversized-discovery",
+        result: {
+          packages: [
+            {
+              name: "x".repeat(1024 * 1024),
+              path: "packages/oversized",
+            },
+          ],
+          packageManager: "pnpm9",
+        },
+      }),
+    );
+    expect(headers?.["grpc-status"]).toBe("13");
+    expect(decodeURIComponent(String(headers?.["grpc-message"]))).toContain(
+      "daemon response exceeds the 1048576 byte payload limit",
+    );
+    expect(payload?.length).toBe(5);
+    expect(payload?.readUInt32BE(1)).toBe(0);
+  });
+
   it("reports asynchronous detached spawn failures", async () => {
     const missingDirectory = join(
       tmpdir(),
@@ -4000,6 +4096,118 @@ describe("repository workflow gate", () => {
     }
   }, 30_000);
 
+  it("bounds retained daemon output registration values", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-daemon-registration-values-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const responses = new Map<string, unknown>();
+      const validHash = "v".repeat(128);
+      const invalidHash = "h".repeat(129);
+      const validGlobs = Array.from({ length: 64 }, () => "g".repeat(1_024));
+      const requests = [
+        {
+          id: "valid",
+          method: DaemonMethod.notifyOutputsWritten,
+          params: { hash: validHash, outputGlobs: validGlobs },
+        },
+        {
+          id: "hash-limit",
+          method: DaemonMethod.notifyOutputsWritten,
+          params: { hash: invalidHash },
+        },
+        {
+          id: "glob-count-limit",
+          method: DaemonMethod.notifyOutputsWritten,
+          params: {
+            hash: "glob-count",
+            outputGlobs: Array.from(
+              { length: 257 },
+              (_, index) => `dist/${index}`,
+            ),
+          },
+        },
+        {
+          id: "glob-length-limit",
+          method: DaemonMethod.notifyOutputsWritten,
+          params: { hash: "glob-length", outputGlobs: ["g".repeat(1_025)] },
+        },
+        {
+          id: "glob-aggregate-limit",
+          method: DaemonMethod.notifyOutputsWritten,
+          params: {
+            hash: "glob-aggregate",
+            outputGlobs: Array.from({ length: 65 }, () => "g".repeat(1_024)),
+          },
+        },
+        {
+          id: "retained",
+          method: DaemonMethod.getChangedOutputs,
+          params: {
+            hashes: [
+              validHash,
+              invalidHash,
+              "glob-count",
+              "glob-length",
+              "glob-aggregate",
+            ],
+          },
+        },
+      ];
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const daemon = yield* DaemonService;
+          return yield* executeDaemon({
+            command: "serve",
+            cwd: directory,
+            idleMilliseconds: 30_000,
+            json: false,
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(DaemonService, {
+                  ...daemon,
+                  serve: () =>
+                    Stream.succeed({
+                      requests: Stream.fromIterable(requests),
+                      respond: (response) =>
+                        Effect.sync(() => {
+                          responses.set(response.id, response);
+                        }),
+                    }),
+                }),
+                Layer.succeed(FileWatcherService, {
+                  watch: () => Stream.never,
+                }),
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(responses.get("valid")).toMatchObject({ result: {} });
+      expect(responses.get("hash-limit")).toMatchObject({
+        error: expect.stringContaining("128 character limit"),
+      });
+      expect(responses.get("glob-count-limit")).toMatchObject({
+        error: expect.stringContaining("at most 256 output globs"),
+      });
+      expect(responses.get("glob-length-limit")).toMatchObject({
+        error: expect.stringContaining("1024 character limit"),
+      });
+      expect(responses.get("glob-aggregate-limit")).toMatchObject({
+        error: expect.stringContaining("65536 aggregate character limit"),
+      });
+      expect(responses.get("retained")).toMatchObject({
+        result: {
+          changedOutputs: [{ hash: validHash, changedOutputGlobs: [] }],
+        },
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("retains daemon output changes recorded while responding", async () => {
     const directory = await mkdtemp(
       join(tmpdir(), "turbo-ts-daemon-generation-"),
@@ -5159,8 +5367,19 @@ describe("repository workflow gate", () => {
 
       sentinel = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
       if (sentinel.pid === undefined) throw new Error("sentinel did not start");
+      const activeLogFile = join(dirname(running.pid_file), "turbod.log-path");
       await writeFile(running.pid_file, `${sentinel.pid}\n`);
       await writeFile(running.sock_file, "stale socket\n");
+      await writeFile(activeLogFile, "stale log pointer\n");
+      await expect(
+        runCandidate("daemon", "start", "--idle-time=30s"),
+      ).rejects.toThrow(/daemon process is alive but did not become healthy/);
+      expect(await readFile(running.pid_file, "utf8")).toBe(
+        `${sentinel.pid}\n`,
+      );
+      expect(await readFile(running.sock_file, "utf8")).toBe("stale socket\n");
+      expect(await readFile(activeLogFile, "utf8")).toBe("stale log pointer\n");
+      expect(sentinel.exitCode).toBeNull();
       await expect(runCandidate("daemon", "stop")).rejects.toThrow(
         /daemon process is alive but did not become healthy/,
       );
@@ -6798,6 +7017,96 @@ describe("repository workflow gate", () => {
       expect(bounded.output).toContain(
         "affected collections support at most 64 distinct ranges per query",
       );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("bounds GraphQL operation complexity before execution", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-query-complexity-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const runQuery = async (query: string) => {
+        let output = "";
+        const exitCode = await Effect.runPromise(
+          Effect.gen(function* () {
+            const terminal = yield* TerminalService;
+            return yield* executeQuery({
+              cwd: directory,
+              query,
+              schema: false,
+              port: 8000,
+            }).pipe(
+              Effect.provide(
+                Layer.succeed(TerminalService, {
+                  ...terminal,
+                  writeStdout: (text) =>
+                    Effect.sync(() => {
+                      output += text;
+                    }),
+                }),
+              ),
+            );
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+        return { exitCode, output };
+      };
+
+      const aliases = Array.from(
+        { length: 513 },
+        (_, index) => `version${index}: version`,
+      ).join(" ");
+      const excessiveSelections = await runQuery(`{ ${aliases} }`);
+      expect(excessiveSelections.exitCode).toBe(1);
+      expect(excessiveSelections.output).toContain(
+        "exceeds the 512 expanded selection limit",
+      );
+
+      let nestedRelationships = "name";
+      for (let depth = 0; depth < 8; depth += 1) {
+        nestedRelationships = `directDependencies { items { ${nestedRelationships} } }`;
+      }
+      const excessiveDepth = await runQuery(
+        `{ package(name: "synthetic-app") { ${nestedRelationships} } }`,
+      );
+      expect(excessiveDepth.exitCode).toBe(1);
+      expect(excessiveDepth.output).toContain(
+        "exceeds the 16 field depth limit",
+      );
+
+      const fragmentFields = Array.from(
+        { length: 100 },
+        (_, index) => `name${index}: name`,
+      ).join(" ");
+      const fragmentParents = Array.from(
+        { length: 6 },
+        (_, index) =>
+          `package${index}: package(name: "synthetic-app") { ...Details }`,
+      ).join(" ");
+      const excessiveExpansion = await runQuery(
+        `fragment Details on Package { ${fragmentFields} } query { ${fragmentParents} }`,
+      );
+      expect(excessiveExpansion.exitCode).toBe(1);
+      expect(excessiveExpansion.output).toContain(
+        "exceeds the 512 expanded selection limit",
+      );
+
+      const tokens = Array.from(
+        { length: 1_400 },
+        (_, index) => `version${index}: version`,
+      ).join(" ");
+      const excessiveTokens = await runQuery(`{ ${tokens} }`);
+      expect(excessiveTokens.exitCode).toBe(1);
+      expect(excessiveTokens.output).toContain("4096 tokens");
+
+      const ordinary = await runQuery(
+        "{ version __schema { queryType { name } } }",
+      );
+      expect(ordinary.exitCode).toBe(0);
+      expect(ordinary.output).toContain('"version": "2.10.12"');
+      expect(ordinary.output).toContain('"name": "RepositoryQuery"');
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

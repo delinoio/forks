@@ -28,7 +28,10 @@ import {
   tarBlockSize,
 } from "../src/cache/archive.js";
 import { parseTarArchiveFile } from "../src/cache/archive-file.js";
-import { maximumCacheArtifactBytes } from "../src/cache/limits.js";
+import {
+  maximumCacheArtifactBytes,
+  maximumCacheMetadataBytes,
+} from "../src/cache/limits.js";
 import {
   evictLocalCache,
   restoreLocalCache,
@@ -1624,6 +1627,92 @@ describe("core CLI execution", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 10_000);
+
+  it("bounds local cache duration metadata reads", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-metadata-"));
+    const cacheDirectory = join(directory, ".turbo/cache");
+    const hash = "0123456789abcdef";
+    const metadataPath = join(cacheDirectory, `${hash}-meta.json`);
+    try {
+      await Effect.runPromise(
+        writeLocalCache(
+          { directory: cacheDirectory },
+          hash,
+          [
+            {
+              path: "output/result.txt",
+              contents: new TextEncoder().encode("cached\n"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+          ],
+          42,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      await truncate(metadataPath, maximumCacheMetadataBytes + 1);
+
+      const restore = async (reportedSize?: number) => {
+        let fullReads = 0;
+        const ranges: Array<readonly [number, number]> = [];
+        let duration: number | undefined;
+        const restored = await Effect.runPromise(
+          Effect.gen(function* () {
+            const fileSystem = yield* FileSystemService;
+            return yield* restoreLocalCache(
+              directory,
+              { directory: cacheDirectory },
+              hash,
+              allowCachePaths("**"),
+              true,
+              (value) => {
+                duration = value;
+              },
+            ).pipe(
+              Effect.provide(
+                Layer.succeed(FileSystemService, {
+                  ...fileSystem,
+                  metadata: (path) =>
+                    fileSystem
+                      .metadata(path)
+                      .pipe(
+                        Effect.map((metadata) =>
+                          path === metadataPath && reportedSize !== undefined
+                            ? { ...metadata, size: reportedSize }
+                            : metadata,
+                        ),
+                      ),
+                  readText: (path) => {
+                    if (path === metadataPath) fullReads += 1;
+                    return fileSystem.readText(path);
+                  },
+                  readBytesRange: (path, offset, length) => {
+                    if (path === metadataPath) ranges.push([offset, length]);
+                    return fileSystem.readBytesRange(path, offset, length);
+                  },
+                }),
+              ),
+            );
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        );
+        return { duration, fullReads, ranges, restored };
+      };
+
+      await expect(restore()).resolves.toEqual({
+        duration: 0,
+        fullReads: 0,
+        ranges: [],
+        restored: true,
+      });
+      await expect(restore(maximumCacheMetadataBytes)).resolves.toEqual({
+        duration: 0,
+        fullReads: 0,
+        ranges: [[0, maximumCacheMetadataBytes + 1]],
+        restored: true,
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 
   it("preserves cache hits when restored task logs cannot be replayed", async () => {
     const directory = await makeFixture();

@@ -26,6 +26,12 @@ official 2.10.12 keys. The bidirectional cache tests prove archive and artifact
 transport compatibility using oracle-provided hashes, not end-to-end cache-key
 identity.
 
+Repository workflow inputs are bounded before retained or effectful work:
+daemon payloads are limited to 1 MiB, output registrations cap hashes and glob
+collections, and GraphQL operations cap tokens, expanded selections, and field
+depth. Daemon start preserves live-process state when health checks fail rather
+than replacing an unresponsive process.
+
 Official `turbo@2.10.12` remains the repository task runner and black-box test
 oracle. No upstream source, tests, fixtures, or diffs are included.
 
@@ -146,7 +152,9 @@ the normal local-execution fallback. Existing-output scan failures likewise
 warn and execute the task locally without cache reads. Decompressed archives
 are parsed from scoped temporary storage. Local restore validation and rejected
 entry cleanup share the entry lock with writers, so corrupt cleanup cannot
-remove a concurrent publication. Cache writes independently limit file content
+remove a concurrent publication. Local duration metadata reads are limited to
+64 KiB; oversized or malformed metadata preserves the hit with zero saved time.
+Cache writes independently limit file content
 and tar metadata overhead to 64 MiB each. Cache output files are read
 sequentially against the remaining content budget, so growth after a metadata
 snapshot cannot exceed the collection bound. Cache publication is serialized

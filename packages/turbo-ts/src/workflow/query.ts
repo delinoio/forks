@@ -1,9 +1,16 @@
 import { Effect, Stream } from "effect";
 import {
   buildSchema,
+  type DocumentNode,
+  type ExecutionResult,
+  execute,
+  GraphQLError,
   type GraphQLSchema,
-  graphql,
   introspectionFromSchema,
+  Kind,
+  parse,
+  type SelectionSetNode,
+  validate,
 } from "graphql";
 import { selectByGlobs } from "../core/glob.js";
 import {
@@ -139,6 +146,84 @@ export const repositoryQuerySchema: GraphQLSchema = buildSchema(schemaSource);
 const maximumRepositoryFileBytes = 1024 * 1024;
 const maximumRepositoryFileQueryBytes = 8 * 1024 * 1024;
 const maximumAffectedRangesPerQuery = 64;
+const maximumGraphqlTokens = 4_096;
+const maximumGraphqlExpandedSelections = 512;
+const maximumGraphqlFieldDepth = 16;
+
+interface GraphqlSelectionFrame {
+  readonly selectionSet: SelectionSetNode;
+  readonly depth: number;
+  readonly fragmentPath: ReadonlySet<string>;
+}
+
+const queryComplexityError = (
+  document: DocumentNode,
+): GraphQLError | undefined => {
+  const fragments = new Map(
+    document.definitions.flatMap((definition) =>
+      definition.kind === Kind.FRAGMENT_DEFINITION
+        ? [[definition.name.value, definition] as const]
+        : [],
+    ),
+  );
+  const stack: Array<GraphqlSelectionFrame> = document.definitions.flatMap(
+    (definition) =>
+      definition.kind === Kind.OPERATION_DEFINITION
+        ? [
+            {
+              selectionSet: definition.selectionSet,
+              depth: 0,
+              fragmentPath: new Set<string>(),
+            },
+          ]
+        : [],
+  );
+  let expandedSelections = 0;
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    for (const selection of frame.selectionSet.selections) {
+      expandedSelections += 1;
+      if (expandedSelections > maximumGraphqlExpandedSelections) {
+        return new GraphQLError(
+          `GraphQL operation exceeds the ${maximumGraphqlExpandedSelections} expanded selection limit`,
+        );
+      }
+      if (selection.kind === Kind.FIELD) {
+        const depth = frame.depth + 1;
+        if (depth > maximumGraphqlFieldDepth) {
+          return new GraphQLError(
+            `GraphQL operation exceeds the ${maximumGraphqlFieldDepth} field depth limit`,
+          );
+        }
+        if (selection.selectionSet !== undefined) {
+          stack.push({
+            selectionSet: selection.selectionSet,
+            depth,
+            fragmentPath: frame.fragmentPath,
+          });
+        }
+        continue;
+      }
+      if (selection.kind === Kind.INLINE_FRAGMENT) {
+        stack.push({
+          selectionSet: selection.selectionSet,
+          depth: frame.depth,
+          fragmentPath: frame.fragmentPath,
+        });
+        continue;
+      }
+      const name = selection.name.value;
+      const fragment = fragments.get(name);
+      if (fragment === undefined || frame.fragmentPath.has(name)) continue;
+      stack.push({
+        selectionSet: fragment.selectionSet,
+        depth: frame.depth,
+        fragmentPath: new Set([...frame.fragmentPath, name]),
+      });
+    }
+  }
+  return undefined;
+};
 
 interface RepositoryFileContents {
   readonly contents: string;
@@ -1026,7 +1111,7 @@ const executeGraphql = (
   source: string,
   variables?: Readonly<Record<string, unknown>>,
 ): Effect.Effect<
-  Awaited<ReturnType<typeof graphql>>,
+  ExecutionResult,
   ConfigurationError,
   FileSystemService | ProcessService
 > =>
@@ -1034,7 +1119,27 @@ const executeGraphql = (
     const fileSystem = yield* FileSystemService;
     const processService = yield* ProcessService;
     return yield* Effect.tryPromise({
-      try: (signal) => {
+      try: async (signal) => {
+        let document: DocumentNode;
+        try {
+          document = parse(source, { maxTokens: maximumGraphqlTokens });
+        } catch (cause) {
+          return {
+            errors: [
+              cause instanceof GraphQLError
+                ? cause
+                : new GraphQLError(String(cause)),
+            ],
+          };
+        }
+        const complexityError = queryComplexityError(document);
+        if (complexityError !== undefined) {
+          return { errors: [complexityError] };
+        }
+        const validationErrors = validate(repositoryQuerySchema, document);
+        if (validationErrors.length > 0) {
+          return { errors: validationErrors };
+        }
         const runResolverEffect = <A, E>(effect: Effect.Effect<A, E, never>) =>
           Effect.runPromise(effect, { signal });
         let externalDependenciesPromise:
@@ -1149,9 +1254,9 @@ const executeGraphql = (
           affectedRepositoryPromises.set(key, loaded);
           return loaded;
         };
-        return graphql({
+        return await execute({
           schema: repositoryQuerySchema,
-          source,
+          document,
           rootValue: repositoryQueryRoot(
             repository,
             async (path) => {
