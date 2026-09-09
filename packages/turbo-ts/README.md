@@ -29,8 +29,9 @@ identity.
 Repository workflow inputs are bounded before retained or effectful work:
 daemon payloads are limited to 1 MiB, output registrations cap hashes and glob
 collections, and GraphQL operations cap tokens, expanded selections, and field
-depth. Daemon start preserves live-process state when health checks fail rather
-than replacing an unresponsive process.
+depth while package-predicate variables cap nodes and nesting depth. Daemon
+start preserves live-process state when health checks fail rather than replacing
+an unresponsive process.
 
 Official `turbo@2.10.12` remains the repository task runner and black-box test
 oracle. No upstream source, tests, fixtures, or diffs are included.
@@ -140,7 +141,8 @@ caching.
 Repository-root Cargo packages reuse the loaded root task configuration.
 Unfiltered Cargo workspace commands merge the effective environments of every
 grouped member and remain package-scoped when any repository member excludes
-the requested verification task.
+the requested verification task. Their JSON input maps qualify member-local
+paths relative to the Cargo workspace.
 Explicitly cached Cargo format tasks hash ancestor `rustfmt.toml` and
 `.rustfmt.toml` files and require at least one positive output declaration so
 formatted sources can be restored on a cache hit.

@@ -459,7 +459,8 @@ discovery uses `--locked`, uses each response's workspace-member list, and does
 not probe excluded or unrelated nested manifests. Combined workspace task
 hashes are propagated into every downstream task hash using the same effective
 task environment as the initial hash computation. JSON dry-run and run summary
-input maps for a grouped task include hashes from every workspace member.
+input maps for a grouped task include hashes from every workspace member under
+member-qualified paths relative to the Cargo workspace.
 Cargo builds with colliding synthesized binary destinations bypass caching,
 including when task configuration explicitly enables it.
 Synthesized Cargo binary outputs cover the extensionless executable plus
@@ -534,7 +535,8 @@ ignore, Turbo configuration, and workspace manifest classification follows
 case-insensitive filesystem semantics on Windows.
 Configured package-relative and `$TURBO_ROOT$/` output paths, patterns, and
 exclusions use the same case-insensitive Windows semantics when watch events
-are filtered.
+are filtered. Task-aware watch selection also compares event paths, package
+directories, and configured input patterns case-insensitively on Windows.
 Explicit graph,
 structured-log, profile, trace, and heap artifacts, default profile artifacts,
 and write-enabled local cache directories are treated as run-owned paths and
@@ -703,7 +705,9 @@ claim workspace-owned files. `query affected`, `query
 ls`, and `ls` share repository discovery and stable ordering. GraphQL documents
 are limited to 4,096 lexer tokens, 512 expanded selections, and a field depth
 of 16 before resolver execution; fragment spreads count each expanded
-selection. The server limits request bodies and closes HTTP handles in Scope;
+selection. Package-predicate variables are limited to 512 nodes and a depth of
+16 before resolver execution. The server limits request bodies and closes HTTP
+handles in Scope;
 oversized requests receive
 HTTP 413 without resetting the connection. Client resets and request errors
 during body upload are isolated before handler execution, and disconnects or

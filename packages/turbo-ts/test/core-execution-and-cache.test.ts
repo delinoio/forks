@@ -4583,14 +4583,21 @@ describe("core CLI execution", () => {
       expect(
         drySummary.tasks.filter((task) => task.taskId.startsWith("rust-")),
       ).toHaveLength(1);
-      expect(
-        drySummary.tasks.find((task) => task.taskId === "rust-a#test"),
-      ).toMatchObject({
+      const groupedTask = drySummary.tasks.find(
+        (task) => task.taskId === "rust-a#test",
+      );
+      expect(groupedTask).toMatchObject({
         taskId: "rust-a#test",
         inputs: {
-          "src/member-b.rs": expect.stringMatching(/^[0-9a-f]{40}$/),
+          "a/Cargo.toml": expect.stringMatching(/^[0-9a-f]{40}$/),
+          "a/src/lib.rs": expect.stringMatching(/^[0-9a-f]{40}$/),
+          "b/Cargo.toml": expect.stringMatching(/^[0-9a-f]{40}$/),
+          "b/src/lib.rs": expect.stringMatching(/^[0-9a-f]{40}$/),
+          "b/src/member-b.rs": expect.stringMatching(/^[0-9a-f]{40}$/),
         },
       });
+      expect(groupedTask?.inputs).not.toHaveProperty("Cargo.toml");
+      expect(groupedTask?.inputs).not.toHaveProperty("src/lib.rs");
       const args = [
         candidateEntrypoint,
         "run",
@@ -10282,14 +10289,14 @@ dependencies = [
     }
   }, 15_000);
 
-  it("matches case-variant implicit task inputs on Windows", async () => {
+  it("matches case-variant task inputs on Windows", async () => {
     const directory = await makeFixture();
     try {
       const configurationPath = `${directory}/turbo.json`;
       const configuration = JSON.parse(
         await readFile(configurationPath, "utf8"),
       ) as { tasks: Record<string, { inputs?: Array<string> }> };
-      configuration.tasks.build!.inputs = ["src/**"];
+      configuration.tasks.build!.inputs = ["SRC/**"];
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
@@ -10304,13 +10311,18 @@ dependencies = [
       const node = buildTaskGraph(model, [library], ["build"], false).nodes.get(
         "synthetic-library#build",
       )!;
-      const changedFiles = ["packages/library/Package.json"];
-      expect(taskMatchesChangedFiles(model, node, changedFiles, {}, true)).toBe(
-        true,
-      );
-      expect(
-        taskMatchesChangedFiles(model, node, changedFiles, {}, false),
-      ).toBe(false);
+      for (const changedFiles of [
+        ["packages/library/Package.json"],
+        ["packages/library/src/index.ts"],
+        ["PACKAGES/LIBRARY/SRC/index.ts"],
+      ]) {
+        expect(
+          taskMatchesChangedFiles(model, node, changedFiles, {}, true),
+        ).toBe(true);
+        expect(
+          taskMatchesChangedFiles(model, node, changedFiles, {}, false),
+        ).toBe(false);
+      }
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

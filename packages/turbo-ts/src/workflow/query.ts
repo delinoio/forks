@@ -10,6 +10,7 @@ import {
   Kind,
   parse,
   type SelectionSetNode,
+  type TypeNode,
   validate,
 } from "graphql";
 import { selectByGlobs } from "../core/glob.js";
@@ -149,6 +150,8 @@ const maximumAffectedRangesPerQuery = 64;
 const maximumGraphqlTokens = 4_096;
 const maximumGraphqlExpandedSelections = 512;
 const maximumGraphqlFieldDepth = 16;
+const maximumGraphqlPredicateNodes = 512;
+const maximumGraphqlPredicateDepth = 16;
 
 interface GraphqlSelectionFrame {
   readonly selectionSet: SelectionSetNode;
@@ -221,6 +224,76 @@ const queryComplexityError = (
         fragmentPath: new Set([...frame.fragmentPath, name]),
       });
     }
+  }
+  return undefined;
+};
+
+const graphqlTypeName = (type: TypeNode): string => {
+  let current = type;
+  while (current.kind !== Kind.NAMED_TYPE) current = current.type;
+  return current.name.value;
+};
+
+interface GraphqlPredicateFrame {
+  readonly value: Readonly<Record<string, unknown>>;
+  readonly depth: number;
+}
+
+const predicateVariablesComplexityError = (
+  document: DocumentNode,
+  variables: Readonly<Record<string, unknown>> | undefined,
+): GraphQLError | undefined => {
+  if (variables === undefined) return undefined;
+  const variableNames = new Set(
+    document.definitions.flatMap((definition) =>
+      definition.kind === Kind.OPERATION_DEFINITION
+        ? (definition.variableDefinitions ?? []).flatMap((variable) =>
+            graphqlTypeName(variable.type) === "PackagePredicate"
+              ? [variable.variable.name.value]
+              : [],
+          )
+        : [],
+    ),
+  );
+  const stack: Array<GraphqlPredicateFrame> = [];
+  let predicateNodes = 0;
+  const enqueue = (value: unknown, depth: number): GraphQLError | undefined => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return undefined;
+    }
+    predicateNodes += 1;
+    if (predicateNodes > maximumGraphqlPredicateNodes) {
+      return new GraphQLError(
+        `GraphQL variables exceed the ${maximumGraphqlPredicateNodes} package predicate node limit`,
+      );
+    }
+    if (depth > maximumGraphqlPredicateDepth) {
+      return new GraphQLError(
+        `GraphQL variables exceed the ${maximumGraphqlPredicateDepth} package predicate depth limit`,
+      );
+    }
+    stack.push({
+      value: value as Readonly<Record<string, unknown>>,
+      depth,
+    });
+    return undefined;
+  };
+  for (const name of variableNames) {
+    const error = enqueue(variables[name], 1);
+    if (error !== undefined) return error;
+  }
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    for (const field of ["and", "or"] as const) {
+      const entries = frame.value[field];
+      if (!Array.isArray(entries)) continue;
+      for (const entry of entries) {
+        const error = enqueue(entry, frame.depth + 1);
+        if (error !== undefined) return error;
+      }
+    }
+    const error = enqueue(frame.value.not, frame.depth + 1);
+    if (error !== undefined) return error;
   }
   return undefined;
 };
@@ -1139,6 +1212,13 @@ const executeGraphql = (
         const validationErrors = validate(repositoryQuerySchema, document);
         if (validationErrors.length > 0) {
           return { errors: validationErrors };
+        }
+        const predicateVariablesError = predicateVariablesComplexityError(
+          document,
+          variables,
+        );
+        if (predicateVariablesError !== undefined) {
+          return { errors: [predicateVariablesError] };
         }
         const runResolverEffect = <A, E>(effect: Effect.Effect<A, E, never>) =>
           Effect.runPromise(effect, { signal });

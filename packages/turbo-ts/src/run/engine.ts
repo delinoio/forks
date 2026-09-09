@@ -636,18 +636,23 @@ interface RunExecutionContext {
 const packageRelativeChangedFile = (
   packageModel: RepositoryPackage,
   repositoryRelativeFile: string,
+  windowsPathSeparators = false,
 ): string | undefined => {
+  const comparablePath = (path: string): string =>
+    windowsPathSeparators ? normalizePath(path, true).toLowerCase() : path;
+  const comparableFile = comparablePath(repositoryRelativeFile);
   if (packageModel.relativeDirectory === ".") {
-    return repositoryRelativeFile;
+    return comparableFile;
   }
   for (const directory of new Set([
     packageModel.relativeDirectory,
     packageModel.canonicalRelativeDirectory,
   ])) {
-    if (repositoryRelativeFile === directory) return ".";
-    const prefix = `${directory}/`;
-    if (repositoryRelativeFile.startsWith(prefix)) {
-      return repositoryRelativeFile.slice(prefix.length);
+    const comparableDirectory = comparablePath(directory);
+    if (comparableFile === comparableDirectory) return ".";
+    const prefix = `${comparableDirectory}/`;
+    if (comparableFile.startsWith(prefix)) {
+      return comparableFile.slice(prefix.length);
     }
   }
   return undefined;
@@ -690,7 +695,11 @@ const affectedPackagesFromChangedFiles = (
       !repository.packages.some(
         (packageModel) =>
           packageModel.relativeDirectory !== "." &&
-          packageRelativeChangedFile(packageModel, path) !== undefined,
+          packageRelativeChangedFile(
+            packageModel,
+            path,
+            windowsPathSeparators,
+          ) !== undefined,
       ),
   );
   const rootConfigurationChanged = changedFiles.includes(
@@ -714,7 +723,11 @@ const affectedPackagesFromChangedFiles = (
             .filter((packageModel) =>
               changedFiles.some(
                 (path) =>
-                  packageRelativeChangedFile(packageModel, path) !== undefined,
+                  packageRelativeChangedFile(
+                    packageModel,
+                    path,
+                    windowsPathSeparators,
+                  ) !== undefined,
               ),
             )
             .map((packageModel) => packageModel.identity),
@@ -931,6 +944,7 @@ export const taskMatchesChangedFiles = (
     const packageRelativeFile = packageRelativeChangedFile(
       node.package,
       repositoryRelativeFile,
+      windowsPathSeparators,
     );
     const logicalRepositoryRelativeFile =
       isRootPackage || packageRelativeFile === undefined
@@ -947,13 +961,14 @@ export const taskMatchesChangedFiles = (
     const matchesInput = (pattern: string): boolean => {
       const rootRelative = pattern.startsWith(rootRelativeInputPrefix);
       const file = rootRelative ? repositoryRelativeFile : packageRelativeFile;
+      const filePattern = rootRelative
+        ? pattern.slice(rootRelativeInputPrefix.length)
+        : pattern;
       return (
         file !== undefined &&
         matchesGlob(
-          file,
-          rootRelative
-            ? pattern.slice(rootRelativeInputPrefix.length)
-            : pattern,
+          windowsPathSeparators ? inputPathIdentity(file) : file,
+          windowsPathSeparators ? inputPathIdentity(filePattern) : filePattern,
           windowsPathSeparators,
         )
       );
@@ -3153,9 +3168,20 @@ const applyCargoWorkspaceHashes = (
           ),
         ].sort(),
         inputFileHashes: Object.fromEntries(
-          scope.members.flatMap((member) =>
-            Object.entries(hashes.get(member.id)?.inputFileHashes ?? {}),
-          ),
+          scope.members.flatMap((member) => {
+            const memberDirectory = relativePath(
+              scope.directory,
+              member.package.directory,
+            );
+            return Object.entries(
+              hashes.get(member.id)?.inputFileHashes ?? {},
+            ).map(([path, hash]) => [
+              memberDirectory === "." || path.startsWith("$TURBO_ROOT$/")
+                ? path
+                : joinPath(memberDirectory, path),
+              hash,
+            ]);
+          }),
         ),
       });
       changed.add(id);

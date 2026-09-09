@@ -7045,7 +7045,10 @@ describe("repository workflow gate", () => {
     );
     try {
       await prepareFixture(directory);
-      const runQuery = async (query: string) => {
+      const runQuery = async (
+        query: string,
+        variables?: Readonly<Record<string, unknown>>,
+      ) => {
         let output = "";
         const exitCode = await Effect.runPromise(
           Effect.gen(function* () {
@@ -7053,6 +7056,7 @@ describe("repository workflow gate", () => {
             return yield* executeQuery({
               cwd: directory,
               query,
+              variables,
               schema: false,
               port: 8000,
             }).pipe(
@@ -7117,6 +7121,41 @@ describe("repository workflow gate", () => {
       const excessiveTokens = await runQuery(`{ ${tokens} }`);
       expect(excessiveTokens.exitCode).toBe(1);
       expect(excessiveTokens.output).toContain("4096 tokens");
+
+      const predicateQuery =
+        "query($filter: PackagePredicate) { packages(filter: $filter) { length } }";
+      const boundedPredicate = await runQuery(predicateQuery, {
+        filter: {
+          and: Array.from({ length: 511 }, () => ({})),
+        },
+      });
+      expect(boundedPredicate.exitCode).toBe(0);
+      const excessivePredicateNodes = await runQuery(predicateQuery, {
+        filter: {
+          and: Array.from({ length: 512 }, () => ({})),
+        },
+      });
+      expect(excessivePredicateNodes.exitCode).toBe(1);
+      expect(excessivePredicateNodes.output).toContain(
+        "512 package predicate node limit",
+      );
+
+      let nestedPredicate: Readonly<Record<string, unknown>> = {};
+      for (let depth = 0; depth < 15; depth += 1) {
+        nestedPredicate = { not: nestedPredicate };
+      }
+      const boundedPredicateDepth = await runQuery(predicateQuery, {
+        filter: nestedPredicate,
+      });
+      expect(boundedPredicateDepth.exitCode).toBe(0);
+      nestedPredicate = { not: nestedPredicate };
+      const excessivePredicateDepth = await runQuery(predicateQuery, {
+        filter: nestedPredicate,
+      });
+      expect(excessivePredicateDepth.exitCode).toBe(1);
+      expect(excessivePredicateDepth.output).toContain(
+        "16 package predicate depth limit",
+      );
 
       const ordinary = await runQuery(
         "{ version __schema { queryType { name } } }",
