@@ -1062,6 +1062,35 @@ export const hashTask = (
     )).filter(
       (entry): entry is NonNullable<typeof entry> => entry !== undefined,
     );
+    const reportedInputFileHashes = yield* Effect.forEach(
+      hashedInputFiles,
+      (entry) =>
+        entry.hash[3] === undefined
+          ? Effect.succeed([entry.input.hashPath, entry.hash[2]] as const)
+          : digest
+              .gitBlobSha1(
+                new TextEncoder().encode(
+                  canonicalStringify({
+                    linkHash: entry.hash[2],
+                    resolvedContentsHash: entry.hash[3],
+                  }),
+                ),
+              )
+              .pipe(
+                Effect.map(
+                  (reportedHash) =>
+                    [entry.input.hashPath, reportedHash] as const,
+                ),
+                Effect.mapError(
+                  (error) =>
+                    new RepositoryError({
+                      path: entry.input.absolutePath,
+                      message: error.message,
+                    }),
+                ),
+              ),
+      { concurrency: 8 },
+    );
     const fileHashes = hashedInputFiles.map((entry) => entry.hash);
     const globalSettings = activeGlobalSettings(repository);
     const hashedEnvironment = selectEnvironment(
@@ -1184,9 +1213,7 @@ export const hashTask = (
       environment: hashedEnvironment,
       inputFiles: hashedInputFiles.map((entry) => entry.input.hashPath),
       inputFileHashes: Object.fromEntries([
-        ...hashedInputFiles.map(
-          (entry) => [entry.input.hashPath, entry.hash[2]] as const,
-        ),
+        ...reportedInputFileHashes,
         ...reportedConfigurationHashes,
       ]),
       globalInputFileHashes: Object.fromEntries(

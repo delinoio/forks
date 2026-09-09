@@ -129,7 +129,9 @@ manifests participate in task-aware selection and hashing independently of user
 input globs. Their implicit input identities follow case-insensitive filesystem
 semantics on Windows. Symlinked owning control manifests retain their link
 identity and also hash the resolved file contents consumed by discovery and
-execution.
+execution. Reported per-task input digests for symlinked mandatory controls
+combine the link and resolved-content hashes so a change to either contribution
+is visible in dry runs and run summaries.
 Package task configurations participate independently in task-aware selection.
 Owning lockfiles, repository-controlled JavaScript package-manager
 configuration, workspace-local Bun `bunfig.toml` files, and Cargo control or
@@ -857,10 +859,11 @@ path; other `profile.*` files remain inputs. Simultaneous bare named and
 anonymous profiles use distinct generated destinations. A bare structured-log
 option exclusively claims its timestamped generated destination before
 validation; a collision uses the run UUID and then a numeric suffix. An early
-claim is removed when preparation fails. No structured-log
-artifact may replace a mandatory task control input or match a declared task
-output or resolved task-log path; output collision matching is case-insensitive
-on Windows. Every active structured-log, named-profile,
+claim is removed when preparation fails. No active structured-log,
+named-profile, anonymous-profile, heap-snapshot, or trace artifact may replace
+a mandatory task control input or match a declared task output or resolved
+task-log path; output collision matching is case-insensitive on Windows. Every
+active structured-log, named-profile,
 anonymous-profile, heap-snapshot, and trace destination must also resolve to a
 distinct path; collisions fail before an artifact is written or a task starts.
 Timestamped streaming applies the timestamp writer to a final unterminated task

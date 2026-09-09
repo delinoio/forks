@@ -3738,98 +3738,6 @@ export const executeRun = (
         }
         return yield* canonicalRunArtifactPath(path);
       });
-    if (structuredLogPath !== undefined) {
-      const canonicalStructuredLogPath =
-        yield* canonicalAtomicRunArtifactPath(structuredLogPath);
-      const structuredLogIdentity = comparableInputPath(
-        canonicalStructuredLogPath,
-      );
-      const controlCandidates = [...selectedGraph.nodes.values()].flatMap(
-        (node) =>
-          implicitTaskInputCandidates(
-            repository,
-            node,
-            environment,
-            platform === "win32",
-          ),
-      );
-      const controlCollision = (yield* Effect.forEach(
-        controlCandidates,
-        (candidate) =>
-          canonicalExistingAncestorPath(candidate, "task control input").pipe(
-            Effect.map(
-              (canonicalCandidate) =>
-                comparableInputPath(canonicalCandidate) ===
-                structuredLogIdentity,
-            ),
-          ),
-        { concurrency: 8 },
-      )).some(Boolean);
-      if (controlCollision) {
-        return yield* Effect.fail(
-          new ConfigurationError({
-            path: structuredLogPath,
-            message:
-              "structured log path must not replace a task control input",
-          }),
-        );
-      }
-      const outputCollision = (yield* Effect.forEach(
-        [...selectedGraph.nodes.values()],
-        (node) =>
-          canonicalExistingAncestorPath(
-            node.package.directory,
-            "task output root",
-          ).pipe(
-            Effect.map((canonicalPackageDirectory) =>
-              taskOutputContainsPath(
-                canonicalRoot,
-                canonicalPackageDirectory,
-                node,
-                canonicalStructuredLogPath,
-                platform === "win32",
-              ),
-            ),
-          ),
-        { concurrency: 8 },
-      )).some(Boolean);
-      if (outputCollision) {
-        return yield* Effect.fail(
-          new ConfigurationError({
-            path: structuredLogPath,
-            message:
-              "structured log path must not match a declared task output",
-          }),
-        );
-      }
-      const taskLogCollision = (yield* Effect.forEach(
-        [...graph.nodes.values()],
-        (node) =>
-          canonicalExistingAncestorPath(
-            taskLogPath(
-              node,
-              cargoWorkspacePlan.scopes.get(node.id),
-              logIdentifiers.get(node.id),
-            ),
-            "task log",
-          ).pipe(
-            Effect.map(
-              (canonicalTaskLogPath) =>
-                comparableInputPath(canonicalTaskLogPath) ===
-                structuredLogIdentity,
-            ),
-          ),
-        { concurrency: 8 },
-      )).some(Boolean);
-      if (taskLogCollision) {
-        return yield* Effect.fail(
-          new ConfigurationError({
-            path: structuredLogPath,
-            message: "structured log path must not replace a task log",
-          }),
-        );
-      }
-    }
     const excludedInputPathCandidates = [
       structuredLogPath,
       ...(parsed.graph === undefined && parsed.dryRun === undefined
@@ -3890,18 +3798,23 @@ export const executeRun = (
         ? undefined
         : (resolveExplicitRunArtifactPath(parsed.trace) ?? defaultProfilePath);
     const artifactDestinations = [
-      ["--log-file", structuredLogPath],
-      ["--profile", resolvedProfilePath],
-      ["--anon-profile", resolvedAnonymousProfilePath],
-      ["--heap", resolvedHeapPath],
-      ["--trace", resolvedTracePath],
+      ["--log-file", "structured log", structuredLogPath],
+      ["--profile", "named profile", resolvedProfilePath],
+      ["--anon-profile", "anonymous profile", resolvedAnonymousProfilePath],
+      ["--heap", "heap snapshot", resolvedHeapPath],
+      ["--trace", "trace", resolvedTracePath],
     ] as const;
     const artifactOwners = new Map<string, string>();
-    for (const [owner, path] of artifactDestinations) {
+    const activeArtifactDestinations: Array<{
+      readonly canonicalPath: string;
+      readonly description: string;
+      readonly identity: string;
+      readonly path: string;
+    }> = [];
+    for (const [owner, description, path] of artifactDestinations) {
       if (path === undefined) continue;
-      const identity = comparableInputPath(
-        yield* canonicalRunArtifactPath(path),
-      );
+      const canonicalPath = yield* canonicalRunArtifactPath(path);
+      const identity = comparableInputPath(canonicalPath);
       const existingOwner = artifactOwners.get(identity);
       if (existingOwner !== undefined) {
         return yield* Effect.fail(
@@ -3912,6 +3825,101 @@ export const executeRun = (
         );
       }
       artifactOwners.set(identity, owner);
+      activeArtifactDestinations.push({
+        canonicalPath,
+        description,
+        identity,
+        path,
+      });
+    }
+    if (activeArtifactDestinations.length > 0) {
+      const controlIdentities = new Set(
+        yield* Effect.forEach(
+          [
+            ...new Set(
+              [...selectedGraph.nodes.values()].flatMap((node) =>
+                implicitTaskInputCandidates(
+                  repository,
+                  node,
+                  environment,
+                  platform === "win32",
+                ),
+              ),
+            ),
+          ],
+          (candidate) =>
+            canonicalExistingAncestorPath(candidate, "task control input").pipe(
+              Effect.map(comparableInputPath),
+            ),
+          { concurrency: 8 },
+        ),
+      );
+      const outputRoots = new Map(
+        yield* Effect.forEach(
+          [...selectedGraph.nodes.values()],
+          (node) =>
+            canonicalExistingAncestorPath(
+              node.package.directory,
+              "task output root",
+            ).pipe(
+              Effect.map(
+                (canonicalPackageDirectory) =>
+                  [node.id, canonicalPackageDirectory] as const,
+              ),
+            ),
+          { concurrency: 8 },
+        ),
+      );
+      const taskLogIdentities = new Set(
+        yield* Effect.forEach(
+          [...graph.nodes.values()],
+          (node) =>
+            canonicalExistingAncestorPath(
+              taskLogPath(
+                node,
+                cargoWorkspacePlan.scopes.get(node.id),
+                logIdentifiers.get(node.id),
+              ),
+              "task log",
+            ).pipe(Effect.map(comparableInputPath)),
+          { concurrency: 8 },
+        ),
+      );
+      for (const artifact of activeArtifactDestinations) {
+        if (controlIdentities.has(artifact.identity)) {
+          return yield* Effect.fail(
+            new ConfigurationError({
+              path: artifact.path,
+              message: `${artifact.description} path must not replace a task control input`,
+            }),
+          );
+        }
+        const outputCollision = [...selectedGraph.nodes.values()].some((node) =>
+          taskOutputContainsPath(
+            canonicalRoot,
+            outputRoots.get(node.id)!,
+            node,
+            artifact.canonicalPath,
+            platform === "win32",
+          ),
+        );
+        if (outputCollision) {
+          return yield* Effect.fail(
+            new ConfigurationError({
+              path: artifact.path,
+              message: `${artifact.description} path must not match a declared task output`,
+            }),
+          );
+        }
+        if (taskLogIdentities.has(artifact.identity)) {
+          return yield* Effect.fail(
+            new ConfigurationError({
+              path: artifact.path,
+              message: `${artifact.description} path must not replace a task log`,
+            }),
+          );
+        }
+      }
     }
     const profileService = yield* Effect.serviceOption(RuntimeProfileService);
     if (resolvedHeapPath !== undefined) {

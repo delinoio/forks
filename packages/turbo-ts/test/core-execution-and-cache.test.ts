@@ -3919,7 +3919,13 @@ describe("core CLI execution", () => {
         manifestTargetPath,
         `${JSON.stringify(manifest, null, 2)}\n`,
       );
-      expect((await compute()).hash).not.toBe(before.hash);
+      const after = await compute();
+      expect(after.hash).not.toBe(before.hash);
+      expect(before.inputFileHashes["package.json"]).toMatch(/^[0-9a-f]{40}$/);
+      expect(after.inputFileHashes["package.json"]).toMatch(/^[0-9a-f]{40}$/);
+      expect(after.inputFileHashes["package.json"]).not.toBe(
+        before.inputFileHashes["package.json"],
+      );
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

@@ -1299,6 +1299,80 @@ describe("repository workflow gate", () => {
     }
   }, 30_000);
 
+  it("rejects profile artifacts that collide with task files before task execution", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-profile-collisions-"),
+    );
+    try {
+      await prepareFixture(directory);
+      for (const packageName of ["app", "library"]) {
+        const manifestPath = join(
+          directory,
+          "packages",
+          packageName,
+          "package.json",
+        );
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          scripts: Record<string, string>;
+        };
+        manifest.scripts.build =
+          "node -e \"require('node:fs').writeFileSync('../../task-ran','1')\"";
+        await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+      }
+      const protectedDestinations = [
+        {
+          path: "packages/app/package.json",
+          message: "must not replace a task control input",
+        },
+        {
+          path: "packages/app/build/profile.json",
+          message: "must not match a declared task output",
+        },
+        {
+          path: "packages/app/.turbo/turbo-build.log",
+          message: "must not replace a task log",
+        },
+      ] as const;
+      for (const destination of protectedDestinations) {
+        const destinationPath = join(directory, destination.path);
+        await mkdir(dirname(destinationPath), { recursive: true });
+        if (destination.path !== "packages/app/package.json") {
+          await writeFile(destinationPath, "preserved\n");
+        }
+        const originalContents = await readFile(destinationPath, "utf8");
+        for (const option of [
+          "--profile",
+          "--anon-profile",
+          "--heap",
+          "--trace",
+        ]) {
+          await expect(
+            execFilePromise(process.execPath, [
+              candidate,
+              "run",
+              "build",
+              "--filter=synthetic-app",
+              "--no-cache",
+              `${option}=${destination.path}`,
+              "--cwd",
+              directory,
+            ]),
+          ).rejects.toThrow(new RegExp(destination.message));
+          expect(await readFile(destinationPath, "utf8")).toBe(
+            originalContents,
+          );
+          expect(
+            await readFile(join(directory, "task-ran"), "utf8").catch(
+              () => undefined,
+            ),
+          ).toBeUndefined();
+        }
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 60_000);
+
   it("rejects atomic run artifact destinations that are symlink leaves", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(
