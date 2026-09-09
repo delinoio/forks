@@ -242,6 +242,91 @@ const configuredYarnPluginPaths = (
     return [...paths.values()];
   });
 
+const writeYarnConfiguration = (
+  source: string,
+  destination: string,
+  repositoryRoot: string,
+  copiedControlPaths: ReadonlyArray<string>,
+  windowsPathSemantics: boolean,
+): Effect.Effect<void, unknown, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    if (copiedControlPaths.length === 0) {
+      yield* fileSystem.copyFile(source, destination);
+      return;
+    }
+    const sourceText = yield* fileSystem.readText(source);
+    const document = parseYaml(sourceText) as unknown;
+    if (
+      typeof document !== "object" ||
+      document === null ||
+      Array.isArray(document)
+    ) {
+      yield* fileSystem.copyFile(source, destination);
+      return;
+    }
+    const copiedDestinations = new Map(
+      copiedControlPaths
+        .filter((path) =>
+          isPathContained(repositoryRoot, path, windowsPathSemantics),
+        )
+        .map((path) => [
+          prunePathIdentity(path, windowsPathSemantics),
+          relativePath(repositoryRoot, path, windowsPathSemantics),
+        ]),
+    );
+    const rewritePath = (value: unknown): unknown => {
+      if (
+        typeof value !== "string" ||
+        !isAbsolutePath(value, windowsPathSemantics)
+      ) {
+        return value;
+      }
+      return (
+        copiedDestinations.get(
+          prunePathIdentity(value, windowsPathSemantics),
+        ) ?? value
+      );
+    };
+    const mutableDocument = document as Record<string, unknown>;
+    let changed = false;
+    const yarnPath = rewritePath(mutableDocument.yarnPath);
+    if (yarnPath !== mutableDocument.yarnPath) {
+      mutableDocument.yarnPath = yarnPath;
+      changed = true;
+    }
+    if (Array.isArray(mutableDocument.plugins)) {
+      const plugins = mutableDocument.plugins.map((plugin) => {
+        if (
+          typeof plugin !== "object" ||
+          plugin === null ||
+          Array.isArray(plugin)
+        ) {
+          return plugin;
+        }
+        const mutablePlugin = plugin as Record<string, unknown>;
+        const path = rewritePath(mutablePlugin.path);
+        if (path === mutablePlugin.path) return plugin;
+        changed = true;
+        return { ...mutablePlugin, path };
+      });
+      if (changed) mutableDocument.plugins = plugins;
+    }
+    if (!changed) {
+      yield* fileSystem.copyFile(source, destination);
+      return;
+    }
+    yield* fileSystem.writeTextAtomic(
+      destination,
+      stringifyYaml(mutableDocument, {
+        indentSeq: false,
+        lineWidth: 0,
+        singleQuote: true,
+      }),
+      0o644,
+    );
+  });
+
 const copyTree = (
   source: string,
   destination: string,
@@ -710,6 +795,11 @@ export const executePrune = (
       repository,
       windowsPathSemantics,
     );
+    const yarnExecutable = repository.packageManagerExecutableInput;
+    const copiedYarnControlPaths = [
+      ...(yarnExecutable === undefined ? [] : [yarnExecutable]),
+      ...yarnPluginPaths,
+    ];
     const ignoreMatcher = options.useGitignore
       ? yield* loadGitIgnoreMatcher(repository.root)
       : undefined;
@@ -893,6 +983,36 @@ export const executePrune = (
             writeWorkspaceConfiguration,
           );
         }
+      } else if (name === ".yarnrc.yml") {
+        const writeConfiguration = (
+          configurationSource: string,
+          configurationDestination: string,
+        ) =>
+          writeYarnConfiguration(
+            configurationSource,
+            configurationDestination,
+            repository.root,
+            copiedYarnControlPaths,
+            windowsPathSemantics,
+          );
+        yield* copyIfPresent(
+          source,
+          joinPath(fullRoot, name),
+          repository.root,
+          canonicalOutputRoot,
+          fullRoot,
+          writeConfiguration,
+        );
+        if (options.docker) {
+          yield* copyIfPresent(
+            source,
+            joinPath(jsonRoot, name),
+            repository.root,
+            canonicalOutputRoot,
+            jsonRoot,
+            writeConfiguration,
+          );
+        }
       } else {
         yield* copyIfPresent(
           source,
@@ -921,7 +1041,6 @@ export const executePrune = (
       }
     }
     const yarnDirectory = joinPath(repository.root, ".yarn");
-    const yarnExecutable = repository.packageManagerExecutableInput;
     const requiredYarnControls = new Set([
       joinPath(yarnDirectory, "patches"),
       joinPath(yarnDirectory, "plugins"),

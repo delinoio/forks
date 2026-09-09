@@ -39,6 +39,7 @@ import {
 } from "effect";
 import { graphql } from "graphql";
 import { parse as parseToml } from "smol-toml";
+import { parse as parseYaml } from "yaml";
 import { commandIndex } from "../src/cli/program.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { normalizeOutput } from "../src/compatibility/normalizers.js";
@@ -9637,7 +9638,7 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
     }
   }, 30_000);
 
-  it("copies ignored required Yarn controls into prune outputs", async () => {
+  it("copies and rewrites ignored required Yarn controls in prune outputs", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-yarn-"));
     try {
       await prepareFixture(directory);
@@ -9655,11 +9656,20 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
       await writeFile(
         join(directory, ".yarnrc.yml"),
         [
-          "yarnPath: .yarn/node_modules/@yarnpkg/cli-dist/bin/yarn.js",
+          `yarnPath: ${join(
+            directory,
+            ".yarn/node_modules/@yarnpkg/cli-dist/bin/yarn.js",
+          )}`,
           "plugins:",
-          "  - path: .yarn/plugins/@yarnpkg/plugin-synthetic.cjs",
+          `  - path: ${join(
+            directory,
+            ".yarn/plugins/@yarnpkg/plugin-synthetic.cjs",
+          )}`,
           "    spec: '@yarnpkg/plugin-synthetic'",
-          "  - path: node_modules/@yarnpkg/plugin-external.cjs",
+          `  - path: ${join(
+            directory,
+            "node_modules/@yarnpkg/plugin-external.cjs",
+          )}`,
           "    spec: '@yarnpkg/plugin-external'",
           "",
         ].join("\n"),
@@ -9703,6 +9713,25 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
         join(directory, "node_modules/unrelated/secret.txt"),
         "not required\n",
       );
+      const expectedYarnControlPaths = {
+        yarnPath: ".yarn/node_modules/@yarnpkg/cli-dist/bin/yarn.js",
+        pluginPaths: [
+          ".yarn/plugins/@yarnpkg/plugin-synthetic.cjs",
+          "node_modules/@yarnpkg/plugin-external.cjs",
+        ],
+      };
+      const readYarnControlPaths = async (root: string) => {
+        const configuration = parseYaml(
+          await readFile(join(root, ".yarnrc.yml"), "utf8"),
+        ) as {
+          readonly yarnPath?: unknown;
+          readonly plugins?: ReadonlyArray<{ readonly path?: unknown }>;
+        };
+        return {
+          yarnPath: configuration.yarnPath,
+          pluginPaths: configuration.plugins?.map((plugin) => plugin.path),
+        };
+      };
 
       await executeDifferentialCommand(process.execPath, [
         candidate,
@@ -9712,6 +9741,9 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
         "--cwd",
         directory,
       ]);
+      expect(
+        await readYarnControlPaths(join(directory, "yarn-result")),
+      ).toEqual(expectedYarnControlPaths);
       expect(
         await readFile(
           join(
@@ -9765,6 +9797,11 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
         directory,
       ]);
       for (const root of ["full", "json"]) {
+        expect(
+          await readYarnControlPaths(
+            join(directory, "yarn-docker-result", root),
+          ),
+        ).toEqual(expectedYarnControlPaths);
         expect(
           await readFile(
             join(
@@ -11681,18 +11718,33 @@ importers:
       const configurationPath = join(directory, "turbo.json");
       const configuration = JSON.parse(
         await readFile(configurationPath, "utf8"),
-      ) as { globalDependencies?: ReadonlyArray<string> };
-      configuration.globalDependencies = ["PACKAGES/APP/shared.json"];
+      ) as {
+        futureFlags?: Record<string, boolean>;
+        globalDependencies?: ReadonlyArray<string>;
+      };
+      configuration.futureFlags = {
+        affectedUsingTaskInputs: true,
+        watchUsingTaskInputs: true,
+      };
+      configuration.globalDependencies = [
+        "PACKAGES/APP/configured-shared.json",
+      ];
       await writeFile(
         configurationPath,
         `${JSON.stringify(configuration, undefined, 2)}\n`,
       );
-      await writeFile(join(directory, "packages/app/shared.json"), "changed\n");
+      await writeFile(
+        join(directory, "packages/app/configured-shared.json"),
+        "configured\n",
+      );
+      await writeFile(join(directory, "packages/app/cli-shared.json"), "CLI\n");
       const changedPaths = new TextEncoder().encode(
-        "packages/app/shared.json\0",
+        "packages/app/configured-shared.json\0",
       );
       let listOutput = "";
       let queryOutput = "";
+      let affectedRunOutput = "";
+      let watchRunOutput = "";
       await Effect.runPromise(
         Effect.gen(function* () {
           const environment = yield* EnvironmentService;
@@ -11757,6 +11809,63 @@ importers:
               ),
             ),
           ).toBe(0);
+          expect(
+            yield* executeRun(
+              parseRunArguments([
+                "run",
+                "build",
+                "--affected",
+                "--no-cache",
+                "--dry=json",
+                "--cwd",
+                directory,
+              ]),
+            ).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  windowsLayer,
+                  processLayer,
+                  Layer.succeed(TerminalService, {
+                    ...terminal,
+                    writeStdout: (text) =>
+                      Effect.sync(() => {
+                        affectedRunOutput += text;
+                      }),
+                  }),
+                ),
+              ),
+            ),
+          ).toBe(0);
+          expect(
+            yield* executeRun(
+              parseRunArguments([
+                "run",
+                "build",
+                "--global-deps=PACKAGES/APP/CLI-SHARED.JSON",
+                "--no-cache",
+                "--dry=json",
+                "--cwd",
+                directory,
+              ]),
+              {
+                changedPaths: [join(directory, "packages/app/cli-shared.json")],
+              },
+            ).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  windowsLayer,
+                  processLayer,
+                  Layer.succeed(TerminalService, {
+                    ...terminal,
+                    writeStdout: (text) =>
+                      Effect.sync(() => {
+                        watchRunOutput += text;
+                      }),
+                  }),
+                ),
+              ),
+            ),
+          ).toBe(0);
         }).pipe(Effect.provide(nodeFoundationLayer)),
       );
       expect(
@@ -11779,6 +11888,17 @@ importers:
           .map(({ name }) => name)
           .sort(),
       ).toEqual(["//", "synthetic-app", "synthetic-library"]);
+      for (const output of [affectedRunOutput, watchRunOutput]) {
+        expect(
+          (
+            JSON.parse(output) as {
+              readonly tasks: ReadonlyArray<{ readonly taskId: string }>;
+            }
+          ).tasks
+            .map(({ taskId }) => taskId)
+            .sort(),
+        ).toEqual(["synthetic-app#build", "synthetic-library#build"]);
+      }
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

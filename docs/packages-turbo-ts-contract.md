@@ -438,8 +438,9 @@ the repository always retain package targeting and bypass caching, as do task
 scopes whose hashes depend on them, because their external Cargo controls are
 not repository hash inputs. Cargo packages with source-free local path
 dependencies that do not resolve to a same-workspace repository package also
-bypass caching. Grouped Cargo commands receive
-the union of all member task environments. Cargo package-graph edges require a
+bypass caching. Grouped Cargo commands receive the union of all member task
+environments, and JSON dry-runs and run summaries report the same union. Cargo
+package-graph edges require a
 source-free metadata dependency path that resolves to the named member in the
 same workspace; registry and Git dependencies remain external. Cargo `run` and
 `dev` tasks are exposed only for crates with one unambiguous binary target, and
@@ -832,7 +833,9 @@ installation root. Root Bun `bunfig.toml` configuration is retained in the
 ordinary output and both Docker installation roots. Root Yarn installation controls, including `.yarnrc.yml`,
 `.pnp.cjs`, releases, patches, plugins, and a repository-contained configured `yarnPath`
 executable, are retained at their repository-relative locations in applicable
-ordinary and Docker layouts. Required Yarn releases, patches, and configured
+ordinary and Docker layouts. Accepted absolute `yarnPath` and plugin references
+are rewritten to those repository-relative locations in every emitted
+`.yarnrc.yml`. Required Yarn releases, patches, and configured
 plugins or executables are retained even when Git-ignore rules match them, including when
 their configured path descends through an otherwise ignored `node_modules`
 directory; unrelated files beneath that ignored directory remain excluded.

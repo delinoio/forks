@@ -4639,7 +4639,7 @@ describe("core CLI execution", () => {
     }
   }, 60_000);
 
-  it("excludes transitive Cargo workspaces from grouped external dependencies", async () => {
+  it("reports grouped Cargo external dependencies and member environments", async () => {
     const directory = await makeFixture();
     const commandDirectory = `${directory}/commands`;
     const cargoWorkspaceDirectory = `${directory}/rust`;
@@ -4679,6 +4679,23 @@ describe("core CLI execution", () => {
         await writeFile(
           `${cargoPackage.packageDirectory}/src/lib.rs`,
           "pub fn value() {}\n",
+        );
+        await writeFile(
+          `${cargoPackage.packageDirectory}/turbo.json`,
+          `${JSON.stringify(
+            {
+              extends: ["//"],
+              tasks: {
+                test: {
+                  env: [
+                    `CARGO_${cargoPackage.name.slice("rust-".length).toUpperCase()}_ENV`,
+                  ],
+                },
+              },
+            },
+            undefined,
+            2,
+          )}\n`,
         );
       }
       await writeFile(
@@ -4766,6 +4783,9 @@ dependencies = [
       await chmod(rustcCommand, 0o755);
       const environment = {
         ...process.env,
+        CARGO_A_ENV: "a",
+        CARGO_B_ENV: "b",
+        CARGO_C_ENV: "c",
         PATH: `${commandDirectory}${delimiter}${process.env.PATH ?? ""}`,
         NO_COLOR: "1",
         TURBO_TELEMETRY_DISABLED: "1",
@@ -4786,6 +4806,9 @@ dependencies = [
         readonly tasks: ReadonlyArray<{
           readonly package: string;
           readonly hashOfExternalDependencies: string;
+          readonly environmentVariables: {
+            readonly specified: { readonly env: ReadonlyArray<string> };
+          };
         }>;
       };
       expect(drySummary.tasks).toHaveLength(1);
@@ -4793,6 +4816,11 @@ dependencies = [
         package: "rust-a",
         hashOfExternalDependencies: expectedHash,
       });
+      expect(drySummary.tasks[0]?.environmentVariables.specified.env).toEqual([
+        "CARGO_A_ENV",
+        "CARGO_B_ENV",
+        "CARGO_C_ENV",
+      ]);
       const completed = await run(
         process.execPath,
         [
@@ -4816,6 +4844,9 @@ dependencies = [
       expect(completedSummary.tasks[0]?.hashOfExternalDependencies).toBe(
         expectedHash,
       );
+      expect(
+        completedSummary.tasks[0]?.environmentVariables.specified.env,
+      ).toEqual(["CARGO_A_ENV", "CARGO_B_ENV", "CARGO_C_ENV"]);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

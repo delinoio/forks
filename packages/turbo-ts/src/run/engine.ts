@@ -687,9 +687,14 @@ const affectedPackagesFromChangedFiles = (
       : (repository.rootConfiguration.value.globalDependencies ?? [])),
     ...commandGlobalDependencies,
   ];
+  const comparableGlobalDependencyPath = (path: string): string =>
+    windowsPathSeparators ? path.toLowerCase() : path;
   const globalDependencyChanged =
-    selectByGlobs(changedFiles, globalDependencyPatterns, windowsPathSeparators)
-      .length > 0;
+    selectByGlobs(
+      changedFiles.map(comparableGlobalDependencyPath),
+      globalDependencyPatterns.map(comparableGlobalDependencyPath),
+      windowsPathSeparators,
+    ).length > 0;
   const ordinaryRootChanged = changedFiles.some(
     (path) =>
       !repository.packages.some(
@@ -3194,6 +3199,10 @@ const applyCargoWorkspaceHashes = (
       combined.set(id, {
         ...representative,
         hash: cargoWorkspaceHash(members),
+        environment: Object.assign(
+          {},
+          ...scope.members.map((member) => hashes.get(member.id)!.environment),
+        ),
         inputFiles: [
           ...new Set(
             scope.members.flatMap((member) =>
