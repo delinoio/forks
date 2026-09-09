@@ -490,6 +490,10 @@ const copyGlobalDependencyFiles = (
       (pattern) => !pattern.startsWith("!"),
     );
     if (positivePatterns.length === 0) return;
+    const comparable = (value: string): string =>
+      windowsPathSemantics ? value.toLowerCase() : value;
+    const comparablePatterns = patterns.map(comparable);
+    const comparablePositivePatterns = positivePatterns.map(comparable);
     const paths = yield* listRepositoryFiles(repository.root, {
       shouldTraverseDirectory: (relativeDirectory) => {
         const directoryName = baseName(relativeDirectory, windowsPathSemantics);
@@ -500,9 +504,9 @@ const copyGlobalDependencyFiles = (
         ) {
           return false;
         }
-        return positivePatterns.some((pattern) =>
+        return comparablePositivePatterns.some((pattern) =>
           canMatchGlobDescendant(
-            relativeDirectory,
+            comparable(relativeDirectory),
             pattern,
             windowsPathSemantics,
           ),
@@ -510,14 +514,29 @@ const copyGlobalDependencyFiles = (
       },
       windowsPathSeparators: windowsPathSemantics,
     });
-    const selected = selectByGlobs(
-      paths.map((path) =>
-        relativePath(repository.root, path, windowsPathSemantics),
-      ),
-      patterns,
-      windowsPathSemantics,
+    const relativePaths = paths.map((path) =>
+      relativePath(repository.root, path, windowsPathSemantics),
     );
-    for (const relative of selected) {
+    const selected = new Set(
+      selectByGlobs(
+        relativePaths.map(comparable),
+        comparablePatterns,
+        windowsPathSemantics,
+      ),
+    );
+    const lockfileIdentity =
+      repository.lockfile === undefined
+        ? undefined
+        : comparable(
+            relativePath(
+              repository.root,
+              repository.lockfile,
+              windowsPathSemantics,
+            ),
+          );
+    for (const relative of relativePaths) {
+      const identity = comparable(relative);
+      if (!selected.has(identity) || identity === lockfileIdentity) continue;
       const source = joinPath(repository.root, relative);
       if (ignoreMatcher?.ignores(source)) continue;
       yield* copyIfPresent(

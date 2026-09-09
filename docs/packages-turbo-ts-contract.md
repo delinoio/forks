@@ -336,7 +336,10 @@ entry holds the same lock through validation and rejected-entry cleanup so it
 cannot remove a concurrent publication. Active entry locks renew their lease
 before the stale-lock threshold, and renewal or ownership loss interrupts the
 protected operation. Locks left by terminated writers remain reclaimable.
-Future-dated entry locks and reclaim markers are stale rather than live.
+Future-dated entry locks and reclaim markers are stale rather than live. Lock
+timestamps are compared at whole-millisecond clock precision, so filesystem
+fractions within the current clock millisecond do not make an active lock
+future-dated.
 Parent-directory durability sync is attempted after atomic rename and ignores
 only platform errors that explicitly report directory sync as unsupported.
 Cache archives use PAX
@@ -530,9 +533,11 @@ suppression is disabled conservatively so tracked inputs remain observable and
 copyable. Non-Git repositories continue to apply their configured ignore rules.
 Declared-output ignore files whose modification belongs to an active or recently
 completed run generation remain suppressed to prevent delayed watcher events
-from creating generated-output loops. Metadata-less removal events retain
-completed-generation ownership for one second; later removals remain
-user-visible triggers. Root, custom, and workspace Turbo
+from creating generated-output loops. Modification ownership uses
+whole-millisecond clock precision so a filesystem timestamp fraction in the
+completion millisecond remains owned by that generation. Metadata-less removal
+events retain completed-generation ownership for one second; later removals
+remain user-visible triggers. Root, custom, and workspace Turbo
 configuration changes and active JavaScript, Cargo, or uv workspace manifest
 changes refresh package discovery and output patterns before the next run. Git
 ignore, Turbo configuration, and workspace manifest classification follows
@@ -652,8 +657,9 @@ filesystem failure checking or reading an existing pointer is propagated
 without cleaning live daemon state.
 Log clients follow the exact dated log reported by the running daemon until
 interrupted, reading only newly available bounded byte ranges while preserving
-split UTF-8 code points. A log that disappears during a range read is tolerated,
-while other range-read failures are propagated. Watcher path equality
+split UTF-8 code points. A log that disappears during metadata lookup or a
+range read is tolerated, while other metadata and range-read failures are
+propagated. Watcher path equality
 normalizes separators and follows case-insensitive filesystem semantics on
 Windows. Stop escalates only after a successful RPC identifies the process as
 the expected daemon; live PIDs without a healthy daemon RPC retain their
@@ -687,7 +693,10 @@ prompts so a dropped file-specific event cannot strand available log bytes.
 package and task collections, affected collections, variables, schema
 introspection, and a GraphQL server that binds and advertises IPv4 loopback.
 Task relationship collections
-come from the resolved task graph. GraphQL affected collections calculate the
+come from the resolved task graph. Task-graph construction is deferred until a
+task relationship, task predicate, or affected-task collection is selected, so
+package, file, version, and other independent queries remain available when
+task-graph validation fails. GraphQL affected collections calculate the
 requested base/head range, include dependent packages, and apply package and
 task filters. Task filters accept bare task names, package-qualified names, and
 collision-qualified ecosystem package identities. The `query affected --tasks`
@@ -705,6 +714,8 @@ permissions against manifest and configured implicit package dependencies. Packa
 center selection retains the named package and its
 direct dependencies, rejects unknown centers, package predicates narrow the
 returned nodes, and graph edges retain the selected nodes' dependency context.
+Package and package-graph lookups accept exact collision-qualified ecosystem
+identities and reject a bare package name when more than one ecosystem owns it.
 Graph filtering uses
 package identities, and same-named cross-ecosystem edge endpoints use qualified
 identities. Affected collections include the root package for root changes and
@@ -820,9 +831,10 @@ selected member set is made explicit. When
 `futureFlags.pruneIncludesGlobalFiles` is enabled, ordered
 `globalDependencies` or `global.inputs` globs copy their safe, non-ignored
 matches into the ordinary output or Docker full tree before generated controls
-and manifests are rewritten. Global-file traversal applies the same
-case-insensitive reserved-directory exclusions on Windows as package-tree
-copying.
+and manifests are rewritten. The active lockfile is excluded from this copy so
+Docker full trees cannot replace the reduced installation lockfile. Global-file
+patterns, traversal pruning, and reserved-directory exclusions follow
+case-insensitive filesystem semantics on Windows.
 
 Run workflows support text and JSON dry-runs; DOT, Mermaid, JSON, and HTML task
 graphs; JSON run summaries and live newline-delimited structured log files;
@@ -843,7 +855,9 @@ Root-level generated
 files are likewise excluded whenever a bare profile option selects the default
 path; other `profile.*` files remain inputs. Simultaneous bare named and
 anonymous profiles use distinct generated destinations. A bare structured-log
-option resolves its generated destination before validation. No structured-log
+option exclusively claims its timestamped generated destination before
+validation; a collision uses the run UUID and then a numeric suffix. An early
+claim is removed when preparation fails. No structured-log
 artifact may replace a mandatory task control input or match a declared task
 output or resolved task-log path; output collision matching is case-insensitive
 on Windows. Every active structured-log, named-profile,

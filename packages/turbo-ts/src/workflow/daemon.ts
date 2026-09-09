@@ -1305,7 +1305,17 @@ export const followDaemonLog = (
       const writeAvailable = Effect.gen(function* () {
         const metadata = yield* fileSystem
           .metadata(logPath)
-          .pipe(Effect.orElseSucceed(() => undefined));
+          .pipe(
+            Effect.catchAll((error) =>
+              fileSystem
+                .exists(logPath)
+                .pipe(
+                  Effect.flatMap((exists) =>
+                    exists ? Effect.fail(error) : Effect.succeed(undefined),
+                  ),
+                ),
+            ),
+          );
         if (metadata === undefined || metadata.kind !== "file") return;
         if (metadata.size < offset) {
           offset = 0;

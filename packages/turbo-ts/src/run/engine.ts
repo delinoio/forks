@@ -3347,8 +3347,10 @@ export const canonicalExistingAncestorPath = (
 export const executeRun = (
   parsed: ParsedRunOptions,
   context: RunExecutionContext = {},
-): Effect.Effect<number, unknown, RunRequirements> =>
-  Effect.gen(function* () {
+): Effect.Effect<number, unknown, RunRequirements> => {
+  let retainGeneratedStructuredLog = false;
+  let cleanupGeneratedStructuredLog: Effect.Effect<void> = Effect.void;
+  return Effect.gen(function* () {
     const environmentService = yield* EnvironmentService;
     const concurrencyService = yield* ConcurrencyService;
     const fileSystem = yield* FileSystemService;
@@ -3664,11 +3666,40 @@ export const executeRun = (
     const runStartedAt = yield* clock.now;
     const ordinaryRun =
       parsed.graph === undefined && parsed.dryRun === undefined;
+    const summaryIsEmitted =
+      parsed.summarize || parsed.json || parsed.logFile !== undefined;
+    const runId = summaryIsEmitted
+      ? yield* (yield* RandomnessService).uuidV7
+      : "";
+    const generatedStructuredLog = ordinaryRun && parsed.logFile === "";
     const structuredLogPath =
       !ordinaryRun || parsed.logFile === undefined
         ? undefined
-        : parsed.logFile === ""
-          ? joinPath(options.root, ".turbo", "logs", `${runStartedAt}.json`)
+        : generatedStructuredLog
+          ? yield* Effect.gen(function* () {
+              const directory = joinPath(options.root, ".turbo", "logs");
+              yield* fileSystem.makeDirectory(directory);
+              let attempt = 0;
+              while (true) {
+                const suffix =
+                  attempt === 0
+                    ? ""
+                    : attempt === 1
+                      ? `-${runId}`
+                      : `-${runId}-${attempt - 1}`;
+                const path = joinPath(
+                  directory,
+                  `${runStartedAt}${suffix}.json`,
+                );
+                if (yield* fileSystem.createExclusiveFile(path, "")) {
+                  cleanupGeneratedStructuredLog = fileSystem
+                    .remove(path)
+                    .pipe(Effect.ignore);
+                  return path;
+                }
+                attempt += 1;
+              }
+            })
           : resolveExplicitRunArtifactPath(parsed.logFile);
     const comparableInputPath = (path: string): string => {
       const normalized = normalizePath(path, platform === "win32");
@@ -4209,7 +4240,11 @@ export const executeRun = (
     }
     const structuredLogSemaphore = yield* Effect.makeSemaphore(1);
     if (structuredLogPath !== undefined) {
-      yield* fileSystem.writeTextAtomic(structuredLogPath, "");
+      if (generatedStructuredLog) {
+        retainGeneratedStructuredLog = true;
+      } else {
+        yield* fileSystem.writeTextAtomic(structuredLogPath, "");
+      }
     }
     const writeStructuredRecord: WriteStructuredRecord = (record) =>
       structuredLogPath === undefined
@@ -4693,11 +4728,6 @@ export const executeRun = (
               },
       };
     });
-    const summaryIsEmitted =
-      parsed.summarize || parsed.json || parsed.logFile !== undefined;
-    const runId = summaryIsEmitted
-      ? yield* (yield* RandomnessService).uuidV7
-      : "";
     const summary = {
       id: runId,
       version: "1",
@@ -4782,4 +4812,11 @@ export const executeRun = (
       yield* terminal.writeStdout(`${JSON.stringify(summaryRecord)}\n`);
     }
     return exitCode;
-  });
+  }).pipe(
+    Effect.onExit(() =>
+      retainGeneratedStructuredLog
+        ? Effect.void
+        : cleanupGeneratedStructuredLog,
+    ),
+  );
+};

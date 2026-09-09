@@ -11842,6 +11842,85 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("keeps active cache locks with sub-millisecond timestamp skew", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-lock-skew-"));
+    const cacheDirectory = `${directory}/cache`;
+    const hash = "1818171716161514";
+    const lockPath = `${cacheDirectory}/${hash}.turbo-ts.lock`;
+    try {
+      const enteredBeforeRelease = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const fileSystem = yield* FileSystemService;
+            const firstArchiveWrite = yield* Deferred.make<void>();
+            const releaseFirstWrite = yield* Deferred.make<void>();
+            const secondArchiveWrite = yield* Deferred.make<void>();
+            const now = Date.now();
+            let archiveWriteCount = 0;
+            const clockLayer = Layer.succeed(ClockService, {
+              now: Effect.succeed(now),
+              sleep: (milliseconds) => Effect.sleep(`${milliseconds} millis`),
+            });
+            const blockingLayer = Layer.succeed(FileSystemService, {
+              ...fileSystem,
+              metadata: (path) =>
+                fileSystem
+                  .metadata(path)
+                  .pipe(
+                    Effect.map((metadata) =>
+                      path === lockPath
+                        ? { ...metadata, modifiedMilliseconds: now + 0.5 }
+                        : metadata,
+                    ),
+                  ),
+              writeBytes: (path, contents) =>
+                path.includes(`${hash}.tar.zst.`)
+                  ? Effect.gen(function* () {
+                      archiveWriteCount += 1;
+                      if (archiveWriteCount === 1) {
+                        yield* Deferred.succeed(firstArchiveWrite, undefined);
+                        yield* Deferred.await(releaseFirstWrite);
+                      } else {
+                        yield* Deferred.succeed(secondArchiveWrite, undefined);
+                      }
+                      yield* fileSystem.writeBytes(path, contents);
+                    })
+                  : fileSystem.writeBytes(path, contents),
+            });
+            const write = () =>
+              writeLocalCache(
+                { directory: cacheDirectory },
+                hash,
+                [
+                  {
+                    path: "packages/app/out.txt",
+                    contents: new TextEncoder().encode("cached"),
+                    mode: 0o644,
+                    modifiedSeconds: 1,
+                  },
+                ],
+                1,
+              ).pipe(Effect.provide(blockingLayer), Effect.provide(clockLayer));
+            const first = yield* Effect.forkScoped(write());
+            yield* Deferred.await(firstArchiveWrite);
+            const second = yield* Effect.forkScoped(write());
+            const entered = yield* Effect.raceFirst(
+              Deferred.await(secondArchiveWrite).pipe(Effect.as(true)),
+              Effect.sleep("50 millis").pipe(Effect.as(false)),
+            );
+            yield* Deferred.succeed(releaseFirstWrite, undefined);
+            yield* Fiber.join(first);
+            yield* Fiber.join(second);
+            return entered;
+          }),
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(enteredBeforeRelease).toBe(false);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("renews active cache writer locks before stale reclamation", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-lock-renewal-"));
     const cacheDirectory = `${directory}/cache`;

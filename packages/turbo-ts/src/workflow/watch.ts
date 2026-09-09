@@ -584,9 +584,11 @@ const modifiedByWatchRun = (
           observedAtMilliseconds <=
             generation.completedAtMilliseconds +
               completedWatchRunRemovalOwnershipMilliseconds)
-      : modifiedAtMilliseconds >= generation.startedAtMilliseconds &&
+      : Math.floor(modifiedAtMilliseconds) >=
+          Math.floor(generation.startedAtMilliseconds) &&
         (generation.completedAtMilliseconds === undefined ||
-          modifiedAtMilliseconds <= generation.completedAtMilliseconds),
+          Math.floor(modifiedAtMilliseconds) <=
+            Math.floor(generation.completedAtMilliseconds)),
   );
 
 export const executeWatch = (

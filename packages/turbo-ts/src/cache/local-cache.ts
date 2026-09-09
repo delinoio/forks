@@ -460,7 +460,8 @@ const isStaleFile = (
     const metadata = yield* Effect.either(fileSystem.metadata(path));
     return (
       metadata._tag === "Right" &&
-      ((futureDatedIsStale && metadata.right.modifiedMilliseconds > now) ||
+      ((futureDatedIsStale &&
+        Math.floor(metadata.right.modifiedMilliseconds) > Math.floor(now)) ||
         now - metadata.right.modifiedMilliseconds >= staleLockMilliseconds)
     );
   });

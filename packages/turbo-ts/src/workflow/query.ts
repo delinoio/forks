@@ -462,6 +462,15 @@ interface TaskView {
   };
 }
 
+interface TaskQueryViews {
+  readonly graph: TaskGraph;
+  readonly nodesByView: ReadonlyMap<TaskView, TaskNode>;
+  readonly tasksByPackage: ReadonlyMap<
+    string,
+    { readonly items: ReadonlyArray<TaskView>; readonly length: number }
+  >;
+}
+
 const list = <A>(items: ReadonlyArray<A>) => ({ items, length: items.length });
 
 interface AffectedRepository {
@@ -917,94 +926,114 @@ const repositoryQueryRoot = (
       tasks: list<TaskView>([]),
     });
   }
-  const taskGraph = repositoryTaskGraph(repository);
-  const taskDependents = new Map<string, Array<string>>();
-  for (const node of taskGraph.nodes.values()) {
-    for (const dependency of node.dependencies) {
-      const entries = taskDependents.get(dependency) ?? [];
-      entries.push(node.id);
-      taskDependents.set(dependency, entries);
+  let loadedTaskQueryViews: TaskQueryViews | undefined;
+  const taskQueryViews = (): TaskQueryViews => {
+    if (loadedTaskQueryViews !== undefined) return loadedTaskQueryViews;
+    const graph = repositoryTaskGraph(repository);
+    const taskDependents = new Map<string, Array<string>>();
+    for (const node of graph.nodes.values()) {
+      for (const dependency of node.dependencies) {
+        const entries = taskDependents.get(dependency) ?? [];
+        entries.push(node.id);
+        taskDependents.set(dependency, entries);
+      }
     }
-  }
-  const taskClosure = (
-    start: string,
-    next: (id: string) => ReadonlyArray<string>,
-  ): ReadonlyArray<string> => {
-    const result = new Set<string>();
-    const pending = [...next(start)];
-    while (pending.length > 0) {
-      const id = pending.shift()!;
-      if (result.has(id)) continue;
-      result.add(id);
-      pending.push(...next(id));
+    const taskClosure = (
+      start: string,
+      next: (id: string) => ReadonlyArray<string>,
+    ): ReadonlyArray<string> => {
+      const result = new Set<string>();
+      const pending = [...next(start)];
+      while (pending.length > 0) {
+        const id = pending.shift()!;
+        if (result.has(id)) continue;
+        result.add(id);
+        pending.push(...next(id));
+      }
+      return [...result].sort();
+    };
+    const taskViews = new Map(
+      [...graph.nodes.values()].map((node) => [
+        node.id,
+        {
+          name: node.task,
+          package: packageView(node.package),
+          fullName: `${node.package.name}#${node.task}`,
+          script: node.command,
+        } as TaskView,
+      ]),
+    );
+    const nodesByView = new Map(
+      [...graph.nodes.values()].map((node) => [taskViews.get(node.id)!, node]),
+    );
+    for (const node of graph.nodes.values()) {
+      const mutable = taskViews.get(node.id)!;
+      const directDependencies = node.dependencies;
+      const directDependents = taskDependents.get(node.id) ?? [];
+      const allDependencies = taskClosure(
+        node.id,
+        (id) => graph.nodes.get(id)?.dependencies ?? [],
+      );
+      const allDependents = taskClosure(
+        node.id,
+        (id) => taskDependents.get(id) ?? [],
+      );
+      Object.assign(mutable, {
+        directDependencies: list(
+          directDependencies.map((id) => taskViews.get(id)!),
+        ),
+        directDependents: list(
+          directDependents.map((id) => taskViews.get(id)!),
+        ),
+        allDependencies: list(allDependencies.map((id) => taskViews.get(id)!)),
+        allDependents: list(allDependents.map((id) => taskViews.get(id)!)),
+        indirectDependencies: list(
+          allDependencies
+            .filter((id) => !directDependencies.includes(id))
+            .map((id) => taskViews.get(id)!),
+        ),
+        indirectDependents: list(
+          allDependents
+            .filter((id) => !directDependents.includes(id))
+            .map((id) => taskViews.get(id)!),
+        ),
+      });
     }
-    return [...result].sort();
+    const tasksByPackage = new Map(
+      models.map((model) => [
+        model.identity,
+        list(
+          [...graph.nodes.values()]
+            .filter((node) => node.package.identity === model.identity)
+            .sort((left, right) => left.task.localeCompare(right.task))
+            .map((node) => taskViews.get(node.id)!),
+        ),
+      ]),
+    );
+    loadedTaskQueryViews = { graph, nodesByView, tasksByPackage };
+    return loadedTaskQueryViews;
   };
-  const taskViews = new Map(
-    [...taskGraph.nodes.values()].map((node) => [
-      node.id,
-      {
-        name: node.task,
-        package: packageView(node.package),
-        fullName: `${node.package.name}#${node.task}`,
-        script: node.command,
-      } as TaskView,
-    ]),
-  );
-  const taskNodesByView = new Map(
-    [...taskGraph.nodes.values()].map((node) => [
-      taskViews.get(node.id)!,
-      node,
-    ]),
-  );
-  for (const node of taskGraph.nodes.values()) {
-    const mutable = taskViews.get(node.id)!;
-    const directDependencies = node.dependencies;
-    const directDependents = taskDependents.get(node.id) ?? [];
-    const allDependencies = taskClosure(
-      node.id,
-      (id) => taskGraph.nodes.get(id)?.dependencies ?? [],
-    );
-    const allDependents = taskClosure(
-      node.id,
-      (id) => taskDependents.get(id) ?? [],
-    );
-    Object.assign(mutable, {
-      directDependencies: list(
-        directDependencies.map((id) => taskViews.get(id)!),
-      ),
-      directDependents: list(directDependents.map((id) => taskViews.get(id)!)),
-      allDependencies: list(allDependencies.map((id) => taskViews.get(id)!)),
-      allDependents: list(allDependents.map((id) => taskViews.get(id)!)),
-      indirectDependencies: list(
-        allDependencies
-          .filter((id) => !directDependencies.includes(id))
-          .map((id) => taskViews.get(id)!),
-      ),
-      indirectDependents: list(
-        allDependents
-          .filter((id) => !directDependents.includes(id))
-          .map((id) => taskViews.get(id)!),
-      ),
-    });
-  }
   for (const model of models) {
-    Object.assign(packageView(model), {
-      tasks: list(
-        [...taskGraph.nodes.values()]
-          .filter((node) => node.package.identity === model.identity)
-          .sort((left, right) => left.task.localeCompare(right.task))
-          .map((node) => taskViews.get(node.id)!),
-      ),
+    Object.defineProperty(packageView(model), "tasks", {
+      enumerable: true,
+      get: () => taskQueryViews().tasksByPackage.get(model.identity)!,
     });
   }
   const packageViews = models.map(packageView);
   const resolvePackage = (name: string): RepositoryPackage => {
-    const model = models.find(
-      (entry) => entry.name === name || entry.identity === name,
-    );
-    if (model === undefined) throw new Error(`package not found: ${name}`);
-    return model;
+    const identityMatch = byIdentity.get(name);
+    if (identityMatch !== undefined) return identityMatch;
+    const matches = models.filter((entry) => entry.name === name);
+    if (matches.length === 0) throw new Error(`package not found: ${name}`);
+    if (matches.length > 1) {
+      throw new Error(
+        `package name is ambiguous: ${name}; use one of ${matches
+          .map((entry) => entry.identity)
+          .sort()
+          .join(", ")}`,
+      );
+    }
+    return matches[0]!;
   };
   const graphEdges = models.flatMap((model) =>
     model.internalDependencies.map((target) => ({
@@ -1091,16 +1120,17 @@ const repositoryQueryRoot = (
         [...result.affected.values()]
           .map(packageView)
           .filter((view) => packageMatchesPredicate(view, filter))
-          .map((view) => ({
-            ...view,
-            reason: {
-              __typename: result.directlyAffected.has(
-                models.find((model) => packageView(model) === view)!.identity,
-              )
-                ? "FileChanged"
-                : "DependencyChanged",
-            },
-          })),
+          .map((view) =>
+            Object.assign(Object.create(view) as PackageView, {
+              reason: {
+                __typename: result.directlyAffected.has(
+                  models.find((model) => packageView(model) === view)!.identity,
+                )
+                  ? "FileChanged"
+                  : "DependencyChanged",
+              },
+            }),
+          ),
       );
     },
     affectedTasks: async ({
@@ -1115,6 +1145,7 @@ const repositoryQueryRoot = (
       readonly filter?: PackagePredicate;
     }) => {
       const result = await affectedRepository(base, head);
+      const taskData = taskQueryViews();
       const requested = new Set(tasks ?? []);
       const allTasks = [...result.affected.values()]
         .map(packageView)
@@ -1124,7 +1155,7 @@ const repositoryQueryRoot = (
         requested.size === 0
           ? allTasks
           : allTasks.filter((task) => {
-              const node = taskNodesByView.get(task)!;
+              const node = taskData.nodesByView.get(task)!;
               return (
                 requested.has(task.name) ||
                 requested.has(task.fullName) ||
@@ -1133,12 +1164,12 @@ const repositoryQueryRoot = (
             });
       return list(
         selected.map((task) => {
-          const node = taskNodesByView.get(task)!;
+          const node = taskData.nodesByView.get(task)!;
           return {
             ...task,
             reason: {
               __typename: affectedTaskReason(
-                taskGraph,
+                taskData.graph,
                 node,
                 result.affected,
                 result.directlyAffected,
