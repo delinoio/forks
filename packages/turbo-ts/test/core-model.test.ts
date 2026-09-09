@@ -286,6 +286,18 @@ describe("core repository model", () => {
       ]),
     ).toBe(true);
     expect(
+      canMatchGlobsDescendantWithExclusions("dist/tmp", [
+        "dist/**",
+        "!dist/tmp",
+      ]),
+    ).toBe(true);
+    expect(
+      canMatchGlobsDescendantWithExclusions("dist/tmp", [
+        "dist/**",
+        "!dist/tmp/*",
+      ]),
+    ).toBe(true);
+    expect(
       canMatchGlobsDescendantWithExclusions("dist/source/newdir", [
         "dist/**/*.js",
         "!dist/source/**",
@@ -310,6 +322,13 @@ describe("core repository model", () => {
         true,
       ),
     ).toBe(false);
+    expect(
+      canMatchGlobsDescendantWithExclusions(
+        "dist\\tmp",
+        ["dist/**", "!dist/tmp"],
+        true,
+      ),
+    ).toBe(true);
   });
 
   it("parses JSONC without interpreting comment markers inside strings", () => {

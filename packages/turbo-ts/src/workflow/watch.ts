@@ -687,7 +687,9 @@ export const executeWatch = (
           const isConfiguredOutputPath = configuredOutputPath(
             currentRepository,
             change.path,
-            entryIsDirectory ? "directory" : change.entryKind,
+            change.kind === "remove" || entryIsDirectory
+              ? "directory"
+              : change.entryKind,
           );
           if (isGitIgnorePath(change.path, windowsPathSeparators)) {
             yield* Ref.set(

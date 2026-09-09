@@ -557,7 +557,8 @@ plus their dependency and `with` closure. Root configuration, `.gitignore`, and
 CLI `--global-deps` matches retain the all-task fallback. Watcher entry types
 distinguish regular file renames from directories when applying directory-only
 ignore rules. Removal events without type metadata reuse directory kinds from
-the loaded ignore snapshot or later watcher observations.
+the loaded ignore snapshot or later watcher observations and always use
+conservative directory matching for configured task outputs.
 
 The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
 identity, per-user temporary state directory, atomic PID files, and a lifecycle
@@ -614,7 +615,8 @@ are race-safe; `info` reports the live daemon state. Lifecycle commands resolve
 daemon state from the repository root without requiring package or lockfile
 discovery; the serving process retains full discovery validation. A missing PID
 file is treated as absent, while filesystem failures checking or reading it are
-propagated without cleaning lifecycle state.
+propagated without cleaning lifecycle state. `clean` likewise propagates a
+failure to remove the daemon state directory.
 Start, status, and logs health checks clean stale PID and socket state even
 when the recorded PID has been reused by an unrelated live process. Stop,
 clean, and restart preserve lifecycle state and fail retryably when the
@@ -699,13 +701,17 @@ or invalid.
 Package-manager fields use protocol identifiers;
 only pnpm's compatibility family uses the versioned `pnpm9` label. File queries
 enforce repository containment
-after resolving symlinks. The startup message describes the static page as a
-GraphQL endpoint rather than an IDE.
+after resolving symlinks, read at most 1 MiB per canonical file, reuse canonical
+reads within an operation, and enforce an 8 MiB aggregate result budget that
+counts aliases independently. The startup message describes the static page as
+a GraphQL endpoint rather than an IDE.
 
 Affected package listing disables Git rename detection so moves between
 workspaces select both the source and destination owners before dependent
-closure is applied. Environment-provided revisions are separated from Git
-options and pathspecs before the affected diff executes.
+closure is applied. Nested workspace changes are owned directly only by the
+co-located scopes at the longest matching logical or canonical workspace path;
+ancestor workspaces are not directly affected. Environment-provided revisions
+are separated from Git options and pathspecs before the affected diff executes.
 
 `prune` selects the transitive internal package closure of both requested
 packages and workspace dependencies retained by the copied root manifest,
@@ -821,6 +827,8 @@ pnpm, Yarn, Cargo, uv, Bun, Aube, and Nub lockfiles and the actual encoded log
 path, including collision-qualified identifiers and alternate execution scopes.
 Global summary inputs record the corresponding root-manifest external-dependency
 closure hash instead of the empty-closure hash when root dependencies resolve.
+Summary preparation reads and parses each distinct owning lockfile once per run
+and reuses its package closures for task and global hashes.
 The equals form of `--summarize` accepts only `true` or `false`; other explicit
 values fail argument parsing without creating a summary.
 Graph-bearing closures retain the declaring manifest reference or resolved

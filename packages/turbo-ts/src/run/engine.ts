@@ -83,7 +83,7 @@ import {
 } from "../logging/events.js";
 import {
   lockfilePackageIdentity,
-  resolveLockfilePackageClosure,
+  prepareLockfilePackageClosure,
 } from "../repository/lockfiles.js";
 import {
   cargoHomeConfigurationPresent,
@@ -1853,92 +1853,141 @@ const taskLogPath = (
 
 const emptyExternalDependenciesHash = "459c029558afe716";
 
-const packagesExternalDependenciesHash = (
+const externalDependenciesHash = (identities: ReadonlyArray<string>): string =>
+  identities.length === 0
+    ? emptyExternalDependenciesHash
+    : xxhash64Hex(JSON.stringify([...new Set(identities)].sort()));
+
+interface SummaryExternalDependencyHashes {
+  readonly tasks: ReadonlyMap<string, string>;
+  readonly global: string;
+}
+
+const summaryExternalDependencyHashes = (
   repository: RepositoryModel,
-  packageModels: ReadonlyArray<RepositoryPackage>,
-  lockfile: string | undefined,
-): Effect.Effect<string, RepositoryError, FileSystemService> =>
+  nodes: ReadonlyArray<TaskNode>,
+  scopes: ReadonlyMap<string, TaskCommandScope>,
+): Effect.Effect<
+  SummaryExternalDependencyHashes,
+  RepositoryError,
+  FileSystemService
+> =>
   Effect.gen(function* () {
-    if (lockfile === undefined) return emptyExternalDependenciesHash;
     const fileSystem = yield* FileSystemService;
-    const contents = yield* fileSystem
-      .readBytes(lockfile)
-      .pipe(
-        Effect.mapError(
-          (error) =>
-            new RepositoryError({ path: lockfile, message: error.message }),
+    const nodeLockfiles = new Map(
+      yield* Effect.forEach(
+        nodes,
+        (node) =>
+          owningLockfile(repository, node).pipe(
+            Effect.map((lockfile) => [node.id, lockfile] as const),
+          ),
+        { concurrency: 8 },
+      ),
+    );
+    const lockfilePaths = [
+      ...new Set(
+        [repository.lockfile, ...nodeLockfiles.values()].filter(
+          (path): path is string => path !== undefined,
         ),
-      );
-    const identities = yield* Effect.try({
-      try: () => {
-        const workspacePackages = repository.packages.flatMap((packageModel) =>
-          packageModel.manifest.version === undefined
-            ? []
-            : [
-                {
-                  name: packageModel.name,
-                  version: packageModel.manifest.version,
-                },
-              ],
+      ),
+    ];
+    const preparedLockfiles = new Map(
+      yield* Effect.forEach(
+        lockfilePaths,
+        (lockfile) =>
+          fileSystem.readBytes(lockfile).pipe(
+            Effect.mapError(
+              (error) =>
+                new RepositoryError({
+                  path: lockfile,
+                  message: error.message,
+                }),
+            ),
+            Effect.flatMap((contents) =>
+              Effect.try({
+                try: () => prepareLockfilePackageClosure(lockfile, contents),
+                catch: (cause) =>
+                  new RepositoryError({
+                    path: lockfile,
+                    message: String(cause),
+                  }),
+              }),
+            ),
+            Effect.map((prepared) => [lockfile, prepared] as const),
+          ),
+        { concurrency: 8 },
+      ),
+    );
+    const workspacePackages = repository.packages.flatMap((packageModel) =>
+      packageModel.manifest.version === undefined
+        ? []
+        : [
+            {
+              name: packageModel.name,
+              version: packageModel.manifest.version,
+            },
+          ],
+    );
+    const packageIdentities = new Map<string, ReadonlyArray<string>>();
+    const identitiesForPackage = (
+      packageModel: RepositoryPackage,
+      lockfile: string | undefined,
+    ): Effect.Effect<ReadonlyArray<string>, RepositoryError> =>
+      Effect.gen(function* () {
+        if (lockfile === undefined) return [];
+        const key = `${lockfile}\0${packageModel.identity}`;
+        const cached = packageIdentities.get(key);
+        if (cached !== undefined) return cached;
+        const manifestDependencyReferences = new Map(
+          [
+            packageModel.manifest.dependencies,
+            packageModel.manifest.devDependencies,
+            packageModel.manifest.optionalDependencies,
+            packageModel.manifest.peerDependencies,
+          ].flatMap((dependencies) => Object.entries(dependencies ?? {})),
         );
-        return [
-          ...new Set(
-            packageModels.flatMap((packageModel) => {
-              const manifestDependencyReferences = new Map(
-                [
-                  packageModel.manifest.dependencies,
-                  packageModel.manifest.devDependencies,
-                  packageModel.manifest.optionalDependencies,
-                  packageModel.manifest.peerDependencies,
-                ].flatMap((dependencies) => Object.entries(dependencies ?? {})),
-              );
-              const directExternalDependencies =
-                packageModel.dependencyNames.map(
-                  (name) =>
-                    [name, manifestDependencyReferences.get(name)] as const,
-                );
-              return resolveLockfilePackageClosure(lockfile, contents, {
+        const directDependencies = packageModel.dependencyNames.map(
+          (name) => [name, manifestDependencyReferences.get(name)] as const,
+        );
+        const identities = yield* Effect.try({
+          try: () =>
+            preparedLockfiles
+              .get(lockfile)!
+              .resolve({
                 workspacePath: packageModel.relativeDirectory,
                 packageName: packageModel.name,
                 packageVersion: packageModel.manifest.version,
-                directDependencies: directExternalDependencies,
+                directDependencies,
                 workspacePackages,
-              }).map(lockfilePackageIdentity);
-            }),
-          ),
-        ].sort();
-      },
-      catch: (cause) =>
-        new RepositoryError({ path: lockfile, message: String(cause) }),
-    });
-    return identities.length === 0
-      ? emptyExternalDependenciesHash
-      : xxhash64Hex(JSON.stringify(identities));
-  });
-
-const packageExternalDependenciesHash = (
-  repository: RepositoryModel,
-  packageModel: RepositoryPackage,
-  lockfile: string | undefined,
-): Effect.Effect<string, RepositoryError, FileSystemService> =>
-  packagesExternalDependenciesHash(repository, [packageModel], lockfile);
-
-const taskExternalDependenciesHash = (
-  repository: RepositoryModel,
-  node: TaskNode,
-  scope: TaskCommandScope | undefined,
-): Effect.Effect<string, RepositoryError, FileSystemService> =>
-  owningLockfile(repository, node).pipe(
-    Effect.flatMap((lockfile) =>
-      packagesExternalDependenciesHash(
-        repository,
+              })
+              .map(lockfilePackageIdentity),
+          catch: (cause) =>
+            new RepositoryError({ path: lockfile, message: String(cause) }),
+        });
+        packageIdentities.set(key, identities);
+        return identities;
+      });
+    const taskHashes = new Map<string, string>();
+    for (const node of nodes) {
+      const scope = scopes.get(node.id);
+      const packageModels =
         scope?.kind === "cargo-workspace"
           ? scope.members.map((member) => member.package)
-          : [node.package],
-        lockfile,
-      ),
-    ),
-  );
+          : [node.package];
+      const identities = yield* Effect.forEach(packageModels, (packageModel) =>
+        identitiesForPackage(packageModel, nodeLockfiles.get(node.id)),
+      );
+      taskHashes.set(node.id, externalDependenciesHash(identities.flat()));
+    }
+    const globalIdentities = yield* identitiesForPackage(
+      repository.rootPackage,
+      repository.lockfile,
+    );
+    return {
+      tasks: taskHashes,
+      global: externalDependenciesHash(globalIdentities),
+    };
+  });
 
 const taskLogIdentifiers = (
   repository: RepositoryModel,
@@ -3923,27 +3972,17 @@ export const executeRun = (
       parsed.summarize ||
       parsed.json ||
       parsed.logFile !== undefined;
-    const externalDependencyHashes = new Map(
-      summariesNeedDependencyHashes
-        ? yield* Effect.forEach(
-            orderedNodes,
-            (node) =>
-              taskExternalDependenciesHash(
-                repository,
-                node,
-                cargoWorkspacePlan.scopes.get(node.id),
-              ).pipe(Effect.map((hash) => [node.id, hash] as const)),
-            { concurrency: 8 },
-          )
-        : [],
-    );
-    const globalExternalDependenciesHash = summariesNeedDependencyHashes
-      ? yield* packageExternalDependenciesHash(
+    const externalDependencyHashes = summariesNeedDependencyHashes
+      ? yield* summaryExternalDependencyHashes(
           repository,
-          repository.rootPackage,
-          repository.lockfile,
+          orderedNodes,
+          cargoWorkspacePlan.scopes,
         )
-      : emptyExternalDependenciesHash;
+      : {
+          tasks: new Map<string, string>(),
+          global: emptyExternalDependenciesHash,
+        };
+    const globalExternalDependenciesHash = externalDependencyHashes.global;
     if (parsed.dryRun !== undefined) {
       const terminal = yield* TerminalService;
       if (parsed.dryRun === "json") {
@@ -3986,7 +4025,7 @@ export const executeRun = (
                     ([path]) => !path.startsWith("$TURBO_ROOT$/"),
                   ),
                 ),
-                hashOfExternalDependencies: externalDependencyHashes.get(
+                hashOfExternalDependencies: externalDependencyHashes.tasks.get(
                   node.id,
                 )!,
                 cache: {
@@ -4526,7 +4565,7 @@ export const executeRun = (
           ),
         ),
         hashOfExternalDependencies:
-          externalDependencyHashes.get(node.id) ??
+          externalDependencyHashes.tasks.get(node.id) ??
           emptyExternalDependenciesHash,
         cache: {
           local: outcome?.cacheSource === "local",

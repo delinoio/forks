@@ -1,4 +1,4 @@
-import { minimatch } from "minimatch";
+import { GLOBSTAR, Minimatch, minimatch } from "minimatch";
 import { toUnixPath } from "./path.js";
 
 const globValue = (value: string, windowsPathSeparators: boolean): string =>
@@ -26,6 +26,41 @@ export const canMatchGlobDescendant = (
     { dot: true, partial: true },
   );
 
+const exclusionCoversGlobDescendants = (
+  path: string,
+  pattern: string,
+  windowsPathSeparators: boolean,
+): boolean => {
+  const matcher = new Minimatch(globValue(pattern, windowsPathSeparators), {
+    dot: true,
+  });
+  const pathParts = globValue(path, windowsPathSeparators).split("/");
+  return matcher.set.some((alternative) =>
+    alternative.some((_, suffixIndex) => {
+      const suffix = alternative.slice(suffixIndex);
+      const segmentWildcards = suffix.filter(
+        (part) => part instanceof RegExp && part._glob === "*",
+      ).length;
+      if (
+        !suffix.includes(GLOBSTAR) ||
+        segmentWildcards > 1 ||
+        !suffix.every(
+          (part) =>
+            part === GLOBSTAR || (part instanceof RegExp && part._glob === "*"),
+        )
+      ) {
+        return false;
+      }
+      const prefix = alternative.slice(0, suffixIndex);
+      return (
+        matcher.matchOne(pathParts, prefix) ||
+        (suffix[0] === GLOBSTAR &&
+          matcher.matchOne(pathParts, [...prefix, GLOBSTAR]))
+      );
+    }),
+  );
+};
+
 export const canMatchGlobsDescendantWithExclusions = (
   path: string,
   patterns: ReadonlyArray<string>,
@@ -39,8 +74,11 @@ export const canMatchGlobsDescendantWithExclusions = (
   !patterns.some(
     (pattern) =>
       pattern.startsWith("!") &&
-      (matchesGlob(path, pattern.slice(1), windowsPathSeparators) ||
-        matchesGlob(`${path}/`, pattern.slice(1), windowsPathSeparators)),
+      exclusionCoversGlobDescendants(
+        path,
+        pattern.slice(1),
+        windowsPathSeparators,
+      ),
   );
 
 export const selectByGlobs = (

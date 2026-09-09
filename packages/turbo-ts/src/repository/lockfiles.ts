@@ -821,15 +821,12 @@ const dependencyEntries = (
   });
 };
 
-const prunePnpmLockfile = (
-  source: string,
+const prunePnpmDocument = (
+  document: Readonly<Record<string, unknown>>,
   workspacePaths: ReadonlySet<string>,
   production: boolean,
   includeRootImporter = true,
-): string => {
-  const document = objectValue(parseYamlDocument(source));
-  if (document === undefined)
-    throw new TypeError("pnpm lockfile is not an object");
+): Record<string, unknown> => {
   const importers = objectValue(document.importers) ?? {};
   const retainedImporters = Object.fromEntries(
     Object.entries(importers)
@@ -905,21 +902,39 @@ const prunePnpmLockfile = (
       Object.entries(snapshots).filter(([key]) => retainedSnapshots.has(key)),
     );
   }
-  return stringifyYaml(pruned, { lineWidth: 0, singleQuote: true });
+  return pruned;
 };
 
-const pruneNpmLockfile = (
+const prunePnpmLockfile = (
   source: string,
   workspacePaths: ReadonlySet<string>,
   production: boolean,
-  includeRootPackage = true,
+  includeRootImporter = true,
 ): string => {
-  const document = objectValue(parseJson(source));
+  const document = objectValue(parseYamlDocument(source));
   if (document === undefined)
-    throw new TypeError("npm lockfile is not an object");
-  const packages = objectValue(document.packages);
+    throw new TypeError("pnpm lockfile is not an object");
+  return stringifyYaml(
+    prunePnpmDocument(
+      document,
+      workspacePaths,
+      production,
+      includeRootImporter,
+    ),
+    { lineWidth: 0, singleQuote: true },
+  );
+};
+
+const pruneNpmDocument = (
+  sourceDocument: Readonly<Record<string, unknown>>,
+  workspacePaths: ReadonlySet<string>,
+  production: boolean,
+  includeRootPackage = true,
+): Record<string, unknown> => {
+  const document: Record<string, unknown> = { ...sourceDocument };
+  const packages = objectValue(sourceDocument.packages);
   if (packages === undefined) {
-    if (production && document.dependencies !== undefined) {
+    if (production && sourceDocument.dependencies !== undefined) {
       const pruneLegacyDependencies = (
         value: unknown,
       ): Readonly<Record<string, unknown>> =>
@@ -941,9 +956,11 @@ const pruneNpmLockfile = (
             },
           ),
         );
-      document.dependencies = pruneLegacyDependencies(document.dependencies);
+      document.dependencies = pruneLegacyDependencies(
+        sourceDocument.dependencies,
+      );
     }
-    return `${JSON.stringify(document, undefined, 2)}\n`;
+    return document;
   }
   const selectedWorkspaces = new Set(
     [...workspacePaths].map((path) => path.replace(/^\.\//, "")),
@@ -1043,7 +1060,23 @@ const pruneNpmLockfile = (
       );
     document.dependencies = pruneLegacyDependencies(document.dependencies);
   }
-  return `${JSON.stringify(document, undefined, 2)}\n`;
+  return document;
+};
+
+const pruneNpmLockfile = (
+  source: string,
+  workspacePaths: ReadonlySet<string>,
+  production: boolean,
+  includeRootPackage = true,
+): string => {
+  const document = objectValue(parseJson(source));
+  if (document === undefined)
+    throw new TypeError("npm lockfile is not an object");
+  return `${JSON.stringify(
+    pruneNpmDocument(document, workspacePaths, production, includeRootPackage),
+    undefined,
+    2,
+  )}\n`;
 };
 
 export interface LockfilePruneManifest {
@@ -1364,135 +1397,191 @@ export const pruneLockfile = (
   return new TextEncoder().encode(output);
 };
 
+export interface LockfilePackageClosureResolver {
+  readonly resolve: (
+    context: LockfilePackageClosureContext,
+  ) => ReadonlyArray<LockfilePackage>;
+}
+
+export const prepareLockfilePackageClosure = (
+  path: string,
+  contents: Uint8Array,
+): LockfilePackageClosureResolver => {
+  const name = baseName(path);
+  if (name === "bun.lockb") {
+    if (contents.length > maximumLockfileBytes) {
+      throw new TypeError("lockfile exceeds the 32 MiB safety limit");
+    }
+    return { resolve: () => [] };
+  }
+  const source = validateSource(contents);
+  if (name === ".pnp.cjs") return { resolve: () => [] };
+  if (name === "package-lock.json" || name === "npm-shrinkwrap.json") {
+    const document = objectValue(parseJson(source));
+    if (document === undefined)
+      throw new TypeError("npm lockfile is not an object");
+    return {
+      resolve: (context) => {
+        const includeRoot = context.workspacePath === ".";
+        return collectNpmPackages(
+          pruneNpmDocument(
+            document,
+            new Set(includeRoot ? [] : [context.workspacePath]),
+            false,
+            includeRoot,
+          ),
+        );
+      },
+    };
+  }
+  if (
+    name === "pnpm-lock.yaml" ||
+    name === "aube.lock" ||
+    name === "nub.lock"
+  ) {
+    const document = objectValue(parseYamlDocument(source));
+    if (document === undefined)
+      throw new TypeError("pnpm lockfile is not an object");
+    return {
+      resolve: (context) => {
+        const includeRoot = context.workspacePath === ".";
+        return collectPackages(
+          prunePnpmDocument(
+            document,
+            new Set(includeRoot ? [] : [context.workspacePath]),
+            false,
+            includeRoot,
+          ),
+        );
+      },
+    };
+  }
+  if (name === "yarn.lock") {
+    const graph = isYarnBerry(source)
+      ? parseYarnBerryGraph(source)
+      : parseYarnClassicGraph(source);
+    if (!isYarnBerry(source)) {
+      return {
+        resolve: (context) =>
+          resolveGraphPackageClosure(graph, context.directDependencies),
+      };
+    }
+    const localWorkspaceEntries = graph.filter(
+      (entry) => entry.localWorkspace === true,
+    );
+    return {
+      resolve: (context) => {
+        const workspacePath = normalizeWorkspacePath(context.workspacePath);
+        const workspaceEntries = graph.filter((entry) =>
+          entry.aliases.some(
+            (alias) => workspaceReferencePath(alias) === workspacePath,
+          ),
+        );
+        return resolveGraphPackageClosure(
+          graph,
+          context.directDependencies,
+          workspaceEntries,
+          localWorkspaceEntries,
+        );
+      },
+    };
+  }
+  if (name === "Cargo.lock") {
+    const graph = parseCargoGraph(source);
+    return {
+      resolve: (context) => {
+        const workspacePackageIdentities = new Set(
+          (context.workspacePackages ?? []).map(lockfilePackageIdentity),
+        );
+        const localWorkspaceEntries = graph.filter(
+          (entry) =>
+            entry.localWorkspace === true &&
+            entry.packages.some((package_) =>
+              workspacePackageIdentities.has(lockfilePackageIdentity(package_)),
+            ),
+        );
+        const workspaceEntries = graph.filter(
+          (entry) =>
+            entry.localWorkspace === true &&
+            entry.packages.some(
+              (package_) =>
+                package_.name === context.packageName &&
+                (context.packageVersion === undefined ||
+                  package_.version === context.packageVersion),
+            ),
+        );
+        return resolveGraphPackageClosure(
+          graph,
+          workspaceEntries.length === 0 ? context.directDependencies : [],
+          workspaceEntries,
+          localWorkspaceEntries,
+        );
+      },
+    };
+  }
+  if (name === "uv.lock") {
+    const graph = parseUvGraph(source);
+    const localWorkspaceEntries = graph.filter(
+      (entry) => entry.localWorkspace === true,
+    );
+    return {
+      resolve: (context) => {
+        const workspacePath = normalizeWorkspacePath(context.workspacePath);
+        const matchingPaths = graph.filter((entry) =>
+          entry.workspacePaths?.includes(workspacePath),
+        );
+        const workspaceEntries =
+          matchingPaths.length > 0
+            ? matchingPaths
+            : graph.filter(
+                (entry) =>
+                  entry.localWorkspace === true &&
+                  entry.packages.some(
+                    (package_) =>
+                      package_.name === context.packageName &&
+                      (context.packageVersion === undefined ||
+                        package_.version === context.packageVersion),
+                  ),
+              );
+        return resolveGraphPackageClosure(
+          graph,
+          workspaceEntries.length === 0 ? context.directDependencies : [],
+          workspaceEntries,
+          localWorkspaceEntries,
+        );
+      },
+    };
+  }
+  if (name === "bun.lock") {
+    const graph = parseBunGraph(source);
+    return {
+      resolve: (context) => {
+        const directDependencyNames = new Set(
+          context.directDependencies.map(([dependencyName]) => dependencyName),
+        );
+        const workspaceKey =
+          context.workspacePath === "."
+            ? ""
+            : context.workspacePath.replace(/^\.\//, "");
+        const workspaceReferences = dependencyObjectEntries(
+          graph.workspaces[workspaceKey],
+          true,
+        ).filter(([dependencyName]) =>
+          directDependencyNames.has(dependencyName),
+        );
+        return resolveGraphPackageClosure(graph.entries, [
+          ...context.directDependencies,
+          ...workspaceReferences,
+        ]);
+      },
+    };
+  }
+  throw new TypeError(`unsupported lockfile: ${name}`);
+};
+
 export const resolveLockfilePackageClosure = (
   path: string,
   contents: Uint8Array,
   context: LockfilePackageClosureContext,
-): ReadonlyArray<LockfilePackage> => {
-  const parsed = parseLockfile(path, contents);
-  const includeRoot = context.workspacePath === ".";
-  const workspacePaths = new Set(includeRoot ? [] : [context.workspacePath]);
-  const directDependencyNames = new Set(
-    context.directDependencies.map(([name]) => name),
-  );
-  if (
-    parsed.format === "pnpm" ||
-    parsed.format === "aube" ||
-    parsed.format === "nub"
-  ) {
-    const source = validateSource(contents);
-    return parseLockfile(
-      path,
-      new TextEncoder().encode(
-        prunePnpmLockfile(source, workspacePaths, false, includeRoot),
-      ),
-    ).packages;
-  }
-  if (parsed.format === "npm") {
-    const source = validateSource(contents);
-    return parseLockfile(
-      path,
-      new TextEncoder().encode(
-        pruneNpmLockfile(source, workspacePaths, false, includeRoot),
-      ),
-    ).packages;
-  }
-  const source = validateSource(contents);
-  if (parsed.format === "yarn-classic") {
-    return resolveGraphPackageClosure(
-      parseYarnClassicGraph(source),
-      context.directDependencies,
-    );
-  }
-  if (parsed.format === "yarn-berry") {
-    const graph = parseYarnBerryGraph(source);
-    const workspacePath = normalizeWorkspacePath(context.workspacePath);
-    const localWorkspaceEntries = graph.filter(
-      (entry) => entry.localWorkspace === true,
-    );
-    const workspaceEntries = graph.filter((entry) =>
-      entry.aliases.some(
-        (alias) => workspaceReferencePath(alias) === workspacePath,
-      ),
-    );
-    return resolveGraphPackageClosure(
-      graph,
-      context.directDependencies,
-      workspaceEntries,
-      localWorkspaceEntries,
-    );
-  }
-  if (parsed.format === "cargo") {
-    const graph = parseCargoGraph(source);
-    const workspacePackageIdentities = new Set(
-      (context.workspacePackages ?? []).map(lockfilePackageIdentity),
-    );
-    const localWorkspaceEntries = graph.filter(
-      (entry) =>
-        entry.localWorkspace === true &&
-        entry.packages.some((package_) =>
-          workspacePackageIdentities.has(lockfilePackageIdentity(package_)),
-        ),
-    );
-    const workspaceEntries = graph.filter(
-      (entry) =>
-        entry.localWorkspace === true &&
-        entry.packages.some(
-          (package_) =>
-            package_.name === context.packageName &&
-            (context.packageVersion === undefined ||
-              package_.version === context.packageVersion),
-        ),
-    );
-    return resolveGraphPackageClosure(
-      graph,
-      workspaceEntries.length === 0 ? context.directDependencies : [],
-      workspaceEntries,
-      localWorkspaceEntries,
-    );
-  }
-  if (parsed.format === "uv") {
-    const graph = parseUvGraph(source);
-    const workspacePath = normalizeWorkspacePath(context.workspacePath);
-    const matchingPaths = graph.filter((entry) =>
-      entry.workspacePaths?.includes(workspacePath),
-    );
-    const workspaceEntries =
-      matchingPaths.length > 0
-        ? matchingPaths
-        : graph.filter(
-            (entry) =>
-              entry.localWorkspace === true &&
-              entry.packages.some(
-                (package_) =>
-                  package_.name === context.packageName &&
-                  (context.packageVersion === undefined ||
-                    package_.version === context.packageVersion),
-              ),
-          );
-    return resolveGraphPackageClosure(
-      graph,
-      workspaceEntries.length === 0 ? context.directDependencies : [],
-      workspaceEntries,
-      graph.filter((entry) => entry.localWorkspace === true),
-    );
-  }
-  if (parsed.format === "bun-text") {
-    const graph = parseBunGraph(source);
-    const workspaceKey =
-      context.workspacePath === "."
-        ? ""
-        : context.workspacePath.replace(/^\.\//, "");
-    const workspaceReferences = dependencyObjectEntries(
-      graph.workspaces[workspaceKey],
-      true,
-    ).filter(([name]) => directDependencyNames.has(name));
-    return resolveGraphPackageClosure(graph.entries, [
-      ...context.directDependencies,
-      ...workspaceReferences,
-    ]);
-  }
-  return parsed.packages.filter((dependency) =>
-    directDependencyNames.has(dependency.name),
-  );
-};
+): ReadonlyArray<LockfilePackage> =>
+  prepareLockfilePackageClosure(path, contents).resolve(context);

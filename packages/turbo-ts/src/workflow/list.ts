@@ -11,6 +11,7 @@ import { selectPackages } from "../graph/task-graph.js";
 import { configuredEnvironmentValue } from "../repository/model.js";
 import {
   loadWorkflowRepository,
+  packagesOwningRepositoryPath,
   repositoryGlobalInputPatterns,
   repositoryPackageManagerLabel,
 } from "./repository.js";
@@ -145,19 +146,7 @@ export const executeList = (
           platform === "win32",
         ).length > 0;
       for (const path of paths) {
-        const owners = repository.packages.filter((packageModel) => {
-          const directories = new Set(
-            [
-              packageModel.relativeDirectory,
-              packageModel.canonicalRelativeDirectory,
-            ].map((directory) => directory.replace(/^\.\/?/, "")),
-          );
-          return [...directories].some(
-            (directory) =>
-              directory !== "" &&
-              (path === directory || path.startsWith(`${directory}/`)),
-          );
-        });
+        const owners = packagesOwningRepositoryPath(repository.packages, path);
         if (owners.length === 0) rootChanged = true;
         for (const owner of owners) selected.add(owner.identity);
       }

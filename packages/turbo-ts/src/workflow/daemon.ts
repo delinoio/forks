@@ -719,7 +719,7 @@ const stopDaemon = (
         Effect.gen(function* () {
           yield* stopDaemonWithLock(paths);
           if (removeStateDirectory) {
-            yield* fileSystem.remove(paths.stateDirectory).pipe(Effect.ignore);
+            yield* fileSystem.remove(paths.stateDirectory);
           }
         }),
       (contents) => releaseStartLock(paths, contents),

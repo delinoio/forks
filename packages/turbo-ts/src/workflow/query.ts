@@ -42,6 +42,7 @@ import type {
 } from "../repository/model.js";
 import {
   loadWorkflowRepository,
+  packagesOwningRepositoryPath,
   repositoryGlobalInputPatterns,
 } from "./repository.js";
 
@@ -133,6 +134,14 @@ const schemaSource = `
 `;
 
 export const repositoryQuerySchema: GraphQLSchema = buildSchema(schemaSource);
+
+const maximumRepositoryFileBytes = 1024 * 1024;
+const maximumRepositoryFileQueryBytes = 8 * 1024 * 1024;
+
+interface RepositoryFileContents {
+  readonly contents: string;
+  readonly byteLength: number;
+}
 
 export interface QueryOptions {
   readonly cwd?: string;
@@ -414,19 +423,7 @@ const calculateAffectedRepository = (
       selectByGlobs(changedPaths, repositoryGlobalInputPatterns(repository))
         .length > 0;
     for (const path of changedPaths) {
-      const owners = childPackages.filter((packageModel) => {
-        const directories = new Set(
-          [
-            packageModel.relativeDirectory,
-            packageModel.canonicalRelativeDirectory,
-          ].map((directory) => directory.replace(/^\.\/?/, "")),
-        );
-        return [...directories].some(
-          (directory) =>
-            directory !== "" &&
-            (path === directory || path.startsWith(`${directory}/`)),
-        );
-      });
+      const owners = packagesOwningRepositoryPath(childPackages, path);
       if (owners.length === 0) globalChange = true;
       for (const owner of owners) directlyAffected.set(owner.identity, owner);
     }
@@ -669,13 +666,14 @@ const boundaryDiagnostics = (
 
 const repositoryQueryRoot = (
   repository: RepositoryModel,
-  readFile: (path: string) => Promise<string>,
+  readFile: (path: string) => Promise<RepositoryFileContents>,
   loadExternalDependencies: () => Promise<ReadonlyArray<LockfilePackage>>,
   affectedRepository: (
     base: string,
     head: string,
   ) => Promise<AffectedRepository>,
 ) => {
+  let returnedFileBytes = 0;
   const models = repositoryModels(repository);
   const byIdentity = new Map(models.map((model) => [model.identity, model]));
   const dependents = new Map<string, Array<RepositoryPackage>>();
@@ -1003,8 +1001,20 @@ const repositoryQueryRoot = (
       ) {
         throw new Error("file path must stay within the repository");
       }
-      const contents = await readFile(absolutePath);
-      return { contents, path: normalized, absolutePath, ast: null };
+      const file = await readFile(absolutePath);
+      if (
+        returnedFileBytes + file.byteLength >
+        maximumRepositoryFileQueryBytes
+      ) {
+        throw new Error("file query results exceed the 8 MiB safety limit");
+      }
+      returnedFileBytes += file.byteLength;
+      return {
+        contents: file.contents,
+        path: normalized,
+        absolutePath,
+        ast: null,
+      };
     },
   };
 };
@@ -1028,6 +1038,10 @@ const executeGraphql = (
         let externalDependenciesPromise:
           | Promise<ReadonlyArray<LockfilePackage>>
           | undefined;
+        const repositoryFilePromises = new Map<
+          string,
+          Promise<RepositoryFileContents>
+        >();
         const loadExternalDependencies = () => {
           externalDependenciesPromise ??= runResolverEffect(
             Effect.gen(function* () {
@@ -1108,37 +1122,75 @@ const executeGraphql = (
           source,
           rootValue: repositoryQueryRoot(
             repository,
-            (path) =>
-              runResolverEffect(
-                fileSystem.realPath(path).pipe(
-                  Effect.mapError(
-                    (error) =>
-                      new ConfigurationError({
-                        path,
-                        message: error.message,
-                      }),
-                  ),
-                  Effect.flatMap((resolved) =>
-                    isPathContained(repository.root, normalizePath(resolved))
-                      ? fileSystem.readText(resolved).pipe(
-                          Effect.mapError(
-                            (error) =>
-                              new ConfigurationError({
-                                path,
-                                message: error.message,
-                              }),
-                          ),
-                        )
-                      : Effect.fail(
-                          new ConfigurationError({
-                            path,
-                            message:
-                              "file path must stay within the repository",
-                          }),
-                        ),
+            async (path) => {
+              const resolved = normalizePath(
+                await runResolverEffect(
+                  fileSystem.realPath(path).pipe(
+                    Effect.mapError(
+                      (error) =>
+                        new ConfigurationError({
+                          path,
+                          message: error.message,
+                        }),
+                    ),
                   ),
                 ),
-              ),
+              );
+              if (!isPathContained(repository.root, resolved)) {
+                throw new ConfigurationError({
+                  path,
+                  message: "file path must stay within the repository",
+                });
+              }
+              const cached = repositoryFilePromises.get(resolved);
+              if (cached !== undefined) return cached;
+              const loaded = runResolverEffect(
+                Effect.gen(function* () {
+                  const metadata = yield* fileSystem.metadata(resolved).pipe(
+                    Effect.mapError(
+                      (error) =>
+                        new ConfigurationError({
+                          path,
+                          message: error.message,
+                        }),
+                    ),
+                  );
+                  if (metadata.size > maximumRepositoryFileBytes) {
+                    return yield* Effect.fail(
+                      new ConfigurationError({
+                        path,
+                        message: "file exceeds the 1 MiB safety limit",
+                      }),
+                    );
+                  }
+                  const contents = yield* fileSystem
+                    .readBytesRange(resolved, 0, maximumRepositoryFileBytes + 1)
+                    .pipe(
+                      Effect.mapError(
+                        (error) =>
+                          new ConfigurationError({
+                            path,
+                            message: error.message,
+                          }),
+                      ),
+                    );
+                  if (contents.length > maximumRepositoryFileBytes) {
+                    return yield* Effect.fail(
+                      new ConfigurationError({
+                        path,
+                        message: "file exceeds the 1 MiB safety limit",
+                      }),
+                    );
+                  }
+                  return {
+                    contents: new TextDecoder().decode(contents),
+                    byteLength: contents.length,
+                  };
+                }),
+              );
+              repositoryFilePromises.set(resolved, loaded);
+              return loaded;
+            },
             loadExternalDependencies,
             (base, head) =>
               runResolverEffect(

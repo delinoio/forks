@@ -15,6 +15,7 @@ import {
 import {
   discoverRepository,
   type RepositoryModel,
+  type RepositoryPackage,
 } from "../repository/model.js";
 import { discoverRepositoryRoot } from "../run/engine.js";
 
@@ -112,6 +113,39 @@ export const repositoryGlobalInputPatterns = (
   repository.rootConfiguration.value.futureFlags?.globalConfiguration === true
     ? (repository.rootConfiguration.value.global?.inputs ?? [])
     : (repository.rootConfiguration.value.globalDependencies ?? []);
+
+export const packagesOwningRepositoryPath = (
+  packages: ReadonlyArray<RepositoryPackage>,
+  path: string,
+): ReadonlyArray<RepositoryPackage> => {
+  const matches = packages.flatMap((packageModel) =>
+    [
+      ...new Set(
+        [
+          packageModel.relativeDirectory,
+          packageModel.canonicalRelativeDirectory,
+        ].map((directory) => directory.replace(/^\.\/?/, "")),
+      ),
+    ].flatMap((directory) =>
+      directory !== "" &&
+      (path === directory || path.startsWith(`${directory}/`))
+        ? [{ packageModel, directory }]
+        : [],
+    ),
+  );
+  const longestDirectory = Math.max(
+    0,
+    ...matches.map(({ directory }) => directory.length),
+  );
+  const ownerIdentities = new Set(
+    matches
+      .filter(({ directory }) => directory.length === longestDirectory)
+      .map(({ packageModel }) => packageModel.identity),
+  );
+  return packages.filter((packageModel) =>
+    ownerIdentities.has(packageModel.identity),
+  );
+};
 
 export const isInternalRepositoryPath = (
   root: string,
