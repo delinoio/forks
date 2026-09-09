@@ -1067,10 +1067,24 @@ const serveDaemon = (
                     (excluded) => `!${excluded}`,
                   ),
                 ];
+                const comparableRelative = windowsPathSeparators
+                  ? relative.toLowerCase()
+                  : relative;
+                const comparablePatterns = windowsPathSeparators
+                  ? patterns.map((pattern) => pattern.toLowerCase())
+                  : patterns;
                 const changed =
                   change.entryKind === "directory" || change.kind === "remove"
-                    ? canMatchGlobsDescendantWithExclusions(relative, patterns)
-                    : matchesGlobsWithExclusions([relative], patterns);
+                    ? canMatchGlobsDescendantWithExclusions(
+                        comparableRelative,
+                        comparablePatterns,
+                        windowsPathSeparators,
+                      )
+                    : matchesGlobsWithExclusions(
+                        [comparableRelative],
+                        comparablePatterns,
+                        windowsPathSeparators,
+                      );
                 if (changed) {
                   markOutputChanged(registration, glob);
                 }

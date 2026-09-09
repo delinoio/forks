@@ -744,6 +744,7 @@ const findAffectedPackages = (
   range?: GitRange,
   globalInputsAreTaskAware = false,
   windowsPathSeparators = false,
+  commandGlobalDependencies: ReadonlyArray<string> = [],
 ): Effect.Effect<AffectedPackages, ConfigurationError, ProcessService> =>
   Effect.gen(function* () {
     const processService = yield* ProcessService;
@@ -833,6 +834,7 @@ const findAffectedPackages = (
       changedFiles,
       globalInputsAreTaskAware,
       windowsPathSeparators,
+      commandGlobalDependencies,
     );
   });
 
@@ -872,6 +874,7 @@ const resolveAffectedPackages = (
         parseGitRange(selector),
         flags?.filterUsingTasks === true,
         windowsPathSeparators,
+        options.globalDependencies,
       );
       ranges.set(selector, affected.packages);
       affectedBySelector.set(selector, affected);
@@ -883,6 +886,7 @@ const resolveAffectedPackages = (
         undefined,
         flags?.affectedUsingTaskInputs === true,
         windowsPathSeparators,
+        options.globalDependencies,
       );
       ranges.set(defaultAffectedSelector, affected.packages);
       affectedBySelector.set(defaultAffectedSelector, affected);
@@ -3148,6 +3152,11 @@ const applyCargoWorkspaceHashes = (
             ),
           ),
         ].sort(),
+        inputFileHashes: Object.fromEntries(
+          scope.members.flatMap((member) =>
+            Object.entries(hashes.get(member.id)?.inputFileHashes ?? {}),
+          ),
+        ),
       });
       changed.add(id);
     }

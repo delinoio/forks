@@ -105,7 +105,6 @@ rows:
       - --remote-only
       - --remote-cache-read-only
       - --no-cache
-      - --cache-workers
       - --dry-run
       - --graph
       - --daemon
@@ -134,6 +133,14 @@ rows:
       - --
     source: black-box-help-and-issue-3
     tests: [repository.workflows]
+  - id: cli.run-cache-workers
+    category: option
+    subject: run cache worker limit
+    targetGate: 3
+    status: planned
+    variants:
+      - --cache-workers
+    source: black-box-help-and-issue-3
   - id: cli.core-run-options
     category: option
     subject: core execution, filter, environment, concurrency, and cache options

@@ -3689,6 +3689,7 @@ describe("repository workflow gate", () => {
       await Effect.runPromise(
         Effect.gen(function* () {
           const daemon = yield* DaemonService;
+          const environment = yield* EnvironmentService;
           const registered = yield* Deferred.make<void>();
           const connection = (request: {
             readonly id: string;
@@ -3736,6 +3737,7 @@ describe("repository workflow gate", () => {
                             ".turbo/generated/*.js",
                             "dist/*.js",
                             "node_modules/generated/*.js",
+                            "reports/**/*.js",
                           ],
                           outputExclusionGlobs: ["dist/ignore.js"],
                         },
@@ -3766,7 +3768,12 @@ describe("repository workflow gate", () => {
                             entryKind: "file" as const,
                           },
                           {
-                            path: join(root, "dist"),
+                            path: join(root, "Dist/output.js"),
+                            kind: "modify" as const,
+                            entryKind: "file" as const,
+                          },
+                          {
+                            path: join(root, "Reports"),
                             kind: "remove" as const,
                           },
                           {
@@ -3783,6 +3790,10 @@ describe("repository workflow gate", () => {
                       ),
                     ),
                 }),
+                Layer.succeed(EnvironmentService, {
+                  ...environment,
+                  platform: Effect.succeed("win32" as const),
+                }),
               ),
             ),
           );
@@ -3797,6 +3808,7 @@ describe("repository workflow gate", () => {
                 ".turbo/generated/*.js",
                 "dist/*.js",
                 "node_modules/generated/*.js",
+                "reports/**/*.js",
               ],
             },
           ],
@@ -3921,6 +3933,7 @@ describe("repository workflow gate", () => {
       await Effect.runPromise(
         Effect.gen(function* () {
           const daemon = yield* DaemonService;
+          const environment = yield* EnvironmentService;
           const registered = yield* Deferred.make<void>();
           const connection = (request: {
             readonly id: string;
@@ -3978,12 +3991,16 @@ describe("repository workflow gate", () => {
                     Stream.fromEffect(
                       Deferred.await(registered).pipe(
                         Effect.as({
-                          path: join(root, "dist/private"),
+                          path: join(root, "DIST/PRIVATE"),
                           kind: "rename" as const,
                           entryKind: "directory" as const,
                         }),
                       ),
                     ),
+                }),
+                Layer.succeed(EnvironmentService, {
+                  ...environment,
+                  platform: Effect.succeed("win32" as const),
                 }),
               ),
             ),

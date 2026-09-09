@@ -503,6 +503,15 @@ describe("configuration generation and compatibility ledger", () => {
         .filter((row) => row.status === "passing")
         .flatMap((row) => row.variants ?? []),
     ).toContain("lockfile-parse-and-prune");
+    expect(
+      ledger.rows.find((row) => row.id === "cli.run-options")?.variants,
+    ).not.toContain("--cache-workers");
+    expect(
+      ledger.rows.find((row) => row.id === "cli.run-cache-workers"),
+    ).toMatchObject({
+      status: "planned",
+      variants: ["--cache-workers"],
+    });
     expect(() =>
       parseCompatibilityLedger(
         ledgerSource.replace(

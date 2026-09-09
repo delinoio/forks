@@ -4556,6 +4556,10 @@ describe("core CLI execution", () => {
         `${directory}/rust/Cargo.toml`,
         '[workspace]\nmembers = ["a", "b"]\nresolver = "3"\n',
       );
+      await writeFile(
+        `${directory}/rust/b/src/member-b.rs`,
+        "pub fn member_b() {}\n",
+      );
       await cp(
         `${repositoryRoot}/rust-toolchain`,
         `${directory}/rust-toolchain`,
@@ -4564,6 +4568,29 @@ describe("core CLI execution", () => {
         (await run("cargo", ["generate-lockfile"], `${directory}/rust`))
           .exitCode,
       ).toBe(0);
+      const dryRun = await run(
+        process.execPath,
+        [candidateEntrypoint, "run", "test", "--cwd", directory, "--dry=json"],
+        repositoryRoot,
+      );
+      expect(dryRun.exitCode, dryRun.stderr).toBe(0);
+      const drySummary = JSON.parse(dryRun.stdout) as {
+        readonly tasks: ReadonlyArray<{
+          readonly taskId: string;
+          readonly inputs: Readonly<Record<string, string>>;
+        }>;
+      };
+      expect(
+        drySummary.tasks.filter((task) => task.taskId.startsWith("rust-")),
+      ).toHaveLength(1);
+      expect(
+        drySummary.tasks.find((task) => task.taskId === "rust-a#test"),
+      ).toMatchObject({
+        taskId: "rust-a#test",
+        inputs: {
+          "src/member-b.rs": expect.stringMatching(/^[0-9a-f]{40}$/),
+        },
+      });
       const args = [
         candidateEntrypoint,
         "run",
@@ -10579,7 +10606,10 @@ dependencies = [
         globalDependencies?: Array<string>;
         tasks: Record<string, { inputs?: Array<string> }>;
       };
-      configuration.futureFlags = { affectedUsingTaskInputs: true };
+      configuration.futureFlags = {
+        affectedUsingTaskInputs: true,
+        filterUsingTasks: true,
+      };
       configuration.globalDependencies = ["configured-global.txt"];
       configuration.tasks.build!.inputs = ["$TURBO_DEFAULT$", "!README.md"];
       configuration.tasks["//#root-check"] = {
@@ -10716,6 +10746,39 @@ dependencies = [
       );
       expect(rootResult.exitCode).toBe(0);
       expect(rootResult.stdout).toContain("root affected check");
+
+      await writeFile(`${directory}/cli-global.txt`, "changed CLI input\n");
+      expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);
+      expect(
+        (await run("git", ["commit", "-m", "CLI global input"], directory))
+          .exitCode,
+      ).toBe(0);
+      for (const selection of [["--affected"], ["--filter=[HEAD~1]"]]) {
+        const globalResult = await run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "build",
+            "--cwd",
+            directory,
+            ...selection,
+            "--no-cache",
+            "--dry=json",
+            "--global-deps=cli-global.txt",
+          ],
+          repositoryRoot,
+          { TURBO_SCM_BASE: "HEAD~1", TURBO_SCM_HEAD: "HEAD" },
+        );
+        expect(globalResult.exitCode).toBe(0);
+        const globalSummary = JSON.parse(globalResult.stdout) as {
+          readonly tasks: ReadonlyArray<{ readonly taskId: string }>;
+        };
+        expect(globalSummary.tasks.map((task) => task.taskId).sort()).toEqual([
+          "synthetic-app#build",
+          "synthetic-library#build",
+        ]);
+      }
 
       await writeFile(`${directory}/README.md`, "root documentation\n");
       expect((await run("git", ["add", "."], directory)).exitCode).toBe(0);

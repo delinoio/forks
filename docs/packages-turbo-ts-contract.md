@@ -116,8 +116,9 @@ and resolve to a directory before nested repository discovery begins from its
 canonical target, including when the requested path is a symlink.
 Task-aware Git selectors retain union semantics with positive package
 selectors; negative Git selectors are applied after that union.
-Package-level affected selection treats legacy `globalDependencies` and, when
-task-aware selection is disabled, `global.inputs` as repository-global inputs.
+Git affected selection treats CLI `--global-deps` and legacy
+`globalDependencies` as repository-global inputs and, when task-aware selection
+is disabled, treats `global.inputs` the same way.
 Repository-root Cargo and uv package scopes do not claim ordinary root files
 for package ownership; those changes retain repository-global package-level
 affected selection.
@@ -457,7 +458,8 @@ prerequisite output depends on unmodeled external controls. Cargo metadata
 discovery uses `--locked`, uses each response's workspace-member list, and does
 not probe excluded or unrelated nested manifests. Combined workspace task
 hashes are propagated into every downstream task hash using the same effective
-task environment as the initial hash computation.
+task environment as the initial hash computation. JSON dry-run and run summary
+input maps for a grouped task include hashes from every workspace member.
 Cargo builds with colliding synthesized binary destinations bypass caching,
 including when task configuration explicitly enables it.
 Synthesized Cargo binary outputs cover the extensionless executable plus
@@ -617,6 +619,8 @@ generations reported after their response is written successfully. A failed
 response remains retryable, and changes recorded while a response is being
 written remain pending for the next query. The daemon retains at most 1,024
 output registrations and evicts the least recently registered or queried hash.
+Registered output and exclusion globs follow case-insensitive filesystem
+semantics on Windows.
 Each registration accepts a non-empty hash of at most 128 characters, at most
 256 combined output and exclusion globs, at most 1,024 characters per glob, and
 at most 64 KiB of aggregate glob text.
