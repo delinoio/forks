@@ -24,7 +24,10 @@ import {
   type GitIgnoreMatcher,
   loadGitIgnoreMatcher,
 } from "../repository/git-ignore.js";
-import { pruneLockfile } from "../repository/lockfiles.js";
+import {
+  maximumLockfileBytes,
+  pruneLockfile,
+} from "../repository/lockfiles.js";
 import {
   listRepositoryFiles,
   type RepositoryModel,
@@ -247,6 +250,7 @@ const copyTree = (
   windowsPathSemantics: boolean,
   ignoreMatcher?: GitIgnoreMatcher,
   excludedSourceRoots: ReadonlySet<string> = new Set(),
+  unsafeSymlinkRoots: ReadonlySet<string> = new Set(),
   alwaysIncludedSourceRoots: ReadonlySet<string> = new Set(),
   requiredOnly = false,
 ): Effect.Effect<void, unknown, FileSystemService> =>
@@ -308,6 +312,7 @@ const copyTree = (
           windowsPathSemantics,
           ignoreMatcher,
           excludedSourceRoots,
+          unsafeSymlinkRoots,
           alwaysIncludedSourceRoots,
           requiredOnly || entersIgnoredDirectory,
         );
@@ -327,7 +332,7 @@ const copyTree = (
         if (
           isAbsolutePath(target) ||
           isPathContained(excludedRoot, resolved, windowsPathSemantics) ||
-          [...excludedSourceRoots].some((root) =>
+          [...unsafeSymlinkRoots].some((root) =>
             isPathContained(root, resolved, windowsPathSemantics),
           ) ||
           !allowedSymlinkRoots.some((root) =>
@@ -466,6 +471,7 @@ const copyGlobalDependencyFiles = (
   repository: RepositoryModel,
   destinationRoot: string,
   excludedRoot: string,
+  windowsPathSemantics: boolean,
   ignoreMatcher?: GitIgnoreMatcher,
 ): Effect.Effect<void, unknown, FileSystemService> =>
   Effect.gen(function* () {
@@ -485,14 +491,31 @@ const copyGlobalDependencyFiles = (
     );
     if (positivePatterns.length === 0) return;
     const paths = yield* listRepositoryFiles(repository.root, {
-      shouldTraverseDirectory: (relativeDirectory) =>
-        positivePatterns.some((pattern) =>
-          canMatchGlobDescendant(relativeDirectory, pattern),
-        ),
+      shouldTraverseDirectory: (relativeDirectory) => {
+        const directoryName = baseName(relativeDirectory, windowsPathSemantics);
+        if (
+          ignoredDirectoryNames.has(
+            windowsPathSemantics ? directoryName.toLowerCase() : directoryName,
+          )
+        ) {
+          return false;
+        }
+        return positivePatterns.some((pattern) =>
+          canMatchGlobDescendant(
+            relativeDirectory,
+            pattern,
+            windowsPathSemantics,
+          ),
+        );
+      },
+      windowsPathSeparators: windowsPathSemantics,
     });
     const selected = selectByGlobs(
-      paths.map((path) => relativePath(repository.root, path)),
+      paths.map((path) =>
+        relativePath(repository.root, path, windowsPathSemantics),
+      ),
       patterns,
+      windowsPathSemantics,
     );
     for (const relative of selected) {
       const source = joinPath(repository.root, relative);
@@ -747,6 +770,33 @@ export const executePrune = (
         );
       }
     }
+    const lockfileContents = yield* fileSystem.readBytesRange(
+      repository.lockfile,
+      0,
+      maximumLockfileBytes + 1,
+    );
+    const prunedLockfile = pruneLockfile(
+      repository.lockfile,
+      lockfileContents,
+      new Set(packages.map((packageModel) => packageModel.relativeDirectory)),
+      {
+        production: options.production,
+        manifests: [
+          { ...repository.rootManifest, workspacePath: "." },
+          ...packages.flatMap((packageModel) =>
+            packageModel.manager === "cargo" || packageModel.manager === "uv"
+              ? []
+              : [
+                  {
+                    ...packageModel.manifest,
+                    workspacePath: packageModel.relativeDirectory,
+                  },
+                ],
+          ),
+        ],
+      },
+    );
+    const lockfileName = baseName(repository.lockfile);
     yield* fileSystem.remove(outputRoot);
     const fullRoot = options.docker ? joinPath(outputRoot, "full") : outputRoot;
     const jsonRoot = options.docker ? joinPath(outputRoot, "json") : outputRoot;
@@ -762,6 +812,7 @@ export const executePrune = (
       repository,
       fullRoot,
       canonicalOutputRoot,
+      windowsPathSemantics,
       ignoreMatcher,
     );
     for (const name of rootControlNames) {
@@ -882,6 +933,7 @@ export const executePrune = (
           [yarnDirectory],
           windowsPathSemantics,
           ignoreMatcher,
+          new Set(),
           new Set(),
           requiredYarnControls,
         );
@@ -1060,6 +1112,7 @@ export const executePrune = (
                 ),
             ),
           ]),
+          excludedPackageRoots,
         );
       }
       yield* terminal.writeStdout(` - Added ${packageModel.name}\n`);
@@ -1100,31 +1153,6 @@ export const executePrune = (
         );
       }
     }
-    const lockfileContents = yield* fileSystem.readBytes(repository.lockfile);
-    const prunedLockfile = pruneLockfile(
-      repository.lockfile,
-      lockfileContents,
-      new Set(packages.map((packageModel) => packageModel.relativeDirectory)),
-      {
-        production: options.production,
-        manifests: [
-          { ...repository.rootManifest, workspacePath: "." },
-          ...packages.flatMap((packageModel) =>
-            packageModel.manager === "cargo" || packageModel.manager === "uv"
-              ? []
-              : [
-                  {
-                    ...packageModel.manifest,
-                    workspacePath: packageModel.relativeDirectory,
-                  },
-                ],
-          ),
-        ],
-      },
-    );
-    const lockfileName = repository.lockfile.slice(
-      repository.lockfile.lastIndexOf("/") + 1,
-    );
     yield* fileSystem.writeBytesAtomic(
       joinPath(outputRoot, lockfileName),
       prunedLockfile,

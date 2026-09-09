@@ -62,7 +62,10 @@ import {
 } from "../src/effect/services.js";
 import { xxhash64Hex } from "../src/hash/xxhash64.js";
 import { loadGitIgnoreMatcher } from "../src/repository/git-ignore.js";
-import { pruneLockfile } from "../src/repository/lockfiles.js";
+import {
+  maximumLockfileBytes,
+  pruneLockfile,
+} from "../src/repository/lockfiles.js";
 import {
   executeRun,
   renderRunTui,
@@ -1275,6 +1278,57 @@ describe("repository workflow gate", () => {
           ]),
         ).rejects.toThrow(/must not resolve to the same run artifact/);
         expect(await readFile(artifactPath, "utf8")).toBe("preserved\n");
+        expect(
+          await readFile(join(directory, "task-ran"), "utf8").catch(
+            () => undefined,
+          ),
+        ).toBeUndefined();
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("rejects atomic run artifact destinations that are symlink leaves", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-artifact-symlink-"),
+    );
+    const targetPath = join(directory, "artifact-target.json");
+    const artifactPath = join(directory, "artifact-link.json");
+    try {
+      await prepareFixture(directory);
+      const manifestPath = join(directory, "packages/app/package.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.build =
+        "node -e \"require('node:fs').writeFileSync('../../task-ran','1')\"";
+      await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+      await writeFile(targetPath, "preserved\n");
+      await symlink("artifact-target.json", artifactPath);
+      for (const option of [
+        "--log-file=artifact-link.json",
+        "--profile=artifact-link.json",
+        "--anon-profile=artifact-link.json",
+        "--trace=artifact-link.json",
+      ]) {
+        await expect(
+          execFilePromise(process.execPath, [
+            candidate,
+            "run",
+            "build",
+            "--filter=synthetic-app",
+            "--no-cache",
+            option,
+            "--cwd",
+            directory,
+          ]),
+        ).rejects.toThrow(
+          /atomic run artifact destination must not be a symlink/,
+        );
+        expect(await readlink(artifactPath)).toBe("artifact-target.json");
+        expect(await readFile(targetPath, "utf8")).toBe("preserved\n");
         expect(
           await readFile(join(directory, "task-ran"), "utf8").catch(
             () => undefined,
@@ -3264,7 +3318,7 @@ describe("repository workflow gate", () => {
     }
   });
 
-  it("keeps active RPCs alive and isolates response transport failures", async () => {
+  it("processes daemon connections concurrently and isolates response failures", async () => {
     const directory = await mkdtemp(
       join(tmpdir(), "turbo-ts-daemon-response-"),
     );
@@ -3272,6 +3326,7 @@ describe("repository workflow gate", () => {
       await prepareFixture(directory);
       const responses = new Map<string, unknown>();
       let failedResponseCompleted = false;
+      let succeededWhileFailedResponsePending = false;
       const responseFailure = new BoundaryError({
         boundary: "daemon",
         message: "synthetic response failure",
@@ -3296,6 +3351,8 @@ describe("repository workflow gate", () => {
                     Effect.zipRight(Effect.fail(responseFailure)),
                   )
                 : Effect.sync(() => {
+                    succeededWhileFailedResponsePending =
+                      !failedResponseCompleted;
                     responses.set(id, response);
                   }),
           });
@@ -3334,6 +3391,7 @@ describe("repository workflow gate", () => {
         }).pipe(Effect.provide(nodeFoundationLayer)),
       );
       expect(failedResponseCompleted).toBe(true);
+      expect(succeededWhileFailedResponsePending).toBe(true);
       expect(responses.get("succeeded")).toMatchObject({
         id: "succeeded",
         result: { uptimeMilliseconds: 0 },
@@ -3363,23 +3421,43 @@ describe("repository workflow gate", () => {
       await Effect.runPromise(
         Effect.gen(function* () {
           const daemon = yield* DaemonService;
-          const connection = (
-            request: {
-              readonly id: string;
-              readonly method: (typeof DaemonMethod)[keyof typeof DaemonMethod];
-              readonly params?: unknown;
-            },
-            delay = 0,
-          ) => ({
+          const registered = yield* Deferred.make<void>();
+          const failedResponseAttempted = yield* Deferred.make<void>();
+          const retryResponseCompleted = yield* Deferred.make<void>();
+          const connection = (request: {
+            readonly id: string;
+            readonly method: (typeof DaemonMethod)[keyof typeof DaemonMethod];
+            readonly params?: unknown;
+          }) => ({
             requests: Stream.fromEffect(
-              Effect.sleep(delay).pipe(Effect.as(request)),
+              (request.id === "get-failed"
+                ? Deferred.await(registered).pipe(
+                    Effect.zipRight(Effect.sleep("50 millis")),
+                  )
+                : request.id === "get-retry"
+                  ? Deferred.await(failedResponseAttempted)
+                  : request.id === "get-empty"
+                    ? Deferred.await(retryResponseCompleted)
+                    : Effect.void
+              ).pipe(Effect.as(request)),
             ),
             respond: (response: { readonly id: string }) =>
               request.id === "get-failed"
-                ? Effect.fail(responseFailure)
+                ? Deferred.succeed(failedResponseAttempted, undefined).pipe(
+                    Effect.zipRight(Effect.fail(responseFailure)),
+                  )
                 : Effect.sync(() => {
                     responses.set(request.id, response);
-                  }),
+                  }).pipe(
+                    request.id === "notify"
+                      ? Effect.zipRight(Deferred.succeed(registered, undefined))
+                      : request.id === "get-retry"
+                        ? Effect.zipRight(
+                            Deferred.succeed(retryResponseCompleted, undefined),
+                          )
+                        : (effect) => effect,
+                    Effect.asVoid,
+                  ),
           });
           return yield* executeDaemon({
             command: "serve",
@@ -3401,14 +3479,11 @@ describe("repository workflow gate", () => {
                           outputGlobs: ["packages/app/build/*.js"],
                         },
                       }),
-                      connection(
-                        {
-                          id: "get-failed",
-                          method: DaemonMethod.getChangedOutputs,
-                          params: { hashes: ["synthetic-hash"] },
-                        },
-                        30,
-                      ),
+                      connection({
+                        id: "get-failed",
+                        method: DaemonMethod.getChangedOutputs,
+                        params: { hashes: ["synthetic-hash"] },
+                      }),
                       connection({
                         id: "get-retry",
                         method: DaemonMethod.getChangedOutputs,
@@ -3887,6 +3962,7 @@ describe("repository workflow gate", () => {
           const firstChangeEmitted = yield* Deferred.make<void>();
           const responseStarted = yield* Deferred.make<void>();
           const secondChangeEmitted = yield* Deferred.make<void>();
+          const newerResponseCompleted = yield* Deferred.make<void>();
           const change = {
             path: join(directory, "packages/app/build/output.js"),
             kind: "modify" as const,
@@ -3898,12 +3974,18 @@ describe("repository workflow gate", () => {
             readonly params?: unknown;
           }) => ({
             requests: Stream.fromEffect(
-              request.id === "get-in-flight"
+              (request.id === "get-in-flight"
                 ? Deferred.await(firstChangeEmitted).pipe(
                     Effect.zipRight(Effect.sleep("10 millis")),
-                    Effect.as(request),
                   )
-                : Effect.succeed(request),
+                : request.id === "get-newer"
+                  ? Deferred.await(secondChangeEmitted).pipe(
+                      Effect.zipRight(Effect.sleep("10 millis")),
+                    )
+                  : request.id === "get-empty"
+                    ? Deferred.await(newerResponseCompleted)
+                    : Effect.void
+              ).pipe(Effect.as(request)),
             ),
             respond: (response: { readonly id: string }) => {
               if (request.id === "notify") {
@@ -3930,7 +4012,14 @@ describe("repository workflow gate", () => {
               }
               return Effect.sync(() => {
                 responses.set(request.id, response);
-              });
+              }).pipe(
+                request.id === "get-newer"
+                  ? Effect.zipRight(
+                      Deferred.succeed(newerResponseCompleted, undefined),
+                    )
+                  : (effect) => effect,
+                Effect.asVoid,
+              );
             },
           });
           return yield* executeDaemon({
@@ -7540,6 +7629,137 @@ dependencies = ["external-package 2.0.0 (registry+https://example.test/index)"]
     }
   });
 
+  it("excludes mixed-case reserved directories from Windows global copies", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-prune-global-case-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const configurationPath = join(directory, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.globalDependencies = ["**/*"];
+      configuration.futureFlags = { pruneIncludesGlobalFiles: true };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
+      await writeFile(join(directory, "global.txt"), "global\n");
+      for (const name of ["Node_Modules", ".TURBO"]) {
+        const reserved = join(directory, name);
+        await mkdir(reserved);
+        await writeFile(join(reserved, "generated.txt"), "generated\n");
+      }
+      expect(
+        await Effect.runPromise(
+          Effect.gen(function* () {
+            const environment = yield* EnvironmentService;
+            return yield* executePrune({
+              scopes: ["synthetic-app"],
+              cwd: directory,
+              outputDirectory: "result",
+              docker: false,
+              production: false,
+              useGitignore: false,
+            }).pipe(
+              Effect.provideService(EnvironmentService, {
+                ...environment,
+                platform: Effect.succeed("win32" as const),
+              }),
+            );
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).toBe(0);
+      expect(await readFile(join(directory, "result/global.txt"), "utf8")).toBe(
+        "global\n",
+      );
+      for (const name of ["Node_Modules", ".TURBO"]) {
+        expect(
+          await readFile(
+            join(directory, "result", name, "generated.txt"),
+            "utf8",
+          ).catch(() => undefined),
+        ).toBeUndefined();
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("validates bounded lockfile contents before replacing prune output", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-prune-lockfile-preflight-"),
+    );
+    const output = join(directory, "result");
+    const sentinel = join(output, "sentinel.txt");
+    const lockfilePath = join(directory, "pnpm-lock.yaml");
+    try {
+      await prepareFixture(directory);
+      const validLockfile = await readFile(lockfilePath);
+      await mkdir(output);
+      await writeFile(sentinel, "preserved\n");
+
+      await writeFile(lockfilePath, new Uint8Array([0]));
+      await expect(
+        Effect.runPromise(
+          executePrune({
+            scopes: ["synthetic-app"],
+            cwd: directory,
+            outputDirectory: "result",
+            docker: false,
+            production: false,
+            useGitignore: false,
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).rejects.toThrow(/text lockfile contains a NUL byte/);
+      expect(await readFile(sentinel, "utf8")).toBe("preserved\n");
+
+      await writeFile(lockfilePath, validLockfile);
+      let unboundedRead = false;
+      let boundedRead: readonly [number, number] | undefined;
+      await expect(
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const fileSystem = yield* FileSystemService;
+            return yield* executePrune({
+              scopes: ["synthetic-app"],
+              cwd: directory,
+              outputDirectory: "result",
+              docker: false,
+              production: false,
+              useGitignore: false,
+            }).pipe(
+              Effect.provide(
+                Layer.succeed(FileSystemService, {
+                  ...fileSystem,
+                  readBytes: (path) => {
+                    if (path === lockfilePath) unboundedRead = true;
+                    return fileSystem.readBytes(path);
+                  },
+                  readBytesRange: (path, offset, length) => {
+                    if (path !== lockfilePath) {
+                      return fileSystem.readBytesRange(path, offset, length);
+                    }
+                    boundedRead = [offset, length];
+                    return Effect.succeed(
+                      new Uint8Array(maximumLockfileBytes + 1),
+                    );
+                  },
+                }),
+              ),
+            );
+          }).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).rejects.toThrow(/lockfile exceeds the 32 MiB safety limit/);
+      expect(unboundedRead).toBe(false);
+      expect(boundedRead).toEqual([0, maximumLockfileBytes + 1]);
+      expect(await readFile(sentinel, "utf8")).toBe("preserved\n");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("writes ordinary and Docker prune lockfiles with readable modes", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-prune-mode-"));
@@ -7917,6 +8137,10 @@ importers:
       );
       await writeFile(join(nestedDirectory, "source.txt"), "nested\n");
       await symlink("source.txt", join(nestedDirectory, "source-link.txt"));
+      await symlink(
+        "nested/source.txt",
+        join(parentDirectory, "nested-source-link.txt"),
+      );
       await writeFile(
         join(directory, "pnpm-workspace.yaml"),
         'packages:\n  - "packages/*"\n  - "packages/parent/nested"\n',
@@ -7948,6 +8172,15 @@ importers:
           ),
         ),
       ).toBe("source.txt");
+      expect(
+        await readlink(
+          join(
+            directory,
+            "selected-result/packages/parent/nested-source-link.txt",
+          ),
+        ),
+      ).toBe("nested/source.txt");
+      await rm(join(parentDirectory, "nested-source-link.txt"));
       await execFilePromise(process.execPath, [
         candidate,
         "prune",

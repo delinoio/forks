@@ -90,6 +90,7 @@ interface OutputRegistration {
 }
 
 const maximumOutputRegistrations = 1_024;
+const maximumConcurrentDaemonConnections = 64;
 
 const retainOutputRegistration = (
   registrations: Map<string, OutputRegistration>,
@@ -966,174 +967,179 @@ const serveDaemon = (
         ),
         Effect.zipRight(Effect.never),
       );
-      const serve = Stream.runForEach(
-        daemon.serve(paths.socket),
-        (connection) =>
-          Stream.runForEach(connection.requests, (request) =>
-            Effect.acquireUseRelease(
-              beginRequest,
-              () =>
-                Effect.gen(function* () {
-                  yield* fileSystem
-                    .appendText(
-                      paths.log,
-                      `${new Date(yield* clock.now).toISOString()} rpc=${request.method}\n`,
-                    )
-                    .pipe(Effect.ignore);
-                  const changedOutputAcknowledgements = new Map<
-                    Map<string, number>,
-                    ReadonlyMap<string, number>
-                  >();
-                  const result = yield* (() => {
-                    if (request.method === DaemonMethod.status) {
-                      return Effect.gen(function* () {
-                        return {
-                          logFile: paths.log.replace(
-                            /\.\d{4}-\d{2}-\d{2}$/,
-                            "",
-                          ),
-                          uptimeMilliseconds: Math.max(
-                            0,
-                            (yield* clock.now) - startedAt,
-                          ),
-                        };
-                      });
-                    }
-                    if (request.method === DaemonMethod.discoverPackages) {
-                      return loadWorkflowRepository({
-                        cwd: repository.root,
-                        rootTurboJson: options.rootTurboJson,
-                      }).pipe(
-                        Effect.map((currentRepository) => ({
-                          packages: currentRepository.packages
-                            .map((packageModel) => ({
-                              name: packageModel.name,
-                              path: packageModel.relativeDirectory,
-                            }))
-                            .sort((left, right) =>
-                              left.name.localeCompare(right.name),
-                            ),
-                          packageManager:
-                            repositoryPackageManagerLabel(currentRepository),
-                        })),
-                      );
-                    }
-                    if (request.method === DaemonMethod.notifyOutputsWritten) {
-                      const params = request.params as {
-                        readonly hash?: unknown;
-                        readonly outputGlobs?: unknown;
-                        readonly outputExclusionGlobs?: unknown;
-                      };
-                      if (
-                        typeof params.hash !== "string" ||
-                        params.hash === ""
-                      ) {
-                        return Effect.fail(
-                          new BoundaryError({
-                            boundary: "daemon",
-                            message: "NotifyOutputsWritten requires a hash",
-                            retryable: false,
-                          }),
-                        );
-                      }
-                      retainOutputRegistration(
-                        outputRegistrations,
-                        params.hash,
-                        {
-                          outputGlobs: Array.isArray(params.outputGlobs)
-                            ? params.outputGlobs.filter(
-                                (value): value is string =>
-                                  typeof value === "string",
-                              )
-                            : [],
-                          outputExclusionGlobs: Array.isArray(
-                            params.outputExclusionGlobs,
-                          )
-                            ? params.outputExclusionGlobs.filter(
-                                (value): value is string =>
-                                  typeof value === "string",
-                              )
-                            : [],
-                          changedOutputGenerations: new Map(),
-                          nextChangeGeneration: 0,
-                        },
-                      );
-                      return Effect.succeed({});
-                    }
-                    if (request.method === DaemonMethod.getChangedOutputs) {
-                      const params = request.params as {
-                        readonly hashes?: unknown;
-                      };
-                      const hashes = Array.isArray(params.hashes)
-                        ? params.hashes.filter(
-                            (value): value is string =>
-                              typeof value === "string",
-                          )
-                        : [];
-                      const changedOutputs = hashes.flatMap((hash) => {
-                        const registration = recentOutputRegistration(
-                          outputRegistrations,
-                          hash,
-                        );
-                        if (registration === undefined) return [];
-                        const acknowledgement = new Map(
-                          registration.changedOutputGenerations,
-                        );
-                        const changedOutputGlobs = [
-                          ...acknowledgement.keys(),
-                        ].sort();
-                        changedOutputAcknowledgements.set(
-                          registration.changedOutputGenerations,
-                          acknowledgement,
-                        );
-                        return [{ hash, changedOutputGlobs }];
-                      });
-                      return Effect.succeed({ changedOutputs });
-                    }
-                    return Effect.succeed({});
-                  })().pipe(Effect.either);
-                  const responseResult = yield* connection
-                    .respond(
-                      result._tag === "Left"
-                        ? {
-                            id: request.id,
-                            error:
-                              result.left instanceof Error
-                                ? result.left.message
-                                : String(result.left),
-                          }
-                        : { id: request.id, result: result.right },
-                    )
-                    .pipe(Effect.either);
-                  if (responseResult._tag === "Left") {
+      const serve = daemon.serve(paths.socket).pipe(
+        Stream.mapEffect(
+          (connection) =>
+            Stream.runForEach(connection.requests, (request) =>
+              Effect.acquireUseRelease(
+                beginRequest,
+                () =>
+                  Effect.gen(function* () {
                     yield* fileSystem
                       .appendText(
                         paths.log,
-                        `${new Date(yield* clock.now).toISOString()} rpc=${request.method} response_error=${responseResult.left.message}\n`,
+                        `${new Date(yield* clock.now).toISOString()} rpc=${request.method}\n`,
                       )
                       .pipe(Effect.ignore);
+                    const changedOutputAcknowledgements = new Map<
+                      Map<string, number>,
+                      ReadonlyMap<string, number>
+                    >();
+                    const result = yield* (() => {
+                      if (request.method === DaemonMethod.status) {
+                        return Effect.gen(function* () {
+                          return {
+                            logFile: paths.log.replace(
+                              /\.\d{4}-\d{2}-\d{2}$/,
+                              "",
+                            ),
+                            uptimeMilliseconds: Math.max(
+                              0,
+                              (yield* clock.now) - startedAt,
+                            ),
+                          };
+                        });
+                      }
+                      if (request.method === DaemonMethod.discoverPackages) {
+                        return loadWorkflowRepository({
+                          cwd: repository.root,
+                          rootTurboJson: options.rootTurboJson,
+                        }).pipe(
+                          Effect.map((currentRepository) => ({
+                            packages: currentRepository.packages
+                              .map((packageModel) => ({
+                                name: packageModel.name,
+                                path: packageModel.relativeDirectory,
+                              }))
+                              .sort((left, right) =>
+                                left.name.localeCompare(right.name),
+                              ),
+                            packageManager:
+                              repositoryPackageManagerLabel(currentRepository),
+                          })),
+                        );
+                      }
+                      if (
+                        request.method === DaemonMethod.notifyOutputsWritten
+                      ) {
+                        const params = request.params as {
+                          readonly hash?: unknown;
+                          readonly outputGlobs?: unknown;
+                          readonly outputExclusionGlobs?: unknown;
+                        };
+                        if (
+                          typeof params.hash !== "string" ||
+                          params.hash === ""
+                        ) {
+                          return Effect.fail(
+                            new BoundaryError({
+                              boundary: "daemon",
+                              message: "NotifyOutputsWritten requires a hash",
+                              retryable: false,
+                            }),
+                          );
+                        }
+                        retainOutputRegistration(
+                          outputRegistrations,
+                          params.hash,
+                          {
+                            outputGlobs: Array.isArray(params.outputGlobs)
+                              ? params.outputGlobs.filter(
+                                  (value): value is string =>
+                                    typeof value === "string",
+                                )
+                              : [],
+                            outputExclusionGlobs: Array.isArray(
+                              params.outputExclusionGlobs,
+                            )
+                              ? params.outputExclusionGlobs.filter(
+                                  (value): value is string =>
+                                    typeof value === "string",
+                                )
+                              : [],
+                            changedOutputGenerations: new Map(),
+                            nextChangeGeneration: 0,
+                          },
+                        );
+                        return Effect.succeed({});
+                      }
+                      if (request.method === DaemonMethod.getChangedOutputs) {
+                        const params = request.params as {
+                          readonly hashes?: unknown;
+                        };
+                        const hashes = Array.isArray(params.hashes)
+                          ? params.hashes.filter(
+                              (value): value is string =>
+                                typeof value === "string",
+                            )
+                          : [];
+                        const changedOutputs = hashes.flatMap((hash) => {
+                          const registration = recentOutputRegistration(
+                            outputRegistrations,
+                            hash,
+                          );
+                          if (registration === undefined) return [];
+                          const acknowledgement = new Map(
+                            registration.changedOutputGenerations,
+                          );
+                          const changedOutputGlobs = [
+                            ...acknowledgement.keys(),
+                          ].sort();
+                          changedOutputAcknowledgements.set(
+                            registration.changedOutputGenerations,
+                            acknowledgement,
+                          );
+                          return [{ hash, changedOutputGlobs }];
+                        });
+                        return Effect.succeed({ changedOutputs });
+                      }
+                      return Effect.succeed({});
+                    })().pipe(Effect.either);
+                    const responseResult = yield* connection
+                      .respond(
+                        result._tag === "Left"
+                          ? {
+                              id: request.id,
+                              error:
+                                result.left instanceof Error
+                                  ? result.left.message
+                                  : String(result.left),
+                            }
+                          : { id: request.id, result: result.right },
+                      )
+                      .pipe(Effect.either);
+                    if (responseResult._tag === "Left") {
+                      yield* fileSystem
+                        .appendText(
+                          paths.log,
+                          `${new Date(yield* clock.now).toISOString()} rpc=${request.method} response_error=${responseResult.left.message}\n`,
+                        )
+                        .pipe(Effect.ignore);
+                      if (request.method === DaemonMethod.shutdown) {
+                        yield* Deferred.succeed(shutdown, undefined);
+                      }
+                      return;
+                    }
+                    for (const [
+                      generations,
+                      acknowledged,
+                    ] of changedOutputAcknowledgements) {
+                      for (const [glob, generation] of acknowledged) {
+                        if (generations.get(glob) === generation) {
+                          generations.delete(glob);
+                        }
+                      }
+                    }
                     if (request.method === DaemonMethod.shutdown) {
                       yield* Deferred.succeed(shutdown, undefined);
                     }
-                    return;
-                  }
-                  for (const [
-                    generations,
-                    acknowledged,
-                  ] of changedOutputAcknowledgements) {
-                    for (const [glob, generation] of acknowledged) {
-                      if (generations.get(glob) === generation) {
-                        generations.delete(glob);
-                      }
-                    }
-                  }
-                  if (request.method === DaemonMethod.shutdown) {
-                    yield* Deferred.succeed(shutdown, undefined);
-                  }
-                }),
-              () => finishRequest,
+                  }),
+                () => finishRequest,
+              ),
             ),
-          ),
+          { concurrency: maximumConcurrentDaemonConnections },
+        ),
+        Stream.runDrain,
       );
       const waitForIdle = Effect.gen(function* () {
         while (true) {

@@ -534,7 +534,9 @@ and write-enabled local cache directories are treated as run-owned paths and
 never trigger another watch run. Explicit artifact paths are resolved through
 existing ancestor symlinks so lexical destinations, canonical targets, atomic
 temporaries, and watcher notifications for the symlink ancestor remain
-suppressed. Write-enabled cache directories are resolved through existing
+suppressed. Explicit structured-log, profile, anonymous-profile, and trace
+destinations reject a symlink at the final path component before task hashing
+or execution. Write-enabled cache directories are resolved through existing
 ancestor symlinks before event filtering. Default profile matching is limited
 to the generated `profile.<timestamp>` names, their anonymous variant, and atomic
 temporary files; other root-level `profile.*` files remain ordinary watch
@@ -587,7 +589,9 @@ responses still require valid gRPC framing.
 Requests that exceed the transport queue receive an immediate protocol error
 instead of displacing an older request. Unsupported-method and queue-capacity
 responses run in the server Scope so endpoint teardown interrupts pending
-response work.
+response work. The server processes up to 64 client connections concurrently,
+so a slow request or response does not block health and lifecycle calls on
+other connections.
 Package discovery reloads the repository model for each request so workspace
 additions, removals, and renames are visible without a daemon restart.
 Custom root Turbo configuration paths are retained by lifecycle commands,
@@ -725,8 +729,13 @@ paths, the active lockfile or configuration, package-manager controls, or a
 non-root package or workspace-control directory.
 Selected package copies stop at nested workspace roots outside the selected
 closure. Co-located ecosystem scopes copy each distinct package directory once.
+Relative package links may target another selected workspace even when that
+workspace is copied independently; links into unselected workspaces remain
+invalid.
 Generated installation manifests, configuration files, and reduced lockfiles
-use readable `0644` modes. It
+use readable `0644` modes. Lockfiles are read with the 32 MiB safety bound and
+fully reduced before an existing output tree is removed, so an unavailable,
+oversized, or invalid lockfile leaves that output untouched. It
 never follows workspace symlinks into a prune output. Output safety and traversal
 exclusions use canonical locations. Contained relative file symlinks are
 recreated without dereferencing unless their resolved target enters an
@@ -773,7 +782,9 @@ selected member set is made explicit. When
 `futureFlags.pruneIncludesGlobalFiles` is enabled, ordered
 `globalDependencies` or `global.inputs` globs copy their safe, non-ignored
 matches into the ordinary output or Docker full tree before generated controls
-and manifests are rewritten.
+and manifests are rewritten. Global-file traversal applies the same
+case-insensitive reserved-directory exclusions on Windows as package-tree
+copying.
 
 Run workflows support text and JSON dry-runs; DOT, Mermaid, JSON, and HTML task
 graphs; JSON run summaries and live newline-delimited structured log files;

@@ -3644,9 +3644,27 @@ export const executeRun = (
         ),
       );
     };
+    const canonicalAtomicRunArtifactPath = (
+      path: string,
+    ): Effect.Effect<string, unknown, FileSystemService> =>
+      Effect.gen(function* () {
+        if (yield* fileSystem.exists(path)) {
+          const metadata = yield* fileSystem.metadata(path);
+          if (metadata.kind === "symlink") {
+            return yield* Effect.fail(
+              new ConfigurationError({
+                path,
+                message:
+                  "atomic run artifact destination must not be a symlink",
+              }),
+            );
+          }
+        }
+        return yield* canonicalRunArtifactPath(path);
+      });
     if (structuredLogPath !== undefined) {
       const canonicalStructuredLogPath =
-        yield* canonicalRunArtifactPath(structuredLogPath);
+        yield* canonicalAtomicRunArtifactPath(structuredLogPath);
       const structuredLogIdentity = comparableInputPath(
         canonicalStructuredLogPath,
       );
@@ -3746,7 +3764,7 @@ export const executeRun = (
     ].filter((path): path is string => path !== undefined);
     const excludedInputPaths = yield* Effect.forEach(
       excludedInputPathCandidates,
-      canonicalRunArtifactPath,
+      canonicalAtomicRunArtifactPath,
     );
     const excludeDefaultProfileArtifacts =
       parsed.graph === undefined &&

@@ -29,7 +29,7 @@ export interface ParsedLockfile {
   readonly packages: ReadonlyArray<LockfilePackage>;
 }
 
-const maximumLockfileBytes = 32 * 1024 * 1024;
+export const maximumLockfileBytes = 32 * 1024 * 1024;
 const maximumNodes = 500_000;
 
 const objectValue = (value: unknown): Record<string, unknown> | undefined =>
