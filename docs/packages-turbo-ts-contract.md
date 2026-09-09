@@ -336,6 +336,7 @@ entry holds the same lock through validation and rejected-entry cleanup so it
 cannot remove a concurrent publication. Active entry locks renew their lease
 before the stale-lock threshold, and renewal or ownership loss interrupts the
 protected operation. Locks left by terminated writers remain reclaimable.
+Future-dated entry locks and reclaim markers are stale rather than live.
 Parent-directory durability sync is attempted after atomic rename and ignores
 only platform errors that explicitly report directory sync as unsupported.
 Cache archives use PAX
@@ -651,10 +652,12 @@ filesystem failure checking or reading an existing pointer is propagated
 without cleaning live daemon state.
 Log clients follow the exact dated log reported by the running daemon until
 interrupted, reading only newly available bounded byte ranges while preserving
-split UTF-8 code points. Watcher path equality normalizes separators and follows
-case-insensitive filesystem semantics on Windows. Stop escalates only after a
-successful RPC identifies the process as the expected daemon; live PIDs without
-a healthy daemon RPC retain their lifecycle state and are never signaled. A
+split UTF-8 code points. A log that disappears during a range read is tolerated,
+while other range-read failures are propagated. Watcher path equality
+normalizes separators and follows case-insensitive filesystem semantics on
+Windows. Stop escalates only after a successful RPC identifies the process as
+the expected daemon; live PIDs without a healthy daemon RPC retain their
+lifecycle state and are never signaled. A
 failed shutdown RPC preserves
 the live daemon's PID, socket, and active-log state and reports the failure so
 the operation can be retried. Forced termination must be available, succeed,
@@ -748,9 +751,9 @@ closure is applied. Nested workspace changes are owned directly only by the
 co-located scopes at the longest matching logical or canonical workspace path;
 ancestor workspaces are not directly affected, and dot-prefixed workspace paths
 retain their leading dot during ownership matching. Repository-global input
-patterns use case-insensitive path matching on Windows in both list and query
-affected calculations. Environment-provided revisions are separated from Git
-options and pathspecs before the affected diff executes.
+patterns and workspace ownership use case-insensitive path matching on Windows
+in both list and query affected calculations. Environment-provided revisions
+are separated from Git options and pathspecs before the affected diff executes.
 
 `prune` selects the transitive internal package closure of both requested
 packages and workspace dependencies retained by the copied root manifest,

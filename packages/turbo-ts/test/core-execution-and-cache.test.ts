@@ -12776,6 +12776,56 @@ describe("cache interoperability and safety", () => {
     }
   });
 
+  it("reclaims future-dated cache writer locks", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-future-lock-"));
+    const cacheDirectory = `${directory}/cache`;
+    const hash = "1212232334344545";
+    try {
+      await mkdir(cacheDirectory, { recursive: true });
+      const lockPath = `${cacheDirectory}/${hash}.turbo-ts.lock`;
+      await writeFile(
+        lockPath,
+        JSON.stringify({
+          owner: "00000000-0000-7000-8000-000000000000",
+          createdAt: 0,
+        }),
+      );
+      const futureTime = new Date(Date.now() + 10 * 60 * 1_000);
+      await utimes(lockPath, futureTime, futureTime);
+      await Effect.runPromise(
+        writeLocalCache(
+          { directory: cacheDirectory },
+          hash,
+          [
+            {
+              path: "packages/app/out.txt",
+              contents: new TextEncoder().encode("recovered"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+          ],
+          1,
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(
+        await Effect.runPromise(
+          restoreLocalCache(
+            directory,
+            { directory: cacheDirectory },
+            hash,
+            allowCachePaths("**"),
+          ).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      ).toBe(true);
+      expect(await readFile(`${directory}/packages/app/out.txt`, "utf8")).toBe(
+        "recovered",
+      );
+      await expect(lstat(lockPath)).rejects.toThrow();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("restores local cache entries through a symlinked repository root", async () => {
     if (process.platform === "win32") return;
     const container = await mkdtemp(join(tmpdir(), "turbo-ts-root-link-"));

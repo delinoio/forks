@@ -5407,6 +5407,65 @@ describe("repository workflow gate", () => {
     }
   });
 
+  it("propagates daemon log range-read failures unless the log disappeared", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-read-"));
+    const logPath = join(directory, "daemon.log");
+    try {
+      await writeFile(logPath, "available\n");
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystemService;
+          const terminal = yield* TerminalService;
+          const failure = new BoundaryError({
+            boundary: "filesystem",
+            message: "synthetic daemon log read failure",
+            retryable: true,
+          });
+          const followWithExistence = (existsAfterFailure: boolean) =>
+            followDaemonLog(logPath).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  Layer.succeed(FileSystemService, {
+                    ...fileSystem,
+                    readBytesRange: (path, offset, length) =>
+                      path === logPath
+                        ? Effect.fail(failure)
+                        : fileSystem.readBytesRange(path, offset, length),
+                    exists: (path) =>
+                      path === logPath
+                        ? Effect.succeed(existsAfterFailure)
+                        : fileSystem.exists(path),
+                  }),
+                  Layer.succeed(FileWatcherService, {
+                    watch: () => Stream.empty,
+                  }),
+                  Layer.succeed(SignalService, { signals: Stream.never }),
+                  Layer.succeed(TerminalService, {
+                    ...terminal,
+                    writeStdout: () => Effect.void,
+                  }),
+                ),
+              ),
+            );
+          const existingLog = yield* followWithExistence(true).pipe(
+            Effect.either,
+          );
+          expect(existingLog).toMatchObject({
+            _tag: "Left",
+            left: {
+              boundary: "filesystem",
+              message: "synthetic daemon log read failure",
+              retryable: true,
+            },
+          });
+          yield* followWithExistence(false);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("serializes daemon starts and recovers stale shared state", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-daemon-race-"));
     const runCandidate = (...arguments_: ReadonlyArray<string>) =>
@@ -10682,6 +10741,105 @@ importers:
         data: {
           affectedPackages: {
             items: [{ name: "synthetic-app", path: ".packages/app" }],
+          },
+          affectedTasks: {
+            items: [{ fullName: "synthetic-app#build" }],
+          },
+        },
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("matches affected workspace owners case-insensitively on Windows", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-workspace-owner-case-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const changedPaths = new TextEncoder().encode(
+        "PACKAGES/APP/source.txt\0packages/app/source.txt\0",
+      );
+      let listOutput = "";
+      let queryOutput = "";
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const environment = yield* EnvironmentService;
+          const processService = yield* ProcessService;
+          const terminal = yield* TerminalService;
+          const windowsLayer = Layer.succeed(EnvironmentService, {
+            ...environment,
+            platform: Effect.succeed("win32" as const),
+          });
+          const processLayer = Layer.succeed(ProcessService, {
+            ...processService,
+            runBytes: (request) =>
+              request.command === "git" && request.args[0] === "diff"
+                ? Effect.succeed({
+                    exitCode: 0,
+                    stdout: changedPaths,
+                    stderr: new Uint8Array(),
+                  })
+                : processService.runBytes(request),
+          });
+          expect(
+            yield* executeList({
+              cwd: directory,
+              filters: [],
+              output: "json",
+              affected: true,
+            }).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  windowsLayer,
+                  processLayer,
+                  Layer.succeed(TerminalService, {
+                    ...terminal,
+                    writeStdout: (text) =>
+                      Effect.sync(() => {
+                        listOutput += text;
+                      }),
+                  }),
+                ),
+              ),
+            ),
+          ).toBe(0);
+          expect(
+            yield* executeQuery({
+              cwd: directory,
+              query:
+                '{ affectedPackages { items { name path } } affectedTasks(tasks: ["build"]) { items { fullName } } }',
+              schema: false,
+              port: 8000,
+            }).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  windowsLayer,
+                  processLayer,
+                  Layer.succeed(TerminalService, {
+                    ...terminal,
+                    writeStdout: (text) =>
+                      Effect.sync(() => {
+                        queryOutput += text;
+                      }),
+                  }),
+                ),
+              ),
+            ),
+          ).toBe(0);
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      expect(JSON.parse(listOutput)).toMatchObject({
+        packages: {
+          count: 1,
+          items: [{ name: "synthetic-app", path: "packages/app" }],
+        },
+      });
+      expect(JSON.parse(queryOutput)).toEqual({
+        data: {
+          affectedPackages: {
+            items: [{ name: "synthetic-app", path: "packages/app" }],
           },
           affectedTasks: {
             items: [{ fullName: "synthetic-app#build" }],

@@ -1319,7 +1319,19 @@ export const followDaemonLog = (
               offset,
               Math.min(chunkSize, availableUntil - offset),
             )
-            .pipe(Effect.orElseSucceed(() => new Uint8Array()));
+            .pipe(
+              Effect.catchAll((error) =>
+                fileSystem
+                  .exists(logPath)
+                  .pipe(
+                    Effect.flatMap((exists) =>
+                      exists
+                        ? Effect.fail(error)
+                        : Effect.succeed(new Uint8Array()),
+                    ),
+                  ),
+              ),
+            );
           if (contents.byteLength === 0) return;
           offset += contents.byteLength;
           const text = decoder.decode(contents, { stream: true });

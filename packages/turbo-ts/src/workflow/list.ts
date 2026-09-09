@@ -144,7 +144,11 @@ export const executeList = (
         platform === "win32",
       );
       for (const path of paths) {
-        const owners = packagesOwningRepositoryPath(repository.packages, path);
+        const owners = packagesOwningRepositoryPath(
+          repository.packages,
+          path,
+          platform === "win32",
+        );
         if (owners.length === 0) rootChanged = true;
         for (const owner of owners) selected.add(owner.identity);
       }

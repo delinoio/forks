@@ -453,13 +453,15 @@ const lockOwner = (contents: string): string => {
 const isStaleFile = (
   path: string,
   now: number,
+  futureDatedIsStale = false,
 ): Effect.Effect<boolean, never, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const metadata = yield* Effect.either(fileSystem.metadata(path));
     return (
       metadata._tag === "Right" &&
-      now - metadata.right.modifiedMilliseconds >= staleLockMilliseconds
+      ((futureDatedIsStale && metadata.right.modifiedMilliseconds > now) ||
+        now - metadata.right.modifiedMilliseconds >= staleLockMilliseconds)
     );
   });
 
@@ -471,7 +473,10 @@ const reclaimStaleLock = (
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const observed = yield* Effect.either(fileSystem.readText(lockPath));
-    if (observed._tag === "Left" || !(yield* isStaleFile(lockPath, now))) {
+    if (
+      observed._tag === "Left" ||
+      !(yield* isStaleFile(lockPath, now, true))
+    ) {
       return;
     }
     // Serialize reclamation by the observed owner so concurrent contenders do
@@ -484,7 +489,7 @@ const reclaimStaleLock = (
     if (
       claimed._tag === "Right" &&
       !claimed.right &&
-      (yield* isStaleFile(reclaimPath, now))
+      (yield* isStaleFile(reclaimPath, now, true))
     ) {
       yield* fileSystem.remove(reclaimPath).pipe(Effect.ignore);
       claimed = yield* Effect.either(
@@ -498,7 +503,7 @@ const reclaimStaleLock = (
     if (
       current._tag === "Right" &&
       current.right === observed.right &&
-      (yield* isStaleFile(lockPath, now))
+      (yield* isStaleFile(lockPath, now, true))
     ) {
       yield* fileSystem.remove(lockPath).pipe(Effect.ignore);
     }

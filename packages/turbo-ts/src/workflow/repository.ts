@@ -134,7 +134,11 @@ export const repositoryGlobalInputsChanged = (
 export const packagesOwningRepositoryPath = (
   packages: ReadonlyArray<RepositoryPackage>,
   path: string,
+  windowsPathSeparators = false,
 ): ReadonlyArray<RepositoryPackage> => {
+  const comparable = (value: string): string =>
+    windowsPathSeparators ? value.toLowerCase() : value;
+  const comparablePath = comparable(path);
   const matches = packages.flatMap((packageModel) =>
     [
       ...new Set(
@@ -147,7 +151,8 @@ export const packagesOwningRepositoryPath = (
       ),
     ].flatMap((directory) =>
       directory !== "" &&
-      (path === directory || path.startsWith(`${directory}/`))
+      (comparablePath === comparable(directory) ||
+        comparablePath.startsWith(`${comparable(directory)}/`))
         ? [{ packageModel, directory }]
         : [],
     ),

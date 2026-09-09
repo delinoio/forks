@@ -588,7 +588,11 @@ const calculateAffectedRepository = (
       windowsPathSeparators,
     );
     for (const path of changedPaths) {
-      const owners = packagesOwningRepositoryPath(childPackages, path);
+      const owners = packagesOwningRepositoryPath(
+        childPackages,
+        path,
+        windowsPathSeparators,
+      );
       if (owners.length === 0) globalChange = true;
       for (const owner of owners) directlyAffected.set(owner.identity, owner);
     }
