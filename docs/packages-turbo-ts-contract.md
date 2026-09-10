@@ -942,9 +942,46 @@ newline-delimited summaries from one run share one canonical UUID v7 identifier.
 Mermaid graphs assign stable,
 unique node identifiers without truncated-hash collisions.
 
-Only behavior with automated ledger evidence is a compatibility claim. Hosted
-authentication, devtools, telemetry transports, and full platform matrices
-remain later gates.
+Gate 4 hosted and secondary surfaces have automated ledger evidence. `login`,
+`link`, `logout`, and `unlink` share the official user configuration under the
+platform configuration directory and the repository `.turbo/config.json`.
+User credentials use private directories, `0600` files on POSIX, atomic
+replacement, regular-file checks, bounded reads, and secret-safe diagnostics.
+Link discovery uses the hosted user and team endpoints, verifies artifact
+status, persists only the selected team identity, and keeps `.turbo` ignored
+unless `--no-gitignore` is requested. Logout can invalidate the current token
+before removing it while retaining unrelated shared configuration fields.
+
+Remote cache control and artifact traffic supports team IDs and slugs,
+preflight, bounded responses, separate download and upload timeouts, safe
+redirects, idempotent retries for transient and rate-limit responses, event
+records, and optional HMAC signatures. Redirects reject credentials,
+unsupported protocols, and HTTPS downgrades, and remove authorization,
+cookies, tokens, credentials, secrets, and signatures before crossing an
+origin. Hosted and OTLP requests identify as `turbo-ts/0.1.0`.
+
+Telemetry state remains compatible with official state that omits the optional
+alert timestamp, preserves identity across enable and disable operations, and
+applies `TURBO_TELEMETRY_DISABLED` as an effective opt-out without destroying
+the persisted preference. OTLP run metrics support HTTP/JSON,
+HTTP/Protobuf, and gRPC framing, bounded request timeouts, environment and CLI
+headers, resource attributes, and an explicit opt-in to reuse the remote cache
+token. Export failure never changes task execution status.
+
+The secondary command set includes versioned documentation search, internal
+workspace and configured generation without `@turbo/gen`, token-protected
+loopback devtools, boundary diagnostics, deterministic microfrontend ports,
+`bin`, hidden `config`, deprecated `scan`, and the remaining daemon, alias, and
+parser surfaces. Update checks remain disabled by default; the explicit
+test-only forced check reads stable upstream tags and reports against the fixed
+2.10.12 baseline. Aube and Nub native or delegated lockfiles retain their
+declared command identity, and tool identity is probed through scoped mocked
+process boundaries in conformance tests. Cargo/rustc 1.97.1 and uv 0.12.7
+remain the fixed experimental matrix entries.
+
+Only behavior with automated ledger evidence is a compatibility claim. The
+project-wide composed task-hash row remains planned as documented above; no
+hosted or secondary evidence is used to claim that separate Gate 2 gap.
 
 The approved compatibility differences are branding and version, Node-only
 distribution, hosted identity, default-disabled updates, V8 heap/trace output,

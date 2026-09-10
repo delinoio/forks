@@ -15,8 +15,8 @@ rows:
   - id: cli.commands
     category: command
     subject: accepted command and implicit-task inventory
-    targetGate: 3
-    status: planned
+    targetGate: 4
+    status: passing
     variants:
       - bin
       - get-mfe-port
@@ -24,13 +24,27 @@ rows:
       - devtools
       - docs
       - generate
+      - gen
+      - generate run
+      - generate workspace
       - telemetry
+      - telemetry disable
+      - telemetry enable
+      - telemetry status
       - scan
       - config
       - link
       - login
       - logout
       - unlink
+      - daemon clean
+      - daemon logs
+      - daemon restart
+      - daemon serve
+      - daemon start
+      - daemon status
+      - daemon stop
+    tests: [secondary.compatibility, hosted.compatibility, telemetry.compatibility, observability.compatibility, repository.workflows]
     source: issue-3-and-black-box-help
   - id: cli.repository-workflow-commands
     category: command
@@ -61,7 +75,7 @@ rows:
     category: option
     subject: global options accepted by every applicable command
     targetGate: 4
-    status: planned
+    status: passing
     variants:
       - --version
       - --skip-infer
@@ -93,6 +107,7 @@ rows:
       - --root-turbo-json
       - --help
       - -h
+    tests: [secondary.compatibility, hosted.compatibility, observability.compatibility]
     source: black-box-help
   - id: cli.run-options
     category: option
@@ -106,6 +121,7 @@ rows:
       - --remote-cache-read-only
       - --no-cache
       - --dry-run
+      - --dry
       - --graph
       - --profile
       - --anon-profile
@@ -135,18 +151,20 @@ rows:
     category: option
     subject: run cache worker limit
     targetGate: 3
-    status: planned
+    status: passing
     variants:
       - --cache-workers
+    tests: [secondary.compatibility, core.execution]
     source: black-box-help-and-issue-3
   - id: cli.run-daemon-options
     category: option
     subject: run daemon preference switches
     targetGate: 3
-    status: planned
+    status: passing
     variants:
       - --daemon
       - --no-daemon
+    tests: [secondary.compatibility, repository.workflows]
     source: black-box-help-and-issue-3
   - id: cli.core-run-options
     category: option
@@ -159,7 +177,7 @@ rows:
     category: option
     subject: secondary, hidden, deprecated, and experimental command options
     targetGate: 4
-    status: planned
+    status: passing
     variants:
       - --ignore
       - --reason
@@ -174,6 +192,18 @@ rows:
       - -r
       - --args
       - -a
+      - --name
+      - -n
+      - --empty
+      - -b
+      - --copy
+      - --destination
+      - -d
+      - --type
+      - -t
+      - --example-path
+      - -p
+      - --show-all-dependencies
       - --output
       - --no-gitignore
       - --scope
@@ -189,13 +219,15 @@ rows:
       - --variables
       - -V
       - --schema
+      - --force-update-check
       - test-only-arguments
+    tests: [secondary.compatibility, hosted.compatibility, telemetry.compatibility, repository.workflows]
     source: black-box-help-and-issue-3
   - id: environment.turbo
     category: environment
     subject: Turbo configuration, cache, SCM, telemetry, update, and testing environment
     targetGate: 4
-    status: planned
+    status: passing
     variants:
       - TURBO_API
       - TURBO_LOGIN
@@ -222,6 +254,7 @@ rows:
       - TURBO_UI
       - TURBO_ROOT_TURBO_JSON
       - TURBO_DANGEROUSLY_DISABLE_PACKAGE_MANAGER_CHECK
+    tests: [secondary.compatibility, hosted.compatibility, telemetry.compatibility, core.execution]
     source: public-documentation-and-black-box
   - id: environment.core
     category: environment
@@ -234,7 +267,7 @@ rows:
     category: environment
     subject: color, CI, package-manager, OpenTelemetry, and test control variables
     targetGate: 4
-    status: planned
+    status: passing
     variants:
       - NO_COLOR
       - CI
@@ -249,6 +282,8 @@ rows:
       - OTEL_EXPORTER_OTLP_HEADERS
       - OTEL_EXPORTER_OTLP_TIMEOUT
       - TURBO_TS_ORACLE_PATH
+      - TURBO_TS_DOCS_ENDPOINT
+    tests: [secondary.compatibility, observability.compatibility, effects.scoped, core.execution]
     source: issue-3-and-public-documentation
   - id: configuration.distributed
     category: configuration
@@ -395,7 +430,7 @@ rows:
     category: protocol
     subject: remote cache, auth, linking, and hosted request protocols
     targetGate: 4
-    status: planned
+    status: passing
     variants:
       - remote-cache-head
       - remote-cache-get
@@ -414,6 +449,7 @@ rows:
       - logout
       - unlink
       - update-check
+    tests: [hosted.protocol, hosted.compatibility, hosted.security, core.cache]
     source: issue-3-and-black-box-traffic
   - id: protocol.core-cache
     category: protocol
@@ -452,13 +488,14 @@ rows:
     category: protocol
     subject: later hosted observability transports
     targetGate: 4
-    status: planned
+    status: passing
     variants:
       - devtools-http
       - telemetry
       - otlp-http-json
       - otlp-http-protobuf
       - otlp-grpc
+    tests: [observability.compatibility, telemetry.compatibility, secondary.compatibility]
     source: issue-3-and-black-box-traffic
   - id: package-manager.node
     category: package-manager
@@ -575,7 +612,7 @@ rows:
     category: failure
     subject: validation, process, filesystem, network, and recovery failures
     targetGate: 3
-    status: planned
+    status: passing
     variants:
       - malformed-input
       - invalid-config
@@ -599,6 +636,7 @@ rows:
       - missing-archive
       - stale-daemon
       - recovery-without-leaks
+    tests: [core.model, core.execution, core.cache, core.security, repository.security, hosted.security, hosted.protocol]
     source: issue-3
   - id: failure.core
     category: failure
@@ -611,7 +649,7 @@ rows:
     category: security
     subject: required adversarial and shared-state cases
     targetGate: 5
-    status: planned
+    status: passing
     variants:
       - archive-traversal
       - escaping-symlink
@@ -625,6 +663,7 @@ rows:
       - secret-redaction
       - cross-team-cache-isolation
       - shared-state-race
+    tests: [core.security, core.cache, repository.security, hosted.security, hosted.protocol]
     source: issue-3
   - id: security.core
     category: security

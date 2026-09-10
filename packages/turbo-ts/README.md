@@ -8,8 +8,9 @@ Turborepo 2.10.12.
 
 ## Status
 
-Compatibility Gate 1, substantial Gate 2 surfaces, and the Gate 3 repository
-workflows are implemented. In addition to the identity,
+Compatibility Gate 1, substantial Gate 2 surfaces, Gate 3 repository
+workflows, and the hosted and secondary Gate 4 surfaces are implemented. In
+addition to the identity,
 schema, Effect, oracle, fixture, hosted-mock, normalizer, and ledger foundation,
 `turbo-ts` now models JavaScript, Cargo, and uv workspaces; loads root and
 package JSON/JSONC configuration; builds package and task graphs; selects
@@ -19,8 +20,11 @@ remote cache archives. Repository workflows include watch/restart recovery, the
 shared daemon lifecycle and HTTP/2 gRPC transport, GraphQL query and affected
 responses, `ls`, lockfile-aware prune, dry runs, task graphs, summaries,
 structured output, completion, system information, and Node/V8 profile
-artifacts. Only passing automated ledger rows are compatibility claims; hosted
-and secondary commands remain planned. Gate 2 is not closed
+artifacts. Hosted support includes shared credentials, link state,
+Vercel-compatible cache control traffic, telemetry consent, OTLP metrics,
+documentation search, internal generation, devtools, boundaries, and
+microfrontend ports. Only passing automated ledger rows are compatibility
+claims. Gate 2 is not closed
 because the independent composed task-hash serializer does not yet match the
 official 2.10.12 keys. The bidirectional cache tests prove archive and artifact
 transport compatibility using oracle-provided hashes, not end-to-end cache-key
@@ -48,6 +52,11 @@ pnpm exec turbo-ts watch build
 pnpm exec turbo-ts query '{ packages { length } }'
 pnpm exec turbo-ts ls --output=json
 pnpm exec turbo-ts prune @scope/application --docker
+pnpm exec turbo-ts login --manual --team=example --token="$TURBO_TOKEN"
+pnpm exec turbo-ts link --scope=example --yes
+pnpm exec turbo-ts telemetry status
+pnpm exec turbo-ts docs microfrontends
+pnpm exec turbo-ts generate workspace --name=example --empty
 ```
 
 The expected output is:
@@ -159,9 +168,10 @@ remove a concurrent publication. Local duration metadata reads are limited to
 Cache writes independently limit file content
 and tar metadata overhead to 64 MiB each. Cache output files are read
 sequentially against the remaining content budget, so growth after a metadata
-snapshot cannot exceed the collection bound. Cache publication is serialized
-within a run to bound writer memory independently of task concurrency. Remote
-downloads, signature verification, and decompression use scoped files so
+snapshot cannot exceed the collection bound. Cache publication is bounded
+independently of task concurrency by `--cache-workers` or
+`TURBO_CACHE_WORKERS` (default 10). Remote downloads, signature verification,
+and decompression use scoped files so
 concurrent cache hits do not retain or duplicate complete compressed response
 bodies in memory. Blank remote-cache timeout values are invalid. Run-option
 environment names follow Windows case-insensitive semantics. Local

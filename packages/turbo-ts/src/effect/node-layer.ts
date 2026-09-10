@@ -94,8 +94,11 @@ import {
   RuntimeProfileService,
   SignalService,
   SigningService,
+  type StoredProjectConfiguration,
+  type StoredUserConfiguration,
   SystemService,
   TelemetryService,
+  type TelemetryState,
   type TerminalOperations,
   TerminalService,
 } from "./services.js";
@@ -1678,6 +1681,189 @@ const terminalLayer = Layer.succeed(
   ),
 );
 
+const credentialError = (_cause: unknown): BoundaryError =>
+  new BoundaryError({
+    boundary: "credentials",
+    message: "credential configuration operation failed",
+    retryable: false,
+  });
+
+const userConfigurationDirectory = (): string => {
+  const configured = process.env.XDG_CONFIG_HOME;
+  if (configured !== undefined && configured !== "") {
+    return join(configured, "turborepo");
+  }
+  const home = process.env.HOME ?? userInfo().homedir;
+  if (process.platform === "darwin") {
+    return join(home, "Library", "Application Support", "turborepo");
+  }
+  if (process.platform === "win32") {
+    return join(
+      process.env.APPDATA ?? join(home, "AppData", "Roaming"),
+      "turborepo",
+    );
+  }
+  return join(home, ".config", "turborepo");
+};
+
+const userConfigurationPath = (): string =>
+  join(userConfigurationDirectory(), "config.json");
+
+const projectConfigurationPath = (root: string): string =>
+  join(root, ".turbo", "config.json");
+
+const readConfigurationObject = async <A extends object>(
+  path: string,
+  privateFile: boolean,
+): Promise<A | undefined> => {
+  let metadata: Awaited<ReturnType<typeof lstat>>;
+  try {
+    metadata = await lstat(path);
+  } catch (cause) {
+    if (isMissingFileError(cause)) return undefined;
+    throw cause;
+  }
+  if (!metadata.isFile()) {
+    throw new TypeError("configuration path is not a regular file");
+  }
+  if (
+    privateFile &&
+    process.platform !== "win32" &&
+    (metadata.mode & 0o077) !== 0
+  ) {
+    throw new TypeError("credential file permissions must be 0600");
+  }
+  if (metadata.size > 1024 * 1024) {
+    throw new TypeError("configuration file exceeds the 1 MiB limit");
+  }
+  const value = JSON.parse(await readFile(path, "utf8")) as unknown;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("configuration file must contain a JSON object");
+  }
+  return value as A;
+};
+
+const writeConfigurationObject = async (
+  path: string,
+  value: object,
+  mode: number,
+  privateDirectory: boolean,
+): Promise<void> => {
+  const directory = dirname(path);
+  await mkdir(directory, {
+    recursive: true,
+    mode: privateDirectory ? 0o700 : 0o755,
+  });
+  if (privateDirectory) await ensurePrivateDirectoryPath(directory);
+  const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporary, "wx", mode);
+    await handle.writeFile(JSON.stringify(value), "utf8");
+    await handle.chmod(mode);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporary, path);
+    await syncParentDirectory(path);
+  } catch (cause) {
+    await handle?.close().catch(() => undefined);
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw cause;
+  }
+};
+
+const validateOptionalStringFields = <A extends object>(
+  value: A | undefined,
+  fields: ReadonlyArray<string>,
+): A | undefined => {
+  if (value === undefined) return undefined;
+  const record = value as Readonly<Record<string, unknown>>;
+  if (
+    fields.some(
+      (field) =>
+        record[field] !== undefined && typeof record[field] !== "string",
+    )
+  ) {
+    throw new TypeError("configuration field must be a string");
+  }
+  return value;
+};
+
+const credentialLayer = Layer.succeed(CredentialService, {
+  userConfigurationPath: Effect.sync(userConfigurationPath),
+  readUserConfiguration: Effect.tryPromise({
+    try: () =>
+      readConfigurationObject<StoredUserConfiguration>(
+        userConfigurationPath(),
+        true,
+      ).then((value) => validateOptionalStringFields(value, ["token"])),
+    catch: credentialError,
+  }),
+  writeUserConfiguration: (value) =>
+    Effect.tryPromise({
+      try: () =>
+        writeConfigurationObject(userConfigurationPath(), value, 0o600, true),
+      catch: credentialError,
+    }),
+  removeUserConfiguration: Effect.tryPromise({
+    try: () => rm(userConfigurationPath(), { force: true }),
+    catch: credentialError,
+  }),
+  readProjectConfiguration: (root) =>
+    Effect.tryPromise({
+      try: () =>
+        readConfigurationObject<StoredProjectConfiguration>(
+          projectConfigurationPath(root),
+          false,
+        ).then((value) =>
+          validateOptionalStringFields(value, ["apiUrl", "teamId", "teamSlug"]),
+        ),
+      catch: credentialError,
+    }),
+  writeProjectConfiguration: (root, value) =>
+    Effect.tryPromise({
+      try: () =>
+        writeConfigurationObject(
+          projectConfigurationPath(root),
+          value,
+          0o644,
+          false,
+        ),
+      catch: credentialError,
+    }),
+  removeProjectConfiguration: (root) =>
+    Effect.tryPromise({
+      try: () => rm(projectConfigurationPath(root), { force: true }),
+      catch: credentialError,
+    }),
+});
+
+const telemetryPath = (): string =>
+  join(userConfigurationDirectory(), "telemetry.json");
+
+const telemetryLayer = Layer.succeed(TelemetryService, {
+  read: Effect.tryPromise({
+    try: () => readConfigurationObject<TelemetryState>(telemetryPath(), false),
+    catch: (cause) =>
+      new BoundaryError({
+        boundary: "telemetry",
+        message: String(cause),
+        retryable: false,
+      }),
+  }),
+  write: (state) =>
+    Effect.tryPromise({
+      try: () => writeConfigurationObject(telemetryPath(), state, 0o644, true),
+      catch: (cause) =>
+        new BoundaryError({
+          boundary: "telemetry",
+          message: String(cause),
+          retryable: false,
+        }),
+    }),
+});
+
 const clockLayer = Layer.succeed(ClockService, {
   now: Effect.sync(() => Date.now()),
   sleep: (milliseconds) => Effect.sleep(`${milliseconds} millis`),
@@ -2983,6 +3169,87 @@ const compressionLayer = Layer.succeed(CompressionService, {
     }),
 });
 
+const redirectStatuses = new Set([301, 302, 303, 307, 308]);
+const sensitiveRedirectHeader =
+  /authorization|cookie|credential|secret|signature|token/i;
+
+const fetchWithSafeRedirects = async (
+  request: {
+    readonly url: string;
+    readonly method: string;
+    readonly headers?: Readonly<Record<string, string>>;
+    readonly body?: Uint8Array | string;
+  },
+  signal: AbortSignal,
+): Promise<Response> => {
+  let url = new URL(request.url);
+  let method = request.method;
+  let body = request.body;
+  let headers = { ...(request.headers ?? {}) };
+  for (let redirects = 0; ; redirects += 1) {
+    const response = await fetch(url, {
+      method,
+      headers,
+      body:
+        body === undefined
+          ? undefined
+          : typeof body === "string"
+            ? body
+            : Buffer.from(body),
+      redirect: "manual",
+      signal,
+    });
+    if (!redirectStatuses.has(response.status)) return response;
+    if (redirects >= 5) {
+      await response.body?.cancel();
+      throw new TypeError("HTTP redirect limit exceeded");
+    }
+    const location = response.headers.get("location");
+    if (location === null) return response;
+    let destination: URL;
+    try {
+      destination = new URL(location, url);
+    } catch {
+      await response.body?.cancel();
+      throw new TypeError("HTTP redirect location is invalid");
+    }
+    if (destination.username !== "" || destination.password !== "") {
+      await response.body?.cancel();
+      throw new TypeError("HTTP redirect contains credentials");
+    }
+    if (url.protocol === "https:" && destination.protocol !== "https:") {
+      await response.body?.cancel();
+      throw new TypeError("HTTP redirect would downgrade transport security");
+    }
+    if (destination.protocol !== "http:" && destination.protocol !== "https:") {
+      await response.body?.cancel();
+      throw new TypeError("HTTP redirect protocol is unsupported");
+    }
+    if (destination.origin !== url.origin) {
+      headers = Object.fromEntries(
+        Object.entries(headers).filter(
+          ([name]) => !sensitiveRedirectHeader.test(name),
+        ),
+      );
+    }
+    if (
+      response.status === 303 ||
+      ((response.status === 301 || response.status === 302) &&
+        method === "POST")
+    ) {
+      method = "GET";
+      body = undefined;
+      headers = Object.fromEntries(
+        Object.entries(headers).filter(
+          ([name]) => !/^content-(?:length|type)$/i.test(name),
+        ),
+      );
+    }
+    await response.body?.cancel();
+    url = destination;
+  }
+};
+
 const httpLayer = Layer.succeed(HttpService, {
   request: (request) =>
     Effect.tryPromise({
@@ -2998,18 +3265,7 @@ const httpLayer = Layer.succeed(HttpService, {
             ? interruptionSignal
             : AbortSignal.any([interruptionSignal, controller.signal]);
         try {
-          const response = await fetch(request.url, {
-            method: request.method,
-            headers: request.headers,
-            body:
-              request.body === undefined
-                ? undefined
-                : typeof request.body === "string"
-                  ? request.body
-                  : Buffer.from(request.body),
-            redirect: "follow",
-            signal,
-          });
+          const response = await fetchWithSafeRedirects(request, signal);
           return {
             status: response.status,
             headers: Object.fromEntries(response.headers.entries()),
@@ -3045,12 +3301,7 @@ const httpLayer = Layer.succeed(HttpService, {
             ? interruptionSignal
             : AbortSignal.any([interruptionSignal, controller.signal]);
         try {
-          const response = await fetch(request.url, {
-            method: request.method,
-            headers: request.headers,
-            redirect: "follow",
-            signal,
-          });
+          const response = await fetchWithSafeRedirects(request, signal);
           await writeResponseBodyToFile(
             response,
             destination,
@@ -3257,9 +3508,9 @@ export const nodeFoundationLayer = Layer.mergeAll(
   Layer.succeed(GitService, boundaryFailure("git")),
   Layer.succeed(PackageManagerService, boundaryFailure("package-manager")),
   concurrencyLayer,
-  Layer.succeed(CredentialService, boundaryFailure("credentials")),
+  credentialLayer,
   Layer.succeed(CacheService, boundaryFailure("cache")),
-  Layer.succeed(TelemetryService, boundaryFailure("telemetry")),
+  telemetryLayer,
   Layer.succeed(ObservabilityService, boundaryFailure("observability")),
   deterministicRetryLayer,
 );

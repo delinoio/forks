@@ -1,4 +1,5 @@
 import { Effect } from "effect";
+import { parseCommonArguments } from "../cli/common-options.js";
 import { ConfigurationError } from "../effect/errors.js";
 import {
   ClockService,
@@ -24,6 +25,9 @@ const completionShells = [
   "zsh",
 ] as const;
 
+const completionCommands =
+  "bin boundaries completion config daemon devtools docs generate get-mfe-port info link login logout ls prune query run scan telemetry unlink watch";
+
 export const isWindowsSubsystemForLinux = (
   operatingSystem: string,
   kernelRelease: string,
@@ -35,8 +39,10 @@ export const executeCompletion = (
 ): Effect.Effect<number, ConfigurationError | unknown, TerminalService> =>
   Effect.gen(function* () {
     const terminal = yield* TerminalService;
-    const shell = arguments_[0];
+    const parsed = parseCommonArguments(arguments_);
+    const shell = parsed.remaining[0];
     if (
+      parsed.remaining.length !== 1 ||
       shell === undefined ||
       !completionShells.includes(shell as (typeof completionShells)[number])
     ) {
@@ -48,13 +54,11 @@ export const executeCompletion = (
       );
     }
     const scripts: Record<(typeof completionShells)[number], string> = {
-      bash: "complete -W 'run watch daemon query ls prune info completion' turbo-ts\n",
-      elvish:
-        "set edit:completion:arg-completer[turbo-ts] = { |@words| put run watch daemon query ls prune info completion }\n",
-      fish: "complete -c turbo-ts -f -a 'run watch daemon query ls prune info completion'\n",
-      powershell:
-        "Register-ArgumentCompleter -Native -CommandName turbo-ts -ScriptBlock { 'run','watch','daemon','query','ls','prune','info','completion' }\n",
-      zsh: "#compdef turbo-ts\n_arguments '1:command:(run watch daemon query ls prune info completion)'\n",
+      bash: `complete -W '${completionCommands}' turbo-ts\n`,
+      elvish: `set edit:completion:arg-completer[turbo-ts] = { |@words| put ${completionCommands} }\n`,
+      fish: `complete -c turbo-ts -f -a '${completionCommands}'\n`,
+      powershell: `Register-ArgumentCompleter -Native -CommandName turbo-ts -ScriptBlock { '${completionCommands.replaceAll(" ", "','")}' }\n`,
+      zsh: `#compdef turbo-ts\n_arguments '1:command:(${completionCommands})'\n`,
     };
     yield* terminal.writeStdout(scripts[shell as keyof typeof scripts]);
     return 0;
