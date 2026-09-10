@@ -18,6 +18,8 @@ const expectedRuntimeDependencies = {
   "@effect/printer": "0.51.0",
   "@effect/printer-ansi": "0.51.0",
   effect: "3.22.1",
+  graphql: "16.14.0",
+  ignore: "7.0.8",
   minimatch: "10.2.6",
   semver: "7.8.5",
   "smol-toml": "1.8.0",

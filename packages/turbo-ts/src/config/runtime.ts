@@ -6,6 +6,7 @@ import {
 } from "../effect/errors.js";
 import { FileSystemService } from "../effect/services.js";
 import type {
+  BoundariesConfig,
   Pipeline,
   RootSchema,
   WorkspaceSchema,
@@ -23,6 +24,9 @@ export interface LoadedRootConfiguration {
 }
 
 export interface LoadedPackageConfiguration {
+  readonly path?: string;
+  readonly tags?: ReadonlyArray<string> | null;
+  readonly boundaries?: BoundariesConfig | null;
   readonly tasks: Readonly<Record<string, Pipeline>>;
   readonly excludedTasks: ReadonlySet<string>;
 }
@@ -661,6 +665,12 @@ export const loadPackageConfiguration = (
     return yield* validateConfigurationEffect(path, () => {
       validateTaskStructure(tasks, path);
       validateTaskInvariants(tasks, path);
-      return { tasks, excludedTasks };
+      return {
+        path,
+        tags: workspace.tags,
+        boundaries: workspace.boundaries,
+        tasks,
+        excludedTasks,
+      };
     });
   });

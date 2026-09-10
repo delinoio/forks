@@ -8,19 +8,30 @@ Turborepo 2.10.12.
 
 ## Status
 
-Compatibility Gate 1 and substantial Gate 2 surfaces are implemented. In
-addition to the identity,
+Compatibility Gate 1, substantial Gate 2 surfaces, and the Gate 3 repository
+workflows are implemented. In addition to the identity,
 schema, Effect, oracle, fixture, hosted-mock, normalizer, and ledger foundation,
 `turbo-ts` now models JavaScript, Cargo, and uv workspaces; loads root and
 package JSON/JSONC configuration; builds package and task graphs; selects
 filters and affected packages; executes explicit or implicit tasks; controls
 task environments and concurrency; and reads and writes compatible local and
-remote cache archives. Only passing automated ledger rows are compatibility
-claims; later commands and protocols remain planned. Gate 2 is not closed
+remote cache archives. Repository workflows include watch/restart recovery, the
+shared daemon lifecycle and HTTP/2 gRPC transport, GraphQL query and affected
+responses, `ls`, lockfile-aware prune, dry runs, task graphs, summaries,
+structured output, completion, system information, and Node/V8 profile
+artifacts. Only passing automated ledger rows are compatibility claims; hosted
+and secondary commands remain planned. Gate 2 is not closed
 because the independent composed task-hash serializer does not yet match the
 official 2.10.12 keys. The bidirectional cache tests prove archive and artifact
 transport compatibility using oracle-provided hashes, not end-to-end cache-key
 identity.
+
+Repository workflow inputs are bounded before retained or effectful work:
+daemon payloads are limited to 1 MiB, output registrations cap hashes and glob
+collections, and GraphQL operations cap tokens, expanded selections, and field
+depth while package-predicate variables cap nodes and nesting depth. Daemon
+start preserves live-process state when health checks fail rather than replacing
+an unresponsive process.
 
 Official `turbo@2.10.12` remains the repository task runner and black-box test
 oracle. No upstream source, tests, fixtures, or diffs are included.
@@ -33,6 +44,10 @@ pnpm exec turbo --version
 pnpm exec turbo-ts --version
 pnpm exec turbo-ts run build
 pnpm exec turbo-ts build --filter=@scope/package
+pnpm exec turbo-ts watch build
+pnpm exec turbo-ts query '{ packages { length } }'
+pnpm exec turbo-ts ls --output=json
+pnpm exec turbo-ts prune @scope/application --docker
 ```
 
 The expected output is:
@@ -126,7 +141,8 @@ caching.
 Repository-root Cargo packages reuse the loaded root task configuration.
 Unfiltered Cargo workspace commands merge the effective environments of every
 grouped member and remain package-scoped when any repository member excludes
-the requested verification task.
+the requested verification task. Their JSON input maps qualify member-local
+paths relative to the Cargo workspace.
 Explicitly cached Cargo format tasks hash ancestor `rustfmt.toml` and
 `.rustfmt.toml` files and require at least one positive output declaration so
 formatted sources can be restored on a cache hit.
@@ -138,7 +154,9 @@ the normal local-execution fallback. Existing-output scan failures likewise
 warn and execute the task locally without cache reads. Decompressed archives
 are parsed from scoped temporary storage. Local restore validation and rejected
 entry cleanup share the entry lock with writers, so corrupt cleanup cannot
-remove a concurrent publication. Cache writes independently limit file content
+remove a concurrent publication. Local duration metadata reads are limited to
+64 KiB; oversized or malformed metadata preserves the hit with zero saved time.
+Cache writes independently limit file content
 and tar metadata overhead to 64 MiB each. Cache output files are read
 sequentially against the remaining content budget, so growth after a metadata
 snapshot cannot exceed the collection bound. Cache publication is serialized

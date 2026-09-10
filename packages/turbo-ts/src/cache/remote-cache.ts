@@ -109,6 +109,7 @@ export const restoreRemoteCache = (
   hash: string,
   scope: CacheRestoreScope,
   windowsPathSeparators = true,
+  onHit?: (durationMilliseconds: number) => void,
 ): Effect.Effect<
   boolean,
   CacheError | CacheRollbackError,
@@ -219,6 +220,14 @@ export const restoreRemoteCache = (
                       ),
                     ),
                   );
+                const duration = Number(
+                  response.headers["x-artifact-duration"] ?? 0,
+                );
+                yield* Effect.sync(() =>
+                  onHit?.(
+                    Number.isFinite(duration) ? Math.max(0, duration) : 0,
+                  ),
+                );
                 return true;
               }),
             ),

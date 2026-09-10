@@ -1,0 +1,1307 @@
+import { Effect } from "effect";
+import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { parseJsonConfiguration } from "../config/runtime.js";
+import { canMatchGlobDescendant, selectByGlobs } from "../core/glob.js";
+import {
+  baseName,
+  isAbsolutePath,
+  isPathContained,
+  joinPath,
+  normalizePath,
+  parentPath,
+  relativePath,
+  relativePathBetween,
+} from "../core/path.js";
+import { ConfigurationError } from "../effect/errors.js";
+import {
+  EnvironmentService,
+  FileSystemService,
+  ProcessService,
+  TerminalService,
+} from "../effect/services.js";
+import {
+  type GitIgnoreMatcher,
+  loadGitIgnoreMatcher,
+} from "../repository/git-ignore.js";
+import {
+  maximumLockfileBytes,
+  pruneLockfile,
+} from "../repository/lockfiles.js";
+import {
+  listRepositoryFiles,
+  type RepositoryModel,
+  type RepositoryPackage,
+} from "../repository/model.js";
+import { loadWorkflowRepository } from "./repository.js";
+
+export interface PruneOptions {
+  readonly scopes: ReadonlyArray<string>;
+  readonly cwd?: string;
+  readonly outputDirectory: string;
+  readonly docker: boolean;
+  readonly production: boolean;
+  readonly useGitignore: boolean;
+}
+
+const rootControlNames = [
+  ".gitignore",
+  ".npmrc",
+  ".pnpmfile.cjs",
+  ".pnp.cjs",
+  ".yarnrc",
+  ".yarnrc.yml",
+  "bunfig.toml",
+  "package.json",
+  "pnpm-workspace.yaml",
+  "turbo.json",
+  "turbo.jsonc",
+] as const;
+
+export const parsePruneArguments = (
+  arguments_: ReadonlyArray<string>,
+): PruneOptions => {
+  const scopes: Array<string> = [];
+  let cwd: string | undefined;
+  let outputDirectory = "out";
+  let docker = false;
+  let production = false;
+  let useGitignore = true;
+  for (let index = 0; index < arguments_.length; index += 1) {
+    const argument = arguments_[index]!;
+    const takeValue = (): string => {
+      const equals = argument.indexOf("=");
+      if (equals !== -1) return argument.slice(equals + 1);
+      const value = arguments_[++index];
+      if (value === undefined || value.startsWith("-")) {
+        throw new ConfigurationError({
+          path: "<arguments>",
+          message: `${argument} requires a value`,
+        });
+      }
+      return value;
+    };
+    if (!argument.startsWith("-")) {
+      scopes.push(argument);
+      continue;
+    }
+    switch (argument.split("=", 1)[0]) {
+      case "--cwd":
+        cwd = takeValue();
+        break;
+      case "--out-dir":
+        outputDirectory = takeValue();
+        break;
+      case "--docker":
+        docker = true;
+        break;
+      case "--production":
+        production = true;
+        break;
+      case "--use-gitignore":
+        useGitignore = !argument.endsWith("=false");
+        break;
+      case "--no-color":
+      case "--no-update-notifier":
+        break;
+      default:
+        throw new ConfigurationError({
+          path: "<arguments>",
+          message: `unknown option: ${argument}`,
+        });
+    }
+  }
+  if (scopes.length === 0) {
+    throw new ConfigurationError({
+      path: "<arguments>",
+      message: "at least one package scope is required",
+    });
+  }
+  return {
+    scopes,
+    cwd,
+    outputDirectory,
+    docker,
+    production,
+    useGitignore,
+  };
+};
+
+const selectedPackages = (
+  repository: RepositoryModel,
+  scopes: ReadonlyArray<string>,
+  production: boolean,
+): ReadonlyArray<RepositoryPackage> => {
+  const selected = new Map<string, RepositoryPackage>();
+  const pending = scopes.flatMap((scope) => {
+    const identityMatch = repository.packages.find(
+      (candidate) => candidate.identity === scope,
+    );
+    const matches =
+      identityMatch === undefined
+        ? repository.packages.filter((candidate) => candidate.name === scope)
+        : [identityMatch];
+    if (matches.length === 0) {
+      throw new ConfigurationError({
+        path: "<arguments>",
+        message: `package not found: ${scope}`,
+      });
+    }
+    return matches;
+  });
+  const dependenciesOf = (packageModel: RepositoryPackage) =>
+    production
+      ? packageModel.productionInternalDependencies
+      : packageModel.internalDependencies;
+  for (const dependency of dependenciesOf(repository.rootPackage)) {
+    const dependencyPackage = repository.packagesByIdentity.get(dependency);
+    if (dependencyPackage !== undefined) pending.push(dependencyPackage);
+  }
+  while (pending.length > 0) {
+    const packageModel = pending.pop()!;
+    if (selected.has(packageModel.identity)) continue;
+    selected.set(packageModel.identity, packageModel);
+    for (const dependency of dependenciesOf(packageModel)) {
+      const dependencyPackage = repository.packagesByIdentity.get(dependency);
+      if (dependencyPackage !== undefined) pending.push(dependencyPackage);
+    }
+  }
+  return [...selected.values()].sort((left, right) =>
+    left.name.localeCompare(right.name),
+  );
+};
+
+const ignoredDirectoryNames = new Set([
+  ".git",
+  ".turbo",
+  ".venv",
+  "node_modules",
+]);
+
+const prunePathIdentity = (
+  path: string,
+  windowsPathSemantics: boolean,
+): string => {
+  const normalized = normalizePath(path, windowsPathSemantics);
+  return windowsPathSemantics ? normalized.toLowerCase() : normalized;
+};
+
+const configuredYarnPluginPaths = (
+  repository: RepositoryModel,
+  windowsPathSemantics: boolean,
+): Effect.Effect<ReadonlyArray<string>, unknown, FileSystemService> =>
+  Effect.gen(function* () {
+    if (repository.manager !== "yarn") return [];
+    const fileSystem = yield* FileSystemService;
+    const configurationPath = joinPath(repository.root, ".yarnrc.yml");
+    if (!(yield* fileSystem.exists(configurationPath))) return [];
+    const document = parseYaml(yield* fileSystem.readText(configurationPath));
+    if (
+      typeof document !== "object" ||
+      document === null ||
+      Array.isArray(document) ||
+      !("plugins" in document) ||
+      !Array.isArray(document.plugins)
+    ) {
+      return [];
+    }
+    const canonicalRoot = normalizePath(
+      yield* fileSystem.realPath(repository.root),
+      windowsPathSemantics,
+    );
+    const paths = new Map<string, string>();
+    for (const plugin of document.plugins) {
+      if (
+        typeof plugin !== "object" ||
+        plugin === null ||
+        Array.isArray(plugin) ||
+        !("path" in plugin) ||
+        typeof plugin.path !== "string" ||
+        plugin.path === ""
+      ) {
+        continue;
+      }
+      const path = isAbsolutePath(plugin.path)
+        ? normalizePath(plugin.path, windowsPathSemantics)
+        : joinPath(repository.root, plugin.path);
+      if (!isPathContained(repository.root, path, windowsPathSemantics)) {
+        continue;
+      }
+      const resolved = yield* fileSystem.realPath(path).pipe(Effect.either);
+      if (
+        resolved._tag === "Right" &&
+        isPathContained(
+          canonicalRoot,
+          normalizePath(resolved.right, windowsPathSemantics),
+          windowsPathSemantics,
+        )
+      ) {
+        paths.set(prunePathIdentity(path, windowsPathSemantics), path);
+      }
+    }
+    return [...paths.values()];
+  });
+
+const writeYarnConfiguration = (
+  source: string,
+  destination: string,
+  repositoryRoot: string,
+  copiedControlPaths: ReadonlyArray<string>,
+  windowsPathSemantics: boolean,
+): Effect.Effect<void, unknown, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    if (copiedControlPaths.length === 0) {
+      yield* fileSystem.copyFile(source, destination);
+      return;
+    }
+    const sourceText = yield* fileSystem.readText(source);
+    const document = parseYaml(sourceText) as unknown;
+    if (
+      typeof document !== "object" ||
+      document === null ||
+      Array.isArray(document)
+    ) {
+      yield* fileSystem.copyFile(source, destination);
+      return;
+    }
+    const copiedDestinations = new Map(
+      copiedControlPaths
+        .filter((path) =>
+          isPathContained(repositoryRoot, path, windowsPathSemantics),
+        )
+        .map((path) => [
+          prunePathIdentity(path, windowsPathSemantics),
+          relativePath(repositoryRoot, path, windowsPathSemantics),
+        ]),
+    );
+    const rewritePath = (value: unknown): unknown => {
+      if (
+        typeof value !== "string" ||
+        !isAbsolutePath(value, windowsPathSemantics)
+      ) {
+        return value;
+      }
+      return (
+        copiedDestinations.get(
+          prunePathIdentity(value, windowsPathSemantics),
+        ) ?? value
+      );
+    };
+    const mutableDocument = document as Record<string, unknown>;
+    let changed = false;
+    const yarnPath = rewritePath(mutableDocument.yarnPath);
+    if (yarnPath !== mutableDocument.yarnPath) {
+      mutableDocument.yarnPath = yarnPath;
+      changed = true;
+    }
+    if (Array.isArray(mutableDocument.plugins)) {
+      const plugins = mutableDocument.plugins.map((plugin) => {
+        if (
+          typeof plugin !== "object" ||
+          plugin === null ||
+          Array.isArray(plugin)
+        ) {
+          return plugin;
+        }
+        const mutablePlugin = plugin as Record<string, unknown>;
+        const path = rewritePath(mutablePlugin.path);
+        if (path === mutablePlugin.path) return plugin;
+        changed = true;
+        return { ...mutablePlugin, path };
+      });
+      if (changed) mutableDocument.plugins = plugins;
+    }
+    if (!changed) {
+      yield* fileSystem.copyFile(source, destination);
+      return;
+    }
+    yield* fileSystem.writeTextAtomic(
+      destination,
+      stringifyYaml(mutableDocument, {
+        indentSeq: false,
+        lineWidth: 0,
+        singleQuote: true,
+      }),
+      0o644,
+    );
+  });
+
+const copyTree = (
+  source: string,
+  destination: string,
+  excludedRoot: string,
+  allowedSymlinkRoots: ReadonlyArray<string>,
+  windowsPathSemantics: boolean,
+  ignoreMatcher?: GitIgnoreMatcher,
+  excludedSourceRoots: ReadonlySet<string> = new Set(),
+  unsafeSymlinkRoots: ReadonlySet<string> = new Set(),
+  alwaysIncludedSourceRoots: ReadonlySet<string> = new Set(),
+  requiredOnly = false,
+): Effect.Effect<void, unknown, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    if (isPathContained(excludedRoot, source, windowsPathSemantics)) return;
+    if (
+      excludedSourceRoots.has(prunePathIdentity(source, windowsPathSemantics))
+    ) {
+      return;
+    }
+    const sourceMetadata = yield* fileSystem.metadata(source);
+    if (sourceMetadata.kind !== "directory") {
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: source,
+          message: "prune source must be a real directory",
+        }),
+      );
+    }
+    const entries = yield* fileSystem.list(source);
+    yield* fileSystem.makeDirectory(destination);
+    for (const entry of entries) {
+      const sourcePath = joinPath(source, entry.name);
+      const destinationPath = joinPath(destination, entry.name);
+      if (
+        excludedSourceRoots.has(
+          prunePathIdentity(sourcePath, windowsPathSemantics),
+        )
+      ) {
+        continue;
+      }
+      const alwaysIncluded = [...alwaysIncludedSourceRoots].some(
+        (root) =>
+          isPathContained(root, sourcePath, windowsPathSemantics) ||
+          (entry.kind === "directory" &&
+            isPathContained(sourcePath, root, windowsPathSemantics)),
+      );
+      const entersIgnoredDirectory =
+        entry.kind === "directory" &&
+        ignoredDirectoryNames.has(
+          windowsPathSemantics ? entry.name.toLowerCase() : entry.name,
+        );
+      if ((requiredOnly || entersIgnoredDirectory) && !alwaysIncluded) {
+        continue;
+      }
+      if (
+        !alwaysIncluded &&
+        ignoreMatcher?.ignores(sourcePath, entry.kind === "directory")
+      ) {
+        continue;
+      }
+      if (entry.kind === "directory") {
+        yield* copyTree(
+          sourcePath,
+          destinationPath,
+          excludedRoot,
+          allowedSymlinkRoots,
+          windowsPathSemantics,
+          ignoreMatcher,
+          excludedSourceRoots,
+          unsafeSymlinkRoots,
+          alwaysIncludedSourceRoots,
+          requiredOnly || entersIgnoredDirectory,
+        );
+      } else if (entry.kind === "file") {
+        yield* fileSystem.copyFile(sourcePath, destinationPath);
+      } else if (entry.kind === "symlink") {
+        const target = yield* fileSystem.readLink(sourcePath);
+        const resolved = yield* fileSystem.realPath(sourcePath).pipe(
+          Effect.mapError(
+            (error) =>
+              new ConfigurationError({
+                path: sourcePath,
+                message: `cannot resolve prune symlink: ${error.message}`,
+              }),
+          ),
+        );
+        if (
+          isAbsolutePath(target) ||
+          isPathContained(excludedRoot, resolved, windowsPathSemantics) ||
+          [...unsafeSymlinkRoots].some((root) =>
+            isPathContained(root, resolved, windowsPathSemantics),
+          ) ||
+          !allowedSymlinkRoots.some((root) =>
+            isPathContained(root, resolved, windowsPathSemantics),
+          )
+        ) {
+          return yield* Effect.fail(
+            new ConfigurationError({
+              path: sourcePath,
+              message:
+                "prune symlink must use a relative target inside the selected package closure",
+            }),
+          );
+        }
+        yield* fileSystem.createSymlink(target, destinationPath);
+      }
+    }
+  });
+
+const canonicalOutputPath = (
+  path: string,
+): Effect.Effect<string, ConfigurationError, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const suffix: Array<string> = [];
+    let current = normalizePath(path);
+    while (
+      !(yield* fileSystem
+        .exists(current)
+        .pipe(
+          Effect.mapError(
+            (error) => new ConfigurationError({ path, message: error.message }),
+          ),
+        ))
+    ) {
+      const parent = parentPath(current);
+      if (parent === current) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path,
+            message: "unable to resolve prune output ancestry",
+          }),
+        );
+      }
+      suffix.unshift(baseName(current));
+      current = parent;
+    }
+    const resolved = yield* fileSystem
+      .realPath(current)
+      .pipe(
+        Effect.mapError(
+          (error) => new ConfigurationError({ path, message: error.message }),
+        ),
+      );
+    return joinPath(resolved, ...suffix);
+  });
+
+const copyIfPresent = (
+  source: string,
+  destination: string,
+  repositoryRoot: string,
+  excludedRoot: string,
+  destinationRoot = parentPath(destination),
+  writeFile?: (
+    source: string,
+    destination: string,
+  ) => Effect.Effect<void, unknown, FileSystemService>,
+  symlinkDescription = "root control",
+): Effect.Effect<void, unknown, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const write =
+      writeFile ??
+      ((sourcePath: string, destinationPath: string) =>
+        fileSystem.copyFile(sourcePath, destinationPath));
+    if (!(yield* fileSystem.exists(source))) return;
+    const metadata = yield* fileSystem.metadata(source);
+    if (metadata.kind === "file") {
+      yield* write(source, destination);
+      return;
+    }
+    if (metadata.kind === "symlink") {
+      const target = yield* fileSystem.readLink(source);
+      const resolved = yield* fileSystem.realPath(source).pipe(
+        Effect.mapError(
+          (error) =>
+            new ConfigurationError({
+              path: source,
+              message: `cannot resolve prune ${symlinkDescription} symlink: ${error.message}`,
+            }),
+        ),
+      );
+      if (
+        isAbsolutePath(target) ||
+        isPathContained(excludedRoot, resolved) ||
+        !isPathContained(repositoryRoot, resolved)
+      ) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: source,
+            message: `prune ${symlinkDescription} symlink must use a relative target inside the repository`,
+          }),
+        );
+      }
+      const targetMetadata = yield* fileSystem.metadata(resolved);
+      if (targetMetadata.kind !== "file") {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: source,
+            message: `prune ${symlinkDescription} symlink must target a regular file`,
+          }),
+        );
+      }
+      const destinationTarget = joinPath(
+        destinationRoot,
+        relativePath(repositoryRoot, resolved),
+      );
+      yield* write(resolved, destinationTarget);
+      yield* fileSystem.makeDirectory(parentPath(destination));
+      yield* fileSystem.remove(destination);
+      yield* fileSystem.createSymlink(
+        relativePathBetween(parentPath(destination), destinationTarget),
+        destination,
+      );
+      return;
+    }
+    return yield* Effect.fail(
+      new ConfigurationError({
+        path: source,
+        message: `prune ${symlinkDescription} must be a regular file or symlink`,
+      }),
+    );
+  });
+
+const copyGlobalDependencyFiles = (
+  repository: RepositoryModel,
+  destinationRoot: string,
+  excludedRoot: string,
+  windowsPathSemantics: boolean,
+  ignoreMatcher?: GitIgnoreMatcher,
+): Effect.Effect<void, unknown, FileSystemService> =>
+  Effect.gen(function* () {
+    if (
+      repository.rootConfiguration.value.futureFlags
+        ?.pruneIncludesGlobalFiles !== true
+    ) {
+      return;
+    }
+    const patterns =
+      repository.rootConfiguration.value.futureFlags?.globalConfiguration ===
+      true
+        ? (repository.rootConfiguration.value.global?.inputs ?? [])
+        : (repository.rootConfiguration.value.globalDependencies ?? []);
+    const positivePatterns = patterns.filter(
+      (pattern) => !pattern.startsWith("!"),
+    );
+    if (positivePatterns.length === 0) return;
+    const comparable = (value: string): string =>
+      windowsPathSemantics ? value.toLowerCase() : value;
+    const comparablePatterns = patterns.map(comparable);
+    const comparablePositivePatterns = positivePatterns.map(comparable);
+    const paths = yield* listRepositoryFiles(repository.root, {
+      shouldTraverseDirectory: (relativeDirectory) => {
+        const directoryName = baseName(relativeDirectory, windowsPathSemantics);
+        if (
+          ignoredDirectoryNames.has(
+            windowsPathSemantics ? directoryName.toLowerCase() : directoryName,
+          )
+        ) {
+          return false;
+        }
+        return comparablePositivePatterns.some((pattern) =>
+          canMatchGlobDescendant(
+            comparable(relativeDirectory),
+            pattern,
+            windowsPathSemantics,
+          ),
+        );
+      },
+      windowsPathSeparators: windowsPathSemantics,
+    });
+    const relativePaths = paths.map((path) =>
+      relativePath(repository.root, path, windowsPathSemantics),
+    );
+    const selected = new Set(
+      selectByGlobs(
+        relativePaths.map(comparable),
+        comparablePatterns,
+        windowsPathSemantics,
+      ),
+    );
+    const lockfileIdentity =
+      repository.lockfile === undefined
+        ? undefined
+        : comparable(
+            relativePath(
+              repository.root,
+              repository.lockfile,
+              windowsPathSemantics,
+            ),
+          );
+    for (const relative of relativePaths) {
+      const identity = comparable(relative);
+      if (!selected.has(identity) || identity === lockfileIdentity) continue;
+      const source = joinPath(repository.root, relative);
+      if (ignoreMatcher?.ignores(source)) continue;
+      yield* copyIfPresent(
+        source,
+        joinPath(destinationRoot, relative),
+        repository.root,
+        excludedRoot,
+        destinationRoot,
+      );
+    }
+  });
+
+const writeManifest = (
+  source: string,
+  destination: string,
+  production: boolean,
+): Effect.Effect<void, unknown, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const sourceText = yield* fileSystem.readText(source);
+    if (!production) {
+      yield* fileSystem.writeTextAtomic(destination, sourceText, 0o644);
+      return;
+    }
+    const manifest = JSON.parse(sourceText) as Record<string, unknown>;
+    delete manifest.devDependencies;
+    yield* fileSystem.writeTextAtomic(
+      destination,
+      `${JSON.stringify(manifest, undefined, 2)}\n`,
+      0o644,
+    );
+  });
+
+const writeCargoWorkspaceManifest = (
+  source: string,
+  destination: string,
+  workspaceDirectory: string,
+  retainedPackages: ReadonlyArray<RepositoryPackage>,
+): Effect.Effect<void, unknown, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const document = parseToml(yield* fileSystem.readText(source)) as Record<
+      string,
+      unknown
+    >;
+    const workspace = document.workspace;
+    if (
+      typeof workspace !== "object" ||
+      workspace === null ||
+      Array.isArray(workspace)
+    ) {
+      yield* fileSystem.copyFile(source, destination);
+      return;
+    }
+    const retainedMembers = retainedPackages
+      .map((packageModel) =>
+        relativePath(workspaceDirectory, packageModel.directory),
+      )
+      .sort();
+    const mutableWorkspace = workspace as Record<string, unknown>;
+    mutableWorkspace.members = retainedMembers;
+    delete mutableWorkspace.exclude;
+    const defaultMembers = mutableWorkspace["default-members"];
+    if (Array.isArray(defaultMembers)) {
+      const retainedDefaults = selectByGlobs(
+        retainedMembers,
+        defaultMembers.filter(
+          (member): member is string => typeof member === "string",
+        ),
+      );
+      if (retainedDefaults.length === 0) {
+        delete mutableWorkspace["default-members"];
+      } else {
+        mutableWorkspace["default-members"] = retainedDefaults;
+      }
+    }
+    yield* fileSystem.writeTextAtomic(
+      destination,
+      `${stringifyToml(document).trimEnd()}\n`,
+      0o644,
+    );
+  });
+
+const writeRootConfiguration = (
+  source: string,
+  destination: string,
+): Effect.Effect<void, unknown, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    if (!(yield* fileSystem.exists(source))) return;
+    const document = parseJsonConfiguration(
+      yield* fileSystem.readText(source),
+      source,
+    );
+    // The reference serializes the pruned root configuration without a final
+    // newline while package-local configuration files remain byte copies.
+    yield* fileSystem.writeTextAtomic(
+      destination,
+      JSON.stringify(document, undefined, 2),
+      0o644,
+    );
+  });
+
+const writeWorkspaceConfiguration = (
+  source: string,
+  destination: string,
+): Effect.Effect<void, unknown, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    if (!(yield* fileSystem.exists(source))) return;
+    const document = parseYaml(yield* fileSystem.readText(source)) as unknown;
+    yield* fileSystem.writeTextAtomic(
+      destination,
+      stringifyYaml(document, {
+        indentSeq: false,
+        lineWidth: 0,
+        singleQuote: true,
+      }),
+      0o644,
+    );
+  });
+
+export const executePrune = (
+  options: PruneOptions,
+): Effect.Effect<
+  number,
+  unknown,
+  EnvironmentService | FileSystemService | ProcessService | TerminalService
+> =>
+  Effect.gen(function* () {
+    const environment = yield* EnvironmentService;
+    const fileSystem = yield* FileSystemService;
+    const terminal = yield* TerminalService;
+    const windowsPathSemantics = (yield* environment.platform) === "win32";
+    const repository = yield* loadWorkflowRepository(options);
+    const packages = selectedPackages(
+      repository,
+      options.scopes,
+      options.production,
+    );
+    for (const packageModel of packages) {
+      const metadata = yield* fileSystem.metadata(packageModel.directory);
+      if (
+        metadata.kind !== "directory" ||
+        packageModel.relativeDirectory !==
+          packageModel.canonicalRelativeDirectory
+      ) {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: packageModel.directory,
+            message: `cannot prune symlinked workspace ${packageModel.name}`,
+          }),
+        );
+      }
+    }
+    if (repository.lockfile === undefined) {
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: repository.root,
+          message: "Cannot prune without parsed lockfile.",
+        }),
+      );
+    }
+    const outputRoot = normalizePath(
+      isAbsolutePath(options.outputDirectory)
+        ? options.outputDirectory
+        : joinPath(repository.root, options.outputDirectory),
+    );
+    const canonicalOutputRoot = yield* canonicalOutputPath(outputRoot);
+    const yarnPluginPaths = yield* configuredYarnPluginPaths(
+      repository,
+      windowsPathSemantics,
+    );
+    const yarnExecutable = repository.packageManagerExecutableInput;
+    const copiedYarnControlPaths = [
+      ...(yarnExecutable === undefined ? [] : [yarnExecutable]),
+      ...yarnPluginPaths,
+    ];
+    const ignoreMatcher = options.useGitignore
+      ? yield* loadGitIgnoreMatcher(repository.root)
+      : undefined;
+    if (
+      canonicalOutputRoot === normalizePath(repository.root) ||
+      isPathContained(canonicalOutputRoot, repository.root)
+    ) {
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: outputRoot,
+          message: "prune output must not contain the repository root",
+        }),
+      );
+    }
+    const protectedRepositoryPaths = yield* Effect.forEach(
+      [
+        joinPath(repository.root, ".git"),
+        joinPath(repository.root, ".yarn"),
+        ...rootControlNames.map((name) => joinPath(repository.root, name)),
+        repository.rootConfiguration.path,
+        repository.lockfile,
+        ...(repository.packageManagerExecutableInput === undefined
+          ? []
+          : [repository.packageManagerExecutableInput]),
+        ...yarnPluginPaths,
+      ],
+      canonicalOutputPath,
+    );
+    if (
+      protectedRepositoryPaths.some((sourcePath) =>
+        isPathContained(sourcePath, canonicalOutputRoot),
+      )
+    ) {
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: outputRoot,
+          message:
+            "prune output must not replace repository metadata or a root control path",
+        }),
+      );
+    }
+    const protectedWorkspaceRoots = yield* Effect.forEach(
+      [
+        ...new Set(
+          [...repository.packages, ...packages].flatMap((packageModel) => [
+            packageModel.directory,
+            packageModel.workspaceDirectory ?? packageModel.directory,
+          ]),
+        ),
+      ],
+      canonicalOutputPath,
+    );
+    if (
+      protectedWorkspaceRoots.some(
+        (sourceRoot) =>
+          isPathContained(canonicalOutputRoot, sourceRoot) ||
+          (sourceRoot !== normalizePath(repository.root) &&
+            isPathContained(sourceRoot, canonicalOutputRoot)),
+      )
+    ) {
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: outputRoot,
+          message:
+            "prune output must not contain or be nested within a repository package or workspace control directory",
+        }),
+      );
+    }
+    if (yield* fileSystem.exists(outputRoot)) {
+      const outputMetadata = yield* fileSystem.metadata(outputRoot);
+      if (outputMetadata.kind === "symlink") {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: outputRoot,
+            message: "prune output must not be a symlink",
+          }),
+        );
+      }
+    }
+    const lockfileContents = yield* fileSystem.readBytesRange(
+      repository.lockfile,
+      0,
+      maximumLockfileBytes + 1,
+    );
+    const prunedLockfile = pruneLockfile(
+      repository.lockfile,
+      lockfileContents,
+      new Set(packages.map((packageModel) => packageModel.relativeDirectory)),
+      {
+        production: options.production,
+        manifests: [
+          { ...repository.rootManifest, workspacePath: "." },
+          ...packages.flatMap((packageModel) =>
+            packageModel.manager === "cargo" || packageModel.manager === "uv"
+              ? []
+              : [
+                  {
+                    ...packageModel.manifest,
+                    workspacePath: packageModel.relativeDirectory,
+                  },
+                ],
+          ),
+        ],
+      },
+    );
+    const lockfileName = baseName(repository.lockfile);
+    yield* fileSystem.remove(outputRoot);
+    const fullRoot = options.docker ? joinPath(outputRoot, "full") : outputRoot;
+    const jsonRoot = options.docker ? joinPath(outputRoot, "json") : outputRoot;
+    const installationRoots = options.docker
+      ? [fullRoot, jsonRoot]
+      : [fullRoot];
+    yield* fileSystem.makeDirectory(fullRoot);
+    yield* fileSystem.makeDirectory(jsonRoot);
+    yield* terminal.writeStdout(
+      `Generating pruned monorepo for ${options.scopes.join(", ")} in ${outputRoot}\n`,
+    );
+    yield* copyGlobalDependencyFiles(
+      repository,
+      fullRoot,
+      canonicalOutputRoot,
+      windowsPathSemantics,
+      ignoreMatcher,
+    );
+    for (const name of rootControlNames) {
+      const source = joinPath(repository.root, name);
+      if (name === "package.json") {
+        yield* copyIfPresent(
+          source,
+          joinPath(fullRoot, name),
+          repository.root,
+          canonicalOutputRoot,
+          fullRoot,
+          (manifestSource, manifestDestination) =>
+            writeManifest(
+              manifestSource,
+              manifestDestination,
+              options.production,
+            ),
+        );
+        if (options.docker) {
+          yield* copyIfPresent(
+            source,
+            joinPath(jsonRoot, name),
+            repository.root,
+            canonicalOutputRoot,
+            jsonRoot,
+            (manifestSource, manifestDestination) =>
+              writeManifest(
+                manifestSource,
+                manifestDestination,
+                options.production,
+              ),
+          );
+        }
+      } else if (name === "turbo.json" || name === "turbo.jsonc") {
+        yield* copyIfPresent(
+          source,
+          joinPath(fullRoot, name),
+          repository.root,
+          canonicalOutputRoot,
+          fullRoot,
+          writeRootConfiguration,
+        );
+      } else if (name === "pnpm-workspace.yaml") {
+        yield* copyIfPresent(
+          source,
+          joinPath(fullRoot, name),
+          repository.root,
+          canonicalOutputRoot,
+          fullRoot,
+          writeWorkspaceConfiguration,
+        );
+        if (options.docker) {
+          yield* copyIfPresent(
+            source,
+            joinPath(jsonRoot, name),
+            repository.root,
+            canonicalOutputRoot,
+            jsonRoot,
+            writeWorkspaceConfiguration,
+          );
+        }
+      } else if (name === ".yarnrc.yml") {
+        const writeConfiguration = (
+          configurationSource: string,
+          configurationDestination: string,
+        ) =>
+          writeYarnConfiguration(
+            configurationSource,
+            configurationDestination,
+            repository.root,
+            copiedYarnControlPaths,
+            windowsPathSemantics,
+          );
+        yield* copyIfPresent(
+          source,
+          joinPath(fullRoot, name),
+          repository.root,
+          canonicalOutputRoot,
+          fullRoot,
+          writeConfiguration,
+        );
+        if (options.docker) {
+          yield* copyIfPresent(
+            source,
+            joinPath(jsonRoot, name),
+            repository.root,
+            canonicalOutputRoot,
+            jsonRoot,
+            writeConfiguration,
+          );
+        }
+      } else {
+        yield* copyIfPresent(
+          source,
+          joinPath(fullRoot, name),
+          repository.root,
+          canonicalOutputRoot,
+        );
+        if (
+          options.docker &&
+          [
+            ".npmrc",
+            ".pnpmfile.cjs",
+            ".pnp.cjs",
+            ".yarnrc",
+            ".yarnrc.yml",
+            "bunfig.toml",
+          ].includes(name)
+        ) {
+          yield* copyIfPresent(
+            source,
+            joinPath(jsonRoot, name),
+            repository.root,
+            canonicalOutputRoot,
+          );
+        }
+      }
+    }
+    const yarnDirectory = joinPath(repository.root, ".yarn");
+    const requiredYarnControls = new Set([
+      joinPath(yarnDirectory, "patches"),
+      joinPath(yarnDirectory, "plugins"),
+      joinPath(yarnDirectory, "releases"),
+      ...(yarnExecutable !== undefined &&
+      isPathContained(yarnDirectory, yarnExecutable)
+        ? [yarnExecutable]
+        : []),
+      ...yarnPluginPaths.filter((path) =>
+        isPathContained(yarnDirectory, path, windowsPathSemantics),
+      ),
+    ]);
+    if (yield* fileSystem.exists(yarnDirectory)) {
+      const metadata = yield* fileSystem.metadata(yarnDirectory);
+      if (metadata.kind !== "directory") {
+        return yield* Effect.fail(
+          new ConfigurationError({
+            path: yarnDirectory,
+            message: ".yarn must be a real directory for prune",
+          }),
+        );
+      }
+      for (const root of installationRoots) {
+        yield* copyTree(
+          yarnDirectory,
+          joinPath(root, ".yarn"),
+          canonicalOutputRoot,
+          [yarnDirectory],
+          windowsPathSemantics,
+          ignoreMatcher,
+          new Set(),
+          new Set(),
+          requiredYarnControls,
+        );
+      }
+    }
+    const externalYarnControls = new Map<string, string>();
+    for (const source of [
+      ...(yarnExecutable === undefined ? [] : [yarnExecutable]),
+      ...yarnPluginPaths,
+    ]) {
+      if (!isPathContained(yarnDirectory, source, windowsPathSemantics)) {
+        externalYarnControls.set(
+          prunePathIdentity(source, windowsPathSemantics),
+          source,
+        );
+      }
+    }
+    for (const source of externalYarnControls.values()) {
+      for (const root of installationRoots) {
+        yield* copyIfPresent(
+          source,
+          joinPath(root, relativePath(repository.root, source)),
+          repository.root,
+          canonicalOutputRoot,
+          root,
+        );
+      }
+    }
+    const ecosystemWorkspaceControls = new Map<
+      string,
+      {
+        readonly manager: "cargo" | "uv";
+        readonly workspaceDirectory: string;
+        readonly paths: ReadonlyArray<string>;
+      }
+    >();
+    for (const packageModel of packages) {
+      if (packageModel.manager !== "cargo" && packageModel.manager !== "uv") {
+        continue;
+      }
+      const workspaceDirectory =
+        packageModel.workspaceDirectory ?? packageModel.directory;
+      const key = `${packageModel.manager}\0${workspaceDirectory}`;
+      ecosystemWorkspaceControls.set(key, {
+        manager: packageModel.manager,
+        workspaceDirectory,
+        paths:
+          packageModel.manager === "cargo"
+            ? [
+                joinPath(workspaceDirectory, "Cargo.toml"),
+                joinPath(workspaceDirectory, "Cargo.lock"),
+              ]
+            : [
+                joinPath(workspaceDirectory, "pyproject.toml"),
+                joinPath(workspaceDirectory, "uv.lock"),
+              ],
+      });
+    }
+    for (const controls of ecosystemWorkspaceControls.values()) {
+      for (const source of controls.paths) {
+        yield* copyIfPresent(
+          source,
+          joinPath(fullRoot, relativePath(repository.root, source)),
+          repository.root,
+          canonicalOutputRoot,
+          fullRoot,
+          controls.manager === "cargo" && baseName(source) === "Cargo.toml"
+            ? (manifestSource, manifestDestination) =>
+                writeCargoWorkspaceManifest(
+                  manifestSource,
+                  manifestDestination,
+                  controls.workspaceDirectory,
+                  packages.filter(
+                    (packageModel) =>
+                      packageModel.manager === "cargo" &&
+                      packageModel.workspaceDirectory ===
+                        controls.workspaceDirectory,
+                  ),
+                )
+            : undefined,
+        );
+      }
+    }
+    const selectedPackageRoots = packages.map(
+      (packageModel) => packageModel.directory,
+    );
+    const selectedPackageTraversalRoots = new Set(
+      packages.flatMap((packageModel) => [
+        prunePathIdentity(packageModel.directory, windowsPathSemantics),
+        prunePathIdentity(
+          joinPath(repository.root, packageModel.canonicalRelativeDirectory),
+          windowsPathSemantics,
+        ),
+      ]),
+    );
+    const selectedCanonicalPackageRoots = new Set(
+      packages.map((packageModel) =>
+        prunePathIdentity(
+          joinPath(repository.root, packageModel.canonicalRelativeDirectory),
+          windowsPathSemantics,
+        ),
+      ),
+    );
+    const excludedPackageRoots = new Set(
+      repository.packages.flatMap((packageModel) => {
+        const logicalRoot = prunePathIdentity(
+          packageModel.directory,
+          windowsPathSemantics,
+        );
+        const canonicalRoot = prunePathIdentity(
+          joinPath(repository.root, packageModel.canonicalRelativeDirectory),
+          windowsPathSemantics,
+        );
+        return selectedCanonicalPackageRoots.has(canonicalRoot)
+          ? []
+          : [logicalRoot, canonicalRoot];
+      }),
+    );
+    const generatedControlSources = [
+      ...rootControlNames.map((name) => joinPath(repository.root, name)),
+      ...(yarnExecutable === undefined ? [] : [yarnExecutable]),
+      ...yarnPluginPaths,
+      ...[...ecosystemWorkspaceControls.values()].flatMap(
+        (controls) => controls.paths,
+      ),
+      ...packages.flatMap((packageModel) =>
+        packageModel.manager === "cargo" || packageModel.manager === "uv"
+          ? []
+          : [joinPath(packageModel.directory, "package.json")],
+      ),
+    ];
+    const generatedControlCopyExclusions = new Set(
+      (yield* Effect.forEach(generatedControlSources, (source) =>
+        canonicalOutputPath(source).pipe(
+          Effect.map((canonicalSource) => [
+            prunePathIdentity(source, windowsPathSemantics),
+            prunePathIdentity(canonicalSource, windowsPathSemantics),
+          ]),
+        ),
+      )).flat(),
+    );
+    const packageCopyExclusions = new Set([
+      ...excludedPackageRoots,
+      ...generatedControlCopyExclusions,
+      prunePathIdentity(yarnDirectory, windowsPathSemantics),
+    ]);
+    const copiedPackageDirectories = new Set<string>();
+    for (const packageModel of packages) {
+      const comparableDirectory = prunePathIdentity(
+        packageModel.directory,
+        windowsPathSemantics,
+      );
+      if (!copiedPackageDirectories.has(comparableDirectory)) {
+        copiedPackageDirectories.add(comparableDirectory);
+        const currentPackageRoots = new Set([
+          comparableDirectory,
+          prunePathIdentity(
+            joinPath(repository.root, packageModel.canonicalRelativeDirectory),
+            windowsPathSemantics,
+          ),
+        ]);
+        yield* copyTree(
+          packageModel.directory,
+          joinPath(fullRoot, packageModel.relativeDirectory),
+          canonicalOutputRoot,
+          selectedPackageRoots,
+          windowsPathSemantics,
+          ignoreMatcher,
+          new Set([
+            ...packageCopyExclusions,
+            ...[...selectedPackageTraversalRoots].filter(
+              (root) =>
+                !currentPackageRoots.has(root) &&
+                [...currentPackageRoots].some((currentRoot) =>
+                  isPathContained(currentRoot, root, windowsPathSemantics),
+                ),
+            ),
+          ]),
+          excludedPackageRoots,
+        );
+      }
+      yield* terminal.writeStdout(` - Added ${packageModel.name}\n`);
+    }
+    for (const packageModel of packages) {
+      if (packageModel.manager === "cargo" || packageModel.manager === "uv") {
+        continue;
+      }
+      const sourceManifest = joinPath(packageModel.directory, "package.json");
+      yield* copyIfPresent(
+        sourceManifest,
+        joinPath(fullRoot, packageModel.relativeDirectory, "package.json"),
+        repository.root,
+        canonicalOutputRoot,
+        fullRoot,
+        (manifestSource, manifestDestination) =>
+          writeManifest(
+            manifestSource,
+            manifestDestination,
+            options.production,
+          ),
+        "workspace manifest",
+      );
+      if (options.docker) {
+        yield* copyIfPresent(
+          sourceManifest,
+          joinPath(jsonRoot, packageModel.relativeDirectory, "package.json"),
+          repository.root,
+          canonicalOutputRoot,
+          jsonRoot,
+          (manifestSource, manifestDestination) =>
+            writeManifest(
+              manifestSource,
+              manifestDestination,
+              options.production,
+            ),
+          "workspace manifest",
+        );
+      }
+    }
+    yield* fileSystem.writeBytesAtomic(
+      joinPath(outputRoot, lockfileName),
+      prunedLockfile,
+      0o644,
+    );
+    if (options.docker) {
+      yield* fileSystem.writeBytesAtomic(
+        joinPath(jsonRoot, lockfileName),
+        prunedLockfile,
+        0o644,
+      );
+    }
+    return 0;
+  });

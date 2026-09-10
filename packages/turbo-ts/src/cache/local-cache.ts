@@ -12,6 +12,7 @@ import { parseTarArchiveFile } from "./archive-file.js";
 import {
   maximumCacheArchiveBytes,
   maximumCacheArtifactBytes,
+  maximumCacheMetadataBytes,
 } from "./limits.js";
 import { type CacheRestoreScope, restoreArchiveEntries } from "./restore.js";
 
@@ -33,6 +34,49 @@ const effectFromExit = <A, E>(exit: Exit.Exit<A, E>): Effect.Effect<A, E> =>
   Exit.isSuccess(exit)
     ? Effect.succeed(exit.value)
     : Effect.failCause(exit.cause);
+
+const parseCacheDuration = (contents: string): number => {
+  try {
+    const parsed: unknown = JSON.parse(contents);
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      !("duration" in parsed) ||
+      typeof parsed.duration !== "number" ||
+      !Number.isFinite(parsed.duration)
+    ) {
+      return 0;
+    }
+    return Math.max(0, parsed.duration);
+  } catch {
+    return 0;
+  }
+};
+
+const readCacheDuration = (
+  path: string,
+): Effect.Effect<number, never, FileSystemService> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystemService;
+    const metadata = yield* fileSystem.metadata(path).pipe(Effect.either);
+    if (
+      metadata._tag === "Left" ||
+      metadata.right.kind !== "file" ||
+      metadata.right.size > maximumCacheMetadataBytes
+    ) {
+      return 0;
+    }
+    const contents = yield* fileSystem
+      .readBytesRange(path, 0, maximumCacheMetadataBytes + 1)
+      .pipe(Effect.either);
+    if (
+      contents._tag === "Left" ||
+      contents.right.length > maximumCacheMetadataBytes
+    ) {
+      return 0;
+    }
+    return parseCacheDuration(new TextDecoder().decode(contents.right));
+  });
 
 const cachePaths = (directory: string, hash: string) => ({
   archive: joinPath(directory, `${hash}.tar.zst`),
@@ -185,6 +229,7 @@ export const restoreLocalCache = (
   hash: string,
   scope: CacheRestoreScope,
   windowsPathSeparators = true,
+  onHit?: (durationMilliseconds: number) => void,
 ): Effect.Effect<
   boolean,
   CacheError | CacheRollbackError,
@@ -298,6 +343,8 @@ export const restoreLocalCache = (
           }
           return yield* Effect.fail(outcome.left);
         }
+        const duration = yield* readCacheDuration(paths.metadata);
+        yield* Effect.sync(() => onHit?.(duration));
         return true;
       }),
     );
@@ -406,13 +453,16 @@ const lockOwner = (contents: string): string => {
 const isStaleFile = (
   path: string,
   now: number,
+  futureDatedIsStale = false,
 ): Effect.Effect<boolean, never, FileSystemService> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const metadata = yield* Effect.either(fileSystem.metadata(path));
     return (
       metadata._tag === "Right" &&
-      now - metadata.right.modifiedMilliseconds >= staleLockMilliseconds
+      ((futureDatedIsStale &&
+        Math.floor(metadata.right.modifiedMilliseconds) > Math.floor(now)) ||
+        now - metadata.right.modifiedMilliseconds >= staleLockMilliseconds)
     );
   });
 
@@ -424,7 +474,10 @@ const reclaimStaleLock = (
   Effect.gen(function* () {
     const fileSystem = yield* FileSystemService;
     const observed = yield* Effect.either(fileSystem.readText(lockPath));
-    if (observed._tag === "Left" || !(yield* isStaleFile(lockPath, now))) {
+    if (
+      observed._tag === "Left" ||
+      !(yield* isStaleFile(lockPath, now, true))
+    ) {
       return;
     }
     // Serialize reclamation by the observed owner so concurrent contenders do
@@ -437,7 +490,7 @@ const reclaimStaleLock = (
     if (
       claimed._tag === "Right" &&
       !claimed.right &&
-      (yield* isStaleFile(reclaimPath, now))
+      (yield* isStaleFile(reclaimPath, now, true))
     ) {
       yield* fileSystem.remove(reclaimPath).pipe(Effect.ignore);
       claimed = yield* Effect.either(
@@ -451,7 +504,7 @@ const reclaimStaleLock = (
     if (
       current._tag === "Right" &&
       current.right === observed.right &&
-      (yield* isStaleFile(lockPath, now))
+      (yield* isStaleFile(lockPath, now, true))
     ) {
       yield* fileSystem.remove(lockPath).pipe(Effect.ignore);
     }

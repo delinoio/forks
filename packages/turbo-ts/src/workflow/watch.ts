@@ -1,0 +1,922 @@
+import { Effect, HashMap, Ref, Stream } from "effect";
+import {
+  canMatchGlobsDescendantWithExclusions,
+  matchesGlobsWithExclusions,
+} from "../core/glob.js";
+import {
+  baseName,
+  isAbsolutePath,
+  isPathContained,
+  joinPath,
+  joinPathWithSeparators,
+  normalizePath,
+  parentPath,
+  relativePath,
+} from "../core/path.js";
+import { ConfigurationError } from "../effect/errors.js";
+import {
+  ClockService,
+  ConcurrencyService,
+  EnvironmentService,
+  FileSystemService,
+  FileWatcherService,
+  ProcessService,
+  TerminalService,
+} from "../effect/services.js";
+import { owningLockfileCandidates } from "../hash/task-hash.js";
+import {
+  type GitIgnoreMatcher,
+  loadGitIgnoreMatcher,
+} from "../repository/git-ignore.js";
+import type { RepositoryModel } from "../repository/model.js";
+import {
+  canonicalExistingAncestorPath,
+  executeRun,
+  type RunRequirements,
+  resolveOptions,
+} from "../run/engine.js";
+import { type ParsedRunOptions, parseRunArguments } from "../run/options.js";
+import { isDefaultProfileArtifactName } from "../run/profile.js";
+import {
+  isInternalRepositoryPath,
+  loadWorkflowRepository,
+} from "./repository.js";
+
+export interface WatchOptions {
+  readonly run: ParsedRunOptions;
+  readonly writeCache: boolean;
+}
+
+export const parseWatchArguments = (
+  arguments_: ReadonlyArray<string>,
+): WatchOptions => {
+  const delimiter = arguments_.indexOf("--");
+  const optionArguments =
+    delimiter === -1 ? arguments_ : arguments_.slice(0, delimiter);
+  const passThroughArguments =
+    delimiter === -1 ? [] : arguments_.slice(delimiter);
+  const writeCache = optionArguments.includes("--experimental-write-cache");
+  const runArguments = [
+    ...optionArguments.filter(
+      (argument) => argument !== "--experimental-write-cache",
+    ),
+    ...passThroughArguments,
+  ];
+  const parsed = parseRunArguments(["run", ...runArguments]);
+  return { writeCache, run: parsed };
+};
+
+export const resolvedWatchRunOptions = (
+  options: WatchOptions,
+  repository: RepositoryModel,
+  environment: Readonly<Record<string, string | undefined>>,
+  availableParallelism: number,
+  windowsPathSeparators: boolean,
+): ParsedRunOptions => {
+  if (options.writeCache) return options.run;
+  const policy = resolveOptions(
+    options.run,
+    repository.root,
+    environment,
+    repository.rootConfiguration,
+    availableParallelism,
+    windowsPathSeparators,
+  ).cachePolicy;
+  const readableSources = [
+    ...(policy.localRead ? ["local:r"] : []),
+    ...(policy.remoteRead ? ["remote:r"] : []),
+  ];
+  return {
+    ...options.run,
+    cacheSpecification:
+      readableSources.length === 0 ? undefined : readableSources.join(","),
+    noCache: options.run.noCache || readableSources.length === 0,
+  };
+};
+
+export const configuredOutputPath = (
+  repository: RepositoryModel,
+  path: string,
+  entryKind: "directory" | "file" | "symlink" | "other" | undefined,
+  windowsPathSeparators = false,
+): boolean => {
+  const rootOutputPrefix = "$TURBO_ROOT$/";
+  const matchesOutput = (
+    directory: string,
+    patterns: ReadonlyArray<string>,
+  ): boolean => {
+    if (!isPathContained(directory, path, windowsPathSeparators)) return false;
+    const relative = relativePath(directory, path, windowsPathSeparators);
+    const comparableRelative = windowsPathSeparators
+      ? relative.toLowerCase()
+      : relative;
+    const comparablePatterns = windowsPathSeparators
+      ? patterns.map((pattern) => pattern.toLowerCase())
+      : patterns;
+    return (
+      matchesGlobsWithExclusions(
+        [comparableRelative],
+        comparablePatterns,
+        windowsPathSeparators,
+      ) ||
+      (entryKind === "directory" &&
+        canMatchGlobsDescendantWithExclusions(
+          comparableRelative,
+          comparablePatterns,
+          windowsPathSeparators,
+        ))
+    );
+  };
+  return [repository.rootPackage, ...repository.packages].some((packageModel) =>
+    Object.values(packageModel.tasks).some((task) => {
+      const outputs = task.outputs ?? [];
+      const packagePatterns = outputs.filter(
+        (pattern) => !pattern.replace(/^!/, "").startsWith(rootOutputPrefix),
+      );
+      const rootPatterns = outputs.flatMap((pattern) => {
+        const negative = pattern.startsWith("!");
+        const value = negative ? pattern.slice(1) : pattern;
+        return value.startsWith(rootOutputPrefix)
+          ? [`${negative ? "!" : ""}${value.slice(rootOutputPrefix.length)}`]
+          : [];
+      });
+      return (
+        matchesOutput(packageModel.directory, packagePatterns) ||
+        matchesOutput(repository.root, rootPatterns)
+      );
+    }),
+  );
+};
+
+export const runOwnedPath = (
+  repository: RepositoryModel,
+  options: ParsedRunOptions,
+  path: string,
+  environment: Readonly<Record<string, string | undefined>>,
+  availableParallelism: number,
+  windowsPathSeparators: boolean,
+): Effect.Effect<boolean, ConfigurationError, FileSystemService> =>
+  Effect.gen(function* () {
+    const resolved = resolveOptions(
+      options,
+      repository.root,
+      environment,
+      repository.rootConfiguration,
+      availableParallelism,
+      windowsPathSeparators,
+    );
+    const ordinaryRun =
+      options.graph === undefined && options.dryRun === undefined;
+    const resolveArtifactPath = (requested: string | undefined) =>
+      requested === undefined || requested === ""
+        ? undefined
+        : normalizePath(
+            isAbsolutePath(requested, windowsPathSeparators)
+              ? requested
+              : joinPath(repository.root, requested),
+            windowsPathSeparators,
+          );
+    const exactPaths = [
+      options.graph === undefined || options.graph === ""
+        ? undefined
+        : resolveArtifactPath(options.graph),
+      ordinaryRun ? resolveArtifactPath(options.logFile) : undefined,
+      ordinaryRun ? resolveArtifactPath(options.profile) : undefined,
+      ordinaryRun ? resolveArtifactPath(options.anonymousProfile) : undefined,
+      ordinaryRun ? resolveArtifactPath(options.heap) : undefined,
+      ordinaryRun ? resolveArtifactPath(options.trace) : undefined,
+    ].filter((candidate): candidate is string => candidate !== undefined);
+    const normalizedPath = normalizePath(path, windowsPathSeparators);
+    const comparablePath = (candidate: string): string => {
+      const normalized = normalizePath(candidate, windowsPathSeparators);
+      return windowsPathSeparators ? normalized.toLowerCase() : normalized;
+    };
+    const comparableBaseName = (candidate: string): string => {
+      const name = baseName(candidate, windowsPathSeparators);
+      return windowsPathSeparators ? name.toLowerCase() : name;
+    };
+    const pathContains = (root: string, candidate: string): boolean => {
+      const rootIdentity = comparablePath(root).replace(/\/$/, "");
+      const candidateIdentity = comparablePath(candidate);
+      return (
+        candidateIdentity === rootIdentity ||
+        candidateIdentity.startsWith(`${rootIdentity}/`)
+      );
+    };
+    const matchesArtifactPath = (
+      exactPath: string,
+      observedPath: string,
+    ): boolean => {
+      const exactName = comparableBaseName(exactPath);
+      const observedName = comparableBaseName(observedPath);
+      return (
+        comparablePath(exactPath) === comparablePath(observedPath) ||
+        (comparablePath(parentPath(exactPath, windowsPathSeparators)) ===
+          comparablePath(parentPath(observedPath, windowsPathSeparators)) &&
+          observedName.startsWith(`${exactName}.`) &&
+          observedName.endsWith(".tmp"))
+      );
+    };
+    if (exactPaths.some((exactPath) => matchesArtifactPath(exactPath, path))) {
+      return true;
+    }
+    if (exactPaths.length > 0) {
+      const canonicalObservedPath = yield* canonicalExistingAncestorPath(
+        normalizedPath,
+        "watch event",
+      );
+      const canonicalArtifactPaths = yield* Effect.forEach(
+        exactPaths,
+        (exactPath) => canonicalExistingAncestorPath(exactPath, "run artifact"),
+        { concurrency: 8 },
+      );
+      const observedAlias =
+        comparablePath(normalizedPath) !==
+        comparablePath(canonicalObservedPath);
+      if (
+        canonicalArtifactPaths.some(
+          (canonicalArtifactPath, index) =>
+            matchesArtifactPath(canonicalArtifactPath, canonicalObservedPath) ||
+            (observedAlias &&
+              pathContains(normalizedPath, exactPaths[index]!) &&
+              pathContains(canonicalObservedPath, canonicalArtifactPath)),
+        )
+      ) {
+        return true;
+      }
+    }
+    const writesDefaultProfile =
+      ordinaryRun &&
+      [options.profile, options.anonymousProfile, options.trace].includes("");
+    if (
+      writesDefaultProfile &&
+      comparablePath(parentPath(normalizedPath, windowsPathSeparators)) ===
+        comparablePath(repository.root) &&
+      isDefaultProfileArtifactName(comparableBaseName(normalizedPath))
+    ) {
+      return true;
+    }
+    if (!ordinaryRun || !resolved.cachePolicy.localWrite) return false;
+    const canonicalCacheDirectory = yield* canonicalExistingAncestorPath(
+      resolved.cacheDirectory,
+    );
+    return [resolved.cacheDirectory, canonicalCacheDirectory].some(
+      (cacheDirectory) =>
+        isPathContained(
+          normalizePath(cacheDirectory, windowsPathSeparators),
+          normalizedPath,
+          windowsPathSeparators,
+        ),
+    );
+  });
+
+interface PendingWatchChange {
+  readonly sequence: number;
+  readonly path: string;
+}
+
+interface PendingWatchInvalidation {
+  readonly earliestSequence: number;
+  readonly latestSequence: number;
+}
+
+export interface PendingWatchChanges {
+  readonly nextSequence: number;
+  readonly changesByPath: HashMap.HashMap<string, PendingWatchChange>;
+  readonly invalidation?: PendingWatchInvalidation;
+}
+
+export const initialPendingWatchChanges = (): PendingWatchChanges => ({
+  nextSequence: 0,
+  changesByPath: HashMap.empty(),
+});
+
+export const appendPendingWatchChange = (
+  pending: PendingWatchChanges,
+  path: string,
+  invalidateAll: boolean,
+): readonly [number, PendingWatchChanges] => {
+  const sequence = pending.nextSequence;
+  return [
+    sequence,
+    {
+      nextSequence: sequence + 1,
+      changesByPath: HashMap.set(pending.changesByPath, path, {
+        sequence,
+        path,
+      }),
+      invalidation: invalidateAll
+        ? {
+            earliestSequence:
+              pending.invalidation?.earliestSequence ?? sequence,
+            latestSequence: sequence,
+          }
+        : pending.invalidation,
+    },
+  ];
+};
+
+export const takePendingWatchChanges = (
+  pending: PendingWatchChanges,
+  throughSequence: number,
+): readonly [
+  { readonly paths: ReadonlyArray<string>; readonly invalidateAll: boolean },
+  PendingWatchChanges,
+] => {
+  const included: Array<PendingWatchChange> = [];
+  let changesByPath = HashMap.empty<string, PendingWatchChange>();
+  for (const change of HashMap.values(pending.changesByPath)) {
+    if (change.sequence <= throughSequence) {
+      included.push(change);
+    } else {
+      changesByPath = HashMap.set(changesByPath, change.path, change);
+    }
+  }
+  included.sort((left, right) => left.sequence - right.sequence);
+  const invalidateAll =
+    pending.invalidation !== undefined &&
+    pending.invalidation.earliestSequence <= throughSequence;
+  const invalidation =
+    pending.invalidation === undefined ||
+    pending.invalidation.latestSequence <= throughSequence
+      ? undefined
+      : pending.invalidation.earliestSequence > throughSequence
+        ? pending.invalidation
+        : {
+            earliestSequence: pending.invalidation.latestSequence,
+            latestSequence: pending.invalidation.latestSequence,
+          };
+  return [
+    { paths: included.map((change) => change.path), invalidateAll },
+    { ...pending, changesByPath, invalidation },
+  ];
+};
+
+const watchPathIdentity = (
+  path: string,
+  windowsPathSeparators: boolean,
+): string => {
+  const normalized = normalizePath(path, windowsPathSeparators);
+  return windowsPathSeparators ? normalized.toLowerCase() : normalized;
+};
+
+export const isGitIgnorePath = (
+  path: string,
+  windowsPathSeparators: boolean,
+): boolean =>
+  (windowsPathSeparators
+    ? baseName(path, windowsPathSeparators).toLowerCase()
+    : baseName(path, windowsPathSeparators)) === ".gitignore";
+
+export const isTurboConfigurationPath = (
+  root: string,
+  configuredRootPath: string | undefined,
+  path: string,
+  windowsPathSeparators: boolean,
+): boolean => {
+  const name = baseName(path, windowsPathSeparators);
+  if (
+    ["turbo.json", "turbo.jsonc"].includes(
+      windowsPathSeparators ? name.toLowerCase() : name,
+    )
+  ) {
+    return true;
+  }
+  if (configuredRootPath === undefined) return false;
+  const absoluteConfiguredPath = isAbsolutePath(
+    configuredRootPath,
+    windowsPathSeparators,
+  )
+    ? configuredRootPath
+    : joinPathWithSeparators(windowsPathSeparators, root, configuredRootPath);
+  return (
+    watchPathIdentity(path, windowsPathSeparators) ===
+    watchPathIdentity(absoluteConfiguredPath, windowsPathSeparators)
+  );
+};
+
+const workspaceManifestNames = [
+  "Cargo.toml",
+  "package.json",
+  "pyproject.toml",
+] as const;
+
+export const isWorkspaceDiscoveryPath = (
+  root: string,
+  path: string,
+  windowsPathSeparators: boolean,
+): boolean => {
+  const manifestName = baseName(path, windowsPathSeparators);
+  if (
+    workspaceManifestNames.some((candidate) =>
+      windowsPathSeparators
+        ? candidate.toLowerCase() === manifestName.toLowerCase()
+        : candidate === manifestName,
+    )
+  ) {
+    return true;
+  }
+  const normalized = normalizePath(path, windowsPathSeparators);
+  const workspaceConfiguration = normalizePath(
+    joinPath(root, "pnpm-workspace.yaml"),
+    windowsPathSeparators,
+  );
+  return windowsPathSeparators
+    ? normalized.toLowerCase() === workspaceConfiguration.toLowerCase()
+    : normalized === workspaceConfiguration;
+};
+
+export const isActiveRepositoryControlPath = (
+  repository: RepositoryModel,
+  path: string,
+  windowsPathSeparators: boolean,
+): boolean => {
+  const packageModels = [
+    repository.rootPackage,
+    ...repository.packages.filter(
+      (packageModel) =>
+        packageModel.identity !== repository.rootPackage.identity,
+    ),
+  ];
+  const controlPaths = new Set([
+    repository.rootConfiguration.path,
+    ...(repository.lockfile === undefined ? [] : [repository.lockfile]),
+    ...(repository.manager === "pnpm"
+      ? [
+          joinPathWithSeparators(
+            windowsPathSeparators,
+            repository.root,
+            "pnpm-workspace.yaml",
+          ),
+        ]
+      : []),
+    ...packageModels.flatMap((packageModel) => {
+      const manifestName =
+        packageModel.manager === "cargo"
+          ? "Cargo.toml"
+          : packageModel.manager === "uv"
+            ? "pyproject.toml"
+            : "package.json";
+      const manifestDirectories = new Set([
+        packageModel.directory,
+        ...(packageModel.workspaceDirectory === undefined
+          ? []
+          : [packageModel.workspaceDirectory]),
+      ]);
+      return [
+        ...owningLockfileCandidates(repository, packageModel),
+        ...(packageModel.configurationPath === undefined
+          ? []
+          : [packageModel.configurationPath]),
+        ...[...manifestDirectories].map((directory) =>
+          joinPathWithSeparators(
+            windowsPathSeparators,
+            directory,
+            manifestName,
+          ),
+        ),
+      ];
+    }),
+  ]);
+  const identity = watchPathIdentity(path, windowsPathSeparators);
+  return [...controlPaths].some(
+    (controlPath) =>
+      watchPathIdentity(controlPath, windowsPathSeparators) === identity,
+  );
+};
+
+export const resolveGitIndexPath = (
+  root: string,
+  windowsPathSeparators: boolean,
+): Effect.Effect<string, never, ProcessService> =>
+  Effect.gen(function* () {
+    const processService = yield* ProcessService;
+    const fallback = joinPathWithSeparators(
+      windowsPathSeparators,
+      root,
+      ".git",
+      "index",
+    );
+    const result = yield* Effect.scoped(
+      processService.run({
+        command: "git",
+        args: ["rev-parse", "--git-path", "index"],
+        cwd: root,
+        inheritEnvironment: true,
+        maxCapturedOutputCharacters: 4_096,
+      }),
+    ).pipe(Effect.either);
+    if (result._tag === "Left" || result.right.exitCode !== 0) return fallback;
+    const reported = result.right.stdout.trim();
+    if (reported === "") return fallback;
+    return normalizePath(
+      isAbsolutePath(reported, windowsPathSeparators)
+        ? reported
+        : joinPathWithSeparators(windowsPathSeparators, root, reported),
+      windowsPathSeparators,
+    );
+  });
+
+interface WatchRunGeneration {
+  readonly generation: number;
+  readonly startedAtMilliseconds: number;
+  readonly completedAtMilliseconds?: number;
+}
+
+interface WatchRunGenerations {
+  readonly nextGeneration: number;
+  readonly generations: ReadonlyArray<WatchRunGeneration>;
+}
+
+const maximumRetainedWatchRunGenerations = 64;
+const completedWatchRunRemovalOwnershipMilliseconds = 1_000;
+
+const beginWatchRunGeneration = (
+  state: WatchRunGenerations,
+  startedAtMilliseconds: number,
+): readonly [number, WatchRunGenerations] => {
+  const generation = state.nextGeneration;
+  return [
+    generation,
+    {
+      nextGeneration: generation + 1,
+      generations: [
+        ...state.generations,
+        { generation, startedAtMilliseconds },
+      ],
+    },
+  ];
+};
+
+const completeWatchRunGeneration = (
+  state: WatchRunGenerations,
+  generation: number,
+  completedAtMilliseconds: number,
+): WatchRunGenerations => {
+  const updated = state.generations.map((entry) =>
+    entry.generation === generation
+      ? {
+          ...entry,
+          completedAtMilliseconds: Math.max(
+            completedAtMilliseconds,
+            entry.startedAtMilliseconds,
+          ),
+        }
+      : entry,
+  );
+  const active = updated.filter(
+    (entry) => entry.completedAtMilliseconds === undefined,
+  );
+  const completed = updated
+    .filter((entry) => entry.completedAtMilliseconds !== undefined)
+    .slice(-maximumRetainedWatchRunGenerations);
+  return { ...state, generations: [...completed, ...active] };
+};
+
+const modifiedByWatchRun = (
+  state: WatchRunGenerations,
+  modifiedAtMilliseconds: number | undefined,
+  removed: boolean,
+  observedAtMilliseconds: number,
+): boolean =>
+  state.generations.some((generation) =>
+    modifiedAtMilliseconds === undefined
+      ? generation.completedAtMilliseconds === undefined ||
+        (removed &&
+          observedAtMilliseconds >= generation.completedAtMilliseconds &&
+          observedAtMilliseconds <=
+            generation.completedAtMilliseconds +
+              completedWatchRunRemovalOwnershipMilliseconds)
+      : Math.floor(modifiedAtMilliseconds) >=
+          Math.floor(generation.startedAtMilliseconds) &&
+        (generation.completedAtMilliseconds === undefined ||
+          Math.floor(modifiedAtMilliseconds) <=
+            Math.floor(generation.completedAtMilliseconds)),
+  );
+
+export const executeWatch = (
+  options: WatchOptions,
+): Effect.Effect<number, unknown, FileWatcherService | RunRequirements> =>
+  Effect.gen(function* () {
+    const watcher = yield* FileWatcherService;
+    const terminal = yield* TerminalService;
+    const clock = yield* ClockService;
+    const environmentService = yield* EnvironmentService;
+    const concurrencyService = yield* ConcurrencyService;
+    const fileSystem = yield* FileSystemService;
+    const environment = yield* environmentService.entries;
+    const platform = yield* environmentService.platform;
+    const availableParallelism = yield* concurrencyService.availableParallelism;
+    const windowsPathSeparators = platform === "win32";
+    const repository = yield* loadWorkflowRepository({
+      cwd: options.run.cwd,
+      rootTurboJson: options.run.rootTurboJson,
+      singlePackage: options.run.singlePackage,
+    });
+    const repositoryRef = yield* Ref.make(repository);
+    const ignoreMatcher = yield* Ref.make<GitIgnoreMatcher>(
+      yield* loadGitIgnoreMatcher(repository.root),
+    );
+    const pendingChanges = yield* Ref.make(initialPendingWatchChanges());
+    const runGenerations = yield* Ref.make<WatchRunGenerations>({
+      nextGeneration: 0,
+      generations: [],
+    });
+    const observedDirectories = yield* Ref.make<ReadonlySet<string>>(new Set());
+    const comparableWatchPath = (path: string): string =>
+      watchPathIdentity(path, windowsPathSeparators);
+    const absoluteRootTurboJson =
+      options.run.rootTurboJson === undefined
+        ? undefined
+        : isAbsolutePath(options.run.rootTurboJson)
+          ? options.run.rootTurboJson
+          : joinPath(repository.root, options.run.rootTurboJson);
+    const externalConfigurationChanges =
+      absoluteRootTurboJson !== undefined &&
+      !isPathContained(
+        repository.root,
+        absoluteRootTurboJson,
+        windowsPathSeparators,
+      )
+        ? watcher
+            .watch(parentPath(absoluteRootTurboJson, windowsPathSeparators))
+            .pipe(
+              Stream.filter(
+                (change) =>
+                  change.kind === "unknown" ||
+                  comparableWatchPath(change.path) ===
+                    comparableWatchPath(absoluteRootTurboJson),
+              ),
+              Stream.map((change) =>
+                change.kind === "unknown"
+                  ? { ...change, path: absoluteRootTurboJson }
+                  : change,
+              ),
+            )
+        : Stream.empty;
+    const gitIndexPath = yield* resolveGitIndexPath(
+      repository.root,
+      windowsPathSeparators,
+    );
+    const externalGitIndexChanges = !isPathContained(
+      repository.root,
+      gitIndexPath,
+      windowsPathSeparators,
+    )
+      ? watcher.watch(parentPath(gitIndexPath, windowsPathSeparators)).pipe(
+          Stream.filter(
+            (change) =>
+              change.kind === "unknown" ||
+              comparableWatchPath(change.path) ===
+                comparableWatchPath(gitIndexPath),
+          ),
+          Stream.map((change) => ({ ...change, path: gitIndexPath })),
+        )
+      : Stream.empty;
+    const watchedChanges = Stream.merge(
+      Stream.merge(
+        watcher.watch(repository.root),
+        externalConfigurationChanges,
+      ),
+      externalGitIndexChanges,
+    );
+    const changes = watchedChanges.pipe(
+      Stream.filterEffect((change) =>
+        Effect.gen(function* () {
+          const isExternalRootTurboJsonChange =
+            absoluteRootTurboJson !== undefined &&
+            comparableWatchPath(change.path) ===
+              comparableWatchPath(absoluteRootTurboJson);
+          if (
+            !isExternalRootTurboJsonChange &&
+            comparableWatchPath(change.path) ===
+              comparableWatchPath(gitIndexPath)
+          ) {
+            yield* Ref.set(
+              ignoreMatcher,
+              yield* loadGitIgnoreMatcher(repository.root),
+            );
+            return false;
+          }
+          if (
+            !isExternalRootTurboJsonChange &&
+            isInternalRepositoryPath(repository.root, change.path)
+          ) {
+            return false;
+          }
+          if (change.kind === "unknown") {
+            const refreshed = yield* Effect.either(
+              loadWorkflowRepository({
+                cwd: options.run.cwd,
+                rootTurboJson: options.run.rootTurboJson,
+                singlePackage: options.run.singlePackage,
+              }),
+            );
+            if (refreshed._tag === "Right") {
+              yield* Ref.set(repositoryRef, refreshed.right);
+            }
+            yield* Ref.set(
+              ignoreMatcher,
+              yield* loadGitIgnoreMatcher(repository.root),
+            );
+            yield* Ref.set(observedDirectories, new Set());
+            return true;
+          }
+          const currentRepository = yield* Ref.get(repositoryRef);
+          const currentIgnoreMatcher = yield* Ref.get(ignoreMatcher);
+          const changeIdentity = comparableWatchPath(change.path);
+          const wasObservedDirectory = (yield* Ref.get(
+            observedDirectories,
+          )).has(changeIdentity);
+          const entryIsDirectory =
+            change.entryKind === "directory" ||
+            (change.kind === "remove" &&
+              (wasObservedDirectory ||
+                currentIgnoreMatcher.wasDirectory(change.path)));
+          yield* Ref.update(observedDirectories, (current) => {
+            const updated = new Set(current);
+            if (
+              change.kind === "remove" ||
+              (change.entryKind !== undefined &&
+                change.entryKind !== "directory")
+            ) {
+              updated.delete(changeIdentity);
+            } else if (change.entryKind === "directory") {
+              updated.add(changeIdentity);
+            }
+            return updated;
+          });
+          const currentRunOptions = resolvedWatchRunOptions(
+            options,
+            currentRepository,
+            environment,
+            availableParallelism,
+            windowsPathSeparators,
+          );
+          const isRunOwnedPath = yield* runOwnedPath(
+            currentRepository,
+            currentRunOptions,
+            change.path,
+            environment,
+            availableParallelism,
+            windowsPathSeparators,
+          );
+          const isConfiguredOutputPath = configuredOutputPath(
+            currentRepository,
+            change.path,
+            change.kind === "remove" || entryIsDirectory
+              ? "directory"
+              : change.entryKind,
+            windowsPathSeparators,
+          );
+          if (isGitIgnorePath(change.path, windowsPathSeparators)) {
+            yield* Ref.set(
+              ignoreMatcher,
+              yield* loadGitIgnoreMatcher(repository.root),
+            );
+            const observedAtMilliseconds = yield* clock.now;
+            const metadata = isConfiguredOutputPath
+              ? yield* fileSystem
+                  .metadata(change.path)
+                  .pipe(Effect.orElseSucceed(() => undefined))
+              : undefined;
+            const runOwnsChange =
+              isConfiguredOutputPath &&
+              modifiedByWatchRun(
+                yield* Ref.get(runGenerations),
+                metadata?.modifiedMilliseconds,
+                change.kind === "remove",
+                observedAtMilliseconds,
+              );
+            return (
+              !isRunOwnedPath && (!isConfiguredOutputPath || !runOwnsChange)
+            );
+          }
+          if (isRunOwnedPath) return false;
+          const refreshRepositoryModel =
+            isWorkspaceDiscoveryPath(
+              repository.root,
+              change.path,
+              windowsPathSeparators,
+            ) ||
+            isTurboConfigurationPath(
+              repository.root,
+              options.run.rootTurboJson,
+              change.path,
+              windowsPathSeparators,
+            );
+          const activeRepositoryControl = isActiveRepositoryControlPath(
+            currentRepository,
+            change.path,
+            windowsPathSeparators,
+          );
+          const ignored = currentIgnoreMatcher.ignores(
+            change.path,
+            entryIsDirectory,
+          );
+          if ((ignored || isConfiguredOutputPath) && !activeRepositoryControl) {
+            return false;
+          }
+          if (refreshRepositoryModel) {
+            const refreshed = yield* Effect.either(
+              loadWorkflowRepository({
+                cwd: options.run.cwd,
+                rootTurboJson: options.run.rootTurboJson,
+                singlePackage: options.run.singlePackage,
+              }),
+            );
+            if (refreshed._tag === "Right") {
+              yield* Ref.set(repositoryRef, refreshed.right);
+            }
+            return true;
+          }
+          return true;
+        }),
+      ),
+      Stream.mapEffect((change) =>
+        Ref.modify(pendingChanges, (pending) =>
+          appendPendingWatchChange(
+            pending,
+            change.path,
+            change.kind === "unknown",
+          ),
+        ),
+      ),
+      Stream.debounce("100 millis"),
+      Stream.mapEffect((sequence) =>
+        Ref.modify(pendingChanges, (pending) =>
+          takePendingWatchChanges(pending, sequence),
+        ),
+      ),
+    );
+    const triggers = Stream.concat(
+      Stream.succeed({
+        paths: [] satisfies ReadonlyArray<string>,
+        invalidateAll: false,
+      }),
+      changes,
+    );
+    yield* triggers.pipe(
+      Stream.flatMap(
+        ({ paths, invalidateAll }) =>
+          Stream.fromEffect(
+            Effect.gen(function* () {
+              if (invalidateAll) {
+                yield* terminal.writeStdout(
+                  "\n• change detected: repository-wide invalidation\n",
+                );
+              } else if (paths.length > 0) {
+                yield* terminal.writeStdout(
+                  `\n• change detected: ${paths.join(", ")}\n`,
+                );
+              }
+              const currentRepository = yield* Ref.get(repositoryRef);
+              const currentRunOptions = resolvedWatchRunOptions(
+                options,
+                currentRepository,
+                environment,
+                availableParallelism,
+                windowsPathSeparators,
+              );
+              return yield* Effect.acquireUseRelease(
+                Effect.gen(function* () {
+                  const startedAtMilliseconds = yield* clock.now;
+                  return yield* Ref.modify(runGenerations, (state) =>
+                    beginWatchRunGeneration(state, startedAtMilliseconds),
+                  );
+                }),
+                () =>
+                  executeRun(
+                    currentRunOptions,
+                    paths.length === 0 || invalidateAll
+                      ? {}
+                      : { changedPaths: paths },
+                  ).pipe(
+                    Effect.catchAll((cause) =>
+                      terminal
+                        .writeStderr(
+                          `turbo-ts: watch run failed: ${String(cause)}\n`,
+                        )
+                        .pipe(Effect.as(1)),
+                    ),
+                  ),
+                (generation) =>
+                  Effect.gen(function* () {
+                    const completedAtMilliseconds = yield* clock.now;
+                    yield* Ref.update(runGenerations, (state) =>
+                      completeWatchRunGeneration(
+                        state,
+                        generation,
+                        completedAtMilliseconds,
+                      ),
+                    );
+                  }),
+              );
+            }),
+          ),
+        { concurrency: "unbounded", switch: true },
+      ),
+      Stream.runDrain,
+    );
+    return 0;
+  });

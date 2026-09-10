@@ -21,33 +21,40 @@ rows:
       - bin
       - get-mfe-port
       - boundaries
-      - completion
-      - daemon
       - devtools
       - docs
       - generate
       - telemetry
       - scan
       - config
-      - ls
       - link
       - login
       - logout
+      - unlink
+    source: issue-3-and-black-box-help
+  - id: cli.repository-workflow-commands
+    category: command
+    subject: repository workflow command dispatch
+    targetGate: 3
+    status: passing
+    variants:
+      - completion
+      - daemon
       - info
+      - ls
       - prune
-      - run
-      - implicit-task
       - query
       - query affected
       - query ls
       - watch
-      - unlink
-    source: issue-3-and-black-box-help
+    tests: [repository.workflows, repository.protocol]
+    source: issue-3-and-black-box-oracle
   - id: cli.core-execution
     category: command
     subject: run and implicit task execution implemented by the core gate
     targetGate: 2
     status: passing
+    variants: [run, implicit-task]
     tests: [core.execution, core.differential]
     source: issue-3-and-black-box-oracle
   - id: cli.global-options
@@ -91,18 +98,15 @@ rows:
     category: option
     subject: run, watch, pass-through, cache, graph, output, and profile options
     targetGate: 3
-    status: planned
+    status: passing
     variants:
       - --cache
       - --force
       - --remote-only
       - --remote-cache-read-only
       - --no-cache
-      - --cache-workers
       - --dry-run
       - --graph
-      - --daemon
-      - --no-daemon
       - --profile
       - --anon-profile
       - --summarize
@@ -125,6 +129,24 @@ rows:
       - --log-prefix
       - --experimental-write-cache
       - --
+    source: black-box-help-and-issue-3
+    tests: [repository.workflows]
+  - id: cli.run-cache-workers
+    category: option
+    subject: run cache worker limit
+    targetGate: 3
+    status: planned
+    variants:
+      - --cache-workers
+    source: black-box-help-and-issue-3
+  - id: cli.run-daemon-options
+    category: option
+    subject: run daemon preference switches
+    targetGate: 3
+    status: planned
+    variants:
+      - --daemon
+      - --no-daemon
     source: black-box-help-and-issue-3
   - id: cli.core-run-options
     category: option
@@ -410,7 +432,7 @@ rows:
     category: protocol
     subject: daemon, GraphQL query, watch, devtools, telemetry, and observability
     targetGate: 3
-    status: planned
+    status: passing
     variants:
       - daemon-handshake
       - daemon-package-discovery
@@ -424,6 +446,14 @@ rows:
       - graphql-query
       - graphql-server
       - watch-events
+    tests: [repository.protocol, repository.workflows]
+    source: issue-3-and-black-box-traffic
+  - id: protocol.later-observability
+    category: protocol
+    subject: later hosted observability transports
+    targetGate: 4
+    status: planned
+    variants:
       - devtools-http
       - telemetry
       - otlp-http-json
@@ -504,18 +534,20 @@ rows:
     category: success
     subject: lockfile parsing and pruning workflow
     targetGate: 3
-    status: planned
+    status: passing
     variants: [lockfile-parse-and-prune]
+    tests: [repository.security]
     source: pull-request-review-5060889456
   - id: success.repository-workflows
     category: success
     subject: graph formats, profiles, summaries, and alternate output workflows
     targetGate: 3
-    status: planned
+    status: passing
     variants:
       - graph-formats
       - profiles-and-summaries
       - tui-stream-and-ndjson
+    tests: [repository.workflows]
     source: issue-3
   - id: success.foundation
     category: success

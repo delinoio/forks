@@ -97,7 +97,9 @@ Matching directory symlinks are traversed by their declared logical path only
 when their canonical target is a directory inside the repository; canonical
 ancestor tracking prevents symlink cycles.
 Git changes beneath a contained workspace symlink's canonical target map back
-to that workspace for package and task-aware affected selection.
+to that workspace for package and task-aware affected selection, including
+`ls --affected`. `--single-package` skips child workspace discovery and treats
+the repository root as the only runnable package.
 Tasks owned by a logical workspace path containing a symlink component execute
 without local or remote caching because restoration intentionally rejects
 symlink parents. Task scopes whose hashes depend on those tasks, including
@@ -114,8 +116,9 @@ and resolve to a directory before nested repository discovery begins from its
 canonical target, including when the requested path is a symlink.
 Task-aware Git selectors retain union semantics with positive package
 selectors; negative Git selectors are applied after that union.
-Package-level affected selection treats legacy `globalDependencies` and, when
-task-aware selection is disabled, `global.inputs` as repository-global inputs.
+Git affected selection treats CLI `--global-deps` and legacy
+`globalDependencies` as repository-global inputs and, when task-aware selection
+is disabled, treats `global.inputs` the same way.
 Repository-root Cargo and uv package scopes do not claim ordinary root files
 for package ownership; those changes retain repository-global package-level
 affected selection.
@@ -123,8 +126,12 @@ Task-input selection uses the same effective global and task inputs as hashing,
 evaluates task owners before Git-range package narrowing, applies negative Git
 ranges after positive task matches, and includes `with` companions. Owning
 manifests participate in task-aware selection and hashing independently of user
-input globs. Symlinked owning control manifests retain their link identity and
-also hash the resolved file contents consumed by discovery and execution.
+input globs. Their implicit input identities follow case-insensitive filesystem
+semantics on Windows. Symlinked owning control manifests retain their link
+identity and also hash the resolved file contents consumed by discovery and
+execution. Reported per-task input digests for symlinked mandatory controls
+combine the link and resolved-content hashes so a change to either contribution
+is visible in dry runs and run summaries.
 Package task configurations participate independently in task-aware selection.
 Owning lockfiles, repository-controlled JavaScript package-manager
 configuration, workspace-local Bun `bunfig.toml` files, and Cargo control or
@@ -191,9 +198,20 @@ compiler identity is not modeled. Effective `RUSTC_WRAPPER` and
 the wrapper executables are not repository hash inputs.
 Environment-name selection follows Windows case-insensitive semantics for run
 options, affected-range controls, hashing, and strict task execution.
-Repository discovery records the resolved root lockfile path without
-structurally parsing it;
-lockfile parsing and pruning remain Gate 3 work. Without Git, explicit task
+Global dependency globs likewise match repository paths case-insensitively on
+Windows while retaining the discovered path spelling in hash inputs.
+Repository discovery records the resolved root lockfile path. Gate 3 validates
+all modeled lockfile formats before prune, rewrites pnpm importer/package/
+snapshot closure, npm workspace package indexes and version 2 legacy dependency
+trees, Yarn Classic and Berry entry closures, and text Bun workspace/package
+indexes. Binary Bun, Yarn PnP, and
+other validated formats without a safely rewritable public workspace index are
+preserved. pnpm aliases derive their target identity from importer specifiers
+and target-qualified resolutions, peer-qualified snapshots retain both the
+base package and qualified snapshot, and resolvable `file:` package and
+snapshot records retain their transitive closure. npm pruning retains only the
+selected workspace dependency closure and its valid workspace links. Without
+Git, explicit task
 inputs under ordinary `dist` and `target` directories remain hashable.
 Cache directories equal to or containing the repository or any discovered
 package directory are rejected by canonical filesystem location before cache
@@ -215,8 +233,10 @@ Symlinks and other non-regular destinations are rejected. An existing regular
 log destination is unlinked before task output is written so a hard link cannot
 redirect truncation outside the execution directory.
 Persistent companions must remain alive until their foreground owners
-complete; any earlier natural exit fails the group, and foreground owners
-sharing a companion remain subject to the run's concurrency limit.
+complete; any earlier natural exit fails the group without replacing outcomes
+for foreground tasks that already completed, including owners that finish in
+the same concurrent cohort before the companion exit is observed. Foreground
+owners sharing a companion remain subject to the run's concurrency limit.
 Persistent task scopes always bypass local and remote caching, regardless of
 their configured cache value.
 On Windows, npm, pnpm, and Yarn task commands use their standard command shims
@@ -250,6 +270,10 @@ failures warn without changing a successful task outcome, and a local failure
 does not suppress a configured remote upload. Local and remote cache restoration
 is limited to 256 MiB compressed and 1 GiB after decompression; preflight and
 upload response bodies have an independent 64 KiB limit.
+Missing or malformed local cache duration metadata reports zero saved time
+without invalidating an otherwise successful restoration. Duration metadata is
+preflighted and read through a 64 KiB bounded range; oversized metadata and
+files that grow beyond the bound during the read also report zero saved time.
 Restored task logs replay through scoped, bounded text chunks with terminal
 backpressure instead of loading the complete log into another string. A task-log
 replay I/O failure warns without changing the successful cache-hit outcome.
@@ -316,6 +340,12 @@ entry holds the same lock through validation and rejected-entry cleanup so it
 cannot remove a concurrent publication. Active entry locks renew their lease
 before the stale-lock threshold, and renewal or ownership loss interrupts the
 protected operation. Locks left by terminated writers remain reclaimable.
+Future-dated entry locks and reclaim markers are stale rather than live. Lock
+timestamps are compared at whole-millisecond clock precision, so filesystem
+fractions within the current clock millisecond do not make an active lock
+future-dated.
+Parent-directory durability sync is attempted after atomic rename and ignores
+only platform errors that explicitly report directory sync as unsupported.
 Cache archives use PAX
 extensions for paths beyond ustar limits. Tar header paths, link targets, and
 PAX metadata must be valid UTF-8, and numeric fields must contain complete octal
@@ -343,6 +373,9 @@ other unsupported filesystem entry skips cache publication without changing a
 successful task result. A symlink that is an untraversed ancestor of a positive
 output pattern also skips publication so a log-only artifact cannot represent
 missing declared outputs.
+The repository-root `.git` entry is never collected as a task output, whether
+it is a directory or a linked-worktree metadata file selected by a broad root
+output glob.
 uv packages are discovered from the root
 `pyproject.toml` workspace root and member globs after applying workspace
 exclusions; unrelated Python projects and `.venv` trees are ignored.
@@ -396,13 +429,18 @@ repository-contained member exposes the requested verification task and their
 interactive, output-log, and persistent runtime settings are compatible;
 otherwise participating members retain package targeting so task exclusions
 and runtime overrides are honored.
+Cargo production dependency closure includes normal and build dependencies but
+not development-only dependencies. uv production closure includes project and
+optional dependencies but excludes PEP 735 dependency groups and legacy
+`tool.uv.dev-dependencies`; ordinary dependency graphs retain all of them.
 Members of an enclosing Cargo workspace outside
 the repository always retain package targeting and bypass caching, as do task
 scopes whose hashes depend on them, because their external Cargo controls are
 not repository hash inputs. Cargo packages with source-free local path
 dependencies that do not resolve to a same-workspace repository package also
-bypass caching. Grouped Cargo commands receive
-the union of all member task environments. Cargo package-graph edges require a
+bypass caching. Grouped Cargo commands receive the union of all member task
+environments, and JSON dry-runs and run summaries report the same union. Cargo
+package-graph edges require a
 source-free metadata dependency path that resolves to the named member in the
 same workspace; registry and Git dependencies remain external. Cargo `run` and
 `dev` tasks are exposed only for crates with one unambiguous binary target, and
@@ -436,7 +474,11 @@ prerequisite output depends on unmodeled external controls. Cargo metadata
 discovery uses `--locked`, uses each response's workspace-member list, and does
 not probe excluded or unrelated nested manifests. Combined workspace task
 hashes are propagated into every downstream task hash using the same effective
-task environment as the initial hash computation.
+task environment as the initial hash computation. JSON dry-run and run summary
+input maps for a grouped task include hashes from every workspace member under
+member-qualified paths relative to the Cargo workspace. Text dry-runs count
+those inputs only after the same qualification, so distinct member files are
+not deduplicated by their package-relative names.
 Cargo builds with colliding synthesized binary destinations bypass caching,
 including when task configuration explicitly enables it.
 Synthesized Cargo binary outputs cover the extensionless executable plus
@@ -469,10 +511,440 @@ Structured `dependencyOutputs` task inputs are rejected during configuration
 validation until their dependency graph and output-hash semantics are
 implemented; they are never treated as ordinary local globs.
 
-Only Gate 2 behavior with automated ledger evidence is a compatibility claim.
-Gate 3 through Gate 5 commands, UI and profile formats, daemon/watch/query
-protocols, hosted authentication workflows, and platform matrices remain
-planned.
+Gate 3 adds repository workflows with automated ledger evidence. `watch`
+debounces filesystem storms, coalesces repeated pending events by path before
+the debounce settles, retains every distinct changed path in each settled
+batch, and uses switching Effect streams so a later batch interrupts an
+in-flight run before recovery. Watchers, child processes, fibers, signals, and
+task resources remain scope-owned. Watch mode resolves cache
+policy from CLI and environment configuration, reads cache by default, and
+enables cache publication only with `--experimental-write-cache`; the effective
+policy is reduced to its readable capabilities until that flag is present, and
+a write-only policy disables cache access. Repository and
+nested Git-ignore rules and configured task-output patterns suppress generated
+files except where an output exclusion denies the changed file. Package-relative
+outputs are matched from their package directory, while `$TURBO_ROOT$/` outputs
+and exclusions are matched from the repository root. Partial output matching is
+limited to directory events. A directory event at the root of a fully excluded
+output subtree remains an input event, while an exclusion that covers only part
+of the directory's descendants does not cancel a positive partial match.
+Already-active Turbo configuration and package or workspace discovery controls
+refresh the repository model before ordinary ignore and output suppression,
+including when the control is intentionally untracked and ignored. Other ignore
+and output filtering still occurs before broad manifest or configuration refresh
+classification, so unrelated generated manifests cannot cause a watch loop.
+The active JavaScript lockfile, each Cargo package's owning workspace
+`Cargo.lock`, and each uv package's ancestor `uv.lock` candidates are active
+controls under the same rule.
+Changes to an ignore file reload the matcher before stale ignore rules are
+applied and remain user-visible triggers.
+Git-ignore matching does not suppress files already tracked in the Git index or
+directory events whose subtree contains tracked files. `.venv` trees remain
+internally ignored even when the repository root does not list them.
+Changes to the effective Git index refresh tracked-file state without triggering
+a run by themselves, so later edits to newly tracked ignored files remain
+observable. Linked worktrees watch the index in their resolved external Git
+directory.
+When tracked-file discovery fails inside a detected Git repository, Git-ignore
+suppression is disabled conservatively so tracked inputs remain observable and
+copyable. Non-Git repositories continue to apply their configured ignore rules.
+Declared-output ignore files whose modification belongs to an active or recently
+completed run generation remain suppressed to prevent delayed watcher events
+from creating generated-output loops. Modification ownership uses
+whole-millisecond clock precision so a filesystem timestamp fraction in the
+completion millisecond remains owned by that generation. Metadata-less removal
+events retain completed-generation ownership for one second; later removals
+remain user-visible triggers. Root, custom, and workspace Turbo
+configuration changes and active JavaScript, Cargo, or uv workspace manifest
+changes refresh package discovery and output patterns before the next run. Git
+ignore, Turbo configuration, and workspace manifest classification follows
+case-insensitive filesystem semantics on Windows.
+Configured package-relative and `$TURBO_ROOT$/` output paths, patterns, and
+exclusions use the same case-insensitive Windows semantics when watch events
+are filtered. Task-aware watch selection also compares event paths, package
+directories, and configured input patterns case-insensitively on Windows.
+Explicit graph,
+structured-log, profile, trace, and heap artifacts, default profile artifacts,
+and write-enabled local cache directories are treated as run-owned paths and
+never trigger another watch run. Explicit artifact paths are resolved through
+existing ancestor symlinks so lexical destinations, canonical targets, atomic
+temporaries, and watcher notifications for the symlink ancestor remain
+suppressed. Explicit structured-log, profile, anonymous-profile, and trace
+destinations reject a symlink at the final path component before task hashing
+or execution. Write-enabled cache directories are resolved through existing
+ancestor symlinks before event filtering. Default profile matching is limited
+to the generated `profile.<timestamp>` names, their anonymous variant, and atomic
+temporary files; other root-level `profile.*` files remain ordinary watch
+inputs. Watch-time discovery honors `--single-package` for both initial and
+refreshed repository models.
+Internal-directory exclusions are matched relative to the watched repository,
+so reserved names in ancestor directories do not suppress repository events.
+Git-ignore discovery and Windows-originated watcher paths match `.git`,
+`.turbo`, `.venv`, and `node_modules` components case-insensitively on Windows.
+The bounded native watcher transport converts overflow into
+a retried repository-wide invalidation; watch refreshes discovery and reruns all
+requested tasks, while the daemon marks every registered output glob changed.
+Run arguments after `--` remain task pass-through arguments, including text
+equal to the watch-only cache-publication flag. Interactive TUI cursor hiding is
+scope-owned and restores the cursor after success, failure, or interruption,
+including when a switching watch run cancels its predecessor.
+When `futureFlags.watchUsingTaskInputs` is enabled, file-triggered runs retain
+only requested task entrypoints whose effective inputs match the changed paths,
+plus their dependency and `with` closure. Root configuration, `.gitignore`, and
+CLI `--global-deps` matches retain the all-task fallback. Watcher entry types
+distinguish regular file renames from directories when applying directory-only
+ignore rules. Removal events without type metadata reuse directory kinds from
+the loaded ignore snapshot or later watcher observations and always use
+conservative directory matching for configured task outputs.
+
+The daemon uses the shared `.turbo/daemon` logs, SHA-256 repository state
+identity, per-user temporary state directory, atomic PID files, and a lifecycle
+lock beside rather than inside the removable repository state directory. It
+uses 0600 Unix sockets on POSIX, per-user named-pipe endpoints on Windows, and
+stale-state cleanup. Windows identities derive from the effective account's
+operating-system user record rather than a shared fallback value. Before any
+state path is accessed, the predictable
+per-user parent is created without following existing paths and validated as a
+real current-user-owned directory. POSIX parents writable by another user are
+rejected; safe legacy modes are tightened to `0700` and revalidated. Windows
+skips Unix filesystem ownership and permission operations. Its public transport
+is the official `turbodprotocol.Turbod` gRPC
+service over HTTP/2. Hello, status, and shutdown calls interoperate in both
+directions with the 2.10.12 executable; package and watch calls share the same
+bounded framing and scoped sessions. Unary request and response bodies contain
+exactly one complete frame with no trailing data. Clients terminate a response
+as soon as its accumulated frame exceeds the 1 MiB payload limit plus framing
+bytes. A server result that would exceed the 1 MiB payload limit is replaced by
+a bounded protocol error before the response is written.
+Oversized request streams discard retained frame data and are never dispatched
+to a daemon handler after cancellation. Nonzero `grpc-message` diagnostics in
+response headers or trailers are percent-decoded; malformed encodings fail with
+a typed protocol error. A nonzero status without a DATA frame returns that
+decoded diagnostic as an error-only response, while successful and data-bearing
+responses still require valid gRPC framing.
+Requests that exceed the transport queue receive an immediate protocol error
+instead of displacing an older request. Unsupported-method and queue-capacity
+responses run in the server Scope so endpoint teardown interrupts pending
+response work. The server admits at most 64 active HTTP/2 request streams before
+buffering their bodies, including streams whose request body has not ended, so
+slow request or response work cannot create unbounded pending stream state.
+Package discovery reloads the repository model for each request so workspace
+additions, removals, and renames are visible without a daemon restart.
+Custom root Turbo configuration paths are retained by lifecycle commands,
+forwarded to detached servers, and reused for request-time package discovery.
+Registered outputs beneath `.turbo` outside the resolved cache directory and
+beneath `node_modules` remain observable. Directory events conservatively mark
+positive output globs when descendants can match, even when an exclusion can
+match only part of that subtree; an event rooted in a fully excluded subtree is
+ignored. Removal events without entry-type metadata receive the same
+conservative descendant matching because a removed path may have been an output
+directory. Git metadata, the resolved cache directory, and daemon-owned logs
+remain excluded. Cache filtering covers both the configured lexical directory
+and its target resolved through existing ancestor symlinks.
+Output-change registration/query calls return their protocol data rather than
+empty acknowledgments. Changed-output snapshots consume only the exact glob
+generations reported after their response is written successfully. A failed
+response remains retryable, and changes recorded while a response is being
+written remain pending for the next query. The daemon retains at most 1,024
+output registrations and evicts the least recently registered or queried hash.
+Registered output and exclusion globs follow case-insensitive filesystem
+semantics on Windows.
+Each registration accepts a non-empty hash of at most 128 characters, at most
+256 combined output and exclusion globs, at most 1,024 characters per glob, and
+at most 64 KiB of aggregate glob text.
+Start-lock ownership is
+preserved across overlapping starts, stale locks are validated before removal,
+and future-dated lock timestamps are stale rather than live. A Hello response
+carrying an error is not healthy. Start, stop, restart, status, logs, and clean
+are race-safe; `info` reports the live daemon state. Lifecycle commands resolve
+daemon state from the repository root without requiring package or lockfile
+discovery; the serving process retains full discovery validation. A missing PID
+file is treated as absent, while filesystem failures checking or reading it are
+propagated without cleaning lifecycle state. `clean` likewise propagates a
+failure to remove the daemon state directory.
+Status and logs health checks clean stale PID and socket state even when the
+recorded PID has been reused by an unrelated live process. Start, stop, clean,
+and restart preserve lifecycle state and fail retryably when the recorded PID
+remains alive but never completes a health handshake.
+Daemon startup health polling has a five-second aggregate deadline and passes
+the remaining budget to each transport request, keeping the lifecycle lock hold
+well below its 30-second stale lease.
+After a successful health handshake, a subsequent status transport or response
+failure preserves the live daemon's PID, socket, and active-log state and is
+reported to the caller for both status and logs commands.
+An absent active-log pointer falls back to the client's dated log path; a
+filesystem failure checking or reading an existing pointer is propagated
+without cleaning live daemon state.
+Log clients follow the exact dated log reported by the running daemon until
+interrupted, reading only newly available bounded byte ranges while preserving
+split UTF-8 code points. A log that disappears during metadata lookup or a
+range read is tolerated, while other metadata and range-read failures are
+propagated. Watcher path equality
+normalizes separators and follows case-insensitive filesystem semantics on
+Windows. Stop escalates only after a successful RPC identifies the process as
+the expected daemon; live PIDs without a healthy daemon RPC retain their
+lifecycle state and are never signaled. A
+failed shutdown RPC preserves
+the live daemon's PID, socket, and active-log state and reports the failure so
+the operation can be retried. Forced termination must be available, succeed,
+and be confirmed before the same state is removed. A timed-out daemon start
+applies the same termination and state-retention rules to its spawned process.
+Detached daemon starts are acknowledged only after Node reports the spawn event;
+asynchronous spawn failures remain typed process errors.
+Malformed streams remain
+isolated, every response callback error, including one reported with an HTTP/2
+`NO_ERROR` reset code, is logged and isolated to its request,
+while a received shutdown request still initiates shutdown after its response
+attempt. An idle server resets its deadline after RPC or repository activity
+without expiring while an RPC is in flight. Idle durations above Node's
+2,147,483,647-millisecond timer limit are rejected during argument parsing.
+Dated daemon log paths derive their time from the configured clock service.
+Serve startup acquires exclusive PID
+ownership, a competing server cannot unlink a live daemon endpoint, endpoint
+cleanup is limited to the owning server instance, and a post-bind endpoint
+setup failure closes the server and all sessions. Repository watcher failure
+terminates the daemon rather than leaving an apparently healthy RPC server.
+Windows deliberately uses Node's forceful
+process termination because Node has no supported graceful Win32 Ctrl+C bridge.
+Daemon log followers treat watcher overflow invalidations as incremental read
+prompts so a dropped file-specific event cannot strand available log bytes.
+
+`query` provides the compatible repository GraphQL root, package graph,
+package and task collections, affected collections, variables, schema
+introspection, and a GraphQL server that binds and advertises IPv4 loopback.
+Task relationship collections
+come from the resolved task graph. Task-graph construction is deferred until a
+task relationship, task predicate, or affected-task collection is selected, so
+package, file, version, and other independent queries remain available when
+task-graph validation fails. GraphQL affected collections calculate the
+requested base/head range, include dependent packages, and apply package and
+task filters. Task filters accept bare task names, package-qualified names, and
+collision-qualified ecosystem package identities. The `query affected --tasks`
+shortcut uses the same resolved task graph for task reasons in both filtered and
+unfiltered forms. Explicitly
+requested bare and package-qualified names include root tasks and configured
+commandless tasks and propagate dependency-task reasons through transitive
+affected package chains, while the unfiltered form retains script-backed task
+enumeration. The `query affected --packages` shortcut accepts
+plain names that retain every matching ecosystem scope and qualified identities
+that select one scope. Cyclic package graphs never include the starting package
+in its own dependency or dependent relationship collections.
+Boundary diagnostics evaluate root, package, and tag dependency and dependent
+permissions against manifest and configured implicit package dependencies.
+When a package has no local Turbo configuration, diagnostics point to its
+owning `package.json`, `Cargo.toml`, or `pyproject.toml` manifest. Package-graph
+center selection retains the named package and its
+direct dependencies, rejects unknown centers, package predicates narrow the
+returned nodes, and graph edges retain the selected nodes' dependency context.
+Package and package-graph lookups accept exact collision-qualified ecosystem
+identities and reject a bare package name when more than one ecosystem owns it.
+Graph filtering uses
+package identities, and same-named cross-ecosystem edge endpoints use qualified
+identities. Affected collections include the root package for root changes and
+when it depends on an affected workspace without allowing the root path to
+claim workspace-owned files. `query affected`, `query
+ls`, and `ls` share repository discovery and stable ordering. GraphQL documents
+are limited to 4,096 lexer tokens, 512 expanded selections, and a field depth
+of 16 before resolver execution; fragment spreads count each expanded
+selection. Package-predicate variables are limited to 512 nodes and a depth of
+16 before resolver execution. The server limits request bodies, admits at most
+64 active requests, rejects excess requests with HTTP 503 without buffering
+their bodies, and closes HTTP handles in Scope;
+oversized requests receive
+HTTP 413 without resetting the connection and retain their active-request slot
+until the request body ends or aborts. Client resets and request errors
+during body upload are isolated before handler execution, and disconnects or
+server shutdown interrupt in-flight resolver effects and their subprocesses.
+Top-level package predicates are
+applied, external dependencies come from manifest references resolved against
+each package model's owning JavaScript, Cargo, or uv lockfile, including npm
+v2/v3 package locations whose entries omit the package name. Each distinct
+owning lockfile is read and parsed once per GraphQL operation. Internal
+workspaces are excluded across the complete
+transitive workspace dependency closure for both query results and external
+dependency hashes by their lockfile workspace identity rather than their bare
+package name, so same-named registry packages remain external. npm root,
+workspace, and workspace-link records are excluded from external package
+results. External dependency identity and query results preserve lockfile
+source when present, so equal names and versions from different Cargo sources
+remain distinct. Yarn Berry entries report their installed
+`version` rather than descriptor ranges. Lockfile reading and parsing are
+deferred until the `externalDependencies` field is selected, so independent
+fields remain available if the discovered lockfile later becomes unavailable
+or invalid. Selected lockfiles are read with the 32 MiB safety bound before
+parsing. Affected package and task fields reuse each distinct base/head
+calculation within one GraphQL operation and accept at most 64 distinct ranges.
+Package-manager fields use protocol identifiers;
+only pnpm's compatibility family uses the versioned `pnpm9` label. File queries
+enforce repository containment after resolving symlinks, reject non-regular
+targets before reading, read at most 1 MiB per canonical file, reuse canonical
+reads within an operation, and enforce an 8 MiB aggregate result budget that
+counts aliases independently. The startup message describes the static page as
+a GraphQL endpoint rather than an IDE.
+
+Affected package listing disables Git rename detection so moves between
+workspaces select both the source and destination owners before dependent
+closure is applied. Nested workspace changes are owned directly only by the
+co-located scopes at the longest matching logical or canonical workspace path;
+ancestor workspaces are not directly affected, and dot-prefixed workspace paths
+retain their leading dot during ownership matching. Repository-global input
+patterns and workspace ownership use case-insensitive path matching on Windows
+in both list and query affected calculations. Environment-provided revisions
+are separated from Git options and pathspecs before the affected diff executes.
+
+`prune` selects the transitive internal package closure of both requested
+packages and workspace dependencies retained by the copied root manifest,
+emits ordinary and Docker layouts, creates reduced lockfiles with
+reference-compatible canonical
+configuration formatting, supports production manifests, and
+rejects output roots that could contain the source repository, any discovered
+package, or any discovered Cargo or uv workspace-control directory. Output
+roots also cannot replace or be nested within repository metadata, root control
+paths, the active lockfile or configuration, package-manager controls, or a
+non-root package or workspace-control directory.
+Selected package copies stop at nested workspace roots outside the selected
+closure. Co-located ecosystem scopes copy each distinct package directory once.
+Relative package links may target another selected workspace even when that
+workspace is copied independently; links into unselected workspaces remain
+invalid.
+Generated installation manifests, configuration files, and reduced lockfiles
+use readable `0644` modes. Lockfiles are read with the 32 MiB safety bound and
+fully reduced before an existing output tree is removed, so an unavailable,
+oversized, or invalid lockfile leaves that output untouched. It
+never follows workspace symlinks into a prune output. Output safety and traversal
+exclusions use canonical locations. Contained relative file symlinks are
+recreated without dereferencing unless their resolved target enters an
+unselected nested workspace; copied root controls include their contained
+regular-file targets at the corresponding installation paths. Absolute,
+escaping, or output-targeting root-control links are rejected, and an exact
+symlinked output root is rejected before replacement. Generated root manifest,
+Turbo configuration, and pnpm workspace configuration transformations are
+applied to validated symlink targets before the links are recreated; this
+includes production dependency removal from root manifests. Recreated control
+links use portable relative targets even when the link and target occupy
+different directories. Selected package
+tree copies, including packages located at a workspace or repository root, do
+not overwrite generated root controls, their validated symlink targets, or
+reduced Cargo workspace manifests; their exclusion identities follow
+case-insensitive filesystem semantics on Windows. The dedicated root `.yarn`
+copy is likewise excluded from repository-root package copies. The root pnpm
+hook `.pnpmfile.cjs` is retained in every
+installation root. Root Bun `bunfig.toml` configuration is retained in the
+ordinary output and both Docker installation roots. Root Yarn installation controls, including `.yarnrc.yml`,
+`.pnp.cjs`, releases, patches, plugins, and a repository-contained configured `yarnPath`
+executable, are retained at their repository-relative locations in applicable
+ordinary and Docker layouts. Accepted absolute `yarnPath` and plugin references
+are rewritten to those repository-relative locations in every emitted
+`.yarnrc.yml`. Required Yarn releases, patches, and configured
+plugins or executables are retained even when Git-ignore rules match them, including when
+their configured path descends through an otherwise ignored `node_modules`
+directory; unrelated files beneath that ignored directory remain excluded.
+Other copying
+honors repository and nested Git-ignore files unless disabled; ordinary pnpm
+pruning retains development dependency closure. Reserved package-tree
+directories use case-insensitive name matching on Windows. Production npm,
+pnpm, Yarn, and text Bun pruning removes development dependency edges and their
+package closure, including development-marked trees in legacy npm v1 lockfiles.
+Production Cargo and uv pruning uses the corresponding production closures:
+Cargo development-only edges and uv dependency-group or legacy development
+edges are omitted, while Cargo build dependencies and uv project or optional
+dependencies remain selected.
+Production pruning also removes `devDependencies` from selected JavaScript
+workspace manifests in the ordinary or Docker full tree. A contained relative
+workspace-manifest symlink remains a symlink in ordinary, Docker full, and
+Docker JSON layouts, and manifest transformations update its copied target.
+Docker JSON subsets contain manifests only for selected JavaScript packages;
+selected Cargo and uv package manifests remain in the full tree. Selected Cargo
+and uv packages also retain their owning workspace manifest and lockfile in the
+ordinary or Docker full tree. Retained Cargo workspace manifests list exactly
+the selected Cargo members, narrow `default-members` to that set, and omit
+`default-members` when none remain. Their exclusion lists are removed after the
+selected member set is made explicit. When
+`futureFlags.pruneIncludesGlobalFiles` is enabled, ordered
+`globalDependencies` or `global.inputs` globs copy their safe, non-ignored
+matches into the ordinary output or Docker full tree before generated controls
+and manifests are rewritten. The active lockfile is excluded from this copy so
+Docker full trees cannot replace the reduced installation lockfile. Global-file
+patterns, traversal pruning, and reserved-directory exclusions follow
+case-insensitive filesystem semantics on Windows.
+
+Run workflows support text and JSON dry-runs; DOT, Mermaid, JSON, and HTML task
+graphs; JSON run summaries and live newline-delimited structured log files;
+stream, grouped, timestamped stream, and NDJSON output;
+completion and info; Chrome-compatible named and anonymous profiles; and the
+approved V8 heap snapshot and trace substitutions. TUI requests retain stream
+semantics when no interactive terminal is available, and all color output
+continues to honor `NO_COLOR`. Rendered graph files create missing destination
+parent directories. Interactive TUI mode renders task status and
+falls back to stream mode when either terminal side is non-interactive. JSON
+mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
+completed task's full log replay. Structured log files append typed task events
+as work runs and end with a typed run summary. An explicit structured-log
+artifact and explicit named, anonymous, or trace profile artifacts are excluded
+from task and global file hashes by their canonical filesystem identities.
+Root-level generated
+`profile.<timestamp>` artifacts, their anonymous variant, and atomic temporary
+files are likewise excluded whenever a bare profile option selects the default
+path; other `profile.*` files remain inputs. Simultaneous bare named and
+anonymous profiles use distinct generated destinations. A bare structured-log
+option exclusively claims its timestamped generated destination before
+validation; a collision uses the run UUID and then a numeric suffix. An early
+claim is removed when preparation fails. No active structured-log,
+named-profile, anonymous-profile, heap-snapshot, or trace artifact may replace
+a mandatory task control input or match a declared task output or resolved
+task-log path; output collision matching is case-insensitive on Windows. Every
+active structured-log, named-profile,
+anonymous-profile, heap-snapshot, and trace destination must also resolve to a
+distinct path; collisions fail before an artifact is written or a task starts.
+Timestamped streaming applies the timestamp writer to a final unterminated task
+line and retains line-start state across bounded output chunks, so one
+continuous line receives one timestamp. Live structured task events retain
+their stdout or stderr channel, including grouped JSON and errors-only failure
+replay buffered through a scoped temporary journal. Compatible cached task logs
+contain merged plain output without channel metadata, so their replay uses the
+neutral `info` level instead of asserting a stdout channel. Errors-only failure
+replay does not duplicate output already recorded while the task ran and reads
+the complete on-disk output instead of the bounded diagnostic tail. CLI
+`--global-deps`
+patterns are merged into task hash inputs, and their repository-relative Git
+blob hashes are reported in summary `globalCacheInputs.files`, including when a
+valid requested task is filtered to a successful no-op. Dry runs do not perform local
+cache eviction, and
+`info` derives WSL status from the Linux kernel release. Log-prefix selection
+applies to live and cached output. Summaries record
+the actual local or remote cache source and saved duration, and summaries and
+profiles use each task's scheduling timestamps. Generated profiles omit tasks
+that were never scheduled, while summary task entries represent them with a
+null `execution` value. Requested heap snapshots are published through a
+sibling temporary file and atomic rename before task input hashes are computed
+so repository-contained snapshots cannot invalidate a cache key after hashing,
+hard-linked destinations cannot redirect truncation into task controls, and
+missing destination parent directories are created. Task summaries record the
+resolved transitive external-dependency closure hash for graph-bearing npm,
+pnpm, Yarn, Cargo, uv, Bun, Aube, and Nub lockfiles and the actual encoded log
+path, including collision-qualified identifiers and alternate execution scopes.
+Global summary inputs record the corresponding root-manifest external-dependency
+closure hash instead of the empty-closure hash when root dependencies resolve.
+Summary preparation reads and parses each distinct owning lockfile once per run
+with the 32 MiB safety bound and reuses its package closures for task and global
+hashes.
+The equals form of `--summarize` accepts only `true` or `false`; other explicit
+values fail argument parsing without creating a summary.
+Graph-bearing closures retain the declaring manifest reference or resolved
+workspace entry so multiple locked versions of one name do not broaden a task's
+external dependency hash. Cargo closures also retain parenthesized source
+qualifiers so identical package names and versions from distinct registries or
+Git sources remain separate graph nodes.
+Summary `monorepo` fields are true whenever ordinary discovery finds at least
+one child workspace and false in explicit single-package mode.
+Persisted, stdout, and
+newline-delimited summaries from one run share one canonical UUID v7 identifier.
+Mermaid graphs assign stable,
+unique node identifiers without truncated-hash collisions.
+
+Only behavior with automated ledger evidence is a compatibility claim. Hosted
+authentication, devtools, telemetry transports, and full platform matrices
+remain later gates.
 
 The approved compatibility differences are branding and version, Node-only
 distribution, hosted identity, default-disabled updates, V8 heap/trace output,
