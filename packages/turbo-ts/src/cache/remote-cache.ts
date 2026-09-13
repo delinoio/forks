@@ -328,9 +328,6 @@ export const restoreRemoteCache = (
                     ),
                   );
                 }
-                yield* recordRemoteCacheEvent(options, hash, "HIT").pipe(
-                  Effect.ignore,
-                );
                 if (options.requireSignature) {
                   if (options.signatureKey === undefined) {
                     return yield* Effect.fail(
@@ -389,6 +386,9 @@ export const restoreRemoteCache = (
                   onHit?.(
                     Number.isFinite(duration) ? Math.max(0, duration) : 0,
                   ),
+                );
+                yield* recordRemoteCacheEvent(options, hash, "HIT").pipe(
+                  Effect.ignore,
                 );
                 return true;
               }),

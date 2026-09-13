@@ -4150,6 +4150,37 @@ export const executeRun = (
     const orderedNodes = [...graph.nodes.values()].sort((left, right) =>
       left.id.localeCompare(right.id),
     );
+    const outcomes = new Map<string, TaskOutcome>();
+    const reportTaskMetrics = (): void =>
+      context.onTaskMetricsResolved?.(
+        orderedNodes.map((node) => {
+          const outcome = outcomes.get(node.id);
+          return {
+            id: node.id,
+            package: node.package.name,
+            task: node.task,
+            status:
+              outcome === undefined || outcome.skipped
+                ? "skipped"
+                : outcome.exitCode === 0
+                  ? "succeeded"
+                  : "failed",
+            ...(outcome === undefined
+              ? {}
+              : {
+                  exitCode: outcome.exitCode,
+                  durationMilliseconds: Math.max(
+                    0,
+                    outcome.endTime - outcome.startTime,
+                  ),
+                  ...(outcome.cacheSource === undefined
+                    ? {}
+                    : { cacheSource: outcome.cacheSource }),
+                }),
+          };
+        }),
+      );
+    reportTaskMetrics();
     const globalInputFileHashes =
       orderedNodes[0] === undefined
         ? yield* hashGlobalInputFiles(
@@ -4449,7 +4480,6 @@ export const executeRun = (
           );
     const groups = taskGroups(graph);
     const pending = new Map(groups.map((members) => [members[0]!, members]));
-    const outcomes = new Map<string, TaskOutcome>();
     const foregroundSemaphore = yield* Effect.makeSemaphore(
       options.concurrency,
     );
@@ -4819,6 +4849,7 @@ export const executeRun = (
           for (const result of results) {
             outcomes.set(result.id, result);
           }
+          reportTaskMetrics();
           if (
             options.continueMode === "never" &&
             results.some((result) => result.exitCode !== 0)
@@ -5005,34 +5036,7 @@ export const executeRun = (
     if (parsed.json) {
       yield* terminal.writeStdout(`${JSON.stringify(summaryRecord)}\n`);
     }
-    context.onTaskMetricsResolved?.(
-      orderedNodes.map((node) => {
-        const outcome = outcomes.get(node.id);
-        return {
-          id: node.id,
-          package: node.package.name,
-          task: node.task,
-          status:
-            outcome === undefined || outcome.skipped
-              ? "skipped"
-              : outcome.exitCode === 0
-                ? "succeeded"
-                : "failed",
-          ...(outcome === undefined
-            ? {}
-            : {
-                exitCode: outcome.exitCode,
-                durationMilliseconds: Math.max(
-                  0,
-                  outcome.endTime - outcome.startTime,
-                ),
-                ...(outcome.cacheSource === undefined
-                  ? {}
-                  : { cacheSource: outcome.cacheSource }),
-              }),
-        };
-      }),
-    );
+    reportTaskMetrics();
     return exitCode;
   }).pipe(
     Effect.onExit(() =>

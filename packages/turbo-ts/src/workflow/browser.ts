@@ -3,6 +3,9 @@ export interface BrowserInvocation {
   readonly args: ReadonlyArray<string>;
 }
 
+const quoteWindowsBrowserUrl = (url: string): string =>
+  `"${url.replaceAll('"', '""')}"`;
+
 export const browserInvocation = (
   platform: NodeJS.Platform,
   url: string,
@@ -10,5 +13,16 @@ export const browserInvocation = (
   platform === "darwin"
     ? { command: "open", args: [url] }
     : platform === "win32"
-      ? { command: "cmd.exe", args: ["/d", "/s", "/c", "start", "", url] }
+      ? {
+          command: "cmd.exe",
+          args: [
+            "/d",
+            "/s",
+            "/v:off",
+            "/c",
+            "start",
+            "",
+            quoteWindowsBrowserUrl(url),
+          ],
+        }
       : { command: "xdg-open", args: [url] };

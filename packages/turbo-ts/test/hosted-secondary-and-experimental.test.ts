@@ -55,6 +55,7 @@ import {
   exportRunMetrics,
   makeOtlpJsonMetrics,
 } from "../src/telemetry/observability.js";
+import { browserInvocation } from "../src/workflow/browser.js";
 import {
   executeDevtools,
   parseDevtoolsArguments,
@@ -482,6 +483,23 @@ describe("hosted compatibility", () => {
               await readFile(join(root, ".turbo/config.json"), "utf8"),
             ),
           ).toEqual({});
+          await writeFile(userPath, "{malformed");
+          const recoveryUnlink = await runCandidate(
+            ["unlink", `--cwd=${root}`],
+            root,
+            {
+              ...environment,
+              TURBO_API: "not-a-url",
+              TURBO_LOGIN: "not-a-url",
+            },
+          );
+          expect(recoveryUnlink.code, recoveryUnlink.stderr).toBe(0);
+          expect(
+            JSON.parse(
+              await readFile(join(root, ".turbo/config.json"), "utf8"),
+            ),
+          ).toEqual({});
+          await writeFile(userPath, JSON.stringify({ token }));
           const personalLink = await runCandidate(
             [
               "link",
@@ -593,6 +611,23 @@ describe("hosted compatibility", () => {
       await rm(directory, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it("quotes complete browser URLs for the Windows command interpreter", () => {
+    const url =
+      "https://login.example.test/turborepo/token?redirect_uri=http%3A%2F%2F127.0.0.1%3A1234%2F&state=synthetic-state";
+    expect(browserInvocation("win32", url)).toEqual({
+      command: "cmd.exe",
+      args: ["/d", "/s", "/v:off", "/c", "start", "", `"${url}"`],
+    });
+    expect(browserInvocation("darwin", url)).toEqual({
+      command: "open",
+      args: [url],
+    });
+    expect(browserInvocation("linux", url)).toEqual({
+      command: "xdg-open",
+      args: [url],
+    });
+  });
 
   it("completes interactive browser login without exposing credentials", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-login-browser-"));
@@ -1197,6 +1232,48 @@ describe("secondary command and parser compatibility", () => {
         ),
       ).toMatchObject({ name: "generated-library", private: true });
 
+      for (const [name, destination] of [
+        ["@bad scope/pkg", "packages/invalid-scoped-space"],
+        ["UPPERCASE", "packages/invalid-uppercase"],
+      ] as const) {
+        const invalidName = await runCandidate(
+          [
+            "generate",
+            "workspace",
+            `--name=${name}`,
+            "--empty",
+            `--destination=${destination}`,
+            `--root=${root}`,
+          ],
+          root,
+        );
+        expect(invalidName.code).toBe(1);
+        expect(invalidName.stderr).toContain(
+          "workspace generation requires a valid --name",
+        );
+        await expect(access(join(root, destination))).rejects.toThrow();
+      }
+      const scopedWorkspace = await runCandidate(
+        [
+          "generate",
+          "workspace",
+          "--name=@valid-scope/generated-scoped",
+          "--empty",
+          "--destination=packages/generated-scoped",
+          `--root=${root}`,
+        ],
+        root,
+      );
+      expect(scopedWorkspace.code, scopedWorkspace.stderr).toBe(0);
+      expect(
+        JSON.parse(
+          await readFile(
+            join(root, "packages/generated-scoped/package.json"),
+            "utf8",
+          ),
+        ).name,
+      ).toBe("@valid-scope/generated-scoped");
+
       const sourceManifestPath = join(root, "packages/library/package.json");
       const sourceManifest = JSON.parse(
         await readFile(sourceManifestPath, "utf8"),
@@ -1224,6 +1301,33 @@ describe("secondary command and parser compatibility", () => {
       expect(JSON.parse(await readFile(sourceManifestPath, "utf8"))).toEqual(
         sourceManifest,
       );
+
+      if (process.platform !== "win32") {
+        const unsupportedTemplateEntry = join(
+          root,
+          "packages/library/z-unsupported-link",
+        );
+        await symlink("package.json", unsupportedTemplateEntry, "file");
+        const failedCopyArguments = [
+          "generate",
+          "workspace",
+          "--name=generated-after-failure",
+          "--copy=packages/library",
+          "--destination=packages/generated-after-failure",
+          `--root=${root}`,
+        ];
+        const failedCopy = await runCandidate(failedCopyArguments, root);
+        expect(failedCopy.code).toBe(1);
+        expect(failedCopy.stderr).toContain(
+          "template contains unsupported entry",
+        );
+        await expect(
+          access(join(root, "packages/generated-after-failure")),
+        ).rejects.toThrow();
+        await rm(unsupportedTemplateEntry);
+        const retriedCopy = await runCandidate(failedCopyArguments, root);
+        expect(retriedCopy.code, retriedCopy.stderr).toBe(0);
+      }
 
       const recursiveCopy = await runCandidate(
         [
@@ -1327,6 +1431,7 @@ describe("secondary command and parser compatibility", () => {
         enabled: true,
         packageManager: "pnpm9",
         timeout: 30,
+        uploadTimeout: 30,
         ui: "stream",
       });
       await mkdir(join(root, ".turbo"), { recursive: true });
@@ -1342,6 +1447,30 @@ describe("secondary command and parser compatibility", () => {
         teamId: null,
         teamSlug: "explicit-team",
       });
+      const environmentConfiguration = await runCandidate(
+        ["config", `--cwd=${root}`],
+        root,
+        {
+          TURBO_REMOTE_CACHE_TIMEOUT: "12.5",
+          TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: "45",
+          TURBO_TEAM: "environment-team",
+        },
+      );
+      expect(JSON.parse(environmentConfiguration.stdout)).toMatchObject({
+        teamId: null,
+        teamSlug: "environment-team",
+        timeout: 12.5,
+        uploadTimeout: 45,
+      });
+      const invalidConfigTimeout = await runCandidate(
+        ["config", `--cwd=${root}`],
+        root,
+        { TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: "invalid" },
+      );
+      expect(invalidConfigTimeout.code).toBe(1);
+      expect(invalidConfigTimeout.stderr).toContain(
+        "invalid remote cache upload timeout",
+      );
       const invalidEnvironment = await runCandidate(
         ["run", "build", `--cwd=${root}`],
         root,
@@ -1840,7 +1969,119 @@ describe("hosted protocols and experimental transports", () => {
       ).pipe(Effect.provide(observabilityLayer)),
     );
     expect(requests).toHaveLength(requestCount);
+
+    await Effect.runPromise(
+      exportRunMetrics(
+        {
+          enabled: true,
+          protocol: "http-json",
+          headers: [],
+          resources: [],
+        },
+        undefined,
+        summary,
+      ).pipe(
+        Effect.provide(
+          Layer.succeed(EnvironmentService, {
+            argv: Effect.succeed([]),
+            cwd: Effect.succeed("/synthetic"),
+            platform: Effect.succeed(process.platform),
+            get: (name) =>
+              Effect.succeed(
+                name === "OTEL_EXPORTER_OTLP_ENDPOINT"
+                  ? "https://collector.example.test/otel/"
+                  : undefined,
+              ),
+            entries: Effect.succeed({}),
+          }),
+        ),
+        Effect.provide(httpLayer),
+        Effect.provide(clockLayer),
+      ),
+    );
+    expect(requests.at(-1)?.url).toBe(
+      "https://collector.example.test/otel/v1/metrics",
+    );
   });
+
+  it("exports resolved non-executing metrics and honors periodic intervals", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-otel-interval-"));
+    const root = join(directory, "repository");
+    await prepareRepository(root);
+    await mkdir(join(root, "packages/library"), { recursive: true });
+    const delayedScript = 'node -e "setTimeout(() => {}, 250)"';
+    await writeFile(
+      join(root, "packages/app/package.json"),
+      JSON.stringify({
+        name: "synthetic-app",
+        private: true,
+        scripts: { build: delayedScript },
+      }),
+    );
+    await writeFile(
+      join(root, "packages/library/package.json"),
+      JSON.stringify({
+        name: "synthetic-library",
+        private: true,
+        scripts: { build: delayedScript },
+      }),
+    );
+    try {
+      await withServer(
+        () => [200, { "content-type": "application/json" }, "{}"],
+        async (baseUrl, requests) => {
+          const otelArguments = [
+            "--no-cache",
+            "--experimental-otel-enabled=true",
+            "--experimental-otel-protocol=http-json",
+            `--experimental-otel-endpoint=${baseUrl}`,
+            "--experimental-otel-metrics-task-details=true",
+            `--cwd=${root}`,
+          ];
+          for (const mode of ["--dry-run=json", "--graph"] as const) {
+            const result = await runCandidate(
+              ["run", "build", mode, ...otelArguments],
+              root,
+            );
+            expect(result.code, result.stderr).toBe(0);
+            const document = JSON.parse(requests.at(-1)?.body ?? "{}");
+            const metrics = document.resourceMetrics[0].scopeMetrics[0].metrics;
+            const runMetric = metrics.find(
+              (metric: { readonly name: string }) =>
+                metric.name === "turbo.run",
+            );
+            const taskCount = runMetric.gauge.dataPoints[0].attributes.find(
+              (attribute: { readonly key: string }) =>
+                attribute.key === "turbo.task_count",
+            );
+            expect(taskCount.value.intValue).toBe("2");
+            const taskMetric = metrics.find(
+              (metric: { readonly name: string }) =>
+                metric.name === "turbo.task",
+            );
+            expect(taskMetric.gauge.dataPoints).toHaveLength(2);
+          }
+
+          const requestCount = requests.length;
+          const periodic = await runCandidate(
+            [
+              "run",
+              "build",
+              "--filter=synthetic-app",
+              "--experimental-otel-interval-ms=25",
+              ...otelArguments,
+            ],
+            root,
+          );
+          expect(periodic.code, periodic.stderr).toBe(0);
+          expect(requests.length - requestCount).toBeGreaterThan(1);
+          expect(requests.at(-1)?.body).toContain("synthetic-app#build");
+        },
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("sends OTLP gRPC over HTTP/2 and handles gRPC status", async () => {
     const requests: Array<{

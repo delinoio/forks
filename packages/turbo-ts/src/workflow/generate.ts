@@ -270,6 +270,32 @@ const copyTree = (
     }
   });
 
+const workspaceNameSegmentPattern = /^[a-z0-9._~-]+$/;
+
+const validWorkspaceNameSegment = (
+  value: string,
+  allowLeadingDotOrUnderscore: boolean,
+): boolean =>
+  value !== "." &&
+  value !== ".." &&
+  workspaceNameSegmentPattern.test(value) &&
+  (allowLeadingDotOrUnderscore || !/^[._]/.test(value));
+
+const validWorkspaceName = (name: string): boolean => {
+  if (name.length === 0 || name.length > 214 || name !== name.toLowerCase()) {
+    return false;
+  }
+  if (!name.startsWith("@")) {
+    return validWorkspaceNameSegment(name, false);
+  }
+  const separator = name.indexOf("/");
+  if (separator <= 1 || separator !== name.lastIndexOf("/")) return false;
+  return (
+    validWorkspaceNameSegment(name.slice(1, separator), false) &&
+    validWorkspaceNameSegment(name.slice(separator + 1), true)
+  );
+};
+
 const executeWorkspaceGenerator = (
   root: string,
   options: GenerateOptions,
@@ -278,7 +304,7 @@ const executeWorkspaceGenerator = (
     const fileSystem = yield* FileSystemService;
     const terminal = yield* TerminalService;
     const name = options.name;
-    if (name === undefined || !/^(?:@[^/]+\/)?[A-Za-z0-9._-]+$/.test(name)) {
+    if (name === undefined || !validWorkspaceName(name)) {
       return yield* Effect.fail(
         failure("workspace generation requires a valid --name"),
       );
@@ -306,7 +332,16 @@ const executeWorkspaceGenerator = (
         failure("workspace destination already exists"),
       );
     }
-    if (options.copy !== undefined && !options.empty) {
+    const materialize = Effect.gen(function* () {
+      if (options.copy === undefined || options.empty) {
+        yield* fileSystem.makeDirectory(destination);
+        yield* fileSystem.writeTextAtomic(
+          joinPath(destination, "package.json"),
+          `${JSON.stringify({ name, version: "0.0.0", private: true }, null, 2)}\n`,
+          0o644,
+        );
+        return;
+      }
       if (/^https?:\/\//.test(options.copy)) {
         return yield* Effect.fail(
           failure(
@@ -354,14 +389,25 @@ const executeWorkspaceGenerator = (
         `${JSON.stringify({ ...manifest, name }, null, 2)}\n`,
         0o644,
       );
-    } else {
-      yield* fileSystem.makeDirectory(destination);
-      yield* fileSystem.writeTextAtomic(
-        joinPath(destination, "package.json"),
-        `${JSON.stringify({ name, version: "0.0.0", private: true }, null, 2)}\n`,
-        0o644,
-      );
-    }
+    });
+    yield* materialize.pipe(
+      Effect.catchAll((cause) =>
+        fileSystem.remove(destination).pipe(
+          Effect.either,
+          Effect.flatMap((cleanup) =>
+            cleanup._tag === "Right"
+              ? Effect.fail(cause)
+              : Effect.fail(
+                  new BoundaryError({
+                    boundary: "generator",
+                    message: `workspace generation failed and destination cleanup failed: ${String(cause)}; ${cleanup.left.message}`,
+                    retryable: false,
+                  }),
+                ),
+          ),
+        ),
+      ),
+    );
     yield* terminal.writeStdout(
       `Generated workspace ${name} at ${destination}\n`,
     );

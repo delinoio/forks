@@ -63,6 +63,25 @@ const requireNoSecondaryArguments = (
   }
 };
 
+const resolvedRemoteTimeout = (
+  input: string | number,
+  path: string,
+  label: string,
+): number => {
+  const seconds = Number(input);
+  if (
+    (typeof input === "string" && input.trim() === "") ||
+    !Number.isFinite(seconds) ||
+    seconds < 0
+  ) {
+    throw new ConfigurationError({
+      path,
+      message: `invalid ${label}: ${String(input)}`,
+    });
+  }
+  return seconds;
+};
+
 const executeBin = (
   arguments_: ReadonlyArray<string>,
 ): Effect.Effect<number, unknown, EnvironmentService | TerminalService> =>
@@ -119,41 +138,69 @@ const executeConfig = (
       repository.root,
     );
     const environmentValue = (name: string) => environment.get(name);
+    const environmentTeamSlug = yield* environmentValue("TURBO_TEAM");
+    const environmentTimeout = yield* environmentValue(
+      "TURBO_REMOTE_CACHE_TIMEOUT",
+    );
+    const environmentUploadTimeout = yield* environmentValue(
+      "TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT",
+    );
+    const remoteConfiguration = global?.remoteCache;
     const apiUrl =
       parsed.options.apiUrl ??
       (yield* environmentValue("TURBO_API")) ??
       project?.apiUrl ??
-      global?.remoteCache?.apiUrl ??
+      remoteConfiguration?.apiUrl ??
       "https://vercel.com/api";
+    const timeoutValue =
+      parsed.options.remoteCacheTimeoutSeconds ??
+      environmentTimeout ??
+      remoteConfiguration?.timeout ??
+      30;
+    const uploadTimeoutValue =
+      parsed.options.remoteCacheTimeoutSeconds ??
+      environmentUploadTimeout ??
+      remoteConfiguration?.uploadTimeout ??
+      remoteConfiguration?.timeout ??
+      30;
     const output = {
       apiUrl,
       loginUrl:
         parsed.options.loginUrl ??
         (yield* environmentValue("TURBO_LOGIN")) ??
-        global?.remoteCache?.loginUrl ??
+        remoteConfiguration?.loginUrl ??
         "https://vercel.com",
       teamSlug:
         parsed.options.team ??
-        (yield* environmentValue("TURBO_TEAM")) ??
+        environmentTeamSlug ??
         project?.teamSlug ??
-        global?.remoteCache?.teamSlug ??
+        remoteConfiguration?.teamSlug ??
         null,
       teamId:
-        parsed.options.team === undefined
+        parsed.options.team === undefined && environmentTeamSlug === undefined
           ? ((yield* environmentValue("TURBO_TEAMID")) ??
             project?.teamId ??
-            global?.remoteCache?.teamId ??
+            remoteConfiguration?.teamId ??
             null)
           : null,
-      signature: global?.remoteCache?.signature ?? false,
+      signature: remoteConfiguration?.signature ?? false,
       preflight:
-        parsed.options.preflight || (global?.remoteCache?.preflight ?? false),
-      timeout:
-        parsed.options.remoteCacheTimeoutSeconds ??
-        global?.remoteCache?.timeout ??
-        30,
-      uploadTimeout: global?.remoteCache?.uploadTimeout ?? 60,
-      enabled: global?.remoteCache?.enabled ?? true,
+        parsed.options.preflight || (remoteConfiguration?.preflight ?? false),
+      timeout: resolvedRemoteTimeout(
+        timeoutValue,
+        environmentTimeout === undefined
+          ? repository.rootConfiguration.path
+          : "TURBO_REMOTE_CACHE_TIMEOUT",
+        "remote cache timeout",
+      ),
+      uploadTimeout: resolvedRemoteTimeout(
+        uploadTimeoutValue,
+        environmentUploadTimeout === undefined
+          ? repository.rootConfiguration.path
+          : "TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT",
+        "remote cache upload timeout",
+      ),
+      enabled: remoteConfiguration?.enabled ?? true,
       ui: parsed.options.ui ?? global?.ui ?? "stream",
       packageManager: repositoryPackageManagerLabel(repository),
       daemon: global?.daemon ?? null,

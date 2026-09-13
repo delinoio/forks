@@ -954,7 +954,9 @@ origin at `/turborepo/token`, and accepts a token through a scoped loopback
 callback protected by a fresh UUID v7 state value. The callback response is
 sent before the token is validated and persisted, and neither the state nor the
 token is written to terminal output. Manual and non-interactive login continue
-to require `--token` or `TURBO_TOKEN`.
+to require `--token` or `TURBO_TOKEN`. Windows browser launches quote the full
+callback URL before handing it to `cmd.exe`. Unlink resolves only the repository
+configuration path and does not read shared hosted settings or user credentials.
 User credentials use private directories, `0600` files on POSIX, atomic
 replacement, regular-file checks, bounded reads, and secret-safe diagnostics.
 Project configuration writes reject symlinked `.turbo` directories before
@@ -980,7 +982,8 @@ suppresses lower-precedence stored team IDs. Hosted and OTLP requests identify
 as `turbo-ts/0.1.0`. Runtime remote API selection uses CLI, environment, linked
 project, root configuration, and default values in descending precedence, so a
 linked project's stored token is never redirected by a lower-precedence root
-API setting.
+API setting. Remote cache hit events are emitted only after signature
+verification, decompression, and archive restoration succeed.
 
 Telemetry state remains compatible with official state that omits the optional
 alert timestamp, preserves identity across enable and disable operations, and
@@ -991,8 +994,12 @@ bounded request timeouts, environment and CLI headers, resource attributes,
 run-summary and task-detail selection, and an explicit opt-in to reuse the
 resolved remote cache token. Every exported run and task gauge point carries
 the export observation time in Unix nanoseconds. Task-detail metrics report
-actual execution and cache outcomes. Export failure never changes task
-execution status.
+actual execution and cache outcomes. A generic HTTP OTLP endpoint preserves its
+path prefix and appends `/v1/metrics`. A positive metric interval emits scoped,
+sequential in-progress snapshots and a final snapshot; zero or an absent
+interval emits only the final snapshot. Graph and dry runs report the resolved
+task count rather than the number of requested task names. Export failure never
+changes task execution status.
 
 The secondary command set includes versioned documentation search, internal
 workspace and configured generation without `@turbo/gen`, token-protected
@@ -1005,20 +1012,28 @@ filters select the packages that own the evaluated rules using normal
 package-selector semantics. `--ignore=prompt` asks once before ignoring found
 violations, accepts only `y` or `yes`, skips prompting when no violation exists,
 and fails safely without an interactive terminal. Hidden `config` suppresses
-lower-precedence team IDs when an explicit team slug is selected. Microfrontend
-configuration is selected only from the explicit `--cwd`, or the process
-working directory when the option is absent, and its package ancestors after
-platform-aware canonical path normalization. Generator destinations are
-validated through canonical existing ancestors, and recursive copies whose
-source contains their destination are rejected. Copied workspace templates
+lower-precedence team IDs when a CLI or environment team slug is selected.
+Remote download and upload timeouts use CLI, environment, configuration, and
+default values in descending precedence and reject negative, empty, or
+non-finite environment values. Microfrontend configuration is selected only
+from the explicit `--cwd`, or the process working directory when the option is
+absent, and its package ancestors after platform-aware canonical path
+normalization.
+Generator destinations are validated through canonical existing ancestors,
+and recursive copies whose source contains their destination are rejected.
+Requested workspace names must be npm-compatible. Copied workspace templates
 require an object `package.json`, preserve its other fields, and atomically
-rewrite `name` to the requested workspace name. Update checks remain disabled
-by default; the explicit
+rewrite `name` to the requested workspace name. Failed template copies or
+manifest rewrites remove the partial destination so a retry can succeed. Update
+checks remain disabled by default; the explicit
 test-only forced check reads stable upstream tags and reports against the fixed
 2.10.12 baseline. Aube and Nub native or delegated lockfiles retain their
 declared command identity, and tool identity is probed through scoped mocked
 process boundaries in conformance tests. Cargo/rustc 1.97.1 and uv 0.12.7
 remain the fixed experimental matrix entries.
+
+Daemon preference forwarding remains planned until the runtime consumes or
+rejects the resolved startup and idle-time options.
 
 Only behavior with automated ledger evidence is a compatibility claim. The
 project-wide composed task-hash row remains planned as documented above; no

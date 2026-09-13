@@ -14162,6 +14162,7 @@ describe("cache interoperability and safety", () => {
       signatureKey: "0123456789abcdef0123456789abcdef",
       token: "dummy-token",
       teamId: "team_synthetic",
+      sessionId: "01992345-6789-7abc-8def-0123456789ab",
     };
     const streamedPath = `packages/app/${"nested-segment/".repeat(12)}remote-large.txt`;
     const streamedContents = new Uint8Array(2 * 1024 * 1024).fill(0x61);
@@ -14274,6 +14275,7 @@ describe("cache interoperability and safety", () => {
       expect(requestPaths).toEqual([
         "/cache/api/v8/artifacts/0011223344556677",
         "/cache/api/v8/artifacts/0011223344556677",
+        "/cache/api/v8/artifacts/events",
         "/cache/api/v8/artifacts/0011223344556677",
       ]);
     } finally {

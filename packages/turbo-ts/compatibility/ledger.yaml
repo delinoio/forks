@@ -160,7 +160,7 @@ rows:
     category: option
     subject: run daemon preference switches
     targetGate: 3
-    status: passing
+    status: planned
     variants:
       - --daemon
       - --no-daemon

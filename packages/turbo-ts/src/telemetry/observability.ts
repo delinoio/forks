@@ -268,7 +268,11 @@ export const makeOtlpJsonMetrics = (
   };
 };
 
-const endpointFor = (configured: string, protocol: OtlpProtocol): string => {
+const endpointFor = (
+  configured: string,
+  protocol: OtlpProtocol,
+  appendHttpMetricsPath: boolean,
+): string => {
   const url = new URL(configured);
   if (url.username !== "" || url.password !== "") {
     throw new TypeError("OTLP endpoint must not contain credentials");
@@ -276,7 +280,9 @@ const endpointFor = (configured: string, protocol: OtlpProtocol): string => {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new TypeError("OTLP endpoint must use HTTP or HTTPS");
   }
-  if (url.pathname === "/" || url.pathname === "") {
+  if (appendHttpMetricsPath && protocol !== "grpc") {
+    url.pathname = `${url.pathname.replace(/\/+$/, "")}/v1/metrics`;
+  } else if (url.pathname === "/" || url.pathname === "") {
     url.pathname =
       protocol === "grpc"
         ? "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export"
@@ -315,9 +321,12 @@ export const exportRunMetrics = (
         yield* environment.get("OTEL_EXPORTER_OTLP_PROTOCOL"),
       ) ??
       "http-protobuf";
+    const environmentEndpoint = yield* environment.get(
+      "OTEL_EXPORTER_OTLP_ENDPOINT",
+    );
     const endpoint =
       options.endpoint ??
-      (yield* environment.get("OTEL_EXPORTER_OTLP_ENDPOINT")) ??
+      environmentEndpoint ??
       (protocol === "grpc" ? "http://127.0.0.1:4317" : "http://127.0.0.1:4318");
     const environmentTimeout = Number(
       yield* environment.get("OTEL_EXPORTER_OTLP_TIMEOUT"),
@@ -369,7 +378,11 @@ export const exportRunMetrics = (
     new DataView(grpcHeader.buffer).setUint32(1, payload.length, false);
     const body = protocol === "grpc" ? concat(grpcHeader, payload) : payload;
     const response = yield* http.request({
-      url: endpointFor(endpoint, protocol),
+      url: endpointFor(
+        endpoint,
+        protocol,
+        options.endpoint === undefined && environmentEndpoint !== undefined,
+      ),
       method: "POST",
       transport: protocol === "grpc" ? "http2" : undefined,
       headers,

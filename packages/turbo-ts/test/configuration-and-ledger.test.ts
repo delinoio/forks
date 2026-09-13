@@ -518,7 +518,7 @@ describe("configuration generation and compatibility ledger", () => {
     expect(
       ledger.rows.find((row) => row.id === "cli.run-daemon-options"),
     ).toMatchObject({
-      status: "passing",
+      status: "planned",
       variants: ["--daemon", "--no-daemon"],
     });
     expect(

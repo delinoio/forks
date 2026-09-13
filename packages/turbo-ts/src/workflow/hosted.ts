@@ -550,6 +550,16 @@ export const executeHostedCommand = (
     const options = parseHostedArguments(command, arguments_);
     const credentials = yield* CredentialService;
     const terminal = yield* TerminalService;
+
+    if (command === "unlink") {
+      const root = yield* resolveWorkflowRepositoryRoot({
+        cwd: options.common.cwd,
+      });
+      yield* credentials.writeProjectConfiguration(root, {});
+      yield* terminal.writeStdout(">>> Disabled Remote Caching\n");
+      return 0;
+    }
+
     const settings = yield* resolveHostedSettings(options);
 
     if (command === "login") {
@@ -619,12 +629,6 @@ export const executeHostedCommand = (
     const root = yield* resolveWorkflowRepositoryRoot({
       cwd: options.common.cwd,
     });
-    if (command === "unlink") {
-      yield* credentials.writeProjectConfiguration(root, {});
-      yield* terminal.writeStdout(">>> Disabled Remote Caching\n");
-      return 0;
-    }
-
     const token = settings.token;
     if (token === undefined) {
       return yield* Effect.fail(

@@ -1,6 +1,7 @@
-import { Cause, Effect } from "effect";
+import { Cause, Effect, Fiber } from "effect";
 import { UnsupportedCompatibilityError } from "../effect/errors.js";
 import {
+  ClockService,
   EnvironmentService,
   ExitStatusService,
   TerminalService,
@@ -446,30 +447,59 @@ export const cliProgram = Effect.gen(function* () {
       Effect.flatMap((options) => {
         let remoteToken = options.token;
         let taskDetails: ReadonlyArray<RunMetricTaskDetail> | undefined;
-        return executeRun(options, {
-          onRemoteTokenResolved: (token) => {
-            remoteToken = token;
-          },
-          onTaskMetricsResolved: (tasks) => {
-            taskDetails = tasks;
-          },
-        }).pipe(
-          Effect.tap((exitCode) =>
-            Effect.promise(() => import("../telemetry/observability.js")).pipe(
-              Effect.flatMap((observability) =>
-                observability.exportRunMetrics(
-                  options.openTelemetry,
-                  remoteToken,
-                  {
-                    exitCode,
-                    taskCount: taskDetails?.length ?? options.tasks.length,
-                    tasks: taskDetails ?? [],
-                  },
-                ),
-              ),
-              Effect.catchAll(() => Effect.void),
-            ),
-          ),
+        return Effect.scoped(
+          Effect.gen(function* () {
+            const observability = yield* Effect.promise(
+              () => import("../telemetry/observability.js"),
+            );
+            const exportMetrics = (exitCode: number) =>
+              observability
+                .exportRunMetrics(options.openTelemetry, remoteToken, {
+                  exitCode,
+                  taskCount: taskDetails?.length ?? options.tasks.length,
+                  tasks: taskDetails ?? [],
+                })
+                .pipe(Effect.catchAll(() => Effect.void));
+            const interval = options.openTelemetry.intervalMilliseconds ?? 0;
+            const periodicFiber =
+              interval > 0
+                ? yield* Effect.gen(function* () {
+                    const clock = yield* ClockService;
+                    return yield* Effect.forever(
+                      clock
+                        .sleep(interval)
+                        .pipe(
+                          Effect.zipRight(
+                            Effect.suspend(() =>
+                              taskDetails === undefined
+                                ? Effect.void
+                                : exportMetrics(
+                                    taskDetails.some(
+                                      (task) => task.status === "failed",
+                                    )
+                                      ? 1
+                                      : 0,
+                                  ),
+                            ),
+                          ),
+                        ),
+                    ).pipe(Effect.forkScoped);
+                  })
+                : undefined;
+            const exitCode = yield* executeRun(options, {
+              onRemoteTokenResolved: (token) => {
+                remoteToken = token;
+              },
+              onTaskMetricsResolved: (tasks) => {
+                taskDetails = tasks;
+              },
+            });
+            if (periodicFiber !== undefined) {
+              yield* Fiber.interrupt(periodicFiber);
+            }
+            yield* exportMetrics(exitCode);
+            return exitCode;
+          }),
         );
       }),
     ) as Effect.Effect<number, unknown, never>;
