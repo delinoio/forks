@@ -53,6 +53,24 @@ const packageRoot = fileURLToPath(new URL("../", import.meta.url));
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const candidate = join(packageRoot, "dist/bin/turbo-ts.js");
 const official = join(repositoryRoot, "node_modules/.bin/turbo");
+// Keep Gate 4 command assertions independent of ambient CI and test-runner
+// color behavior. Remove this isolation when those environments gain coverage.
+const ambientOutputEnvironmentNames = new Set([
+  "CI",
+  "FORCE_COLOR",
+  "GITHUB_ACTIONS",
+  "NO_COLOR",
+  "TURBO_TELEMETRY_DISABLED",
+]);
+const commandEnvironment: NodeJS.ProcessEnv = {
+  ...Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name]) => !ambientOutputEnvironmentNames.has(name.toUpperCase()),
+    ),
+  ),
+  NO_COLOR: "1",
+  TURBO_TELEMETRY_DISABLED: "1",
+};
 
 interface CommandResult {
   readonly code: number;
@@ -70,9 +88,7 @@ const runCommand = async (
     const result = await execFilePromise(command, [...arguments_], {
       cwd,
       env: {
-        ...process.env,
-        NO_COLOR: "1",
-        TURBO_TELEMETRY_DISABLED: "1",
+        ...commandEnvironment,
         ...environment,
       },
       maxBuffer: 4 * 1024 * 1024,
