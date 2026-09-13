@@ -4,7 +4,11 @@ import type {
   OtlpProtocol,
 } from "../cli/common-options.js";
 import { BoundaryError } from "../effect/errors.js";
-import { EnvironmentService, HttpService } from "../effect/services.js";
+import {
+  ClockService,
+  EnvironmentService,
+  HttpService,
+} from "../effect/services.js";
 import type { RunMetricTaskDetail } from "../run/engine.js";
 import { packageVersion } from "../version.js";
 
@@ -95,6 +99,7 @@ const resourceAttributes = (
 // generated OTLP dependency.
 export const encodeOtlpMetrics = (
   summary: RunMetricSummary,
+  observationTimeUnixNano: bigint,
   configuredResources: ReadonlyArray<readonly [string, string]> = [],
   selection: MetricSelection = { runSummary: true, taskDetails: false },
 ): Uint8Array => {
@@ -109,6 +114,7 @@ export const encodeOtlpMetrics = (
     attributes: ReadonlyArray<readonly [string, string]>,
   ): Uint8Array =>
     concat(
+      fixed64Field(3, observationTimeUnixNano),
       fixed64Field(6, 1n),
       ...attributes.map(([key, value]) => field(7, keyValue(key, value))),
     );
@@ -175,6 +181,7 @@ export const encodeOtlpMetrics = (
 
 export const makeOtlpJsonMetrics = (
   summary: RunMetricSummary,
+  observationTimeUnixNano: bigint,
   configuredResources: ReadonlyArray<readonly [string, string]> = [],
   selection: MetricSelection = { runSummary: true, taskDetails: false },
 ): Readonly<Record<string, unknown>> => {
@@ -195,6 +202,7 @@ export const makeOtlpJsonMetrics = (
               dataPoints: [
                 {
                   asInt: "1",
+                  timeUnixNano: observationTimeUnixNano.toString(),
                   attributes: [
                     integerAttribute("turbo.exit_code", summary.exitCode),
                     integerAttribute("turbo.task_count", summary.taskCount),
@@ -212,6 +220,7 @@ export const makeOtlpJsonMetrics = (
             gauge: {
               dataPoints: summary.tasks.map((task) => ({
                 asInt: "1",
+                timeUnixNano: observationTimeUnixNano.toString(),
                 attributes: [
                   stringAttribute("turbo.task_id", task.id),
                   stringAttribute("turbo.package", task.package),
@@ -280,7 +289,11 @@ export const exportRunMetrics = (
   options: OpenTelemetryOptions,
   token: string | undefined,
   summary: RunMetricSummary,
-): Effect.Effect<void, BoundaryError, EnvironmentService | HttpService> =>
+): Effect.Effect<
+  void,
+  BoundaryError,
+  ClockService | EnvironmentService | HttpService
+> =>
   Effect.gen(function* () {
     const environment = yield* EnvironmentService;
     const http = yield* HttpService;
@@ -293,6 +306,9 @@ export const exportRunMetrics = (
       taskDetails: options.metricsTaskDetails === true,
     };
     if (!selection.runSummary && !selection.taskDetails) return;
+    const clock = yield* ClockService;
+    const observationTimeUnixNano =
+      BigInt(Math.floor(yield* clock.now)) * 1_000_000n;
     const protocol =
       options.protocol ??
       protocolFromEnvironment(
@@ -335,10 +351,20 @@ export const exportRunMetrics = (
       protocol === "http-json"
         ? new TextEncoder().encode(
             JSON.stringify(
-              makeOtlpJsonMetrics(summary, options.resources, selection),
+              makeOtlpJsonMetrics(
+                summary,
+                observationTimeUnixNano,
+                options.resources,
+                selection,
+              ),
             ),
           )
-        : encodeOtlpMetrics(summary, options.resources, selection);
+        : encodeOtlpMetrics(
+            summary,
+            observationTimeUnixNano,
+            options.resources,
+            selection,
+          );
     const grpcHeader = new Uint8Array(5);
     new DataView(grpcHeader.buffer).setUint32(1, payload.length, false);
     const body = protocol === "grpc" ? concat(grpcHeader, payload) : payload;

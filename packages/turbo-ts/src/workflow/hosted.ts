@@ -531,6 +531,7 @@ export const executeHostedCommand = (
     const existing = (yield* credentials.readProjectConfiguration(root)) ?? {};
     yield* credentials.writeProjectConfiguration(root, {
       ...existing,
+      apiUrl: settings.api.toString(),
       teamId: team.id,
     });
     if (!options.noGitignore) yield* updateGitIgnore(root);

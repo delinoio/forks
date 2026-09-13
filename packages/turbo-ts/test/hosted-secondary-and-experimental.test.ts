@@ -32,6 +32,7 @@ import { evidenceId } from "../src/compatibility/ledger.js";
 import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import { nodeFoundationLayer } from "../src/effect/node-layer.js";
 import {
+  ClockService,
   deterministicRetryLayer,
   EnvironmentService,
   type HttpRequest,
@@ -311,6 +312,7 @@ describe("hosted compatibility", () => {
                   ? [200, { "content-type": "application/json" }, "{}"]
                   : [404, {}, "not found"],
         async (baseUrl, requests) => {
+          const configuredApiUrl = new URL(baseUrl).toString();
           const environment = { XDG_CONFIG_HOME: configurationHome };
           const login = await runCandidate(
             [
@@ -381,7 +383,19 @@ describe("hosted compatibility", () => {
             JSON.parse(
               await readFile(join(root, ".turbo/config.json"), "utf8"),
             ),
-          ).toEqual({ teamId: "team_synthetic" });
+          ).toEqual({
+            apiUrl: configuredApiUrl,
+            teamId: "team_synthetic",
+          });
+          const linkedConfiguration = await runCandidate(
+            ["config", `--cwd=${root}`],
+            root,
+            environment,
+          );
+          expect(linkedConfiguration.code, linkedConfiguration.stderr).toBe(0);
+          expect(JSON.parse(linkedConfiguration.stdout).apiUrl).toBe(
+            configuredApiUrl,
+          );
           expect(await readFile(join(root, ".gitignore"), "utf8")).toContain(
             ".turbo",
           );
@@ -411,7 +425,10 @@ describe("hosted compatibility", () => {
             JSON.parse(
               await readFile(join(root, ".turbo/config.json"), "utf8"),
             ),
-          ).toEqual({ teamId: "user_synthetic" });
+          ).toEqual({
+            apiUrl: configuredApiUrl,
+            teamId: "user_synthetic",
+          });
           const disabledLink = await runCandidate(
             [
               "link",
@@ -431,7 +448,10 @@ describe("hosted compatibility", () => {
             JSON.parse(
               await readFile(join(root, ".turbo/config.json"), "utf8"),
             ),
-          ).toEqual({ teamId: "user_synthetic" });
+          ).toEqual({
+            apiUrl: configuredApiUrl,
+            teamId: "user_synthetic",
+          });
           const disabledLogin = await runCandidate(
             [
               "login",
@@ -600,6 +620,72 @@ describe("hosted compatibility", () => {
           await expect(
             readFile(join(root, ".relative-config/turborepo/config.json")),
           ).rejects.toThrow();
+        },
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects symlinked project configuration directories", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-project-config-"));
+    const root = join(directory, "repository");
+    const outside = join(directory, "outside");
+    const outsideConfiguration = join(outside, "config.json");
+    await prepareRepository(root);
+    await mkdir(outside, { recursive: true });
+    await writeFile(
+      outsideConfiguration,
+      JSON.stringify({ sentinel: "retained" }),
+    );
+    await symlink(outside, join(root, ".turbo"), "dir");
+    try {
+      await withServer(
+        (request) =>
+          request.url === "/v2/user"
+            ? [
+                200,
+                { "content-type": "application/json" },
+                '{"user":{"id":"user_synthetic","username":"synthetic-user","name":"Synthetic User"}}',
+              ]
+            : request.url === "/v2/teams?limit=100"
+              ? [200, { "content-type": "application/json" }, '{"teams":[]}']
+              : request.url?.startsWith("/v8/artifacts/status") === true
+                ? [
+                    200,
+                    { "content-type": "application/json" },
+                    '{"status":"enabled"}',
+                  ]
+                : [404, {}, "not found"],
+        async (baseUrl) => {
+          const link = await runCandidate(
+            [
+              "link",
+              "--scope=synthetic-user",
+              "--yes",
+              "--token=synthetic-token",
+              `--api=${baseUrl}`,
+              `--cwd=${root}`,
+            ],
+            root,
+          );
+          expect(link.code).toBe(1);
+          expect(link.stderr).toContain(
+            "credential configuration operation failed",
+          );
+          expect(
+            JSON.parse(await readFile(outsideConfiguration, "utf8")),
+          ).toEqual({ sentinel: "retained" });
+
+          const unlink = await runCandidate(["unlink", `--cwd=${root}`], root);
+          expect(unlink.code).toBe(1);
+          expect(unlink.stderr).toContain(
+            "credential configuration operation failed",
+          );
+          expect(
+            JSON.parse(await readFile(outsideConfiguration, "utf8")),
+          ).toEqual({ sentinel: "retained" });
         },
       );
     } finally {
@@ -778,6 +864,36 @@ describe("secondary command and parser compatibility", () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-secondary-"));
     const root = join(directory, "repository");
     await prepareRepository(root);
+    await mkdir(join(root, "packages/library"), { recursive: true });
+    await writeFile(
+      join(root, "packages/app/package.json"),
+      JSON.stringify({
+        name: "synthetic-app",
+        private: true,
+        scripts: { build: 'node -e ""' },
+        dependencies: { "synthetic-library": "workspace:*" },
+      }),
+    );
+    await writeFile(
+      join(root, "packages/app/turbo.json"),
+      JSON.stringify({
+        extends: ["//"],
+        tags: ["app"],
+        boundaries: { dependencies: { deny: ["library"] } },
+      }),
+    );
+    await writeFile(
+      join(root, "packages/library/package.json"),
+      JSON.stringify({ name: "synthetic-library", private: true }),
+    );
+    await writeFile(
+      join(root, "packages/library/turbo.json"),
+      JSON.stringify({
+        extends: ["//"],
+        tags: ["library"],
+        boundaries: { dependents: { deny: ["app"] } },
+      }),
+    );
     await writeFile(
       join(root, "microfrontends.json"),
       JSON.stringify({
@@ -877,8 +993,8 @@ describe("secondary command and parser compatibility", () => {
       }
 
       const mfe = await runCandidate(
-        ["get-mfe-port", `--cwd=${root}`],
-        join(root, "packages/app"),
+        ["get-mfe-port", "--cwd=packages/app"],
+        root,
       );
       expect(mfe).toMatchObject({ code: 0, stdout: "4123\n" });
       await writeFile(
@@ -890,14 +1006,14 @@ describe("secondary command and parser compatibility", () => {
         }),
       );
       const generatedMfe = await runCandidate(
-        ["get-mfe-port", `--cwd=${root}`],
-        join(root, "packages/app"),
+        ["get-mfe-port", "--cwd=packages/app"],
+        root,
       );
       expect(generatedMfe).toMatchObject({ code: 0, stdout: "6697\n" });
       await rm(join(root, "packages/app/microfrontends.json"));
       const inheritedMfe = await runCandidate(
-        ["get-mfe-port", `--cwd=${root}`],
-        join(root, "packages/app"),
+        ["get-mfe-port", "--cwd=packages/app"],
+        root,
       );
       expect(inheritedMfe).toMatchObject({ code: 0, stdout: "4001\n" });
 
@@ -912,6 +1028,19 @@ describe("secondary command and parser compatibility", () => {
         packageManager: "pnpm9",
         timeout: 30,
         ui: "stream",
+      });
+      await mkdir(join(root, ".turbo"), { recursive: true });
+      await writeFile(
+        join(root, ".turbo/config.json"),
+        JSON.stringify({ teamId: "stored-team-id", teamSlug: "stored-team" }),
+      );
+      const explicitTeamConfiguration = await runCandidate(
+        ["config", "--team=explicit-team", `--cwd=${root}`],
+        root,
+      );
+      expect(JSON.parse(explicitTeamConfiguration.stdout)).toMatchObject({
+        teamId: null,
+        teamSlug: "explicit-team",
       });
       const invalidEnvironment = await runCandidate(
         ["run", "build", `--cwd=${root}`],
@@ -934,6 +1063,17 @@ describe("secondary command and parser compatibility", () => {
           )
         ).code,
       ).toBe(0);
+      const filteredBoundaries = await runCandidate(
+        ["boundaries", "--filter={./packages/app}", `--cwd=${root}`],
+        root,
+      );
+      expect(filteredBoundaries.code).toBe(1);
+      expect(filteredBoundaries.stderr).toContain(
+        "denylist for `synthetic-app`",
+      );
+      expect(filteredBoundaries.stderr).not.toContain(
+        "denylist for `synthetic-library`",
+      );
       await exerciseDevtools(root);
 
       await withServer(
@@ -1233,6 +1373,18 @@ describe("hosted protocols and experimental transports", () => {
       get: () => Effect.succeed(undefined),
       entries: Effect.succeed({}),
     });
+    const observationTimeMilliseconds = 1_700_000_000_123;
+    const observationTimeUnixNano =
+      BigInt(observationTimeMilliseconds) * 1_000_000n;
+    const clockLayer = Layer.succeed(ClockService, {
+      now: Effect.succeed(observationTimeMilliseconds),
+      sleep: () => Effect.void,
+    });
+    const observabilityLayer = Layer.mergeAll(
+      httpLayer,
+      environmentLayer,
+      clockLayer,
+    );
     const summary = {
       exitCode: 0,
       taskCount: 2,
@@ -1261,7 +1413,7 @@ describe("hosted protocols and experimental transports", () => {
           },
           "synthetic-token",
           summary,
-        ).pipe(Effect.provide(Layer.merge(httpLayer, environmentLayer))),
+        ).pipe(Effect.provide(observabilityLayer)),
       );
     }
     expect(
@@ -1278,9 +1430,47 @@ describe("hosted protocols and experimental transports", () => {
         "x-synthetic": "yes",
       });
     }
-    const json = makeOtlpJsonMetrics(summary);
+    const metricSelection = { runSummary: true, taskDetails: true };
+    const json = makeOtlpJsonMetrics(
+      summary,
+      observationTimeUnixNano,
+      [],
+      metricSelection,
+    );
     expect(JSON.stringify(json)).toContain('"service.name"');
-    expect(encodeOtlpMetrics(summary).byteLength).toBeGreaterThan(20);
+    const resourceMetrics = json.resourceMetrics as ReadonlyArray<{
+      readonly scopeMetrics: ReadonlyArray<{
+        readonly metrics: ReadonlyArray<{
+          readonly gauge: {
+            readonly dataPoints: ReadonlyArray<{
+              readonly timeUnixNano: string;
+            }>;
+          };
+        }>;
+      }>;
+    }>;
+    const jsonDataPoints = resourceMetrics[0]!.scopeMetrics[0]!.metrics.flatMap(
+      (metric) => metric.gauge.dataPoints,
+    );
+    expect(jsonDataPoints).toHaveLength(2);
+    expect(
+      jsonDataPoints.every(
+        (point) => point.timeUnixNano === observationTimeUnixNano.toString(),
+      ),
+    ).toBe(true);
+    const protobuf = Buffer.from(
+      encodeOtlpMetrics(summary, observationTimeUnixNano, [], metricSelection),
+    );
+    const protobufTimestamp = Buffer.alloc(9);
+    protobufTimestamp[0] = 0x19;
+    protobufTimestamp.writeBigUInt64LE(observationTimeUnixNano, 1);
+    let protobufTimestampCount = 0;
+    for (let offset = 0; offset <= protobuf.length - 9; offset += 1) {
+      if (protobuf.subarray(offset, offset + 9).equals(protobufTimestamp)) {
+        protobufTimestampCount += 1;
+      }
+    }
+    expect(protobufTimestampCount).toBe(2);
 
     await Effect.runPromise(
       exportRunMetrics(
@@ -1295,7 +1485,7 @@ describe("hosted protocols and experimental transports", () => {
         },
         undefined,
         summary,
-      ).pipe(Effect.provide(Layer.merge(httpLayer, environmentLayer))),
+      ).pipe(Effect.provide(observabilityLayer)),
     );
     const taskMetricBody = requests.at(-1)?.body;
     const taskMetrics = JSON.parse(
@@ -1324,7 +1514,7 @@ describe("hosted protocols and experimental transports", () => {
         },
         undefined,
         summary,
-      ).pipe(Effect.provide(Layer.merge(httpLayer, environmentLayer))),
+      ).pipe(Effect.provide(observabilityLayer)),
     );
     expect(requests).toHaveLength(requestCount);
   });

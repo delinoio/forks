@@ -1756,7 +1756,13 @@ const writeConfigurationObject = async (
     recursive: true,
     mode: privateDirectory ? 0o700 : 0o755,
   });
-  if (privateDirectory) await ensurePrivateDirectoryPath(directory);
+  if (privateDirectory) {
+    await ensurePrivateDirectoryPath(directory);
+  } else if (!(await lstat(directory)).isDirectory()) {
+    throw new TypeError(
+      "project configuration directory is not a real directory",
+    );
+  }
   const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {

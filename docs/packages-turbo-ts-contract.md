@@ -950,11 +950,13 @@ repository configuration file. Relative `XDG_CONFIG_HOME` values are ignored in
 favor of the platform configuration directory.
 User credentials use private directories, `0600` files on POSIX, atomic
 replacement, regular-file checks, bounded reads, and secret-safe diagnostics.
+Project configuration writes reject symlinked `.turbo` directories before
+creating or replacing `config.json`.
 Link discovery uses the hosted user and team endpoints, verifies artifact
 status is exactly `enabled`, offers the personal user scope alongside team
-scopes, persists only the selected identity, and keeps `.turbo` ignored unless
-`--no-gitignore` is requested. Logout can invalidate the current token before
-removing it while retaining unrelated shared configuration fields.
+scopes, persists the selected identity and validated API URL, and keeps `.turbo`
+ignored unless `--no-gitignore` is requested. Logout can invalidate the current
+token before removing it while retaining unrelated shared configuration fields.
 
 Remote cache control and artifact traffic supports team IDs and slugs,
 preflight, bounded responses, separate download and upload timeouts, safe
@@ -973,19 +975,24 @@ the persisted preference. OTLP run metrics support HTTP/JSON,
 HTTP/Protobuf, and HTTP/2 gRPC framing with required successful gRPC trailers,
 bounded request timeouts, environment and CLI headers, resource attributes,
 run-summary and task-detail selection, and an explicit opt-in to reuse the
-resolved remote cache token. Task-detail metrics report actual execution and
-cache outcomes. Export failure never changes task execution status.
+resolved remote cache token. Every exported run and task gauge point carries
+the export observation time in Unix nanoseconds. Task-detail metrics report
+actual execution and cache outcomes. Export failure never changes task
+execution status.
 
 The secondary command set includes versioned documentation search, internal
 workspace and configured generation without `@turbo/gen`, token-protected
 loopback devtools, boundary diagnostics, deterministic microfrontend ports,
 `bin`, hidden `config`, deprecated `scan`, and the remaining daemon, alias, and
 parser surfaces. Documentation output honors both `NO_COLOR` and `--no-color`.
-Microfrontend configuration is selected only from the current package and its
-ancestors after platform-aware path normalization. Generator destinations are
-validated through canonical existing ancestors, and recursive copies whose
-source contains their destination are rejected. Update checks remain disabled
-by default; the explicit
+Boundary filters select the packages that own the evaluated rules using normal
+package-selector semantics. Hidden `config` suppresses lower-precedence team
+IDs when an explicit team slug is selected. Microfrontend configuration is
+selected only from the explicit `--cwd`, or the process working directory when
+the option is absent, and its package ancestors after platform-aware canonical
+path normalization. Generator destinations are validated through canonical
+existing ancestors, and recursive copies whose source contains their
+destination are rejected. Update checks remain disabled by default; the explicit
 test-only forced check reads stable upstream tags and reports against the fixed
 2.10.12 baseline. Aube and Nub native or delegated lockfiles retain their
 declared command identity, and tool identity is probed through scoped mocked

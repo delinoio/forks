@@ -1,7 +1,12 @@
 import { Effect } from "effect";
 import { parseCommonArguments } from "../cli/common-options.js";
 import { parseJsonConfiguration } from "../config/runtime.js";
-import { isPathContained, joinPath, normalizePath } from "../core/path.js";
+import {
+  isAbsolutePath,
+  isPathContained,
+  joinPath,
+  normalizePath,
+} from "../core/path.js";
 import { BoundaryError, ConfigurationError } from "../effect/errors.js";
 import {
   CredentialService,
@@ -11,6 +16,7 @@ import {
   ProcessService,
   TerminalService,
 } from "../effect/services.js";
+import { selectPackages } from "../graph/task-graph.js";
 import { packageVersion } from "../version.js";
 import { boundaryDiagnostics } from "./query.js";
 import {
@@ -133,10 +139,12 @@ const executeConfig = (
         global?.remoteCache?.teamSlug ??
         null,
       teamId:
-        (yield* environmentValue("TURBO_TEAMID")) ??
-        project?.teamId ??
-        global?.remoteCache?.teamId ??
-        null,
+        parsed.options.team === undefined
+          ? ((yield* environmentValue("TURBO_TEAMID")) ??
+            project?.teamId ??
+            global?.remoteCache?.teamId ??
+            null)
+          : null,
       signature: global?.remoteCache?.signature ?? false,
       preflight:
         parsed.options.preflight || (global?.remoteCache?.preflight ?? false),
@@ -202,14 +210,15 @@ const executeBoundaries = (
       cwd: parsed.options.cwd,
       rootTurboJson: parsed.options.rootTurboJson,
     });
-    const diagnostics = boundaryDiagnostics(repository).filter(
-      (diagnostic) =>
-        filters.length === 0 ||
-        filters.some(
-          (filter) =>
-            diagnostic.import === filter || diagnostic.path.includes(filter),
-        ),
-    );
+    const selectedRuleOwners =
+      filters.length === 0
+        ? undefined
+        : new Set(
+            selectPackages(repository, filters).map(
+              (packageModel) => packageModel.identity,
+            ),
+          );
+    const diagnostics = boundaryDiagnostics(repository, selectedRuleOwners);
     for (const diagnostic of diagnostics) {
       yield* terminal.writeStderr(
         `${diagnostic.message}\n  at ${diagnostic.path}: ${diagnostic.import}${
@@ -443,14 +452,21 @@ const readMicrofrontendPort = (
     const processCwd = yield* environment.cwd;
     const platform = yield* environment.platform;
     const windowsPathSeparators = platform === "win32";
+    const requestedCwd =
+      parsed.options.cwd === undefined
+        ? processCwd
+        : isAbsolutePath(parsed.options.cwd, windowsPathSeparators)
+          ? parsed.options.cwd
+          : joinPath(processCwd, parsed.options.cwd);
     const repository = yield* loadWorkflowRepository({
       cwd: parsed.options.cwd,
       rootTurboJson: parsed.options.rootTurboJson,
     });
+    const currentCwd = yield* fileSystem.realPath(requestedCwd);
     const packages = [repository.rootPackage, ...repository.packages];
     const currentPackage = selectCurrentPackage(
       packages,
-      processCwd,
+      currentCwd,
       windowsPathSeparators,
     );
     if (

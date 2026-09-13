@@ -771,6 +771,7 @@ const boundaryRuleDiagnostics = (
 
 export const boundaryDiagnostics = (
   repository: RepositoryModel,
+  ruleOwnerIdentities?: ReadonlySet<string>,
 ): ReadonlyArray<BoundaryDiagnostic> => {
   const models = [repository.rootPackage, ...repository.packages];
   const byIdentity = new Map(models.map((model) => [model.identity, model]));
@@ -810,10 +811,16 @@ export const boundaryDiagnostics = (
       const target = byIdentity.get(dependencyIdentity);
       if (target === undefined) continue;
       const targetTags = target.tags ?? [];
-      const dependencyRules = [
-        configurationFor(source)?.dependencies,
-        ...sourceTags.map((tag) => rootBoundaries?.tags?.[tag]?.dependencies),
-      ].filter(activePermissions);
+      const dependencyRules =
+        ruleOwnerIdentities === undefined ||
+        ruleOwnerIdentities.has(source.identity)
+          ? [
+              configurationFor(source)?.dependencies,
+              ...sourceTags.map(
+                (tag) => rootBoundaries?.tags?.[tag]?.dependencies,
+              ),
+            ].filter(activePermissions)
+          : [];
       for (const permissions of dependencyRules) {
         record(
           boundaryRuleDiagnostics(
@@ -825,10 +832,16 @@ export const boundaryDiagnostics = (
           ),
         );
       }
-      const dependentRules = [
-        configurationFor(target)?.dependents,
-        ...targetTags.map((tag) => rootBoundaries?.tags?.[tag]?.dependents),
-      ].filter(activePermissions);
+      const dependentRules =
+        ruleOwnerIdentities === undefined ||
+        ruleOwnerIdentities.has(target.identity)
+          ? [
+              configurationFor(target)?.dependents,
+              ...targetTags.map(
+                (tag) => rootBoundaries?.tags?.[tag]?.dependents,
+              ),
+            ].filter(activePermissions)
+          : [];
       for (const permissions of dependentRules) {
         record(
           boundaryRuleDiagnostics(
