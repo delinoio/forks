@@ -1036,7 +1036,7 @@ version = "1.0.0"
     });
   });
 
-  it("does not combine an explicit team slug with a stored team ID", () => {
+  it("does not combine explicit team slugs with stored team IDs", () => {
     const model = repository([]);
     const options = resolveOptions(
       parseRunArguments([
@@ -1062,6 +1062,30 @@ version = "1.0.0"
       teamSlug: "explicit-team",
     });
     expect(options.remote?.teamId).toBeUndefined();
+
+    const environmentOptions = resolveOptions(
+      parseRunArguments([
+        "run",
+        "build",
+        "--api=https://cache.example.test/api",
+        "--token=token",
+      ]),
+      model.root,
+      { TURBO_TEAM: "environment-team" },
+      model.rootConfiguration,
+      8,
+      false,
+      {
+        project: {
+          teamId: "stored-team-id",
+          teamSlug: "stored-team-slug",
+        },
+      },
+    );
+    expect(environmentOptions.remote).toMatchObject({
+      teamSlug: "environment-team",
+    });
+    expect(environmentOptions.remote?.teamId).toBeUndefined();
   });
 
   it("builds dependency graphs, filters closures, and rejects cycles", () => {

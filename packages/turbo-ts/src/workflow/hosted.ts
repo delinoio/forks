@@ -254,6 +254,37 @@ const resolveHostedSettings = (
     };
   });
 
+const resolveLogoutInvalidationApi = (
+  options: HostedCommandOptions,
+  configuredApi: URL,
+): Effect.Effect<
+  URL | undefined,
+  never,
+  CredentialService | EnvironmentService | FileSystemService
+> =>
+  Effect.gen(function* () {
+    if (
+      options.common.apiUrl !== undefined ||
+      (yield* configuredValue("TURBO_API")) !== undefined
+    ) {
+      return configuredApi;
+    }
+    const credentials = yield* CredentialService;
+    const projectApiUrl = yield* resolveWorkflowRepositoryRoot({
+      cwd: options.common.cwd,
+    }).pipe(
+      Effect.flatMap((root) => credentials.readProjectConfiguration(root)),
+      Effect.map((configuration) => configuration?.apiUrl),
+      Effect.catchAll(() => Effect.succeed(undefined)),
+    );
+    if (projectApiUrl === undefined) return undefined;
+    try {
+      return hostedUrl(projectApiUrl, "project API");
+    } catch {
+      return undefined;
+    }
+  });
+
 const validateRemoteCaching = (
   settings: ResolvedHostedSettings,
   token: string,
@@ -472,20 +503,26 @@ export const executeHostedCommand = (
       const existing = (yield* credentials.readUserConfiguration) ?? {};
       const token = settings.token;
       if (options.invalidate && token !== undefined) {
-        const response = yield* requestHosted(
-          withPath(settings.api, "/v3/user/tokens/current"),
-          "DELETE",
-          token,
-          settings.timeoutMilliseconds,
+        const invalidationApi = yield* resolveLogoutInvalidationApi(
+          options,
+          settings.api,
         );
-        if (response.status < 200 || response.status >= 300) {
-          return yield* Effect.fail(
-            new BoundaryError({
-              boundary: "hosted",
-              message: `token invalidation failed with status ${response.status}`,
-              retryable: false,
-            }),
+        if (invalidationApi !== undefined) {
+          const response = yield* requestHosted(
+            withPath(invalidationApi, "/v3/user/tokens/current"),
+            "DELETE",
+            token,
+            settings.timeoutMilliseconds,
           );
+          if (response.status < 200 || response.status >= 300) {
+            return yield* Effect.fail(
+              new BoundaryError({
+                boundary: "hosted",
+                message: `token invalidation failed with status ${response.status}`,
+                retryable: false,
+              }),
+            );
+          }
         }
       }
       const { token: _removed, ...retained } = existing;

@@ -3179,7 +3179,7 @@ const compressionLayer = Layer.succeed(CompressionService, {
 
 const redirectStatuses = new Set([301, 302, 303, 307, 308]);
 const sensitiveRedirectHeader =
-  /authorization|cookie|credential|secret|signature|token/i;
+  /authorization|cookie|credential|secret|signature|token|^x-artifact-tag$/i;
 
 const fetchWithSafeRedirects = async (
   request: {

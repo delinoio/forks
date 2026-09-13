@@ -411,7 +411,7 @@ export const parseRunArguments = (
     remoteOnly,
     remoteCacheReadOnly,
     noCache,
-    frameworkInference,
+    frameworkInference: common.options.skipInfer ? false : frameworkInference,
     outputLogs,
     only,
     parallel,

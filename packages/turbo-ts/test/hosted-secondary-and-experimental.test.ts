@@ -472,7 +472,7 @@ describe("hosted compatibility", () => {
             rootConfiguration,
           );
           const logout = await runCandidate(
-            ["logout", `--api=${baseUrl}`, `--cwd=${root}`],
+            ["logout", `--cwd=${root}`],
             root,
             environment,
           );
@@ -506,7 +506,10 @@ describe("hosted compatibility", () => {
           expect(
             requests.some((request) => request.path === "/v2/teams?limit=100"),
           ).toBe(true);
-          expect(requests.at(-1)?.method).toBe("DELETE");
+          expect(requests.at(-1)).toMatchObject({
+            method: "DELETE",
+            path: "/v3/user/tokens/current",
+          });
           for (const request of requests) {
             expect(request.headers.authorization).toBe(`Bearer ${token}`);
             expect(request.headers["user-agent"]).toBe("turbo-ts/0.1.0");
@@ -706,7 +709,21 @@ describe("hosted compatibility", () => {
     await writeFile(projectPath, "invalid project credentials");
     if (process.platform !== "win32") await chmod(userPath, 0o600);
     try {
-      const disabled = await runCandidate(
+      await writeFile(
+        join(root, "turbo.json"),
+        JSON.stringify({
+          remoteCache: { enabled: false },
+          tasks: { build: {} },
+        }),
+      );
+      const configurationDisabled = await runCandidate(
+        ["run", "build", "--filter=synthetic-app", `--cwd=${root}`],
+        root,
+        { XDG_CONFIG_HOME: configurationHome },
+      );
+      expect(configurationDisabled.code, configurationDisabled.stderr).toBe(0);
+
+      const cacheDisabled = await runCandidate(
         [
           "run",
           "build",
@@ -717,7 +734,7 @@ describe("hosted compatibility", () => {
         root,
         { XDG_CONFIG_HOME: configurationHome },
       );
-      expect(disabled.code, disabled.stderr).toBe(0);
+      expect(cacheDisabled.code, cacheDisabled.stderr).toBe(0);
 
       await withServer(
         () => [
@@ -819,6 +836,7 @@ describe("secondary command and parser compatibility", () => {
       parseRunArguments([
         "run",
         "build",
+        "--skip-infer",
         "--cache-workers=4",
         "--daemon",
         "--no-daemon",
@@ -828,6 +846,7 @@ describe("secondary command and parser compatibility", () => {
       cacheWorkers: 4,
       daemonPreference: false,
       dryRun: "json",
+      frameworkInference: false,
       tasks: ["build"],
     });
     expect(
@@ -853,13 +872,23 @@ describe("secondary command and parser compatibility", () => {
     expect(
       selectCurrentPackage(
         [
-          { directory: "C:/synthetic/repository" },
-          { directory: "C:/synthetic/repository/packages/app" },
+          {
+            canonicalRelativeDirectory: ".",
+            directory: "C:/synthetic/repository",
+          },
+          {
+            canonicalRelativeDirectory: "packages/app",
+            directory: "C:/synthetic/repository/packages/app",
+          },
         ],
         "c:\\SYNTHETIC\\repository\\packages\\app\\src",
+        "C:/synthetic/repository",
         true,
       ),
-    ).toEqual({ directory: "C:/synthetic/repository/packages/app" });
+    ).toEqual({
+      canonicalRelativeDirectory: "packages/app",
+      directory: "C:/synthetic/repository/packages/app",
+    });
 
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-secondary-"));
     const root = join(directory, "repository");
@@ -990,6 +1019,32 @@ describe("secondary command and parser compatibility", () => {
           "generator action escapes the repository",
         );
         await expect(access(join(outside, "outside.txt"))).rejects.toThrow();
+      }
+
+      if (process.platform !== "win32") {
+        const linkedTarget = join(root, "linked-app-target");
+        const linkedWorkspace = join(root, "packages/linked-app");
+        await mkdir(linkedTarget, { recursive: true });
+        await writeFile(
+          join(linkedTarget, "package.json"),
+          JSON.stringify({ name: "synthetic-linked-app", private: true }),
+        );
+        await writeFile(
+          join(linkedTarget, "microfrontends.json"),
+          JSON.stringify({
+            applications: {
+              "synthetic-linked-app": {
+                development: { local: { port: 4234 } },
+              },
+            },
+          }),
+        );
+        await symlink("../linked-app-target", linkedWorkspace, "dir");
+        const linkedMfe = await runCandidate(
+          ["get-mfe-port", "--cwd=packages/linked-app"],
+          root,
+        );
+        expect(linkedMfe).toMatchObject({ code: 0, stdout: "4234\n" });
       }
 
       const mfe = await runCandidate(
@@ -1657,39 +1712,46 @@ describe("hosted protocols and experimental transports", () => {
   }, 30_000);
 
   it("strips secrets on cross-origin redirects and enforces timeouts", async () => {
-    await withServer(
-      () => [200, {}, "ok"],
-      async (destination, destinationRequests) => {
-        await withServer(
-          () => [302, { location: destination }, "redirect"],
-          async (source) => {
-            const result = await Effect.runPromise(
-              HttpService.pipe(
-                Effect.flatMap((http) =>
-                  http.request({
-                    url: source,
-                    method: "GET",
-                    headers: {
-                      authorization: "Bearer synthetic-token",
-                      "x-cache-signature": "synthetic-signature",
-                    },
-                    timeoutMilliseconds: 1_000,
-                  }),
+    for (const redirectStatus of [307, 308]) {
+      await withServer(
+        () => [200, {}, "ok"],
+        async (destination, destinationRequests) => {
+          await withServer(
+            () => [redirectStatus, { location: destination }, "redirect"],
+            async (source) => {
+              const result = await Effect.runPromise(
+                HttpService.pipe(
+                  Effect.flatMap((http) =>
+                    http.request({
+                      url: source,
+                      method: "PUT",
+                      headers: {
+                        authorization: "Bearer synthetic-token",
+                        "x-artifact-tag": "synthetic-artifact-tag",
+                      },
+                      body: "synthetic-body",
+                      timeoutMilliseconds: 1_000,
+                    }),
+                  ),
+                  Effect.provide(nodeFoundationLayer),
                 ),
-                Effect.provide(nodeFoundationLayer),
-              ),
-            );
-            expect(result.status).toBe(200);
-            expect(
-              destinationRequests[0]?.headers.authorization,
-            ).toBeUndefined();
-            expect(
-              destinationRequests[0]?.headers["x-cache-signature"],
-            ).toBeUndefined();
-          },
-        );
-      },
-    );
+              );
+              expect(result.status).toBe(200);
+              expect(destinationRequests[0]).toMatchObject({
+                body: "synthetic-body",
+                method: "PUT",
+              });
+              expect(
+                destinationRequests[0]?.headers.authorization,
+              ).toBeUndefined();
+              expect(
+                destinationRequests[0]?.headers["x-artifact-tag"],
+              ).toBeUndefined();
+            },
+          );
+        },
+      );
+    }
 
     await withServer(
       async () => {

@@ -415,6 +415,7 @@ export const resolveOptions = (
     );
   const configuredEnvironmentMode = environmentValue("TURBO_ENV_MODE");
   const configuredApiUrl = environmentValue("TURBO_API");
+  const configuredTeamSlug = environmentValue("TURBO_TEAM");
   const configuredRemoteTimeout = environmentValue(
     "TURBO_REMOTE_CACHE_TIMEOUT",
   );
@@ -601,13 +602,15 @@ export const resolveOptions = (
       teamId:
         parsed.team === undefined
           ? (environmentValue("TURBO_TEAMID") ??
-            remoteConfiguration?.teamId ??
-            storedCredentials.project?.teamId ??
-            undefined)
+            (configuredTeamSlug === undefined
+              ? (remoteConfiguration?.teamId ??
+                storedCredentials.project?.teamId ??
+                undefined)
+              : undefined))
           : undefined,
       teamSlug:
         parsed.team ??
-        environmentValue("TURBO_TEAM") ??
+        configuredTeamSlug ??
         remoteConfiguration?.teamSlug ??
         storedCredentials.project?.teamSlug ??
         undefined,
@@ -3560,8 +3563,12 @@ export const executeRun = (
     const environmentValue = (name: string): string | undefined =>
       configuredEnvironmentValue(environment, name, platform === "win32");
     const preliminaryCachePolicy = parseCachePolicy(parsed, environmentValue);
+    const configuredRemoteCache =
+      configuration.value.remoteCache ??
+      configuration.value.global?.remoteCache;
     const remoteCacheActive =
-      preliminaryCachePolicy.remoteRead || preliminaryCachePolicy.remoteWrite;
+      configuredRemoteCache?.enabled !== false &&
+      (preliminaryCachePolicy.remoteRead || preliminaryCachePolicy.remoteWrite);
     const openTelemetryEnabled =
       parsed.openTelemetry.enabled ??
       environmentValue("TURBO_EXPERIMENTAL_OTEL_ENABLED") === "true";

@@ -415,21 +415,36 @@ const executeDocs = (
     return 0;
   });
 
-export const selectCurrentPackage = <A extends { readonly directory: string }>(
+export const selectCurrentPackage = <
+  A extends {
+    readonly canonicalRelativeDirectory: string;
+    readonly directory: string;
+  },
+>(
   packages: ReadonlyArray<A>,
   cwd: string,
+  repositoryRoot: string,
   windowsPathSeparators: boolean,
 ): A | undefined => {
   const normalizedCwd = normalizePath(cwd, windowsPathSeparators);
   return packages
-    .filter((packageModel) =>
-      isPathContained(
-        packageModel.directory,
+    .flatMap((packageModel) => {
+      const canonicalDirectory = normalizePath(
+        joinPath(repositoryRoot, packageModel.canonicalRelativeDirectory),
+        windowsPathSeparators,
+      );
+      return isPathContained(
+        canonicalDirectory,
         normalizedCwd,
         windowsPathSeparators,
-      ),
-    )
-    .sort((left, right) => right.directory.length - left.directory.length)[0];
+      )
+        ? [{ canonicalDirectory, packageModel }]
+        : [];
+    })
+    .sort(
+      (left, right) =>
+        right.canonicalDirectory.length - left.canonicalDirectory.length,
+    )[0]?.packageModel;
 };
 
 const readMicrofrontendPort = (
@@ -467,6 +482,7 @@ const readMicrofrontendPort = (
     const currentPackage = selectCurrentPackage(
       packages,
       currentCwd,
+      repository.root,
       windowsPathSeparators,
     );
     if (

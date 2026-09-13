@@ -940,7 +940,8 @@ one child workspace and false in explicit single-package mode.
 Persisted, stdout, and
 newline-delimited summaries from one run share one canonical UUID v7 identifier.
 Mermaid graphs assign stable,
-unique node identifiers without truncated-hash collisions.
+unique node identifiers without truncated-hash collisions. `--skip-infer`
+disables framework environment inference for task hashing and execution.
 
 Gate 4 hosted and secondary surfaces have automated ledger evidence. `login`,
 `link`, `logout`, and `unlink` share the official user configuration under the
@@ -955,8 +956,11 @@ creating or replacing `config.json`.
 Link discovery uses the hosted user and team endpoints, verifies artifact
 status is exactly `enabled`, offers the personal user scope alongside team
 scopes, persists the selected identity and validated API URL, and keeps `.turbo`
-ignored unless `--no-gitignore` is requested. Logout can invalidate the current
-token before removing it while retaining unrelated shared configuration fields.
+ignored unless `--no-gitignore` is requested. Logout invalidates the current
+token only against an API selected explicitly or persisted by the linked
+project. When the issuing API is unavailable, it skips remote invalidation
+before removing the token while retaining unrelated shared configuration
+fields.
 
 Remote cache control and artifact traffic supports team IDs and slugs,
 preflight, bounded responses, separate download and upload timeouts, safe
@@ -964,9 +968,10 @@ redirects, idempotent retries for transient and rate-limit responses, event
 records, and optional HMAC signatures. Redirects reject credentials,
 unsupported protocols, and HTTPS downgrades, and remove authorization,
 cookies, tokens, credentials, secrets, and signatures before crossing an
-origin. Local-only and no-cache runs do not load remote credentials or probe
-hosted status. An explicit team slug suppresses lower-precedence stored team
-IDs. Hosted and OTLP requests identify as `turbo-ts/0.1.0`.
+origin. Local-only, configuration-disabled remote, and no-cache runs do not
+load remote credentials or probe hosted status. An explicit team slug
+suppresses lower-precedence stored team IDs. Hosted and OTLP requests identify
+as `turbo-ts/0.1.0`.
 
 Telemetry state remains compatible with official state that omits the optional
 alert timestamp, preserves identity across enable and disable operations, and
