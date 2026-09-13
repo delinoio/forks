@@ -6,7 +6,7 @@ import {
   TerminalService,
 } from "../effect/services.js";
 import { redactText } from "../logging/redaction.js";
-import { executeRun } from "../run/engine.js";
+import { executeRun, type RunMetricTaskDetail } from "../run/engine.js";
 import { parseRunArguments } from "../run/options.js";
 import { versionOutput } from "../version.js";
 import { executeDaemon, parseDaemonArguments } from "../workflow/daemon.js";
@@ -443,22 +443,35 @@ export const cliProgram = Effect.gen(function* () {
         ),
       catch: (cause) => cause,
     }).pipe(
-      Effect.flatMap((options) =>
-        executeRun(options).pipe(
+      Effect.flatMap((options) => {
+        let remoteToken = options.token;
+        let taskDetails: ReadonlyArray<RunMetricTaskDetail> | undefined;
+        return executeRun(options, {
+          onRemoteTokenResolved: (token) => {
+            remoteToken = token;
+          },
+          onTaskMetricsResolved: (tasks) => {
+            taskDetails = tasks;
+          },
+        }).pipe(
           Effect.tap((exitCode) =>
             Effect.promise(() => import("../telemetry/observability.js")).pipe(
               Effect.flatMap((observability) =>
                 observability.exportRunMetrics(
                   options.openTelemetry,
-                  options.token,
-                  { exitCode, taskCount: options.tasks.length },
+                  remoteToken,
+                  {
+                    exitCode,
+                    taskCount: taskDetails?.length ?? options.tasks.length,
+                    tasks: taskDetails ?? [],
+                  },
                 ),
               ),
               Effect.catchAll(() => Effect.void),
             ),
           ),
-        ),
-      ),
+        );
+      }),
     ) as Effect.Effect<number, unknown, never>;
   };
   const outcome = yield* Effect.either(

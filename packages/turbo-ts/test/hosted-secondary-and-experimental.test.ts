@@ -1,14 +1,20 @@
 import { execFile, spawn } from "node:child_process";
 import {
+  access,
   chmod,
   mkdir,
   mkdtemp,
   readFile,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
+import {
+  createServer as createHttp2Server,
+  constants as http2Constants,
+} from "node:http2";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,6 +53,7 @@ import {
 } from "../src/telemetry/observability.js";
 import { parseGenerateArguments } from "../src/workflow/generate.js";
 import { parseHostedArguments } from "../src/workflow/hosted.js";
+import { selectCurrentPackage } from "../src/workflow/secondary.js";
 
 const execFilePromise = promisify(execFile);
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -185,10 +192,17 @@ const prepareRepository = async (root: string): Promise<void> => {
     join(root, "pnpm-workspace.yaml"),
     "packages:\n  - packages/*\n",
   );
-  await writeFile(join(root, "turbo.json"), JSON.stringify({ tasks: {} }));
+  await writeFile(
+    join(root, "turbo.json"),
+    JSON.stringify({ tasks: { build: {} } }),
+  );
   await writeFile(
     join(root, "packages/app/package.json"),
-    JSON.stringify({ name: "synthetic-app", private: true }),
+    JSON.stringify({
+      name: "synthetic-app",
+      private: true,
+      scripts: { build: 'node -e ""' },
+    }),
   );
 };
 
@@ -264,6 +278,11 @@ describe("hosted compatibility", () => {
     const configurationHome = join(directory, "configuration");
     const token = "synthetic-secret-token";
     await prepareRepository(root);
+    await rm(join(root, "turbo.json"));
+    const rootConfigurationPath = join(root, "turbo.jsonc");
+    const rootConfiguration =
+      '{\n  // retained login comment\n  "tasks": { "build": {} }\n}\n';
+    await writeFile(rootConfigurationPath, rootConfiguration);
     try {
       await withServer(
         (request) =>
@@ -271,19 +290,22 @@ describe("hosted compatibility", () => {
             ? [
                 200,
                 { "content-type": "application/json" },
-                '{"user":{"id":"user_synthetic","name":"Synthetic User"}}',
+                '{"user":{"id":"user_synthetic","username":"synthetic-user","name":"Synthetic User"}}',
               ]
             : request.url === "/v2/teams?limit=100"
               ? [
                   200,
                   { "content-type": "application/json" },
-                  '{"teams":[{"id":"team_synthetic","slug":"synthetic","name":"Synthetic Team"}]}',
+                  '{"teams":[{"id":"team_synthetic","slug":"synthetic","name":"Synthetic Team"},{"id":"team_disabled","slug":"disabled","name":"Disabled Team"}]}',
                 ]
               : request.url?.startsWith("/v8/artifacts/status") === true
                 ? [
                     200,
                     { "content-type": "application/json" },
-                    '{"status":"enabled"}',
+                    request.url.includes("teamId=team_disabled") ||
+                    request.url.includes("slug=disabled")
+                      ? '{"status":"disabled"}'
+                      : '{"status":"enabled"}',
                   ]
                 : request.url === "/v3/user/tokens/current"
                   ? [200, { "content-type": "application/json" }, "{}"]
@@ -304,6 +326,9 @@ describe("hosted compatibility", () => {
           );
           expect(login.code).toBe(0);
           expect(`${login.stdout}${login.stderr}`).not.toContain(token);
+          expect(await readFile(rootConfigurationPath, "utf8")).toBe(
+            rootConfiguration,
+          );
           const userPath = join(configurationHome, "turborepo/config.json");
           expect(JSON.parse(await readFile(userPath, "utf8"))).toEqual({
             token,
@@ -370,6 +395,62 @@ describe("hosted compatibility", () => {
               await readFile(join(root, ".turbo/config.json"), "utf8"),
             ),
           ).toEqual({});
+          const personalLink = await runCandidate(
+            [
+              "link",
+              "--scope=synthetic-user",
+              "--yes",
+              `--api=${baseUrl}`,
+              `--cwd=${root}`,
+            ],
+            root,
+            environment,
+          );
+          expect(personalLink.code).toBe(0);
+          expect(
+            JSON.parse(
+              await readFile(join(root, ".turbo/config.json"), "utf8"),
+            ),
+          ).toEqual({ teamId: "user_synthetic" });
+          const disabledLink = await runCandidate(
+            [
+              "link",
+              "--scope=disabled",
+              "--yes",
+              `--api=${baseUrl}`,
+              `--cwd=${root}`,
+            ],
+            root,
+            environment,
+          );
+          expect(disabledLink.code).toBe(1);
+          expect(disabledLink.stderr).toContain(
+            "remote caching status response is invalid",
+          );
+          expect(
+            JSON.parse(
+              await readFile(join(root, ".turbo/config.json"), "utf8"),
+            ),
+          ).toEqual({ teamId: "user_synthetic" });
+          const disabledLogin = await runCandidate(
+            [
+              "login",
+              "--manual",
+              `--token=${token}`,
+              "--team=disabled",
+              `--api=${baseUrl}`,
+              `--cwd=${root}`,
+            ],
+            root,
+            environment,
+          );
+          expect(disabledLogin.code).toBe(1);
+          expect(JSON.parse(await readFile(userPath, "utf8"))).toEqual({
+            token,
+          });
+          expect(await readFile(rootConfigurationPath, "utf8")).toBe(
+            rootConfiguration,
+          );
           const logout = await runCandidate(
             ["logout", `--api=${baseUrl}`, `--cwd=${root}`],
             root,
@@ -383,6 +464,13 @@ describe("hosted compatibility", () => {
             requests.some(
               (request) =>
                 request.path === "/v8/artifacts/status?slug=synthetic-team",
+            ),
+          ).toBe(true);
+          expect(
+            requests.some(
+              (request) =>
+                request.path ===
+                "/v8/artifacts/status?teamId=user_synthetic&slug=synthetic-user",
             ),
           ).toBe(true);
           expect(
@@ -465,6 +553,118 @@ describe("hosted compatibility", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("ignores relative XDG configuration paths", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-xdg-"));
+    const root = join(directory, "repository");
+    const fallbackHome = join(directory, "home");
+    const fallbackAppData = join(fallbackHome, "AppData", "Roaming");
+    await prepareRepository(root);
+    try {
+      await withServer(
+        () => [
+          200,
+          { "content-type": "application/json" },
+          '{"status":"enabled"}',
+        ],
+        async (baseUrl) => {
+          const result = await runCandidate(
+            [
+              "login",
+              "--manual",
+              "--token=synthetic-token",
+              `--api=${baseUrl}`,
+            ],
+            root,
+            {
+              APPDATA: fallbackAppData,
+              HOME: fallbackHome,
+              XDG_CONFIG_HOME: ".relative-config",
+            },
+          );
+          expect(result.code, result.stderr).toBe(0);
+          const configurationRoot =
+            process.platform === "darwin"
+              ? join(fallbackHome, "Library", "Application Support")
+              : process.platform === "win32"
+                ? fallbackAppData
+                : join(fallbackHome, ".config");
+          expect(
+            JSON.parse(
+              await readFile(
+                join(configurationRoot, "turborepo/config.json"),
+                "utf8",
+              ),
+            ),
+          ).toEqual({ token: "synthetic-token" });
+          await expect(
+            readFile(join(root, ".relative-config/turborepo/config.json")),
+          ).rejects.toThrow();
+        },
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("does not load credentials or probe hosted status for local-only runs", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-local-only-"));
+    const root = join(directory, "repository");
+    const configurationHome = join(directory, "configuration");
+    const userPath = join(configurationHome, "turborepo/config.json");
+    const projectPath = join(root, ".turbo/config.json");
+    await prepareRepository(root);
+    await mkdir(join(configurationHome, "turborepo"), { recursive: true });
+    await mkdir(join(root, ".turbo"), { recursive: true });
+    await writeFile(userPath, "invalid user credentials");
+    await writeFile(projectPath, "invalid project credentials");
+    if (process.platform !== "win32") await chmod(userPath, 0o600);
+    try {
+      const disabled = await runCandidate(
+        [
+          "run",
+          "build",
+          "--filter=synthetic-app",
+          "--no-cache",
+          `--cwd=${root}`,
+        ],
+        root,
+        { XDG_CONFIG_HOME: configurationHome },
+      );
+      expect(disabled.code, disabled.stderr).toBe(0);
+
+      await withServer(
+        () => [
+          200,
+          { "content-type": "application/json" },
+          '{"status":"enabled"}',
+        ],
+        async (baseUrl, requests) => {
+          await writeFile(
+            userPath,
+            JSON.stringify({ token: "synthetic-token" }),
+          );
+          if (process.platform !== "win32") await chmod(userPath, 0o600);
+          await writeFile(projectPath, JSON.stringify({ apiUrl: baseUrl }));
+          const localOnly = await runCandidate(
+            [
+              "run",
+              "build",
+              "--filter=synthetic-app",
+              "--cache=local:rw",
+              `--cwd=${root}`,
+            ],
+            root,
+            { XDG_CONFIG_HOME: configurationHome },
+          );
+          expect(localOnly.code, localOnly.stderr).toBe(0);
+          expect(requests).toHaveLength(0);
+        },
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 describe("secondary command and parser compatibility", () => {
@@ -564,10 +764,28 @@ describe("secondary command and parser compatibility", () => {
       type: "app",
       workspace: true,
     });
+    expect(
+      selectCurrentPackage(
+        [
+          { directory: "C:/synthetic/repository" },
+          { directory: "C:/synthetic/repository/packages/app" },
+        ],
+        "c:\\SYNTHETIC\\repository\\packages\\app\\src",
+        true,
+      ),
+    ).toEqual({ directory: "C:/synthetic/repository/packages/app" });
 
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-secondary-"));
     const root = join(directory, "repository");
     await prepareRepository(root);
+    await writeFile(
+      join(root, "microfrontends.json"),
+      JSON.stringify({
+        applications: {
+          "synthetic-app": { development: { local: { port: 4001 } } },
+        },
+      }),
+    );
     await writeFile(
       join(root, "packages/app/microfrontends.json"),
       JSON.stringify({
@@ -617,6 +835,47 @@ describe("secondary command and parser compatibility", () => {
         ),
       ).toMatchObject({ name: "generated-library", private: true });
 
+      const recursiveCopy = await runCandidate(
+        [
+          "generate",
+          "workspace",
+          "--name=recursive-copy",
+          "--copy=.",
+          "--destination=packages/recursive-copy",
+          `--root=${root}`,
+        ],
+        root,
+      );
+      expect(recursiveCopy.code).toBe(1);
+      expect(recursiveCopy.stderr).toContain(
+        "workspace template must not contain its destination",
+      );
+      await expect(
+        access(join(root, "packages/recursive-copy")),
+      ).rejects.toThrow();
+
+      if (process.platform !== "win32") {
+        const outside = join(directory, "outside");
+        const linkedDestination = join(root, "generated");
+        const generatorDirectory = join(root, "turbo/generators");
+        await mkdir(outside, { recursive: true });
+        await mkdir(generatorDirectory, { recursive: true });
+        await symlink(outside, linkedDestination, "dir");
+        await writeFile(
+          join(generatorDirectory, "config.mjs"),
+          'export default (api) => api.setGenerator("unsafe", { actions: [{ type: "add", path: "generated/outside.txt", template: "unsafe" }] });\n',
+        );
+        const unsafe = await runCandidate(
+          ["generate", "unsafe", `--root=${root}`],
+          root,
+        );
+        expect(unsafe.code).toBe(1);
+        expect(unsafe.stderr).toContain(
+          "generator action escapes the repository",
+        );
+        await expect(access(join(outside, "outside.txt"))).rejects.toThrow();
+      }
+
       const mfe = await runCandidate(
         ["get-mfe-port", `--cwd=${root}`],
         join(root, "packages/app"),
@@ -635,6 +894,12 @@ describe("secondary command and parser compatibility", () => {
         join(root, "packages/app"),
       );
       expect(generatedMfe).toMatchObject({ code: 0, stdout: "6697\n" });
+      await rm(join(root, "packages/app/microfrontends.json"));
+      const inheritedMfe = await runCandidate(
+        ["get-mfe-port", `--cwd=${root}`],
+        join(root, "packages/app"),
+      );
+      expect(inheritedMfe).toMatchObject({ code: 0, stdout: "4001\n" });
 
       const configuration = await runCandidate(
         ["config", `--cwd=${root}`],
@@ -704,6 +969,17 @@ describe("secondary command and parser compatibility", () => {
             "Found 1 results for 'synthetic query'",
           );
           expect(docs.stdout).toContain("Synthetic guide");
+          expect(docs.stdout).not.toContain("\u001B");
+          const explicitlyPlainDocs = await runCandidate(
+            ["docs", "synthetic query", "--no-color"],
+            root,
+            {
+              NO_COLOR: undefined,
+              TURBO_TS_DOCS_ENDPOINT: `${baseUrl}/search`,
+            },
+          );
+          expect(explicitlyPlainDocs.code).toBe(0);
+          expect(explicitlyPlainDocs.stdout).not.toContain("\u001B");
           const update = await runCandidate(
             [`--force-update-check=${baseUrl}/tags`],
             root,
@@ -957,8 +1233,22 @@ describe("hosted protocols and experimental transports", () => {
       get: () => Effect.succeed(undefined),
       entries: Effect.succeed({}),
     });
-    const summary = { exitCode: 0, taskCount: 2 };
-    for (const protocol of ["http-json", "http-protobuf", "grpc"] as const) {
+    const summary = {
+      exitCode: 0,
+      taskCount: 2,
+      tasks: [
+        {
+          id: "synthetic-app#build",
+          package: "synthetic-app",
+          task: "build",
+          status: "succeeded" as const,
+          exitCode: 0,
+          durationMilliseconds: 12,
+          cacheSource: "local" as const,
+        },
+      ],
+    };
+    for (const protocol of ["http-json", "http-protobuf"] as const) {
       await Effect.runPromise(
         exportRunMetrics(
           {
@@ -976,15 +1266,10 @@ describe("hosted protocols and experimental transports", () => {
     }
     expect(
       requests.map((request) => request.headers?.["content-type"]),
-    ).toEqual([
-      "application/json",
-      "application/x-protobuf",
-      "application/grpc",
-    ]);
+    ).toEqual(["application/json", "application/x-protobuf"]);
     expect(requests.map((request) => request.url)).toEqual([
       "http://127.0.0.1:4318/v1/metrics",
       "http://127.0.0.1:4318/v1/metrics",
-      "http://127.0.0.1:4318/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
     ]);
     for (const request of requests) {
       expect(request.headers).toMatchObject({
@@ -996,8 +1281,190 @@ describe("hosted protocols and experimental transports", () => {
     const json = makeOtlpJsonMetrics(summary);
     expect(JSON.stringify(json)).toContain('"service.name"');
     expect(encodeOtlpMetrics(summary).byteLength).toBeGreaterThan(20);
-    expect((requests[2]?.body as Uint8Array)[0]).toBe(0);
+
+    await Effect.runPromise(
+      exportRunMetrics(
+        {
+          enabled: true,
+          protocol: "http-json",
+          endpoint: "http://127.0.0.1:4318",
+          headers: [],
+          resources: [],
+          metricsRunSummary: false,
+          metricsTaskDetails: true,
+        },
+        undefined,
+        summary,
+      ).pipe(Effect.provide(Layer.merge(httpLayer, environmentLayer))),
+    );
+    const taskMetricBody = requests.at(-1)?.body;
+    const taskMetrics = JSON.parse(
+      typeof taskMetricBody === "string"
+        ? taskMetricBody
+        : new TextDecoder().decode(taskMetricBody),
+    );
+    expect(
+      taskMetrics.resourceMetrics[0].scopeMetrics[0].metrics.map(
+        (metric: { readonly name: string }) => metric.name,
+      ),
+    ).toEqual(["turbo.task"]);
+    expect(JSON.stringify(taskMetrics)).toContain("synthetic-app#build");
+
+    const requestCount = requests.length;
+    await Effect.runPromise(
+      exportRunMetrics(
+        {
+          enabled: true,
+          protocol: "http-json",
+          endpoint: "http://127.0.0.1:4318",
+          headers: [],
+          resources: [],
+          metricsRunSummary: false,
+          metricsTaskDetails: false,
+        },
+        undefined,
+        summary,
+      ).pipe(Effect.provide(Layer.merge(httpLayer, environmentLayer))),
+    );
+    expect(requests).toHaveLength(requestCount);
   });
+
+  it("sends OTLP gRPC over HTTP/2 and handles gRPC status", async () => {
+    const requests: Array<{
+      readonly body: Buffer;
+      readonly headers: Readonly<Record<string, unknown>>;
+    }> = [];
+    let grpcStatus = "0";
+    const server = createHttp2Server();
+    server.on("stream", (stream, headers) => {
+      const chunks: Array<Buffer> = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+      stream.on("end", () => {
+        requests.push({ body: Buffer.concat(chunks), headers });
+        stream.respond(
+          {
+            [http2Constants.HTTP2_HEADER_STATUS]: 200,
+            [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+          },
+          { waitForTrailers: true },
+        );
+        stream.on("wantTrailers", () =>
+          stream.sendTrailers({
+            "grpc-status": grpcStatus,
+            ...(grpcStatus === "0"
+              ? {}
+              : { "grpc-message": "permission%20denied" }),
+          }),
+        );
+        stream.end(Buffer.alloc(5));
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      server.close();
+      throw new Error("HTTP/2 test server did not expose a TCP address");
+    }
+    const options = {
+      enabled: true,
+      protocol: "grpc" as const,
+      endpoint: `http://127.0.0.1:${address.port}`,
+      headers: [["x-synthetic", "yes"]] as const,
+      resources: [],
+    };
+    const summary = { exitCode: 0, taskCount: 0, tasks: [] };
+    try {
+      await Effect.runPromise(
+        exportRunMetrics(options, undefined, summary).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(requests[0]?.headers[http2Constants.HTTP2_HEADER_METHOD]).toBe(
+        "POST",
+      );
+      expect(requests[0]?.headers[http2Constants.HTTP2_HEADER_PATH]).toBe(
+        "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+      );
+      expect(requests[0]?.body[0]).toBe(0);
+
+      grpcStatus = "7";
+      const failed = await Effect.runPromise(
+        Effect.either(
+          exportRunMetrics(options, undefined, summary).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        ),
+      );
+      expect(failed._tag).toBe("Left");
+      if (failed._tag === "Right") throw new Error("expected gRPC failure");
+      expect(failed.left.message).toContain("permission denied");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("exports resolved environment and stored remote tokens with task details", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-otel-run-"));
+    const root = join(directory, "repository");
+    const configurationHome = join(directory, "configuration");
+    await prepareRepository(root);
+    try {
+      await withServer(
+        () => [200, { "content-type": "application/json" }, "{}"],
+        async (baseUrl, requests) => {
+          const commonArguments = [
+            "run",
+            "build",
+            "--filter=synthetic-app",
+            "--no-cache",
+            "--experimental-otel-enabled=true",
+            "--experimental-otel-protocol=http-json",
+            `--experimental-otel-endpoint=${baseUrl}`,
+            "--experimental-otel-use-remote-cache-token=true",
+            `--cwd=${root}`,
+          ];
+          const environmentToken = await runCandidate(commonArguments, root, {
+            TURBO_TOKEN: "environment-token",
+          });
+          expect(environmentToken.code, environmentToken.stderr).toBe(0);
+          expect(requests[0]?.headers.authorization).toBe(
+            "Bearer environment-token",
+          );
+
+          const userPath = join(configurationHome, "turborepo/config.json");
+          await mkdir(join(configurationHome, "turborepo"), {
+            recursive: true,
+          });
+          await writeFile(userPath, JSON.stringify({ token: "stored-token" }));
+          if (process.platform !== "win32") await chmod(userPath, 0o600);
+          const storedToken = await runCandidate(
+            [
+              ...commonArguments,
+              "--experimental-otel-metrics-run-summary=false",
+              "--experimental-otel-metrics-task-details=true",
+            ],
+            root,
+            { XDG_CONFIG_HOME: configurationHome },
+          );
+          expect(storedToken.code, storedToken.stderr).toBe(0);
+          expect(requests[1]?.headers.authorization).toBe(
+            "Bearer stored-token",
+          );
+          const document = JSON.parse(requests[1]?.body ?? "{}");
+          const metrics = document.resourceMetrics[0].scopeMetrics[0].metrics;
+          expect(
+            metrics.map((metric: { readonly name: string }) => metric.name),
+          ).toEqual(["turbo.task"]);
+          expect(JSON.stringify(metrics)).toContain("synthetic-app#build");
+        },
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("strips secrets on cross-origin redirects and enforces timeouts", async () => {
     await withServer(

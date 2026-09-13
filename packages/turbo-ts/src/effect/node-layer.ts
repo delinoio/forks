@@ -52,7 +52,7 @@ import {
   tmpdir,
   userInfo,
 } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { Readable, Transform, type Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
@@ -83,6 +83,8 @@ import {
   FileSystemService,
   FileWatcherService,
   GitService,
+  type HttpRequest,
+  type HttpResponse,
   HttpService,
   type LoopbackHttpResponse,
   LoopbackHttpService,
@@ -1690,7 +1692,7 @@ const credentialError = (_cause: unknown): BoundaryError =>
 
 const userConfigurationDirectory = (): string => {
   const configured = process.env.XDG_CONFIG_HOME;
-  if (configured !== undefined && configured !== "") {
+  if (configured !== undefined && configured !== "" && isAbsolute(configured)) {
     return join(configured, "turborepo");
   }
   const home = process.env.HOME ?? userInfo().homedir;
@@ -3250,6 +3252,106 @@ const fetchWithSafeRedirects = async (
   }
 };
 
+const requestWithHttp2 = (
+  request: HttpRequest,
+  signal: AbortSignal,
+): Promise<HttpResponse> =>
+  new Promise((resolve, reject) => {
+    const url = new URL(request.url);
+    if (
+      (url.protocol !== "http:" && url.protocol !== "https:") ||
+      url.username !== "" ||
+      url.password !== ""
+    ) {
+      reject(new TypeError("HTTP/2 request URL is invalid"));
+      return;
+    }
+    const session = connectHttp2(url.origin);
+    let settled = false;
+    let status: number | undefined;
+    const responseHeaders: Record<string, string> = {};
+    const chunks: Array<Buffer> = [];
+    let responseLength = 0;
+    const complete = (cause?: unknown) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      session.destroy();
+      if (cause !== undefined) {
+        reject(cause);
+        return;
+      }
+      if (status === undefined) {
+        reject(new TypeError("HTTP/2 response omitted its status"));
+        return;
+      }
+      resolve({
+        status,
+        headers: responseHeaders,
+        body: new Uint8Array(Buffer.concat(chunks)),
+      });
+    };
+    const abort = () => complete(signal.reason ?? new Error("request aborted"));
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    session.once("error", complete);
+    const regularHeaders = Object.fromEntries(
+      Object.entries(request.headers ?? {}).filter(
+        ([name]) => !name.startsWith(":") && name.toLowerCase() !== "host",
+      ),
+    );
+    const stream = session.request({
+      [http2Constants.HTTP2_HEADER_METHOD]: request.method,
+      [http2Constants.HTTP2_HEADER_PATH]: `${url.pathname}${url.search}`,
+      [http2Constants.HTTP2_HEADER_SCHEME]: url.protocol.slice(0, -1),
+      [http2Constants.HTTP2_HEADER_AUTHORITY]: url.host,
+      ...regularHeaders,
+    });
+    const recordHeaders = (
+      headers: Readonly<Record<string, string | string[] | number | undefined>>,
+    ) => {
+      const responseStatus = headers[http2Constants.HTTP2_HEADER_STATUS];
+      if (typeof responseStatus === "number") status = responseStatus;
+      for (const [name, value] of Object.entries(headers)) {
+        if (name.startsWith(":") || value === undefined) continue;
+        responseHeaders[name.toLowerCase()] = Array.isArray(value)
+          ? value.join(", ")
+          : String(value);
+      }
+    };
+    stream.on("response", recordHeaders);
+    stream.on("trailers", recordHeaders);
+    stream.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      responseLength += chunk.length;
+      if (
+        request.maxResponseBodyBytes !== undefined &&
+        responseLength > request.maxResponseBodyBytes
+      ) {
+        stream.close(http2Constants.NGHTTP2_CANCEL);
+        complete(
+          new HttpResponseBodyLimitError(
+            `HTTP response body exceeds the ${request.maxResponseBodyBytes} byte limit`,
+          ),
+        );
+        return;
+      }
+      chunks.push(chunk);
+    });
+    stream.once("error", complete);
+    stream.once("end", () => complete());
+    stream.end(
+      request.body === undefined
+        ? undefined
+        : typeof request.body === "string"
+          ? request.body
+          : Buffer.from(request.body),
+    );
+  });
+
 const httpLayer = Layer.succeed(HttpService, {
   request: (request) =>
     Effect.tryPromise({
@@ -3265,6 +3367,9 @@ const httpLayer = Layer.succeed(HttpService, {
             ? interruptionSignal
             : AbortSignal.any([interruptionSignal, controller.signal]);
         try {
+          if (request.transport === "http2") {
+            return await requestWithHttp2(request, signal);
+          }
           const response = await fetchWithSafeRedirects(request, signal);
           return {
             status: response.status,

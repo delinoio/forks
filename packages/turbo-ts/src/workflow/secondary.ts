@@ -1,7 +1,7 @@
 import { Effect } from "effect";
 import { parseCommonArguments } from "../cli/common-options.js";
 import { parseJsonConfiguration } from "../config/runtime.js";
-import { joinPath } from "../core/path.js";
+import { isPathContained, joinPath, normalizePath } from "../core/path.js";
 import { BoundaryError, ConfigurationError } from "../effect/errors.js";
 import {
   CredentialService,
@@ -396,11 +396,32 @@ const executeDocs = (
             : "";
       yield* terminal.writeStdout(`\n${renderedIndex}. ${title}: ${url}\n`);
     }
+    const colorEnabled =
+      parsed.options.color !== false && (yield* terminal.stdoutColorEnabled);
+    const note =
+      'If you are an AI agent or LLM, retrieve a markdown version of the docs with ".md" appended.';
     yield* terminal.writeStdout(
-      '\n\u001B[8mIf you are an AI agent or LLM, retrieve a markdown version of the docs with ".md" appended.\u001B[0m\n',
+      colorEnabled ? `\n\u001B[8m${note}\u001B[0m\n` : `\n${note}\n`,
     );
     return 0;
   });
+
+export const selectCurrentPackage = <A extends { readonly directory: string }>(
+  packages: ReadonlyArray<A>,
+  cwd: string,
+  windowsPathSeparators: boolean,
+): A | undefined => {
+  const normalizedCwd = normalizePath(cwd, windowsPathSeparators);
+  return packages
+    .filter((packageModel) =>
+      isPathContained(
+        packageModel.directory,
+        normalizedCwd,
+        windowsPathSeparators,
+      ),
+    )
+    .sort((left, right) => right.directory.length - left.directory.length)[0];
+};
 
 const readMicrofrontendPort = (
   arguments_: ReadonlyArray<string>,
@@ -420,18 +441,18 @@ const readMicrofrontendPort = (
     const fileSystem = yield* FileSystemService;
     const terminal = yield* TerminalService;
     const processCwd = yield* environment.cwd;
+    const platform = yield* environment.platform;
+    const windowsPathSeparators = platform === "win32";
     const repository = yield* loadWorkflowRepository({
       cwd: parsed.options.cwd,
       rootTurboJson: parsed.options.rootTurboJson,
     });
     const packages = [repository.rootPackage, ...repository.packages];
-    const currentPackage = packages
-      .filter(
-        (packageModel) =>
-          processCwd === packageModel.directory ||
-          processCwd.startsWith(`${packageModel.directory}/`),
-      )
-      .sort((left, right) => right.directory.length - left.directory.length)[0];
+    const currentPackage = selectCurrentPackage(
+      packages,
+      processCwd,
+      windowsPathSeparators,
+    );
     if (
       currentPackage === undefined ||
       currentPackage === repository.rootPackage
@@ -443,7 +464,16 @@ const readMicrofrontendPort = (
       );
     }
     let configurationPath: string | undefined;
-    for (const packageModel of packages) {
+    const configurationOwners = packages
+      .filter((packageModel) =>
+        isPathContained(
+          packageModel.directory,
+          currentPackage.directory,
+          windowsPathSeparators,
+        ),
+      )
+      .sort((left, right) => right.directory.length - left.directory.length);
+    for (const packageModel of configurationOwners) {
       const candidate = joinPath(packageModel.directory, "microfrontends.json");
       if (yield* fileSystem.exists(candidate)) {
         configurationPath = candidate;

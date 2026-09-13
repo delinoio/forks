@@ -14,6 +14,7 @@ import {
   ProcessService,
   TerminalService,
 } from "../effect/services.js";
+import { canonicalExistingAncestorPath } from "../run/engine.js";
 import { resolveWorkflowRepositoryRoot } from "./repository.js";
 
 interface GeneratorAction {
@@ -287,7 +288,14 @@ const executeWorkspaceGenerator = (
       options.destination ??
         joinPath(defaultParent, name.replace(/^@[^/]+\//, "")),
     );
-    if (!isPathContained(root, destination) || destination === root) {
+    const [canonicalRoot, canonicalDestination] = yield* Effect.all([
+      canonicalExistingAncestorPath(root, "generator repository"),
+      canonicalExistingAncestorPath(destination, "workspace destination"),
+    ]);
+    if (
+      !isPathContained(canonicalRoot, canonicalDestination) ||
+      canonicalDestination === canonicalRoot
+    ) {
       return yield* Effect.fail(
         failure("workspace destination must remain inside the repository"),
       );
@@ -308,11 +316,17 @@ const executeWorkspaceGenerator = (
       const source = isAbsolutePath(options.copy)
         ? options.copy
         : joinPath(root, options.copy);
-      if (
-        !isPathContained(root, source) ||
-        !(yield* fileSystem.exists(source))
-      ) {
+      if (!(yield* fileSystem.exists(source))) {
         return yield* Effect.fail(failure("workspace template does not exist"));
+      }
+      const canonicalSource = yield* fileSystem.realPath(source);
+      if (!isPathContained(canonicalRoot, canonicalSource)) {
+        return yield* Effect.fail(failure("workspace template does not exist"));
+      }
+      if (isPathContained(canonicalSource, canonicalDestination)) {
+        return yield* Effect.fail(
+          failure("workspace template must not contain its destination"),
+        );
       }
       yield* copyTree(source, destination);
     } else {
@@ -394,6 +408,10 @@ export const executeGenerate = (
         return yield* Effect.fail(failure("generator returned invalid output"));
       }
       const configurationDirectory = parentPath(configuration);
+      const canonicalRoot = yield* canonicalExistingAncestorPath(
+        root,
+        "generator repository",
+      );
       for (const action of loaded.actions) {
         if (typeof action === "string") {
           yield* terminal.writeStdout(`${action}\n`);
@@ -413,7 +431,14 @@ export const executeGenerate = (
           root,
           renderTemplate(action.path, loaded.answers),
         );
-        if (!isPathContained(root, destination) || destination === root) {
+        const canonicalDestination = yield* canonicalExistingAncestorPath(
+          destination,
+          "generator action destination",
+        );
+        if (
+          !isPathContained(canonicalRoot, canonicalDestination) ||
+          canonicalDestination === canonicalRoot
+        ) {
           return yield* Effect.fail(
             failure("generator action escapes the repository"),
           );

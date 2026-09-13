@@ -252,6 +252,7 @@ export class ConcurrencyService extends Context.Tag(
 export interface HttpRequest {
   readonly url: string;
   readonly method: "DELETE" | "GET" | "HEAD" | "OPTIONS" | "POST" | "PUT";
+  readonly transport?: "http2";
   readonly headers?: Readonly<Record<string, string>>;
   readonly body?: Uint8Array | string;
   readonly timeoutMilliseconds?: number;

@@ -5,11 +5,18 @@ import type {
 } from "../cli/common-options.js";
 import { BoundaryError } from "../effect/errors.js";
 import { EnvironmentService, HttpService } from "../effect/services.js";
+import type { RunMetricTaskDetail } from "../run/engine.js";
 import { packageVersion } from "../version.js";
 
 export interface RunMetricSummary {
   readonly exitCode: number;
   readonly taskCount: number;
+  readonly tasks: ReadonlyArray<RunMetricTaskDetail>;
+}
+
+interface MetricSelection {
+  readonly runSummary: boolean;
+  readonly taskDetails: boolean;
 }
 
 const protocolFromEnvironment = (
@@ -89,6 +96,7 @@ const resourceAttributes = (
 export const encodeOtlpMetrics = (
   summary: RunMetricSummary,
   configuredResources: ReadonlyArray<readonly [string, string]> = [],
+  selection: MetricSelection = { runSummary: true, taskDetails: false },
 ): Uint8Array => {
   const keyValue = (key: string, value: string) =>
     concat(stringField(1, key), field(2, stringField(1, value)));
@@ -97,18 +105,70 @@ export const encodeOtlpMetrics = (
       field(1, keyValue(key, value)),
     ),
   );
-  const dataPoint = concat(
-    fixed64Field(6, 1n),
-    field(7, keyValue("turbo.exit_code", String(summary.exitCode))),
-    field(7, keyValue("turbo.task_count", String(summary.taskCount))),
-  );
-  const gauge = field(1, dataPoint);
-  const metric = concat(stringField(1, "turbo.run"), field(5, gauge));
+  const dataPoint = (
+    attributes: ReadonlyArray<readonly [string, string]>,
+  ): Uint8Array =>
+    concat(
+      fixed64Field(6, 1n),
+      ...attributes.map(([key, value]) => field(7, keyValue(key, value))),
+    );
+  const gaugeMetric = (
+    name: string,
+    points: ReadonlyArray<Uint8Array>,
+  ): Uint8Array =>
+    concat(
+      stringField(1, name),
+      field(5, concat(...points.map((point) => field(1, point)))),
+    );
+  const metrics = [
+    ...(selection.runSummary
+      ? [
+          gaugeMetric("turbo.run", [
+            dataPoint([
+              ["turbo.exit_code", String(summary.exitCode)],
+              ["turbo.task_count", String(summary.taskCount)],
+            ]),
+          ]),
+        ]
+      : []),
+    ...(selection.taskDetails
+      ? [
+          gaugeMetric(
+            "turbo.task",
+            summary.tasks.map((task) =>
+              dataPoint([
+                ["turbo.task_id", task.id],
+                ["turbo.package", task.package],
+                ["turbo.task", task.task],
+                ["turbo.status", task.status],
+                ...(task.exitCode === undefined
+                  ? []
+                  : [["turbo.exit_code", String(task.exitCode)] as const]),
+                ...(task.durationMilliseconds === undefined
+                  ? []
+                  : [
+                      [
+                        "turbo.duration_ms",
+                        String(task.durationMilliseconds),
+                      ] as const,
+                    ]),
+                ...(task.cacheSource === undefined
+                  ? []
+                  : [["turbo.cache_source", task.cacheSource] as const]),
+              ]),
+            ),
+          ),
+        ]
+      : []),
+  ];
   const scope = concat(
     stringField(1, "turbo-ts"),
     stringField(2, packageVersion),
   );
-  const scopeMetrics = concat(field(1, scope), field(2, metric));
+  const scopeMetrics = concat(
+    field(1, scope),
+    ...metrics.map((metric) => field(2, metric)),
+  );
   const resourceMetrics = concat(field(1, resource), field(2, scopeMetrics));
   return field(1, resourceMetrics);
 };
@@ -116,44 +176,88 @@ export const encodeOtlpMetrics = (
 export const makeOtlpJsonMetrics = (
   summary: RunMetricSummary,
   configuredResources: ReadonlyArray<readonly [string, string]> = [],
-): Readonly<Record<string, unknown>> => ({
-  resourceMetrics: [
-    {
-      resource: {
-        attributes: resourceAttributes(configuredResources).map(
-          ([key, value]) => ({ key, value: { stringValue: value } }),
-        ),
-      },
-      scopeMetrics: [
-        {
-          scope: { name: "turbo-ts", version: packageVersion },
-          metrics: [
-            {
-              name: "turbo.run",
-              gauge: {
-                dataPoints: [
-                  {
-                    asInt: "1",
-                    attributes: [
-                      {
-                        key: "turbo.exit_code",
-                        value: { intValue: String(summary.exitCode) },
-                      },
-                      {
-                        key: "turbo.task_count",
-                        value: { intValue: String(summary.taskCount) },
-                      },
-                    ],
-                  },
-                ],
-              },
+  selection: MetricSelection = { runSummary: true, taskDetails: false },
+): Readonly<Record<string, unknown>> => {
+  const integerAttribute = (key: string, value: number) => ({
+    key,
+    value: { intValue: String(value) },
+  });
+  const stringAttribute = (key: string, value: string) => ({
+    key,
+    value: { stringValue: value },
+  });
+  const metrics = [
+    ...(selection.runSummary
+      ? [
+          {
+            name: "turbo.run",
+            gauge: {
+              dataPoints: [
+                {
+                  asInt: "1",
+                  attributes: [
+                    integerAttribute("turbo.exit_code", summary.exitCode),
+                    integerAttribute("turbo.task_count", summary.taskCount),
+                  ],
+                },
+              ],
             },
-          ],
+          },
+        ]
+      : []),
+    ...(selection.taskDetails
+      ? [
+          {
+            name: "turbo.task",
+            gauge: {
+              dataPoints: summary.tasks.map((task) => ({
+                asInt: "1",
+                attributes: [
+                  stringAttribute("turbo.task_id", task.id),
+                  stringAttribute("turbo.package", task.package),
+                  stringAttribute("turbo.task", task.task),
+                  stringAttribute("turbo.status", task.status),
+                  ...(task.exitCode === undefined
+                    ? []
+                    : [integerAttribute("turbo.exit_code", task.exitCode)]),
+                  ...(task.durationMilliseconds === undefined
+                    ? []
+                    : [
+                        integerAttribute(
+                          "turbo.duration_ms",
+                          task.durationMilliseconds,
+                        ),
+                      ]),
+                  ...(task.cacheSource === undefined
+                    ? []
+                    : [
+                        stringAttribute("turbo.cache_source", task.cacheSource),
+                      ]),
+                ],
+              })),
+            },
+          },
+        ]
+      : []),
+  ];
+  return {
+    resourceMetrics: [
+      {
+        resource: {
+          attributes: resourceAttributes(configuredResources).map(
+            ([key, value]) => ({ key, value: { stringValue: value } }),
+          ),
         },
-      ],
-    },
-  ],
-});
+        scopeMetrics: [
+          {
+            scope: { name: "turbo-ts", version: packageVersion },
+            metrics,
+          },
+        ],
+      },
+    ],
+  };
+};
 
 const endpointFor = (configured: string, protocol: OtlpProtocol): string => {
   const url = new URL(configured);
@@ -184,6 +288,11 @@ export const exportRunMetrics = (
       options.enabled ??
       (yield* environment.get("TURBO_EXPERIMENTAL_OTEL_ENABLED")) === "true";
     if (!enabled) return;
+    const selection = {
+      runSummary: options.metricsRunSummary !== false,
+      taskDetails: options.metricsTaskDetails === true,
+    };
+    if (!selection.runSummary && !selection.taskDetails) return;
     const protocol =
       options.protocol ??
       protocolFromEnvironment(
@@ -216,6 +325,7 @@ export const exportRunMetrics = (
             ? "application/json"
             : "application/x-protobuf",
       "user-agent": `turbo-ts/${packageVersion}`,
+      ...(protocol === "grpc" ? { te: "trailers" } : {}),
       ...Object.fromEntries(configuredHeaders),
       ...(options.useRemoteCacheToken === true && token !== undefined
         ? { authorization: `Bearer ${token}` }
@@ -224,15 +334,18 @@ export const exportRunMetrics = (
     const payload =
       protocol === "http-json"
         ? new TextEncoder().encode(
-            JSON.stringify(makeOtlpJsonMetrics(summary, options.resources)),
+            JSON.stringify(
+              makeOtlpJsonMetrics(summary, options.resources, selection),
+            ),
           )
-        : encodeOtlpMetrics(summary, options.resources);
+        : encodeOtlpMetrics(summary, options.resources, selection);
     const grpcHeader = new Uint8Array(5);
     new DataView(grpcHeader.buffer).setUint32(1, payload.length, false);
     const body = protocol === "grpc" ? concat(grpcHeader, payload) : payload;
     const response = yield* http.request({
       url: endpointFor(endpoint, protocol),
       method: "POST",
+      transport: protocol === "grpc" ? "http2" : undefined,
       headers,
       body,
       timeoutMilliseconds,
@@ -244,6 +357,24 @@ export const exportRunMetrics = (
           boundary: "observability",
           message: `OTLP export returned ${response.status}`,
           retryable: response.status === 429 || response.status >= 500,
+        }),
+      );
+    }
+    if (protocol === "grpc" && response.headers["grpc-status"] !== "0") {
+      const encodedMessage = response.headers["grpc-message"];
+      let message = encodedMessage ?? "gRPC status is missing";
+      if (encodedMessage !== undefined) {
+        try {
+          message = decodeURIComponent(encodedMessage);
+        } catch {
+          message = "gRPC status message is malformed";
+        }
+      }
+      return yield* Effect.fail(
+        new BoundaryError({
+          boundary: "observability",
+          message: `OTLP gRPC export failed: ${message}`,
+          retryable: false,
         }),
       );
     }

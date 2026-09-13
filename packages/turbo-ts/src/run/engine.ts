@@ -164,6 +164,7 @@ interface ResolvedRunOptions {
   readonly outputLogs?: OutputLogs;
   readonly only: boolean;
   readonly parallel: boolean;
+  readonly remoteToken?: string;
   readonly remote?: RemoteCacheOptions;
   readonly colorEnabled: boolean;
   readonly json: boolean;
@@ -481,6 +482,7 @@ export const resolveOptions = (
   const cacheDirectory = isAbsolutePath(cacheDirectoryValue)
     ? cacheDirectoryValue
     : joinPath(root, cacheDirectoryValue);
+  const cachePolicy = parseCachePolicy(parsed, environmentValue);
   const remoteConfiguration = value.remoteCache ?? global?.remoteCache;
   const token =
     parsed.token ?? environmentValue("TURBO_TOKEN") ?? storedCredentials.token;
@@ -597,10 +599,12 @@ export const resolveOptions = (
       apiUrl,
       token,
       teamId:
-        environmentValue("TURBO_TEAMID") ??
-        remoteConfiguration?.teamId ??
-        storedCredentials.project?.teamId ??
-        undefined,
+        parsed.team === undefined
+          ? (environmentValue("TURBO_TEAMID") ??
+            remoteConfiguration?.teamId ??
+            storedCredentials.project?.teamId ??
+            undefined)
+          : undefined,
       teamSlug:
         parsed.team ??
         environmentValue("TURBO_TEAM") ??
@@ -669,7 +673,7 @@ export const resolveOptions = (
         gib: 1_073_741_824,
       },
     ),
-    cachePolicy: parseCachePolicy(parsed, environmentValue),
+    cachePolicy,
     force:
       parsed.force ||
       environmentBoolean(environmentValue("TURBO_FORCE")) === true,
@@ -677,6 +681,7 @@ export const resolveOptions = (
     outputLogs: parsed.outputLogs,
     only: parsed.only,
     parallel: parsed.parallel,
+    remoteToken: token,
     remote,
     colorEnabled: !parsed.noColor && environmentValue("NO_COLOR") === undefined,
     json: parsed.json,
@@ -709,8 +714,22 @@ interface AffectedPackages {
   readonly rootChanged: boolean;
 }
 
+export interface RunMetricTaskDetail {
+  readonly cacheSource?: "local" | "remote";
+  readonly durationMilliseconds?: number;
+  readonly exitCode?: number;
+  readonly id: string;
+  readonly package: string;
+  readonly status: "failed" | "skipped" | "succeeded";
+  readonly task: string;
+}
+
 interface RunExecutionContext {
   readonly changedPaths?: ReadonlyArray<string>;
+  readonly onRemoteTokenResolved?: (token: string | undefined) => void;
+  readonly onTaskMetricsResolved?: (
+    tasks: ReadonlyArray<RunMetricTaskDetail>,
+  ) => void;
 }
 
 const packageRelativeChangedFile = (
@@ -3538,10 +3557,30 @@ export const executeRun = (
           ? rootTurboJson
           : joinPath(preliminaryRoot, rootTurboJson),
     );
-    const credentialService = yield* CredentialService;
-    const projectCredentials =
-      yield* credentialService.readProjectConfiguration(preliminaryRoot);
-    const userCredentials = yield* credentialService.readUserConfiguration;
+    const environmentValue = (name: string): string | undefined =>
+      configuredEnvironmentValue(environment, name, platform === "win32");
+    const preliminaryCachePolicy = parseCachePolicy(parsed, environmentValue);
+    const remoteCacheActive =
+      preliminaryCachePolicy.remoteRead || preliminaryCachePolicy.remoteWrite;
+    const openTelemetryEnabled =
+      parsed.openTelemetry.enabled ??
+      environmentValue("TURBO_EXPERIMENTAL_OTEL_ENABLED") === "true";
+    const telemetryNeedsStoredToken =
+      openTelemetryEnabled &&
+      parsed.openTelemetry.useRemoteCacheToken === true &&
+      parsed.token === undefined &&
+      environmentValue("TURBO_TOKEN") === undefined;
+    const credentialService =
+      remoteCacheActive || telemetryNeedsStoredToken
+        ? yield* CredentialService
+        : undefined;
+    const projectCredentials = remoteCacheActive
+      ? yield* credentialService!.readProjectConfiguration(preliminaryRoot)
+      : undefined;
+    const userCredentials =
+      remoteCacheActive || telemetryNeedsStoredToken
+        ? yield* credentialService!.readUserConfiguration
+        : undefined;
     const availableParallelism = yield* concurrencyService.availableParallelism;
     const unresolvedOptions = resolveOptions(
       parsed,
@@ -3600,7 +3639,11 @@ export const executeRun = (
           )
         : unresolvedOptions.cacheDirectory,
     };
-    if (options.remote?.token !== undefined) {
+    context.onRemoteTokenResolved?.(options.remoteToken);
+    if (
+      options.remote?.token !== undefined &&
+      (options.cachePolicy.remoteRead || options.cachePolicy.remoteWrite)
+    ) {
       yield* verifyRemoteCacheStatus(options.remote).pipe(Effect.ignore);
     }
     const repository = yield* discoverRepository(options.root, configuration, {
@@ -4955,6 +4998,34 @@ export const executeRun = (
     if (parsed.json) {
       yield* terminal.writeStdout(`${JSON.stringify(summaryRecord)}\n`);
     }
+    context.onTaskMetricsResolved?.(
+      orderedNodes.map((node) => {
+        const outcome = outcomes.get(node.id);
+        return {
+          id: node.id,
+          package: node.package.name,
+          task: node.task,
+          status:
+            outcome === undefined || outcome.skipped
+              ? "skipped"
+              : outcome.exitCode === 0
+                ? "succeeded"
+                : "failed",
+          ...(outcome === undefined
+            ? {}
+            : {
+                exitCode: outcome.exitCode,
+                durationMilliseconds: Math.max(
+                  0,
+                  outcome.endTime - outcome.startTime,
+                ),
+                ...(outcome.cacheSource === undefined
+                  ? {}
+                  : { cacheSource: outcome.cacheSource }),
+              }),
+        };
+      }),
+    );
     return exitCode;
   }).pipe(
     Effect.onExit(() =>

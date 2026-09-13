@@ -1,6 +1,5 @@
 import { Effect, Schedule } from "effect";
 import { parseCommonArguments } from "../cli/common-options.js";
-import { parseJsonConfiguration } from "../config/runtime.js";
 import { joinPath } from "../core/path.js";
 import { BoundaryError, ConfigurationError } from "../effect/errors.js";
 import {
@@ -292,7 +291,7 @@ const validateRemoteCaching = (
       typeof status !== "object" ||
       status === null ||
       !("status" in status) ||
-      typeof status.status !== "string"
+      status.status !== "enabled"
     ) {
       return yield* Effect.fail(
         new BoundaryError({
@@ -328,6 +327,40 @@ const availableHostedTeams = (
         }),
       );
     }
+    let userDocument: unknown;
+    try {
+      userDocument = JSON.parse(new TextDecoder().decode(userResponse.body));
+    } catch {
+      userDocument = undefined;
+    }
+    const user =
+      typeof userDocument === "object" &&
+      userDocument !== null &&
+      "user" in userDocument &&
+      typeof userDocument.user === "object" &&
+      userDocument.user !== null
+        ? userDocument.user
+        : undefined;
+    const userId =
+      user !== undefined && "id" in user && typeof user.id === "string"
+        ? user.id
+        : undefined;
+    const userSlug =
+      user !== undefined &&
+      "username" in user &&
+      typeof user.username === "string"
+        ? user.username
+        : user !== undefined && "slug" in user && typeof user.slug === "string"
+          ? user.slug
+          : userId;
+    const userName =
+      user !== undefined && "name" in user && typeof user.name === "string"
+        ? user.name
+        : userSlug;
+    const personalScope =
+      userId === undefined || userSlug === undefined || userName === undefined
+        ? []
+        : [{ id: userId, slug: userSlug, name: userName }];
     const teamsUrl = withPath(settings.api, "/v2/teams");
     teamsUrl.searchParams.set("limit", "100");
     const teamsResponse = yield* requestHosted(
@@ -358,17 +391,20 @@ const availableHostedTeams = (
       Array.isArray(document.teams)
         ? document.teams
         : [];
-    return teams.flatMap((team) => {
-      if (typeof team !== "object" || team === null) return [];
-      const id = "id" in team ? team.id : undefined;
-      const slug = "slug" in team ? team.slug : undefined;
-      const name = "name" in team ? team.name : undefined;
-      return typeof id === "string" &&
-        typeof slug === "string" &&
-        typeof name === "string"
-        ? [{ id, slug, name }]
-        : [];
-    });
+    return [
+      ...personalScope,
+      ...teams.flatMap((team) => {
+        if (typeof team !== "object" || team === null) return [];
+        const id = "id" in team ? team.id : undefined;
+        const slug = "slug" in team ? team.slug : undefined;
+        const name = "name" in team ? team.name : undefined;
+        return typeof id === "string" &&
+          typeof slug === "string" &&
+          typeof name === "string"
+          ? [{ id, slug, name }]
+          : [];
+      }),
+    ];
   });
 
 const updateGitIgnore = (
@@ -387,63 +423,6 @@ const updateGitIgnore = (
     yield* fileSystem.writeTextAtomic(
       path,
       `${current}${prefix}.turbo\n`,
-      0o644,
-    );
-  });
-
-const updateRootRemoteCache = (
-  root: string,
-  options: HostedCommandOptions,
-  settings: ResolvedHostedSettings,
-): Effect.Effect<void, BoundaryError | ConfigurationError, FileSystemService> =>
-  Effect.gen(function* () {
-    const fileSystem = yield* FileSystemService;
-    const override = options.common.rootTurboJson;
-    const path =
-      override === undefined
-        ? (yield* fileSystem.exists(joinPath(root, "turbo.json")))
-          ? joinPath(root, "turbo.json")
-          : joinPath(root, "turbo.jsonc")
-        : override.startsWith("/")
-          ? override
-          : joinPath(root, override);
-    if (!(yield* fileSystem.exists(path))) return;
-    const document = parseJsonConfiguration(
-      yield* fileSystem.readText(path),
-      path,
-    );
-    if (
-      typeof document !== "object" ||
-      document === null ||
-      Array.isArray(document)
-    ) {
-      return yield* Effect.fail(
-        new ConfigurationError({
-          path,
-          message: "configuration must be an object",
-        }),
-      );
-    }
-    const existing = document as Record<string, unknown>;
-    const remote =
-      typeof existing.remoteCache === "object" &&
-      existing.remoteCache !== null &&
-      !Array.isArray(existing.remoteCache)
-        ? (existing.remoteCache as Record<string, unknown>)
-        : {};
-    yield* fileSystem.writeTextAtomic(
-      path,
-      JSON.stringify({
-        ...existing,
-        remoteCache: {
-          ...remote,
-          ...(settings.teamId === undefined ? {} : { teamId: settings.teamId }),
-          ...(settings.teamSlug === undefined
-            ? {}
-            : { teamSlug: settings.teamSlug }),
-          apiUrl: settings.api.toString().replace(/\/$/, ""),
-        },
-      }),
       0o644,
     );
   });
@@ -485,14 +464,6 @@ export const executeHostedCommand = (
       yield* validateRemoteCaching(selected, token);
       const existing = (yield* credentials.readUserConfiguration) ?? {};
       yield* credentials.writeUserConfiguration({ ...existing, token });
-      const repositoryRoot = yield* Effect.either(
-        resolveWorkflowRepositoryRoot({ cwd: options.common.cwd }),
-      );
-      if (repositoryRoot._tag === "Right") {
-        yield* updateRootRemoteCache(repositoryRoot.right, options, selected);
-      } else if (options.common.cwd !== undefined) {
-        return yield* Effect.fail(repositoryRoot.left);
-      }
       yield* terminal.writeStdout("Successfully logged in to turbo-ts.\n");
       return 0;
     }
