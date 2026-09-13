@@ -1036,6 +1036,34 @@ version = "1.0.0"
     });
   });
 
+  it("does not combine an explicit team slug with a stored team ID", () => {
+    const model = repository([]);
+    const options = resolveOptions(
+      parseRunArguments([
+        "run",
+        "build",
+        "--team=explicit-team",
+        "--api=https://cache.example.test/api",
+        "--token=token",
+      ]),
+      model.root,
+      {},
+      model.rootConfiguration,
+      8,
+      false,
+      {
+        project: {
+          teamId: "stored-team-id",
+          teamSlug: "stored-team-slug",
+        },
+      },
+    );
+    expect(options.remote).toMatchObject({
+      teamSlug: "explicit-team",
+    });
+    expect(options.remote?.teamId).toBeUndefined();
+  });
+
   it("builds dependency graphs, filters closures, and rejects cycles", () => {
     const library = packageModel("library", []);
     const app = packageModel("app", ["library"], { dependsOn: ["^build"] });

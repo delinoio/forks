@@ -512,15 +512,20 @@ describe("configuration generation and compatibility ledger", () => {
     expect(
       ledger.rows.find((row) => row.id === "cli.run-cache-workers"),
     ).toMatchObject({
-      status: "planned",
+      status: "passing",
       variants: ["--cache-workers"],
     });
     expect(
       ledger.rows.find((row) => row.id === "cli.run-daemon-options"),
     ).toMatchObject({
-      status: "planned",
+      status: "passing",
       variants: ["--daemon", "--no-daemon"],
     });
+    expect(
+      ledger.rows.filter(
+        (row) => row.targetGate === 4 && row.status === "planned",
+      ),
+    ).toEqual([]);
     expect(() =>
       parseCompatibilityLedger(
         ledgerSource.replace(

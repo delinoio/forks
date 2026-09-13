@@ -9,6 +9,7 @@ import {
 import {
   type RemoteCacheOptions,
   restoreRemoteCache,
+  verifyRemoteCacheStatus,
   writeRemoteCache,
 } from "../cache/remote-cache.js";
 import {
@@ -44,6 +45,7 @@ import {
   ClockService,
   CompressionService,
   ConcurrencyService,
+  CredentialService,
   DigestService,
   EnvironmentService,
   FileSystemService,
@@ -53,6 +55,7 @@ import {
   RetryScheduleService,
   RuntimeProfileService,
   SigningService,
+  type StoredProjectConfiguration,
   TerminalService,
 } from "../effect/services.js";
 import type { OutputLogs } from "../generated/configuration.js";
@@ -148,6 +151,7 @@ interface ResolvedRunOptions {
   readonly globalDependencies: ReadonlyArray<string>;
   readonly affected: boolean;
   readonly concurrency: number;
+  readonly cacheWorkers: number;
   readonly continueMode: "always" | "dependencies-successful" | "never";
   readonly environmentMode: "loose" | "strict";
   readonly cacheDirectory: string;
@@ -160,6 +164,7 @@ interface ResolvedRunOptions {
   readonly outputLogs?: OutputLogs;
   readonly only: boolean;
   readonly parallel: boolean;
+  readonly remoteToken?: string;
   readonly remote?: RemoteCacheOptions;
   readonly colorEnabled: boolean;
   readonly json: boolean;
@@ -232,6 +237,7 @@ export type RunRequirements =
   | ClockService
   | CompressionService
   | ConcurrencyService
+  | CredentialService
   | DigestService
   | EnvironmentService
   | FileSystemService
@@ -394,6 +400,10 @@ export const resolveOptions = (
   configuration: LoadedRootConfiguration,
   availableParallelism: number,
   caseInsensitiveEnvironmentNames = false,
+  storedCredentials: {
+    readonly token?: string;
+    readonly project?: StoredProjectConfiguration;
+  } = {},
 ): ResolvedRunOptions => {
   const value = configuration.value;
   const global = value.global;
@@ -411,6 +421,42 @@ export const resolveOptions = (
   const configuredRemoteUploadTimeout = environmentValue(
     "TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT",
   );
+  const configuredUi = environmentValue("TURBO_UI");
+  if (
+    configuredUi !== undefined &&
+    configuredUi !== "stream" &&
+    configuredUi !== "stream-with-experimental-timestamps" &&
+    configuredUi !== "tui"
+  ) {
+    throw new ConfigurationError({
+      path: "TURBO_UI",
+      message: `invalid UI mode: ${configuredUi}`,
+    });
+  }
+  const configuredLogOrder = environmentValue("TURBO_LOG_ORDER");
+  if (
+    configuredLogOrder !== undefined &&
+    configuredLogOrder !== "auto" &&
+    configuredLogOrder !== "stream" &&
+    configuredLogOrder !== "grouped"
+  ) {
+    throw new ConfigurationError({
+      path: "TURBO_LOG_ORDER",
+      message: `invalid log order: ${configuredLogOrder}`,
+    });
+  }
+  const configuredLogPrefix = environmentValue("TURBO_LOG_PREFIX");
+  if (
+    configuredLogPrefix !== undefined &&
+    configuredLogPrefix !== "auto" &&
+    configuredLogPrefix !== "none" &&
+    configuredLogPrefix !== "task"
+  ) {
+    throw new ConfigurationError({
+      path: "TURBO_LOG_PREFIX",
+      message: `invalid log prefix: ${configuredLogPrefix}`,
+    });
+  }
   const concurrency =
     parsed.concurrency ??
     environmentValue("TURBO_CONCURRENCY") ??
@@ -436,13 +482,16 @@ export const resolveOptions = (
   const cacheDirectory = isAbsolutePath(cacheDirectoryValue)
     ? cacheDirectoryValue
     : joinPath(root, cacheDirectoryValue);
+  const cachePolicy = parseCachePolicy(parsed, environmentValue);
   const remoteConfiguration = value.remoteCache ?? global?.remoteCache;
+  const token =
+    parsed.token ?? environmentValue("TURBO_TOKEN") ?? storedCredentials.token;
   const apiUrl =
     parsed.apiUrl ??
     configuredApiUrl ??
     remoteConfiguration?.apiUrl ??
-    undefined;
-  const token = parsed.token ?? environmentValue("TURBO_TOKEN");
+    storedCredentials.project?.apiUrl ??
+    (token === undefined ? undefined : "https://vercel.com/api");
   const signatureKey = environmentValue("TURBO_REMOTE_CACHE_SIGNATURE_KEY");
   const remoteTimeoutValue =
     parsed.remoteCacheTimeoutSeconds ??
@@ -507,6 +556,11 @@ export const resolveOptions = (
       if (parsedApiUrl.username !== "" || parsedApiUrl.password !== "") {
         throw new TypeError("remote cache URL credentials are not supported");
       }
+      if (parsedApiUrl.search !== "" || parsedApiUrl.hash !== "") {
+        throw new TypeError(
+          "remote cache URL query and fragment are not supported",
+        );
+      }
     } catch {
       throw new ConfigurationError({
         path: apiUrlPath,
@@ -545,13 +599,17 @@ export const resolveOptions = (
       apiUrl,
       token,
       teamId:
-        environmentValue("TURBO_TEAMID") ??
-        remoteConfiguration?.teamId ??
-        undefined,
+        parsed.team === undefined
+          ? (environmentValue("TURBO_TEAMID") ??
+            remoteConfiguration?.teamId ??
+            storedCredentials.project?.teamId ??
+            undefined)
+          : undefined,
       teamSlug:
         parsed.team ??
         environmentValue("TURBO_TEAM") ??
         remoteConfiguration?.teamSlug ??
+        storedCredentials.project?.teamSlug ??
         undefined,
       timeoutMilliseconds: 1_000 * remoteTimeoutSeconds,
       uploadTimeoutMilliseconds: 1_000 * remoteUploadTimeoutSeconds,
@@ -571,6 +629,21 @@ export const resolveOptions = (
       concurrency ?? undefined,
       availableParallelism,
     ),
+    cacheWorkers: (() => {
+      const environmentWorkers = environmentValue("TURBO_CACHE_WORKERS");
+      const value = parsed.cacheWorkers ?? environmentWorkers ?? 10;
+      const count = Number(value);
+      if (!Number.isSafeInteger(count) || count <= 0) {
+        throw new ConfigurationError({
+          path:
+            parsed.cacheWorkers !== undefined
+              ? "<arguments>"
+              : "TURBO_CACHE_WORKERS",
+          message: `invalid cache worker count: ${String(value)}`,
+        });
+      }
+      return count;
+    })(),
     continueMode: parsed.continueMode ?? "never",
     environmentMode: environmentModeValue,
     cacheDirectory,
@@ -600,7 +673,7 @@ export const resolveOptions = (
         gib: 1_073_741_824,
       },
     ),
-    cachePolicy: parseCachePolicy(parsed, environmentValue),
+    cachePolicy,
     force:
       parsed.force ||
       environmentBoolean(environmentValue("TURBO_FORCE")) === true,
@@ -608,12 +681,24 @@ export const resolveOptions = (
     outputLogs: parsed.outputLogs,
     only: parsed.only,
     parallel: parsed.parallel,
+    remoteToken: token,
     remote,
     colorEnabled: !parsed.noColor && environmentValue("NO_COLOR") === undefined,
     json: parsed.json,
-    ui: parsed.ui ?? value.ui ?? global?.ui ?? "stream",
-    logOrder: parsed.logOrder ?? "auto",
-    logPrefix: parsed.logPrefix ?? "auto",
+    ui:
+      parsed.ui ??
+      (configuredUi as ResolvedRunOptions["ui"] | undefined) ??
+      value.ui ??
+      global?.ui ??
+      "stream",
+    logOrder:
+      parsed.logOrder ??
+      (configuredLogOrder as ResolvedRunOptions["logOrder"] | undefined) ??
+      "auto",
+    logPrefix:
+      parsed.logPrefix ??
+      (configuredLogPrefix as ResolvedRunOptions["logPrefix"] | undefined) ??
+      "auto",
   };
 };
 
@@ -629,8 +714,22 @@ interface AffectedPackages {
   readonly rootChanged: boolean;
 }
 
+export interface RunMetricTaskDetail {
+  readonly cacheSource?: "local" | "remote";
+  readonly durationMilliseconds?: number;
+  readonly exitCode?: number;
+  readonly id: string;
+  readonly package: string;
+  readonly status: "failed" | "skipped" | "succeeded";
+  readonly task: string;
+}
+
 interface RunExecutionContext {
   readonly changedPaths?: ReadonlyArray<string>;
+  readonly onRemoteTokenResolved?: (token: string | undefined) => void;
+  readonly onTaskMetricsResolved?: (
+    tasks: ReadonlyArray<RunMetricTaskDetail>,
+  ) => void;
 }
 
 const packageRelativeChangedFile = (
@@ -2247,12 +2346,17 @@ type CachePublicationPermit = <A, E, R>(
   publication: Effect.Effect<A, E, R>,
 ) => Effect.Effect<A, E, R>;
 
-export const makeCachePublicationPermit: Effect.Effect<CachePublicationPermit> =
-  Effect.makeSemaphore(1).pipe(
+const cachePublicationPermit = (
+  permits = 1,
+): Effect.Effect<CachePublicationPermit> =>
+  Effect.makeSemaphore(permits).pipe(
     Effect.map(
       (semaphore) => (publication) => semaphore.withPermits(1)(publication),
     ),
   );
+
+export const makeCachePublicationPermit: Effect.Effect<CachePublicationPermit> =
+  cachePublicationPermit();
 
 const prepareTaskLogPath = (
   logPath: string,
@@ -3439,14 +3543,44 @@ export const executeRun = (
     const preliminaryRoot = yield* discoverRepositoryRoot(
       resolvedRequestedRoot ?? processCwd,
     );
+    const configuredRootTurboJson = configuredEnvironmentValue(
+      environment,
+      "TURBO_ROOT_TURBO_JSON",
+      platform === "win32",
+    );
+    const rootTurboJson = parsed.rootTurboJson ?? configuredRootTurboJson;
     const configuration = yield* loadRootConfiguration(
       preliminaryRoot,
-      parsed.rootTurboJson === undefined
+      rootTurboJson === undefined
         ? undefined
-        : isAbsolutePath(parsed.rootTurboJson)
-          ? parsed.rootTurboJson
-          : joinPath(preliminaryRoot, parsed.rootTurboJson),
+        : isAbsolutePath(rootTurboJson)
+          ? rootTurboJson
+          : joinPath(preliminaryRoot, rootTurboJson),
     );
+    const environmentValue = (name: string): string | undefined =>
+      configuredEnvironmentValue(environment, name, platform === "win32");
+    const preliminaryCachePolicy = parseCachePolicy(parsed, environmentValue);
+    const remoteCacheActive =
+      preliminaryCachePolicy.remoteRead || preliminaryCachePolicy.remoteWrite;
+    const openTelemetryEnabled =
+      parsed.openTelemetry.enabled ??
+      environmentValue("TURBO_EXPERIMENTAL_OTEL_ENABLED") === "true";
+    const telemetryNeedsStoredToken =
+      openTelemetryEnabled &&
+      parsed.openTelemetry.useRemoteCacheToken === true &&
+      parsed.token === undefined &&
+      environmentValue("TURBO_TOKEN") === undefined;
+    const credentialService =
+      remoteCacheActive || telemetryNeedsStoredToken
+        ? yield* CredentialService
+        : undefined;
+    const projectCredentials = remoteCacheActive
+      ? yield* credentialService!.readProjectConfiguration(preliminaryRoot)
+      : undefined;
+    const userCredentials =
+      remoteCacheActive || telemetryNeedsStoredToken
+        ? yield* credentialService!.readUserConfiguration
+        : undefined;
     const availableParallelism = yield* concurrencyService.availableParallelism;
     const unresolvedOptions = resolveOptions(
       parsed,
@@ -3455,7 +3589,12 @@ export const executeRun = (
       configuration,
       availableParallelism,
       platform === "win32",
+      { token: userCredentials?.token, project: projectCredentials },
     );
+    const remoteSessionId =
+      unresolvedOptions.remote === undefined
+        ? undefined
+        : yield* (yield* RandomnessService).uuidV7;
     const [canonicalRoot, canonicalCacheDirectory] = yield* Effect.all([
       canonicalExistingAncestorPath(unresolvedOptions.root),
       canonicalExistingAncestorPath(unresolvedOptions.cacheDirectory),
@@ -3480,6 +3619,10 @@ export const executeRun = (
         : yield* terminal.stdoutIsTerminal;
     const options: ResolvedRunOptions = {
       ...unresolvedOptions,
+      remote:
+        unresolvedOptions.remote === undefined
+          ? undefined
+          : { ...unresolvedOptions.remote, sessionId: remoteSessionId },
       ui: resolveRunUiMode(
         unresolvedOptions.ui,
         stdinIsTerminal,
@@ -3496,6 +3639,13 @@ export const executeRun = (
           )
         : unresolvedOptions.cacheDirectory,
     };
+    context.onRemoteTokenResolved?.(options.remoteToken);
+    if (
+      options.remote?.token !== undefined &&
+      (options.cachePolicy.remoteRead || options.cachePolicy.remoteWrite)
+    ) {
+      yield* verifyRemoteCacheStatus(options.remote).pipe(Effect.ignore);
+    }
     const repository = yield* discoverRepository(options.root, configuration, {
       singlePackage: parsed.singlePackage,
     });
@@ -4296,7 +4446,9 @@ export const executeRun = (
     const foregroundSemaphore = yield* Effect.makeSemaphore(
       options.concurrency,
     );
-    const withCachePublicationPermit = yield* makeCachePublicationPermit;
+    const withCachePublicationPermit = yield* cachePublicationPermit(
+      options.cacheWorkers,
+    );
     const outputSemaphore = yield* Effect.makeSemaphore(1);
     const withOutputPermit: OutputPermit = (output) =>
       options.logOrder === "grouped"
@@ -4846,6 +4998,34 @@ export const executeRun = (
     if (parsed.json) {
       yield* terminal.writeStdout(`${JSON.stringify(summaryRecord)}\n`);
     }
+    context.onTaskMetricsResolved?.(
+      orderedNodes.map((node) => {
+        const outcome = outcomes.get(node.id);
+        return {
+          id: node.id,
+          package: node.package.name,
+          task: node.task,
+          status:
+            outcome === undefined || outcome.skipped
+              ? "skipped"
+              : outcome.exitCode === 0
+                ? "succeeded"
+                : "failed",
+          ...(outcome === undefined
+            ? {}
+            : {
+                exitCode: outcome.exitCode,
+                durationMilliseconds: Math.max(
+                  0,
+                  outcome.endTime - outcome.startTime,
+                ),
+                ...(outcome.cacheSource === undefined
+                  ? {}
+                  : { cacheSource: outcome.cacheSource }),
+              }),
+        };
+      }),
+    );
     return exitCode;
   }).pipe(
     Effect.onExit(() =>

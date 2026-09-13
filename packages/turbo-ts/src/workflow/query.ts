@@ -709,7 +709,7 @@ const packageMatchesPredicate = (
   );
 };
 
-interface BoundaryDiagnostic {
+export interface BoundaryDiagnostic {
   readonly message: string;
   readonly reason: string | null;
   readonly path: string;
@@ -769,7 +769,7 @@ const boundaryRuleDiagnostics = (
   return [];
 };
 
-const boundaryDiagnostics = (
+export const boundaryDiagnostics = (
   repository: RepositoryModel,
 ): ReadonlyArray<BoundaryDiagnostic> => {
   const models = [repository.rootPackage, ...repository.packages];

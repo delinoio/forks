@@ -1,4 +1,8 @@
 import { Schema } from "effect";
+import {
+  type OpenTelemetryOptions,
+  parseCommonArguments,
+} from "../cli/common-options.js";
 import { OutputLogsSchema } from "../config/schema.js";
 import { ConfigurationError } from "../effect/errors.js";
 import type { OutputLogs } from "../generated/configuration.js";
@@ -18,6 +22,7 @@ export interface ParsedRunOptions {
   readonly environmentMode?: EnvironmentMode;
   readonly cacheDirectory?: string;
   readonly cacheSpecification?: string;
+  readonly cacheWorkers?: number;
   readonly force: boolean;
   readonly remoteOnly: boolean;
   readonly remoteCacheReadOnly: boolean;
@@ -34,6 +39,11 @@ export interface ParsedRunOptions {
   readonly remoteCacheTimeoutSeconds?: number;
   readonly rootTurboJson?: string;
   readonly noColor: boolean;
+  readonly noUpdateNotifier: boolean;
+  readonly loginUrl?: string;
+  readonly verbosity?: number;
+  readonly openTelemetry: OpenTelemetryOptions;
+  readonly daemonPreference?: boolean;
   readonly dangerouslyDisablePackageManagerCheck: boolean;
   readonly dryRun?: "text" | "json";
   readonly graph?: string;
@@ -92,20 +102,22 @@ export const parseRunArguments = (
   input: ReadonlyArray<string>,
 ): ParsedRunOptions => {
   const delimiter = input.indexOf("--");
-  const arguments_ = delimiter === -1 ? input : input.slice(0, delimiter);
+  const parserArguments = delimiter === -1 ? input : input.slice(0, delimiter);
   const passThroughArguments =
     delimiter === -1 ? [] : input.slice(delimiter + 1);
-  const start = arguments_[0] === "run" ? 1 : 0;
+  const start = parserArguments[0] === "run" ? 1 : 0;
+  const common = parseCommonArguments(parserArguments.slice(start));
+  const arguments_ = common.remaining;
   const tasks: Array<string> = [];
   const filters: Array<string> = [];
   const globalDependencies: Array<string> = [];
-  let cwd: string | undefined;
   let affected = false;
   let concurrency: string | undefined;
   let continueMode: ContinueMode | undefined;
   let environmentMode: EnvironmentMode | undefined;
   let cacheDirectory: string | undefined;
   let cacheSpecification: string | undefined;
+  let cacheWorkers: number | undefined;
   let force = false;
   let remoteOnly = false;
   let remoteCacheReadOnly = false;
@@ -115,27 +127,17 @@ export const parseRunArguments = (
   let only = false;
   let parallel = false;
   let singlePackage = false;
-  let apiUrl: string | undefined;
-  let token: string | undefined;
-  let team: string | undefined;
-  let preflight = false;
-  let remoteCacheTimeoutSeconds: number | undefined;
-  let rootTurboJson: string | undefined;
-  let noColor = false;
-  let dangerouslyDisablePackageManagerCheck = false;
+  let daemonPreference: boolean | undefined;
   let dryRun: "text" | "json" | undefined;
   let graph: string | undefined;
   let summarize = false;
   let profile: string | undefined;
   let anonymousProfile: string | undefined;
-  let heap: string | undefined;
-  let trace: string | undefined;
-  let ui: ParsedRunOptions["ui"];
   let json = false;
   let logFile: string | undefined;
   let logOrder: ParsedRunOptions["logOrder"];
   let logPrefix: ParsedRunOptions["logPrefix"];
-  for (let index = start; index < arguments_.length; index += 1) {
+  for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index]!;
     if (!argument.startsWith("-")) {
       tasks.push(argument);
@@ -143,10 +145,6 @@ export const parseRunArguments = (
     }
     const [name] = argument.split("=", 1);
     switch (name) {
-      case "--cwd": {
-        [cwd, index] = optionValue(arguments_, index, name);
-        break;
-      }
       case "--filter":
       case "-F": {
         let value: string;
@@ -230,43 +228,6 @@ export const parseRunArguments = (
         break;
       case "--single-package":
         singlePackage = true;
-        break;
-      case "--api":
-        [apiUrl, index] = optionValue(arguments_, index, name);
-        break;
-      case "--token":
-        [token, index] = optionValue(arguments_, index, name);
-        break;
-      case "--team":
-        [team, index] = optionValue(arguments_, index, name);
-        break;
-      case "--preflight":
-        preflight = true;
-        break;
-      case "--remote-cache-timeout": {
-        let value: string;
-        [value, index] = optionValue(arguments_, index, name);
-        remoteCacheTimeoutSeconds = Number(value);
-        if (
-          value.trim() === "" ||
-          !Number.isFinite(remoteCacheTimeoutSeconds) ||
-          remoteCacheTimeoutSeconds < 0
-        ) {
-          throw new ConfigurationError({
-            path: "<arguments>",
-            message: `invalid remote cache timeout: ${value}`,
-          });
-        }
-        break;
-      }
-      case "--root-turbo-json":
-        [rootTurboJson, index] = optionValue(arguments_, index, name);
-        break;
-      case "--no-color":
-        noColor = true;
-        break;
-      case "--dangerously-disable-package-manager-check":
-        dangerouslyDisablePackageManagerCheck = true;
         break;
       case "--dry":
       case "--dry-run": {
@@ -354,28 +315,6 @@ export const parseRunArguments = (
         }
         break;
       }
-      case "--heap":
-        [heap, index] = optionValue(arguments_, index, name);
-        break;
-      case "--trace":
-        [trace, index] = optionValue(arguments_, index, name);
-        break;
-      case "--ui": {
-        let value: string;
-        [value, index] = optionValue(arguments_, index, name);
-        if (
-          value !== "tui" &&
-          value !== "stream" &&
-          value !== "stream-with-experimental-timestamps"
-        ) {
-          throw new ConfigurationError({
-            path: "<arguments>",
-            message: `invalid UI mode: ${value}`,
-          });
-        }
-        ui = value;
-        break;
-      }
       case "--json":
         json = true;
         break;
@@ -417,35 +356,29 @@ export const parseRunArguments = (
         logPrefix = value;
         break;
       }
-      case "--color":
       case "--no-daemon":
+        daemonPreference = false;
+        break;
       case "--daemon":
-      case "--no-update-notifier":
-      case "--skip-infer":
-      case "--experimental-otel-enabled":
-      case "--experimental-otel-metrics-run-summary":
-      case "--experimental-otel-metrics-task-details":
-      case "--experimental-otel-use-remote-cache-token":
+        daemonPreference = true;
         break;
-      case "--verbosity": {
-        [, index] = optionValue(arguments_, index, name);
-        break;
-      }
       case "--global-deps": {
         let value: string;
         [value, index] = optionValue(arguments_, index, name);
         globalDependencies.push(value);
         break;
       }
-      case "--cache-workers":
-      case "--login":
-      case "--experimental-otel-protocol":
-      case "--experimental-otel-endpoint":
-      case "--experimental-otel-timeout-ms":
-      case "--experimental-otel-interval-ms":
-      case "--experimental-otel-header":
-      case "--experimental-otel-resource": {
-        [, index] = optionValue(arguments_, index, name);
+      case "--cache-workers": {
+        let value: string;
+        [value, index] = optionValue(arguments_, index, name);
+        const parsedCount = Number(value);
+        if (!Number.isSafeInteger(parsedCount) || parsedCount <= 0) {
+          throw new ConfigurationError({
+            path: "<arguments>",
+            message: `invalid cache worker count: ${value}`,
+          });
+        }
+        cacheWorkers = parsedCount;
         break;
       }
       default:
@@ -464,7 +397,7 @@ export const parseRunArguments = (
   return {
     tasks,
     passThroughArguments,
-    cwd,
+    cwd: common.options.cwd,
     filters,
     globalDependencies,
     affected,
@@ -473,6 +406,7 @@ export const parseRunArguments = (
     environmentMode,
     cacheDirectory,
     cacheSpecification,
+    cacheWorkers,
     force,
     remoteOnly,
     remoteCacheReadOnly,
@@ -482,22 +416,28 @@ export const parseRunArguments = (
     only,
     parallel,
     singlePackage,
-    apiUrl,
-    token,
-    team,
-    preflight,
-    remoteCacheTimeoutSeconds,
-    rootTurboJson,
-    noColor,
-    dangerouslyDisablePackageManagerCheck,
+    apiUrl: common.options.apiUrl,
+    token: common.options.token,
+    team: common.options.team,
+    preflight: common.options.preflight,
+    remoteCacheTimeoutSeconds: common.options.remoteCacheTimeoutSeconds,
+    rootTurboJson: common.options.rootTurboJson,
+    noColor: common.options.color === false,
+    noUpdateNotifier: common.options.noUpdateNotifier,
+    loginUrl: common.options.loginUrl,
+    verbosity: common.options.verbosity,
+    openTelemetry: common.options.openTelemetry,
+    daemonPreference,
+    dangerouslyDisablePackageManagerCheck:
+      common.options.dangerouslyDisablePackageManagerCheck,
     dryRun,
     graph,
     summarize,
     profile,
     anonymousProfile,
-    heap,
-    trace,
-    ui,
+    heap: common.options.heap,
+    trace: common.options.trace,
+    ui: common.options.ui,
     json,
     logFile,
     logOrder,

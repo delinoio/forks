@@ -747,14 +747,14 @@ describe("repository workflow gate", () => {
       parsePruneArguments(["app", "--docker", "--production"]),
     ).toMatchObject({ scopes: ["app"], docker: true, production: true });
 
+    const commands =
+      "bin boundaries completion config daemon devtools docs generate get-mfe-port info link login logout ls prune query run scan telemetry unlink watch";
     const completionScripts = {
-      bash: "complete -W 'run watch daemon query ls prune info completion' turbo-ts\n",
-      elvish:
-        "set edit:completion:arg-completer[turbo-ts] = { |@words| put run watch daemon query ls prune info completion }\n",
-      fish: "complete -c turbo-ts -f -a 'run watch daemon query ls prune info completion'\n",
-      powershell:
-        "Register-ArgumentCompleter -Native -CommandName turbo-ts -ScriptBlock { 'run','watch','daemon','query','ls','prune','info','completion' }\n",
-      zsh: "#compdef turbo-ts\n_arguments '1:command:(run watch daemon query ls prune info completion)'\n",
+      bash: `complete -W '${commands}' turbo-ts\n`,
+      elvish: `set edit:completion:arg-completer[turbo-ts] = { |@words| put ${commands} }\n`,
+      fish: `complete -c turbo-ts -f -a '${commands}'\n`,
+      powershell: `Register-ArgumentCompleter -Native -CommandName turbo-ts -ScriptBlock { '${commands.replaceAll(" ", "','")}' }\n`,
+      zsh: `#compdef turbo-ts\n_arguments '1:command:(${commands})'\n`,
     } as const;
     for (const [shell, script] of Object.entries(completionScripts)) {
       const completion = await executeDifferentialCommand(process.execPath, [

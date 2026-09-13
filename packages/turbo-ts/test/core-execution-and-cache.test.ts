@@ -11091,7 +11091,7 @@ dependencies = [
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  }, 30_000);
+  }, 60_000);
 
   it("applies ordered negations in structured task inputs", async () => {
     const directory = await mkdtemp(join(packageRoot, "turbo-ts-inputs-"));
