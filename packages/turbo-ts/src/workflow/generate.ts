@@ -1,5 +1,6 @@
 import { Effect } from "effect";
 import { parseCommonArguments } from "../cli/common-options.js";
+import { parseJsonConfiguration } from "../config/runtime.js";
 import {
   isAbsolutePath,
   isPathContained,
@@ -328,7 +329,31 @@ const executeWorkspaceGenerator = (
           failure("workspace template must not contain its destination"),
         );
       }
+      const manifestPath = joinPath(source, "package.json");
+      if (!(yield* fileSystem.exists(manifestPath))) {
+        return yield* Effect.fail(
+          failure("workspace template must contain a package.json object"),
+        );
+      }
+      const manifest = parseJsonConfiguration(
+        yield* fileSystem.readText(manifestPath),
+        manifestPath,
+      );
+      if (
+        typeof manifest !== "object" ||
+        manifest === null ||
+        Array.isArray(manifest)
+      ) {
+        return yield* Effect.fail(
+          failure("workspace template must contain a package.json object"),
+        );
+      }
       yield* copyTree(source, destination);
+      yield* fileSystem.writeTextAtomic(
+        joinPath(destination, "package.json"),
+        `${JSON.stringify({ ...manifest, name }, null, 2)}\n`,
+        0o644,
+      );
     } else {
       yield* fileSystem.makeDirectory(destination);
       yield* fileSystem.writeTextAtomic(

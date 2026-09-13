@@ -1,4 +1,4 @@
-import { Effect, Schedule } from "effect";
+import { Deferred, Effect, Schedule } from "effect";
 import { parseCommonArguments } from "../cli/common-options.js";
 import { joinPath } from "../core/path.js";
 import { BoundaryError, ConfigurationError } from "../effect/errors.js";
@@ -7,10 +7,14 @@ import {
   EnvironmentService,
   FileSystemService,
   HttpService,
+  LoopbackHttpService,
+  ProcessService,
+  RandomnessService,
   RetryScheduleService,
   TerminalService,
 } from "../effect/services.js";
 import { packageVersion } from "../version.js";
+import { browserInvocation } from "./browser.js";
 import { resolveWorkflowRepositoryRoot } from "./repository.js";
 
 type HostedCommand = "link" | "login" | "logout" | "unlink";
@@ -27,6 +31,7 @@ interface HostedCommandOptions {
 
 interface ResolvedHostedSettings {
   readonly api: URL;
+  readonly login: URL;
   readonly teamId?: string;
   readonly teamSlug?: string;
   readonly timeoutMilliseconds: number;
@@ -243,8 +248,13 @@ const resolveHostedSettings = (
       options.common.apiUrl ??
       (yield* configuredValue("TURBO_API")) ??
       "https://vercel.com/api";
+    const loginValue =
+      options.common.loginUrl ??
+      (yield* configuredValue("TURBO_LOGIN")) ??
+      "https://vercel.com";
     return {
       api: hostedUrl(apiValue, "API"),
+      login: hostedUrl(loginValue, "login"),
       teamId,
       teamSlug,
       timeoutMilliseconds: Math.round(
@@ -253,6 +263,68 @@ const resolveHostedSettings = (
       token,
     };
   });
+
+const requestInteractiveLoginToken = (
+  settings: ResolvedHostedSettings,
+): Effect.Effect<
+  string,
+  unknown,
+  | EnvironmentService
+  | LoopbackHttpService
+  | ProcessService
+  | RandomnessService
+  | TerminalService
+> =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const environment = yield* EnvironmentService;
+      const loopback = yield* LoopbackHttpService;
+      const processes = yield* ProcessService;
+      const randomness = yield* RandomnessService;
+      const terminal = yield* TerminalService;
+      if (processes.spawnDetached === undefined) {
+        return yield* Effect.fail(
+          fail(
+            "interactive login cannot open a browser; use --manual with --token or TURBO_TOKEN",
+          ),
+        );
+      }
+      const state = yield* randomness.uuidV7;
+      const token = yield* Deferred.make<string>();
+      const server = yield* loopback.serve(0, (request) => {
+        const callback = new URL(request.path, "http://127.0.0.1");
+        if (request.method !== "GET" || callback.pathname !== "/") {
+          return Effect.succeed({ status: 404, body: "Not Found" });
+        }
+        if (callback.searchParams.get("state") !== state) {
+          return Effect.succeed({ status: 403, body: "Forbidden" });
+        }
+        const received = callback.searchParams.get("token");
+        if (received === null || received === "") {
+          return Effect.succeed({ status: 400, body: "Missing token" });
+        }
+        return Effect.succeed({
+          status: 200,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+          body: "Authorization complete. You may close this window.",
+          afterSent: Deferred.succeed(token, received).pipe(Effect.asVoid),
+        });
+      });
+      const callback = new URL(`http://127.0.0.1:${server.port}/`);
+      const authorization = withPath(settings.login, "/turborepo/token");
+      authorization.searchParams.set("redirect_uri", callback.toString());
+      authorization.searchParams.set("state", state);
+      const platform = yield* environment.platform;
+      const cwd = yield* environment.cwd;
+      yield* terminal.writeStdout("Opening browser for turbo-ts login.\n");
+      yield* processes.spawnDetached({
+        ...browserInvocation(platform, authorization.toString()),
+        cwd,
+        inheritEnvironment: true,
+      });
+      return yield* Deferred.await(token);
+    }),
+  );
 
 const resolveLogoutInvalidationApi = (
   options: HostedCommandOptions,
@@ -468,6 +540,9 @@ export const executeHostedCommand = (
   | EnvironmentService
   | FileSystemService
   | HttpService
+  | LoopbackHttpService
+  | ProcessService
+  | RandomnessService
   | RetryScheduleService
   | TerminalService
 > =>
@@ -478,15 +553,25 @@ export const executeHostedCommand = (
     const settings = yield* resolveHostedSettings(options);
 
     if (command === "login") {
-      const token = settings.token;
+      let token = settings.token;
       if (token === undefined) {
-        return yield* Effect.fail(
-          fail(
-            options.manual
-              ? "manual login requires a token from --token or TURBO_TOKEN"
-              : "login requires a token from --token or TURBO_TOKEN in non-interactive mode",
-          ),
-        );
+        if (options.manual) {
+          return yield* Effect.fail(
+            fail("manual login requires a token from --token or TURBO_TOKEN"),
+          );
+        }
+        const stdinIsTerminal =
+          terminal.stdinIsTerminal === undefined
+            ? false
+            : yield* terminal.stdinIsTerminal;
+        if (!stdinIsTerminal) {
+          return yield* Effect.fail(
+            fail(
+              "login requires a token from --token or TURBO_TOKEN in non-interactive mode",
+            ),
+          );
+        }
+        token = yield* requestInteractiveLoginToken(settings);
       }
       const selected = {
         ...settings,

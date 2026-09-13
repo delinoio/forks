@@ -490,8 +490,8 @@ export const resolveOptions = (
   const apiUrl =
     parsed.apiUrl ??
     configuredApiUrl ??
-    remoteConfiguration?.apiUrl ??
     storedCredentials.project?.apiUrl ??
+    remoteConfiguration?.apiUrl ??
     (token === undefined ? undefined : "https://vercel.com/api");
   const signatureKey = environmentValue("TURBO_REMOTE_CACHE_SIGNATURE_KEY");
   const remoteTimeoutValue =

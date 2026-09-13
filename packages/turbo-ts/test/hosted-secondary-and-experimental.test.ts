@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import {
   access,
   chmod,
@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "@rstest/core";
-import { Effect, Layer } from "effect";
+import { Effect, Fiber, Layer } from "effect";
 import {
   headRemoteCache,
   type RemoteCacheOptions,
@@ -33,12 +33,15 @@ import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import { nodeFoundationLayer } from "../src/effect/node-layer.js";
 import {
   ClockService,
+  CredentialService,
   deterministicRetryLayer,
   EnvironmentService,
   type HttpRequest,
   type HttpResponse,
   HttpService,
   ProcessService,
+  RandomnessService,
+  TerminalService,
 } from "../src/effect/services.js";
 import { redactRecord, redactText } from "../src/logging/redaction.js";
 import { parseLockfile } from "../src/repository/lockfiles.js";
@@ -52,9 +55,19 @@ import {
   exportRunMetrics,
   makeOtlpJsonMetrics,
 } from "../src/telemetry/observability.js";
+import {
+  executeDevtools,
+  parseDevtoolsArguments,
+} from "../src/workflow/devtools.js";
 import { parseGenerateArguments } from "../src/workflow/generate.js";
-import { parseHostedArguments } from "../src/workflow/hosted.js";
-import { selectCurrentPackage } from "../src/workflow/secondary.js";
+import {
+  executeHostedCommand,
+  parseHostedArguments,
+} from "../src/workflow/hosted.js";
+import {
+  executeSecondaryCommand,
+  selectCurrentPackage,
+} from "../src/workflow/secondary.js";
 
 const execFilePromise = promisify(execFile);
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -220,37 +233,71 @@ const exerciseDevtools = async (root: string): Promise<void> => {
   }
   const port = address.port;
   await new Promise<void>((resolve) => reservation.close(() => resolve()));
-  const child = spawn(
-    process.execPath,
-    [candidate, "devtools", `--port=${port}`, "--no-open", `--cwd=${root}`],
-    {
-      cwd: root,
-      env: { ...process.env, NO_COLOR: "1", TURBO_TELEMETRY_DISABLED: "1" },
-      stdio: ["ignore", "pipe", "pipe"],
-    },
+  const services = await Effect.runPromise(
+    Effect.gen(function* () {
+      return {
+        environment: yield* EnvironmentService,
+        processes: yield* ProcessService,
+        terminal: yield* TerminalService,
+      };
+    }).pipe(Effect.provide(nodeFoundationLayer)),
   );
   let output = "";
-  const url = await new Promise<string>((resolve, reject) => {
-    const timeout = setTimeout(
-      () => reject(new Error("devtools start timed out")),
-      10_000,
-    );
-    child.once("error", reject);
-    child.once("exit", (code) =>
-      reject(new Error(`devtools exited early: ${code}`)),
-    );
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      output += chunk;
-      const match = /turbo-ts devtools: (http:\/\/[^\s]+)/.exec(output);
-      if (match?.[1] !== undefined) {
-        clearTimeout(timeout);
-        resolve(match[1]);
-      }
-    });
+  let resolveOpened: ((url: string) => void) | undefined;
+  const opened = new Promise<string>((resolve) => {
+    resolveOpened = resolve;
   });
+  const token = "018f05c9-7b4a-7cc0-98c4-66395a148002";
+  const overrides = Layer.mergeAll(
+    Layer.succeed(EnvironmentService, {
+      ...services.environment,
+      platform: Effect.succeed("linux" as NodeJS.Platform),
+    }),
+    Layer.succeed(ProcessService, {
+      ...services.processes,
+      spawnDetached: (request) =>
+        Effect.sync(() => {
+          const url = request.args.find((argument) =>
+            argument.startsWith("http://"),
+          );
+          if (url === undefined) throw new Error("browser URL was not passed");
+          resolveOpened?.(url);
+          return 12_345;
+        }),
+    }),
+    Layer.succeed(RandomnessService, {
+      uuidV7: Effect.succeed(token),
+    }),
+    Layer.succeed(TerminalService, {
+      ...services.terminal,
+      writeStdout: (text) =>
+        Effect.sync(() => {
+          output += text;
+        }),
+      writeStderr: () => Effect.void,
+    }),
+  );
+  const fiber = Effect.runFork(
+    executeDevtools([`--port=${port}`, `--cwd=${root}`]).pipe(
+      Effect.provide(overrides),
+      Effect.provide(nodeFoundationLayer),
+    ),
+  );
   try {
-    const authorized = new URL(url);
+    const openedUrl = await Promise.race([
+      opened,
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("devtools browser launch timed out")),
+          10_000,
+        ),
+      ),
+    ]);
+    const publicUrl = `http://127.0.0.1:${port}/`;
+    expect(output).toContain(`turbo-ts devtools: ${publicUrl}`);
+    expect(output).not.toContain(token);
+    const authorized = new URL(openedUrl);
+    expect(authorized.searchParams.get("token")).toBe(token);
     authorized.pathname = "/graph";
     const graphResponse = await fetch(authorized);
     expect(graphResponse.status).toBe(200);
@@ -261,15 +308,41 @@ const exerciseDevtools = async (root: string): Promise<void> => {
     forbidden.search = "";
     expect((await fetch(forbidden)).status).toBe(403);
   } finally {
-    child.kill("SIGTERM");
-    await new Promise<void>((resolve) => {
-      const force = setTimeout(() => child.kill("SIGKILL"), 2_000);
-      child.once("close", () => {
-        clearTimeout(force);
-        resolve();
-      });
-    });
+    await Effect.runPromise(Fiber.interrupt(fiber));
   }
+};
+
+const promptForBoundaries = async (
+  root: string,
+  answer: string,
+  filter?: string,
+): Promise<{
+  readonly code: number;
+  readonly prompts: ReadonlyArray<string>;
+}> => {
+  const terminal = await Effect.runPromise(
+    TerminalService.pipe(Effect.provide(nodeFoundationLayer)),
+  );
+  const prompts: Array<string> = [];
+  const arguments_ = ["--ignore=prompt", "--reason=synthetic", `--cwd=${root}`];
+  if (filter !== undefined) arguments_.push(`--filter=${filter}`);
+  const code = await Effect.runPromise(
+    executeSecondaryCommand("boundaries", arguments_).pipe(
+      Effect.provide(
+        Layer.succeed(TerminalService, {
+          ...terminal,
+          stdinIsTerminal: Effect.succeed(true),
+          readLine: (prompt) =>
+            Effect.sync(() => {
+              prompts.push(prompt);
+              return answer;
+            }),
+        }),
+      ),
+      Effect.provide(nodeFoundationLayer),
+    ),
+  );
+  return { code, prompts };
 };
 
 describe("hosted compatibility", () => {
@@ -520,6 +593,150 @@ describe("hosted compatibility", () => {
       await rm(directory, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it("completes interactive browser login without exposing credentials", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-login-browser-"));
+    const root = join(directory, "repository");
+    const token = "synthetic-browser-login-token";
+    const state = "018f05c9-7b4a-7cc0-98c4-66395a148003";
+    await prepareRepository(root);
+    try {
+      await withServer(
+        (request) =>
+          request.url === "/v8/artifacts/status"
+            ? [
+                200,
+                { "content-type": "application/json" },
+                '{"status":"enabled"}',
+              ]
+            : [404, {}, "not found"],
+        async (baseUrl, requests) => {
+          const services = await Effect.runPromise(
+            Effect.gen(function* () {
+              return {
+                credentials: yield* CredentialService,
+                environment: yield* EnvironmentService,
+                processes: yield* ProcessService,
+                terminal: yield* TerminalService,
+              };
+            }).pipe(Effect.provide(nodeFoundationLayer)),
+          );
+          let output = "";
+          let storedConfiguration:
+            | { readonly token?: string; readonly [name: string]: unknown }
+            | undefined;
+          let resolveOpened: ((url: string) => void) | undefined;
+          const opened = new Promise<string>((resolve) => {
+            resolveOpened = resolve;
+          });
+          const overrides = Layer.mergeAll(
+            Layer.succeed(CredentialService, {
+              ...services.credentials,
+              readUserConfiguration: Effect.succeed(undefined),
+              writeUserConfiguration: (configuration) =>
+                Effect.sync(() => {
+                  storedConfiguration = configuration;
+                }),
+            }),
+            Layer.succeed(EnvironmentService, {
+              ...services.environment,
+              cwd: Effect.succeed(root),
+              platform: Effect.succeed("linux" as NodeJS.Platform),
+              get: () => Effect.succeed(undefined),
+            }),
+            Layer.succeed(ProcessService, {
+              ...services.processes,
+              spawnDetached: (request) =>
+                Effect.sync(() => {
+                  const url = request.args.find((argument) =>
+                    argument.startsWith("https://"),
+                  );
+                  if (url === undefined) {
+                    throw new Error("login URL was not passed to the browser");
+                  }
+                  resolveOpened?.(url);
+                  return 12_346;
+                }),
+            }),
+            Layer.succeed(RandomnessService, {
+              uuidV7: Effect.succeed(state),
+            }),
+            Layer.succeed(TerminalService, {
+              ...services.terminal,
+              stdinIsTerminal: Effect.succeed(true),
+              writeStdout: (text) =>
+                Effect.sync(() => {
+                  output += text;
+                }),
+              writeStderr: () => Effect.void,
+            }),
+          );
+          const fiber = Effect.runFork(
+            executeHostedCommand("login", [
+              `--api=${baseUrl}`,
+              "--login=https://login.example.test",
+              `--cwd=${root}`,
+            ]).pipe(
+              Effect.provide(overrides),
+              Effect.provide(nodeFoundationLayer),
+            ),
+          );
+          try {
+            const openedUrl = await Promise.race([
+              opened,
+              new Promise<never>((_, reject) =>
+                setTimeout(
+                  () => reject(new Error("login browser launch timed out")),
+                  10_000,
+                ),
+              ),
+            ]);
+            const authorization = new URL(openedUrl);
+            expect(authorization.origin).toBe("https://login.example.test");
+            expect(authorization.pathname).toBe("/turborepo/token");
+            expect(authorization.searchParams.get("state")).toBe(state);
+            const redirect = authorization.searchParams.get("redirect_uri");
+            expect(redirect).toBeDefined();
+            const callback = new URL(redirect!);
+            expect((await Effect.runPromise(Fiber.poll(fiber)))._tag).toBe(
+              "None",
+            );
+            const invokeCallback = async (): Promise<Response> => {
+              try {
+                return await fetch(callback);
+              } catch (cause) {
+                const nested = (cause as { readonly cause?: unknown }).cause;
+                throw new Error(
+                  `login callback request failed for ${callback.origin}: ${String(nested ?? cause)}`,
+                );
+              }
+            };
+            callback.searchParams.set("state", "wrong-state");
+            callback.searchParams.set("token", token);
+            expect((await invokeCallback()).status).toBe(403);
+            callback.searchParams.set("state", state);
+            expect((await invokeCallback()).status).toBe(200);
+
+            expect(await Effect.runPromise(Fiber.join(fiber))).toBe(0);
+            expect(storedConfiguration).toEqual({ token });
+            expect(output).not.toContain(token);
+            expect(output).not.toContain(state);
+            expect(output).not.toContain(openedUrl);
+            expect(requests).toHaveLength(1);
+            expect(requests[0]).toMatchObject({
+              method: "GET",
+              path: "/v8/artifacts/status",
+            });
+            expect(requests[0]?.headers.authorization).toBe(`Bearer ${token}`);
+          } finally {
+            await Effect.runPromise(Fiber.interrupt(fiber));
+          }
+        },
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 
   it(evidenceId.hostedSecurity, async () => {
     const secret = "synthetic-sensitive-value";
@@ -980,6 +1197,34 @@ describe("secondary command and parser compatibility", () => {
         ),
       ).toMatchObject({ name: "generated-library", private: true });
 
+      const sourceManifestPath = join(root, "packages/library/package.json");
+      const sourceManifest = JSON.parse(
+        await readFile(sourceManifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      const copied = await runCandidate(
+        [
+          "generate",
+          "workspace",
+          "--name=generated-copy",
+          "--copy=packages/library",
+          "--destination=packages/generated-copy",
+          `--root=${root}`,
+        ],
+        root,
+      );
+      expect(copied.code, copied.stderr).toBe(0);
+      expect(
+        JSON.parse(
+          await readFile(
+            join(root, "packages/generated-copy/package.json"),
+            "utf8",
+          ),
+        ),
+      ).toEqual({ ...sourceManifest, name: "generated-copy" });
+      expect(JSON.parse(await readFile(sourceManifestPath, "utf8"))).toEqual(
+        sourceManifest,
+      );
+
       const recursiveCopy = await runCandidate(
         [
           "generate",
@@ -1118,6 +1363,29 @@ describe("secondary command and parser compatibility", () => {
           )
         ).code,
       ).toBe(0);
+      const acceptedPrompt = await promptForBoundaries(root, "yes");
+      expect(acceptedPrompt.code).toBe(0);
+      expect(acceptedPrompt.prompts).toEqual([
+        "Ignore 2 boundary violations? [y/N] ",
+      ]);
+      const declinedPrompt = await promptForBoundaries(root, "no");
+      expect(declinedPrompt.code).toBe(1);
+      expect(declinedPrompt.prompts).toHaveLength(1);
+      const emptyPrompt = await promptForBoundaries(root, "yes", "//");
+      expect(emptyPrompt).toEqual({ code: 0, prompts: [] });
+      const nonInteractivePrompt = await runCandidate(
+        [
+          "boundaries",
+          "--ignore=prompt",
+          "--reason=synthetic",
+          `--cwd=${root}`,
+        ],
+        root,
+      );
+      expect(nonInteractivePrompt.code).toBe(1);
+      expect(nonInteractivePrompt.stderr).toContain(
+        "prompt ignore mode requires an interactive terminal",
+      );
       const filteredBoundaries = await runCandidate(
         ["boundaries", "--filter={./packages/app}", `--cwd=${root}`],
         root,

@@ -179,6 +179,7 @@ export class ExitStatusService extends Context.Tag(
 export interface TerminalOperations {
   readonly writeStdout: (text: string) => Effect.Effect<void, BoundaryError>;
   readonly writeStderr: (text: string) => Effect.Effect<void, BoundaryError>;
+  readonly readLine?: (prompt: string) => Effect.Effect<string, BoundaryError>;
   readonly stdoutColorEnabled: Effect.Effect<boolean>;
   readonly stderrColorEnabled: Effect.Effect<boolean>;
   readonly stdinIsTerminal?: Effect.Effect<boolean>;
@@ -441,6 +442,7 @@ export interface LoopbackHttpResponse {
   readonly status: number;
   readonly headers?: Readonly<Record<string, string>>;
   readonly body: Uint8Array | string;
+  readonly afterSent?: Effect.Effect<void, BoundaryError>;
 }
 
 export interface LoopbackHttpServer {

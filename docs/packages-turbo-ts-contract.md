@@ -949,6 +949,12 @@ platform configuration directory and the repository `.turbo/config.json`.
 `login` updates only the user credential file and never creates or rewrites a
 repository configuration file. Relative `XDG_CONFIG_HOME` values are ignored in
 favor of the platform configuration directory.
+Tokenless `login` requires an interactive terminal, opens the configured login
+origin at `/turborepo/token`, and accepts a token through a scoped loopback
+callback protected by a fresh UUID v7 state value. The callback response is
+sent before the token is validated and persisted, and neither the state nor the
+token is written to terminal output. Manual and non-interactive login continue
+to require `--token` or `TURBO_TOKEN`.
 User credentials use private directories, `0600` files on POSIX, atomic
 replacement, regular-file checks, bounded reads, and secret-safe diagnostics.
 Project configuration writes reject symlinked `.turbo` directories before
@@ -971,7 +977,10 @@ cookies, tokens, credentials, secrets, and signatures before crossing an
 origin. Local-only, configuration-disabled remote, and no-cache runs do not
 load remote credentials or probe hosted status. An explicit team slug
 suppresses lower-precedence stored team IDs. Hosted and OTLP requests identify
-as `turbo-ts/0.1.0`.
+as `turbo-ts/0.1.0`. Runtime remote API selection uses CLI, environment, linked
+project, root configuration, and default values in descending precedence, so a
+linked project's stored token is never redirected by a lower-precedence root
+API setting.
 
 Telemetry state remains compatible with official state that omits the optional
 alert timestamp, preserves identity across enable and disable operations, and
@@ -990,14 +999,21 @@ workspace and configured generation without `@turbo/gen`, token-protected
 loopback devtools, boundary diagnostics, deterministic microfrontend ports,
 `bin`, hidden `config`, deprecated `scan`, and the remaining daemon, alias, and
 parser surfaces. Documentation output honors both `NO_COLOR` and `--no-color`.
-Boundary filters select the packages that own the evaluated rules using normal
-package-selector semantics. Hidden `config` suppresses lower-precedence team
-IDs when an explicit team slug is selected. Microfrontend configuration is
-selected only from the explicit `--cwd`, or the process working directory when
-the option is absent, and its package ancestors after platform-aware canonical
-path normalization. Generator destinations are validated through canonical
-existing ancestors, and recursive copies whose source contains their
-destination are rejected. Update checks remain disabled by default; the explicit
+Devtools prints only its token-free loopback URL; its bearer URL is passed only
+to the browser launcher, and `--no-open` does not expose that URL. Boundary
+filters select the packages that own the evaluated rules using normal
+package-selector semantics. `--ignore=prompt` asks once before ignoring found
+violations, accepts only `y` or `yes`, skips prompting when no violation exists,
+and fails safely without an interactive terminal. Hidden `config` suppresses
+lower-precedence team IDs when an explicit team slug is selected. Microfrontend
+configuration is selected only from the explicit `--cwd`, or the process
+working directory when the option is absent, and its package ancestors after
+platform-aware canonical path normalization. Generator destinations are
+validated through canonical existing ancestors, and recursive copies whose
+source contains their destination are rejected. Copied workspace templates
+require an object `package.json`, preserve its other fields, and atomically
+rewrite `name` to the requested workspace name. Update checks remain disabled
+by default; the explicit
 test-only forced check reads stable upstream tags and reports against the fixed
 2.10.12 baseline. Aube and Nub native or delegated lockfiles retain their
 declared command identity, and tool identity is probed through scoped mocked

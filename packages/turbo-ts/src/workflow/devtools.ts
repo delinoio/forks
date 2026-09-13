@@ -9,6 +9,7 @@ import {
   RandomnessService,
   TerminalService,
 } from "../effect/services.js";
+import { browserInvocation } from "./browser.js";
 import { loadWorkflowRepository } from "./repository.js";
 
 interface DevtoolsOptions {
@@ -47,16 +48,6 @@ export const parseDevtoolsArguments = (
   }
   return { common: parsed.options, noOpen, port };
 };
-
-const browserInvocation = (
-  platform: NodeJS.Platform,
-  url: string,
-): { readonly command: string; readonly args: ReadonlyArray<string> } =>
-  platform === "darwin"
-    ? { command: "open", args: [url] }
-    : platform === "win32"
-      ? { command: "cmd.exe", args: ["/d", "/s", "/c", "start", "", url] }
-      : { command: "xdg-open", args: [url] };
 
 export const executeDevtools = (
   arguments_: ReadonlyArray<string>,
@@ -116,11 +107,12 @@ export const executeDevtools = (
           body: "<!doctype html><title>turbo-ts devtools</title><main id=app>turbo-ts package graph</main>",
         });
       });
-      const url = `http://127.0.0.1:${server.port}/?token=${token}`;
-      yield* terminal.writeStdout(`turbo-ts devtools: ${url}\n`);
+      const publicUrl = `http://127.0.0.1:${server.port}/`;
+      const authenticatedUrl = `${publicUrl}?token=${token}`;
+      yield* terminal.writeStdout(`turbo-ts devtools: ${publicUrl}\n`);
       if (!options.noOpen && processes.spawnDetached !== undefined) {
         const platform = yield* environment.platform;
-        const invocation = browserInvocation(platform, url);
+        const invocation = browserInvocation(platform, authenticatedUrl);
         yield* processes
           .spawnDetached({
             ...invocation,

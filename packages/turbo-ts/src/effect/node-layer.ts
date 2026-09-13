@@ -53,6 +53,7 @@ import {
   userInfo,
 } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { Readable, Transform, type Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
@@ -1661,6 +1662,22 @@ export const makeTerminalOperations = (
 ): TerminalOperations => ({
   writeStdout: makeTerminalWriter(stdout),
   writeStderr: makeTerminalWriter(stderr),
+  readLine: (prompt) =>
+    Effect.acquireUseRelease(
+      Effect.sync(() =>
+        createInterface({
+          input: process.stdin,
+          output: stderr,
+          terminal: process.stdin.isTTY === true,
+        }),
+      ),
+      (terminal) =>
+        Effect.tryPromise({
+          try: (signal) => terminal.question(prompt, { signal }),
+          catch: terminalError,
+        }),
+      (terminal) => Effect.sync(() => terminal.close()),
+    ),
   stdoutColorEnabled: Effect.sync(() => noColor() === undefined),
   stderrColorEnabled: Effect.sync(() => noColor() === undefined),
   stdinIsTerminal: Effect.sync(() => process.stdin.isTTY === true),
@@ -2873,7 +2890,11 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
                 }
                 if (Exit.isSuccess(exit)) {
                   response.writeHead(exit.value.status, exit.value.headers);
-                  response.end(exit.value.body);
+                  response.end(exit.value.body, () => {
+                    if (exit.value.afterSent !== undefined) {
+                      Effect.runFork(exit.value.afterSent);
+                    }
+                  });
                   return;
                 }
                 if (Cause.isInterruptedOnly(exit.cause)) return;

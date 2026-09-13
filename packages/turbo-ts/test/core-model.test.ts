@@ -1088,6 +1088,61 @@ version = "1.0.0"
     expect(environmentOptions.remote?.teamId).toBeUndefined();
   });
 
+  it("prefers linked project APIs over root remote-cache configuration", () => {
+    const model = repository([]);
+    const configuration = {
+      ...model.rootConfiguration,
+      value: {
+        remoteCache: {
+          apiUrl: "https://root.example.test/api",
+          enabled: true,
+        },
+      },
+    };
+    const storedCredentials = {
+      token: "synthetic-token",
+      project: { apiUrl: "https://linked.example.test/api" },
+    };
+    const linked = resolveOptions(
+      parseRunArguments(["run", "build"]),
+      model.root,
+      {},
+      configuration,
+      8,
+      false,
+      storedCredentials,
+    );
+    expect(linked.remote?.apiUrl).toBe("https://linked.example.test/api");
+
+    const environment = resolveOptions(
+      parseRunArguments(["run", "build"]),
+      model.root,
+      { TURBO_API: "https://environment.example.test/api" },
+      configuration,
+      8,
+      false,
+      storedCredentials,
+    );
+    expect(environment.remote?.apiUrl).toBe(
+      "https://environment.example.test/api",
+    );
+
+    const explicit = resolveOptions(
+      parseRunArguments([
+        "run",
+        "build",
+        "--api=https://explicit.example.test/api",
+      ]),
+      model.root,
+      { TURBO_API: "https://environment.example.test/api" },
+      configuration,
+      8,
+      false,
+      storedCredentials,
+    );
+    expect(explicit.remote?.apiUrl).toBe("https://explicit.example.test/api");
+  });
+
   it("builds dependency graphs, filters closures, and rejects cycles", () => {
     const library = packageModel("library", []);
     const app = packageModel("app", ["library"], { dependsOn: ["^build"] });

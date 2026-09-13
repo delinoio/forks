@@ -226,7 +226,26 @@ const executeBoundaries = (
         }\n`,
       );
     }
-    return diagnostics.length === 0 || ignore === "all" ? 0 : 1;
+    if (diagnostics.length === 0 || ignore === "all") return 0;
+    if (ignore !== "prompt") return 1;
+    const stdinIsTerminal =
+      terminal.stdinIsTerminal === undefined
+        ? false
+        : yield* terminal.stdinIsTerminal;
+    if (!stdinIsTerminal || terminal.readLine === undefined) {
+      return yield* Effect.fail(
+        argumentError("prompt ignore mode requires an interactive terminal"),
+      );
+    }
+    const answer = yield* terminal.readLine(
+      `Ignore ${diagnostics.length} boundary violation${
+        diagnostics.length === 1 ? "" : "s"
+      }? [y/N] `,
+    );
+    return answer.trim().toLowerCase() === "y" ||
+      answer.trim().toLowerCase() === "yes"
+      ? 0
+      : 1;
   });
 
 const compareVersions = (left: string, right: string): number => {
