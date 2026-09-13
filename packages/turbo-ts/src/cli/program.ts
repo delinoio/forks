@@ -7,7 +7,7 @@ import {
   TerminalService,
 } from "../effect/services.js";
 import { redactText } from "../logging/redaction.js";
-import { executeRun, type RunMetricTaskDetail } from "../run/engine.js";
+import { executeRun, type RunMetricSnapshot } from "../run/engine.js";
 import { parseRunArguments } from "../run/options.js";
 import { versionOutput } from "../version.js";
 import { executeDaemon, parseDaemonArguments } from "../workflow/daemon.js";
@@ -446,7 +446,7 @@ export const cliProgram = Effect.gen(function* () {
     }).pipe(
       Effect.flatMap((options) => {
         let remoteToken = options.token;
-        let taskDetails: ReadonlyArray<RunMetricTaskDetail> | undefined;
+        let taskSnapshot: RunMetricSnapshot | undefined;
         return Effect.scoped(
           Effect.gen(function* () {
             const observability = yield* Effect.promise(
@@ -456,8 +456,8 @@ export const cliProgram = Effect.gen(function* () {
               observability
                 .exportRunMetrics(options.openTelemetry, remoteToken, {
                   exitCode,
-                  taskCount: taskDetails?.length ?? options.tasks.length,
-                  tasks: taskDetails ?? [],
+                  taskCount: taskSnapshot?.taskCount ?? options.tasks.length,
+                  tasks: taskSnapshot?.tasks ?? [],
                 })
                 .pipe(Effect.catchAll(() => Effect.void));
             const interval = options.openTelemetry.intervalMilliseconds ?? 0;
@@ -471,10 +471,10 @@ export const cliProgram = Effect.gen(function* () {
                         .pipe(
                           Effect.zipRight(
                             Effect.suspend(() =>
-                              taskDetails === undefined
+                              taskSnapshot === undefined
                                 ? Effect.void
                                 : exportMetrics(
-                                    taskDetails.some(
+                                    taskSnapshot.tasks.some(
                                       (task) => task.status === "failed",
                                     )
                                       ? 1
@@ -490,8 +490,8 @@ export const cliProgram = Effect.gen(function* () {
               onRemoteTokenResolved: (token) => {
                 remoteToken = token;
               },
-              onTaskMetricsResolved: (tasks) => {
-                taskDetails = tasks;
+              onTaskMetricsResolved: (snapshot) => {
+                taskSnapshot = snapshot;
               },
             });
             if (periodicFiber !== undefined) {

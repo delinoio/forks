@@ -92,7 +92,6 @@ rows:
       - --team
       - --token
       - --trace
-      - --verbosity
       - --experimental-otel-enabled
       - --experimental-otel-protocol
       - --experimental-otel-endpoint
@@ -108,6 +107,13 @@ rows:
       - --help
       - -h
     tests: [secondary.compatibility, hosted.compatibility, observability.compatibility]
+    source: black-box-help
+  - id: cli.global-verbosity
+    category: option
+    subject: global verbosity affects runtime logging
+    targetGate: 4
+    status: planned
+    variants: [--verbosity]
     source: black-box-help
   - id: cli.run-options
     category: option

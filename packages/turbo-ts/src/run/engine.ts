@@ -7,6 +7,7 @@ import {
   writeLocalCache,
 } from "../cache/local-cache.js";
 import {
+  headRemoteCache,
   type RemoteCacheOptions,
   restoreRemoteCache,
   verifyRemoteCacheStatus,
@@ -727,12 +728,15 @@ export interface RunMetricTaskDetail {
   readonly task: string;
 }
 
+export interface RunMetricSnapshot {
+  readonly taskCount: number;
+  readonly tasks: ReadonlyArray<RunMetricTaskDetail>;
+}
+
 interface RunExecutionContext {
   readonly changedPaths?: ReadonlyArray<string>;
   readonly onRemoteTokenResolved?: (token: string | undefined) => void;
-  readonly onTaskMetricsResolved?: (
-    tasks: ReadonlyArray<RunMetricTaskDetail>,
-  ) => void;
+  readonly onTaskMetricsResolved?: (snapshot: RunMetricSnapshot) => void;
 }
 
 const packageRelativeChangedFile = (
@@ -3071,19 +3075,30 @@ const executeTask = (
             );
           }
           if (options.cachePolicy.remoteWrite && options.remote !== undefined) {
-            yield* writeRemoteCache(
-              options.remote,
-              hash.hash,
-              collected.entries,
-              duration,
-              platform === "win32",
-            ).pipe(
-              Effect.catchAll((error) =>
-                writeTaskWarning(
-                  `remote cache upload failed for ${taskLabel}; preserving successful task result: ${error.message}`,
-                ).pipe(Effect.ignore),
-              ),
-            );
+            const alreadyPublished = options.cachePolicy.remoteRead
+              ? false
+              : yield* headRemoteCache(options.remote, hash.hash).pipe(
+                  Effect.catchAll((error) =>
+                    writeTaskWarning(
+                      `remote cache existence check failed for ${taskLabel}; continuing with upload: ${error.message}`,
+                    ).pipe(Effect.ignore, Effect.as(false)),
+                  ),
+                );
+            if (!alreadyPublished) {
+              yield* writeRemoteCache(
+                options.remote,
+                hash.hash,
+                collected.entries,
+                duration,
+                platform === "win32",
+              ).pipe(
+                Effect.catchAll((error) =>
+                  writeTaskWarning(
+                    `remote cache upload failed for ${taskLabel}; preserving successful task result: ${error.message}`,
+                  ).pipe(Effect.ignore),
+                ),
+              );
+            }
           }
         }),
       );
@@ -4151,35 +4166,39 @@ export const executeRun = (
       left.id.localeCompare(right.id),
     );
     const outcomes = new Map<string, TaskOutcome>();
-    const reportTaskMetrics = (): void =>
-      context.onTaskMetricsResolved?.(
-        orderedNodes.map((node) => {
+    const reportTaskMetrics = (includeUnresolved = false): void =>
+      context.onTaskMetricsResolved?.({
+        taskCount: orderedNodes.length,
+        tasks: orderedNodes.flatMap((node) => {
           const outcome = outcomes.get(node.id);
-          return {
-            id: node.id,
-            package: node.package.name,
-            task: node.task,
-            status:
-              outcome === undefined || outcome.skipped
-                ? "skipped"
-                : outcome.exitCode === 0
-                  ? "succeeded"
-                  : "failed",
-            ...(outcome === undefined
-              ? {}
-              : {
-                  exitCode: outcome.exitCode,
-                  durationMilliseconds: Math.max(
-                    0,
-                    outcome.endTime - outcome.startTime,
-                  ),
-                  ...(outcome.cacheSource === undefined
-                    ? {}
-                    : { cacheSource: outcome.cacheSource }),
-                }),
-          };
+          if (outcome === undefined && !includeUnresolved) return [];
+          return [
+            {
+              id: node.id,
+              package: node.package.name,
+              task: node.task,
+              status:
+                outcome === undefined || outcome.skipped
+                  ? "skipped"
+                  : outcome.exitCode === 0
+                    ? "succeeded"
+                    : "failed",
+              ...(outcome === undefined
+                ? {}
+                : {
+                    exitCode: outcome.exitCode,
+                    durationMilliseconds: Math.max(
+                      0,
+                      outcome.endTime - outcome.startTime,
+                    ),
+                    ...(outcome.cacheSource === undefined
+                      ? {}
+                      : { cacheSource: outcome.cacheSource }),
+                  }),
+            },
+          ];
         }),
-      );
+      });
     reportTaskMetrics();
     const globalInputFileHashes =
       orderedNodes[0] === undefined
@@ -4199,6 +4218,7 @@ export const executeRun = (
           normalizePath(repository.root, platform === "win32"),
       );
     if (parsed.graph !== undefined) {
+      reportTaskMetrics(true);
       const edges = orderedNodes.flatMap((node) =>
         node.dependencies.length === 0
           ? ([[node.id, "___ROOT___"]] as const)
@@ -4301,6 +4321,7 @@ export const executeRun = (
         };
     const globalExternalDependenciesHash = externalDependencyHashes.global;
     if (parsed.dryRun !== undefined) {
+      reportTaskMetrics(true);
       const terminal = yield* TerminalService;
       if (parsed.dryRun === "json") {
         yield* terminal.writeStdout(
@@ -5036,7 +5057,7 @@ export const executeRun = (
     if (parsed.json) {
       yield* terminal.writeStdout(`${JSON.stringify(summaryRecord)}\n`);
     }
-    reportTaskMetrics();
+    reportTaskMetrics(true);
     return exitCode;
   }).pipe(
     Effect.onExit(() =>

@@ -13960,6 +13960,11 @@ describe("cache interoperability and safety", () => {
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
+        if (request.method === "HEAD") {
+          response.writeHead(404);
+          response.end();
+          return;
+        }
         uploads += 1;
         response.writeHead(403);
         response.end();
@@ -13998,12 +14003,81 @@ describe("cache interoperability and safety", () => {
     }
   }, 10_000);
 
+  it("checks write-only remote artifacts before uploading", async () => {
+    const directory = await makeFixture();
+    const methods: Array<string> = [];
+    let artifactExists = false;
+    let headFails = false;
+    const server = createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        if (request.method === "HEAD") {
+          methods.push("HEAD");
+          response.writeHead(headFails ? 403 : artifactExists ? 200 : 404);
+          response.end();
+          return;
+        }
+        if (request.method === "PUT") {
+          methods.push("PUT");
+          artifactExists = true;
+          response.writeHead(201);
+          response.end();
+          return;
+        }
+        response.writeHead(200);
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    const arguments_ = [
+      candidateEntrypoint,
+      "run",
+      "build",
+      "--cwd",
+      directory,
+      "--filter=synthetic-library",
+      "--cache=remote:w",
+      "--output-logs=hash-only",
+    ];
+    try {
+      for (let runIndex = 0; runIndex < 2; runIndex += 1) {
+        const result = await run(process.execPath, arguments_, repositoryRoot, {
+          TURBO_API: `http://127.0.0.1:${address.port}`,
+        });
+        expect(result.exitCode).toBe(0);
+      }
+      artifactExists = false;
+      headFails = true;
+      const fallback = await run(process.execPath, arguments_, repositoryRoot, {
+        TURBO_API: `http://127.0.0.1:${address.port}`,
+      });
+      expect(fallback.exitCode).toBe(0);
+      expect(fallback.stderr).toContain("remote cache existence check failed");
+      expect(fallback.stderr).toContain("continuing with upload");
+      expect(methods).toEqual(["HEAD", "PUT", "HEAD", "HEAD", "PUT"]);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
   it("continues remote upload when a local cache write fails", async () => {
     const directory = await makeFixture();
     let uploads = 0;
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
+        if (request.method === "HEAD") {
+          response.writeHead(404);
+          response.end();
+          return;
+        }
         if (request.method === "PUT") uploads += 1;
         response.writeHead(201);
         response.end();
@@ -14481,6 +14555,11 @@ describe("cache interoperability and safety", () => {
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
+        if (request.method === "HEAD") {
+          response.writeHead(404);
+          response.end();
+          return;
+        }
         uploads += 1;
         setTimeout(() => {
           response.writeHead(201);

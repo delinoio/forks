@@ -525,7 +525,12 @@ describe("configuration generation and compatibility ledger", () => {
       ledger.rows.filter(
         (row) => row.targetGate === 4 && row.status === "planned",
       ),
-    ).toEqual([]);
+    ).toEqual([
+      expect.objectContaining({
+        id: "cli.global-verbosity",
+        variants: ["--verbosity"],
+      }),
+    ]);
     expect(() =>
       parseCompatibilityLedger(
         ledgerSource.replace(

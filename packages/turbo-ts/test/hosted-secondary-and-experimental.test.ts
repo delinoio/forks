@@ -36,6 +36,7 @@ import {
   CredentialService,
   deterministicRetryLayer,
   EnvironmentService,
+  FileSystemService,
   type HttpRequest,
   type HttpResponse,
   HttpService,
@@ -60,7 +61,10 @@ import {
   executeDevtools,
   parseDevtoolsArguments,
 } from "../src/workflow/devtools.js";
-import { parseGenerateArguments } from "../src/workflow/generate.js";
+import {
+  executeGenerate,
+  parseGenerateArguments,
+} from "../src/workflow/generate.js";
 import {
   executeHostedCommand,
   parseHostedArguments,
@@ -299,6 +303,11 @@ const exerciseDevtools = async (root: string): Promise<void> => {
     expect(output).not.toContain(token);
     const authorized = new URL(openedUrl);
     expect(authorized.searchParams.get("token")).toBe(token);
+    const pageResponse = await fetch(authorized);
+    expect(pageResponse.status).toBe(200);
+    const page = await pageResponse.text();
+    expect(page).toContain("synthetic-app");
+    expect(page).toContain("synthetic-library");
     authorized.pathname = "/graph";
     const graphResponse = await fetch(authorized);
     expect(graphResponse.status).toBe(200);
@@ -571,6 +580,24 @@ describe("hosted compatibility", () => {
           expect(`${logout.stdout}${logout.stderr}`).not.toContain(token);
           expect(JSON.parse(await readFile(userPath, "utf8"))).toEqual({});
 
+          await writeFile(
+            userPath,
+            JSON.stringify({ retained: "synthetic", token }),
+          );
+          const localLogout = await runCandidate(
+            ["logout", "--invalidate=false", `--cwd=${root}`],
+            root,
+            {
+              ...environment,
+              TURBO_API: "not-a-url",
+              TURBO_LOGIN: "not-a-url",
+            },
+          );
+          expect(localLogout.code, localLogout.stderr).toBe(0);
+          expect(JSON.parse(await readFile(userPath, "utf8"))).toEqual({
+            retained: "synthetic",
+          });
+
           expect(
             requests.some(
               (request) =>
@@ -638,7 +665,7 @@ describe("hosted compatibility", () => {
     try {
       await withServer(
         (request) =>
-          request.url === "/v8/artifacts/status"
+          request.url?.startsWith("/v8/artifacts/status") === true
             ? [
                 200,
                 { "content-type": "application/json" },
@@ -677,7 +704,10 @@ describe("hosted compatibility", () => {
               ...services.environment,
               cwd: Effect.succeed(root),
               platform: Effect.succeed("linux" as NodeJS.Platform),
-              get: () => Effect.succeed(undefined),
+              get: (name) =>
+                Effect.succeed(
+                  name === "TURBO_TEAMID" ? "team_stored" : undefined,
+                ),
             }),
             Layer.succeed(ProcessService, {
               ...services.processes,
@@ -710,6 +740,7 @@ describe("hosted compatibility", () => {
             executeHostedCommand("login", [
               `--api=${baseUrl}`,
               "--login=https://login.example.test",
+              "--sso-team=synthetic-sso",
               `--cwd=${root}`,
             ]).pipe(
               Effect.provide(overrides),
@@ -730,6 +761,9 @@ describe("hosted compatibility", () => {
             expect(authorization.origin).toBe("https://login.example.test");
             expect(authorization.pathname).toBe("/turborepo/token");
             expect(authorization.searchParams.get("state")).toBe(state);
+            expect(authorization.searchParams.get("ssoTeam")).toBe(
+              "synthetic-sso",
+            );
             const redirect = authorization.searchParams.get("redirect_uri");
             expect(redirect).toBeDefined();
             const callback = new URL(redirect!);
@@ -760,7 +794,7 @@ describe("hosted compatibility", () => {
             expect(requests).toHaveLength(1);
             expect(requests[0]).toMatchObject({
               method: "GET",
-              path: "/v8/artifacts/status",
+              path: "/v8/artifacts/status?slug=synthetic-sso",
             });
             expect(requests[0]?.headers.authorization).toBe(`Bearer ${token}`);
           } finally {
@@ -1328,6 +1362,42 @@ describe("secondary command and parser compatibility", () => {
         const retriedCopy = await runCandidate(failedCopyArguments, root);
         expect(retriedCopy.code, retriedCopy.stderr).toBe(0);
       }
+
+      const fileSystem = await Effect.runPromise(
+        FileSystemService.pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const racedDestination = join(root, "packages/raced-destination");
+      const marker = join(racedDestination, "other-process.txt");
+      const racedFileSystemLayer = Layer.succeed(FileSystemService, {
+        ...fileSystem,
+        createExclusiveDirectory: (path) =>
+          path === racedDestination
+            ? fileSystem
+                .makeDirectory(path)
+                .pipe(
+                  Effect.zipRight(
+                    fileSystem.writeText(marker, "created elsewhere\n"),
+                  ),
+                  Effect.as(false),
+                )
+            : fileSystem.createExclusiveDirectory(path),
+      });
+      const racedGeneration = await Effect.runPromise(
+        Effect.either(
+          executeGenerate([
+            "workspace",
+            "--name=raced-destination",
+            "--empty",
+            "--destination=packages/raced-destination",
+            `--root=${root}`,
+          ]).pipe(
+            Effect.provide(racedFileSystemLayer),
+            Effect.provide(nodeFoundationLayer),
+          ),
+        ),
+      );
+      expect(racedGeneration._tag).toBe("Left");
+      expect(await readFile(marker, "utf8")).toBe("created elsewhere\n");
 
       const recursiveCopy = await runCandidate(
         [
@@ -1913,6 +1983,23 @@ describe("hosted protocols and experimental transports", () => {
     const protobuf = Buffer.from(
       encodeOtlpMetrics(summary, observationTimeUnixNano, [], metricSelection),
     );
+    const protobufIntegerAttribute = (key: string, value: number): Buffer => {
+      const keyBytes = Buffer.from(key);
+      return Buffer.concat([
+        Buffer.from([0x0a, keyBytes.length]),
+        keyBytes,
+        Buffer.from([0x12, 0x02, 0x18, value]),
+      ]);
+    };
+    expect(
+      protobuf.includes(protobufIntegerAttribute("turbo.task_count", 2)),
+    ).toBe(true);
+    expect(
+      protobuf.includes(protobufIntegerAttribute("turbo.exit_code", 0)),
+    ).toBe(true);
+    expect(
+      protobuf.includes(protobufIntegerAttribute("turbo.duration_ms", 12)),
+    ).toBe(true);
     const protobufTimestamp = Buffer.alloc(9);
     protobufTimestamp[0] = 0x19;
     protobufTimestamp.writeBigUInt64LE(observationTimeUnixNano, 1);
@@ -2002,6 +2089,45 @@ describe("hosted protocols and experimental transports", () => {
     expect(requests.at(-1)?.url).toBe(
       "https://collector.example.test/otel/v1/metrics",
     );
+
+    for (const configuredTimeout of [
+      { option: 0, environment: undefined },
+      { option: undefined, environment: "" },
+      { option: undefined, environment: "0" },
+    ] as const) {
+      await Effect.runPromise(
+        exportRunMetrics(
+          {
+            enabled: true,
+            protocol: "http-json",
+            endpoint: "http://127.0.0.1:4318",
+            timeoutMilliseconds: configuredTimeout.option,
+            headers: [],
+            resources: [],
+          },
+          undefined,
+          summary,
+        ).pipe(
+          Effect.provide(
+            Layer.succeed(EnvironmentService, {
+              argv: Effect.succeed([]),
+              cwd: Effect.succeed("/synthetic"),
+              platform: Effect.succeed(process.platform),
+              get: (name) =>
+                Effect.succeed(
+                  name === "OTEL_EXPORTER_OTLP_TIMEOUT"
+                    ? configuredTimeout.environment
+                    : undefined,
+                ),
+              entries: Effect.succeed({}),
+            }),
+          ),
+          Effect.provide(httpLayer),
+          Effect.provide(clockLayer),
+        ),
+      );
+      expect(requests.at(-1)?.timeoutMilliseconds).toBe(10_000);
+    }
   });
 
   it("exports resolved non-executing metrics and honors periodic intervals", async () => {
@@ -2074,8 +2200,30 @@ describe("hosted protocols and experimental transports", () => {
             root,
           );
           expect(periodic.code, periodic.stderr).toBe(0);
-          expect(requests.length - requestCount).toBeGreaterThan(1);
-          expect(requests.at(-1)?.body).toContain("synthetic-app#build");
+          const periodicRequests = requests.slice(requestCount);
+          expect(periodicRequests.length).toBeGreaterThan(1);
+          for (const request of periodicRequests) {
+            const document = JSON.parse(request.body ?? "{}");
+            const metrics = document.resourceMetrics[0].scopeMetrics[0].metrics;
+            const runMetric = metrics.find(
+              (metric: { readonly name: string }) =>
+                metric.name === "turbo.run",
+            );
+            const taskCount = runMetric.gauge.dataPoints[0].attributes.find(
+              (attribute: { readonly key: string }) =>
+                attribute.key === "turbo.task_count",
+            );
+            expect(taskCount.value.intValue).toBe("1");
+          }
+          for (const request of periodicRequests.slice(0, -1)) {
+            expect(request.body).not.toContain('"stringValue":"skipped"');
+          }
+          expect(periodicRequests.at(-1)?.body).toContain(
+            "synthetic-app#build",
+          );
+          expect(periodicRequests.at(-1)?.body).toContain(
+            '"stringValue":"succeeded"',
+          );
         },
       );
     } finally {

@@ -332,9 +332,16 @@ const executeWorkspaceGenerator = (
         failure("workspace destination already exists"),
       );
     }
+    let ownsDestination = false;
     const materialize = Effect.gen(function* () {
+      yield* fileSystem.makeDirectory(parentPath(destination));
+      ownsDestination = yield* fileSystem.createExclusiveDirectory(destination);
+      if (!ownsDestination) {
+        return yield* Effect.fail(
+          failure("workspace destination already exists"),
+        );
+      }
       if (options.copy === undefined || options.empty) {
-        yield* fileSystem.makeDirectory(destination);
         yield* fileSystem.writeTextAtomic(
           joinPath(destination, "package.json"),
           `${JSON.stringify({ name, version: "0.0.0", private: true }, null, 2)}\n`,
@@ -392,7 +399,7 @@ const executeWorkspaceGenerator = (
     });
     yield* materialize.pipe(
       Effect.catchAll((cause) =>
-        fileSystem.remove(destination).pipe(
+        (ownsDestination ? fileSystem.remove(destination) : Effect.void).pipe(
           Effect.either,
           Effect.flatMap((cleanup) =>
             cleanup._tag === "Right"

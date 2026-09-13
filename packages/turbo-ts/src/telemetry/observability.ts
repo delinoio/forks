@@ -59,6 +59,17 @@ const varint = (value: number): Uint8Array => {
   return new Uint8Array(output);
 };
 
+const signedInt64Varint = (value: number): Uint8Array => {
+  const output: Array<number> = [];
+  let remaining = BigInt.asUintN(64, BigInt(Math.trunc(value)));
+  do {
+    const byte = Number(remaining & 0x7fn);
+    remaining >>= 7n;
+    output.push(byte | (remaining > 0n ? 0x80 : 0));
+  } while (remaining > 0n);
+  return new Uint8Array(output);
+};
+
 const concat = (...parts: ReadonlyArray<Uint8Array>): Uint8Array => {
   const output = new Uint8Array(
     parts.reduce((size, part) => size + part.length, 0),
@@ -76,6 +87,9 @@ const field = (number: number, value: Uint8Array): Uint8Array =>
 
 const stringField = (number: number, value: string): Uint8Array =>
   field(number, new TextEncoder().encode(value));
+
+const int64Field = (number: number, value: number): Uint8Array =>
+  concat(varint(number * 8), signedInt64Varint(value));
 
 const fixed64Field = (number: number, value: bigint): Uint8Array => {
   const bytes = new Uint8Array(8);
@@ -103,15 +117,23 @@ export const encodeOtlpMetrics = (
   configuredResources: ReadonlyArray<readonly [string, string]> = [],
   selection: MetricSelection = { runSummary: true, taskDetails: false },
 ): Uint8Array => {
-  const keyValue = (key: string, value: string) =>
-    concat(stringField(1, key), field(2, stringField(1, value)));
+  const keyValue = (key: string, value: string | number) =>
+    concat(
+      stringField(1, key),
+      field(
+        2,
+        typeof value === "number"
+          ? int64Field(3, value)
+          : stringField(1, value),
+      ),
+    );
   const resource = concat(
     ...resourceAttributes(configuredResources).map(([key, value]) =>
       field(1, keyValue(key, value)),
     ),
   );
   const dataPoint = (
-    attributes: ReadonlyArray<readonly [string, string]>,
+    attributes: ReadonlyArray<readonly [string, string | number]>,
   ): Uint8Array =>
     concat(
       fixed64Field(3, observationTimeUnixNano),
@@ -131,8 +153,8 @@ export const encodeOtlpMetrics = (
       ? [
           gaugeMetric("turbo.run", [
             dataPoint([
-              ["turbo.exit_code", String(summary.exitCode)],
-              ["turbo.task_count", String(summary.taskCount)],
+              ["turbo.exit_code", summary.exitCode],
+              ["turbo.task_count", summary.taskCount],
             ]),
           ]),
         ]
@@ -149,14 +171,11 @@ export const encodeOtlpMetrics = (
                 ["turbo.status", task.status],
                 ...(task.exitCode === undefined
                   ? []
-                  : [["turbo.exit_code", String(task.exitCode)] as const]),
+                  : [["turbo.exit_code", task.exitCode] as const]),
                 ...(task.durationMilliseconds === undefined
                   ? []
                   : [
-                      [
-                        "turbo.duration_ms",
-                        String(task.durationMilliseconds),
-                      ] as const,
+                      ["turbo.duration_ms", task.durationMilliseconds] as const,
                     ]),
                 ...(task.cacheSource === undefined
                   ? []
@@ -331,11 +350,11 @@ export const exportRunMetrics = (
     const environmentTimeout = Number(
       yield* environment.get("OTEL_EXPORTER_OTLP_TIMEOUT"),
     );
+    const configuredTimeout = options.timeoutMilliseconds ?? environmentTimeout;
     const timeoutMilliseconds =
-      options.timeoutMilliseconds ??
-      (Number.isFinite(environmentTimeout) && environmentTimeout >= 0
-        ? environmentTimeout
-        : 10_000);
+      Number.isFinite(configuredTimeout) && configuredTimeout > 0
+        ? configuredTimeout
+        : 10_000;
     const configuredHeaders = [
       ...parseEnvironmentHeaders(
         yield* environment.get("OTEL_EXPORTER_OTLP_HEADERS"),

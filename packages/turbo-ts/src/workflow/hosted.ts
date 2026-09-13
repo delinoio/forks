@@ -266,6 +266,7 @@ const resolveHostedSettings = (
 
 const requestInteractiveLoginToken = (
   settings: ResolvedHostedSettings,
+  ssoTeam: string | undefined,
 ): Effect.Effect<
   string,
   unknown,
@@ -314,6 +315,9 @@ const requestInteractiveLoginToken = (
       const authorization = withPath(settings.login, "/turborepo/token");
       authorization.searchParams.set("redirect_uri", callback.toString());
       authorization.searchParams.set("state", state);
+      if (ssoTeam !== undefined) {
+        authorization.searchParams.set("ssoTeam", ssoTeam);
+      }
       const platform = yield* environment.platform;
       const cwd = yield* environment.cwd;
       yield* terminal.writeStdout("Opening browser for turbo-ts login.\n");
@@ -560,9 +564,25 @@ export const executeHostedCommand = (
       return 0;
     }
 
+    if (command === "logout" && !options.invalidate) {
+      const existing = (yield* credentials.readUserConfiguration) ?? {};
+      const { token: _removed, ...retained } = existing;
+      yield* credentials.writeUserConfiguration(retained);
+      yield* terminal.writeStdout(">>> Logged out\n");
+      return 0;
+    }
+
     const settings = yield* resolveHostedSettings(options);
 
     if (command === "login") {
+      const selected =
+        options.ssoTeam === undefined
+          ? settings
+          : {
+              ...settings,
+              teamId: undefined,
+              teamSlug: options.ssoTeam,
+            };
       let token = settings.token;
       if (token === undefined) {
         if (options.manual) {
@@ -581,12 +601,8 @@ export const executeHostedCommand = (
             ),
           );
         }
-        token = yield* requestInteractiveLoginToken(settings);
+        token = yield* requestInteractiveLoginToken(settings, options.ssoTeam);
       }
-      const selected = {
-        ...settings,
-        teamSlug: options.ssoTeam ?? settings.teamSlug,
-      };
       yield* validateRemoteCaching(selected, token);
       const existing = (yield* credentials.readUserConfiguration) ?? {};
       yield* credentials.writeUserConfiguration({ ...existing, token });

@@ -962,6 +962,26 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
       },
       catch: filesystemError,
     }),
+  createExclusiveDirectory: (path) =>
+    Effect.tryPromise({
+      try: async () => {
+        try {
+          await mkdir(path);
+          return true;
+        } catch (cause) {
+          if (
+            typeof cause === "object" &&
+            cause !== null &&
+            "code" in cause &&
+            cause.code === "EEXIST"
+          ) {
+            return false;
+          }
+          throw cause;
+        }
+      },
+      catch: filesystemError,
+    }),
   ensurePrivateDirectory: (path) =>
     Effect.tryPromise({
       try: () => ensurePrivateDirectoryPath(path),

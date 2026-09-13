@@ -943,7 +943,9 @@ Mermaid graphs assign stable,
 unique node identifiers without truncated-hash collisions. `--skip-infer`
 disables framework environment inference for task hashing and execution.
 
-Gate 4 hosted and secondary surfaces have automated ledger evidence. `login`,
+Gate 4 hosted and secondary surfaces have automated ledger evidence except for
+runtime verbosity logging, which remains planned while `--verbosity` is only
+parsed. `login`,
 `link`, `logout`, and `unlink` share the official user configuration under the
 platform configuration directory and the repository `.turbo/config.json`.
 `login` updates only the user credential file and never creates or rewrites a
@@ -953,7 +955,9 @@ Tokenless `login` requires an interactive terminal, opens the configured login
 origin at `/turborepo/token`, and accepts a token through a scoped loopback
 callback protected by a fresh UUID v7 state value. The callback response is
 sent before the token is validated and persisted, and neither the state nor the
-token is written to terminal output. Manual and non-interactive login continue
+token is written to terminal output. An explicit `--sso-team` adds the team slug
+to the browser authorization request and suppresses lower-precedence team IDs
+during validation. Manual and non-interactive login continue
 to require `--token` or `TURBO_TOKEN`. Windows browser launches quote the full
 callback URL before handing it to `cmd.exe`. Unlink resolves only the repository
 configuration path and does not read shared hosted settings or user credentials.
@@ -968,7 +972,8 @@ ignored unless `--no-gitignore` is requested. Logout invalidates the current
 token only against an API selected explicitly or persisted by the linked
 project. When the issuing API is unavailable, it skips remote invalidation
 before removing the token while retaining unrelated shared configuration
-fields.
+fields. `logout --invalidate=false` removes the local token without resolving
+or validating hosted API and login URLs.
 
 Remote cache control and artifact traffic supports team IDs and slugs,
 preflight, bounded responses, separate download and upload timeouts, safe
@@ -984,6 +989,9 @@ project, root configuration, and default values in descending precedence, so a
 linked project's stored token is never redirected by a lower-precedence root
 API setting. Remote cache hit events are emitted only after signature
 verification, decompression, and archive restoration succeed.
+Write-only remote publication issues an artifact HEAD request before upload,
+skips PUT when the artifact already exists, and warns but continues to PUT when
+the existence check fails.
 
 Telemetry state remains compatible with official state that omits the optional
 alert timestamp, preserves identity across enable and disable operations, and
@@ -994,7 +1002,11 @@ bounded request timeouts, environment and CLI headers, resource attributes,
 run-summary and task-detail selection, and an explicit opt-in to reuse the
 resolved remote cache token. Every exported run and task gauge point carries
 the export observation time in Unix nanoseconds. Task-detail metrics report
-actual execution and cache outcomes. A generic HTTP OTLP endpoint preserves its
+actual execution and cache outcomes. Periodic snapshots omit tasks that have
+not reached an outcome, while final and non-executing snapshots identify tasks
+that were actually bypassed as skipped. Numeric task and run attributes use
+OTLP integer values for every protocol. Empty and zero OTLP timeouts use the
+finite default. A generic HTTP OTLP endpoint preserves its
 path prefix and appends `/v1/metrics`. A positive metric interval emits scoped,
 sequential in-progress snapshots and a final snapshot; zero or an absent
 interval emits only the final snapshot. Graph and dry runs report the resolved
@@ -1007,7 +1019,9 @@ loopback devtools, boundary diagnostics, deterministic microfrontend ports,
 `bin`, hidden `config`, deprecated `scan`, and the remaining daemon, alias, and
 parser surfaces. Documentation output honors both `NO_COLOR` and `--no-color`.
 Devtools prints only its token-free loopback URL; its bearer URL is passed only
-to the browser launcher, and `--no-open` does not expose that URL. Boundary
+to the browser launcher, and `--no-open` does not expose that URL. The
+authenticated root page renders the package and dependency graph exposed by
+the JSON graph route. Boundary
 filters select the packages that own the evaluated rules using normal
 package-selector semantics. `--ignore=prompt` asks once before ignoring found
 violations, accepts only `y` or `yes`, skips prompting when no violation exists,
@@ -1024,7 +1038,9 @@ and recursive copies whose source contains their destination are rejected.
 Requested workspace names must be npm-compatible. Copied workspace templates
 require an object `package.json`, preserve its other fields, and atomically
 rewrite `name` to the requested workspace name. Failed template copies or
-manifest rewrites remove the partial destination so a retry can succeed. Update
+manifest rewrites remove the partial destination only when the generator
+acquired that destination exclusively, so a concurrently created destination
+is preserved. Update
 checks remain disabled by default; the explicit
 test-only forced check reads stable upstream tags and reports against the fixed
 2.10.12 baseline. Aube and Nub native or delegated lockfiles retain their

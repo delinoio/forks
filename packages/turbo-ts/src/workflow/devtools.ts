@@ -21,6 +21,18 @@ interface DevtoolsOptions {
 const failure = (message: string): ConfigurationError =>
   new ConfigurationError({ path: "<arguments>", message });
 
+const escapeHtml = (value: string): string =>
+  value.replace(/[&<>]/g, (character) => {
+    switch (character) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      default:
+        return "&gt;";
+    }
+  });
+
 export const parseDevtoolsArguments = (
   arguments_: ReadonlyArray<string>,
 ): DevtoolsOptions => {
@@ -74,7 +86,7 @@ export const executeDevtools = (
         rootTurboJson: options.common.rootTurboJson,
       });
       const token = yield* randomness.uuidV7;
-      const graph = JSON.stringify({
+      const graphDocument = {
         root: repository.rootPackage.name,
         packages: [repository.rootPackage, ...repository.packages].map(
           (packageModel) => ({
@@ -83,7 +95,9 @@ export const executeDevtools = (
             dependencies: [...packageModel.internalDependencies].sort(),
           }),
         ),
-      });
+      };
+      const graph = JSON.stringify(graphDocument);
+      const page = `<!doctype html><title>turbo-ts devtools</title><main><h1>turbo-ts package graph</h1><pre>${escapeHtml(JSON.stringify(graphDocument, undefined, 2))}</pre></main>`;
       const server = yield* http.serve(options.port, (request) => {
         const url = new URL(request.path, "http://127.0.0.1");
         if (url.searchParams.get("token") !== token) {
@@ -104,7 +118,7 @@ export const executeDevtools = (
             "content-type": "text/html; charset=utf-8",
             "referrer-policy": "no-referrer",
           },
-          body: "<!doctype html><title>turbo-ts devtools</title><main id=app>turbo-ts package graph</main>",
+          body: page,
         });
       });
       const publicUrl = `http://127.0.0.1:${server.port}/`;
