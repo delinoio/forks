@@ -266,11 +266,17 @@ rows:
       - TURBO_SCM_BASE
       - TURBO_SCM_HEAD
       - TURBO_TELEMETRY_DISABLED
-      - TURBO_TELEMETRY_MESSAGE_DISABLED
       - TURBO_UI
       - TURBO_ROOT_TURBO_JSON
       - TURBO_DANGEROUSLY_DISABLE_PACKAGE_MANAGER_CHECK
     tests: [secondary.compatibility, hosted.compatibility, telemetry.compatibility, core.execution]
+    source: public-documentation-and-black-box
+  - id: environment.turbo-telemetry-message
+    category: environment
+    subject: telemetry notice suppression environment
+    targetGate: 4
+    status: planned
+    variants: [TURBO_TELEMETRY_MESSAGE_DISABLED]
     source: public-documentation-and-black-box
   - id: environment.turbo-daemon
     category: environment

@@ -541,10 +541,25 @@ describe("configuration generation and compatibility ledger", () => {
         id: "cli.generate-workspace-dependencies",
         variants: ["--show-all-dependencies"],
       }),
+      expect.objectContaining({
+        id: "environment.turbo-telemetry-message",
+        variants: ["TURBO_TELEMETRY_MESSAGE_DISABLED"],
+      }),
     ]);
     expect(
       ledger.rows.find((row) => row.id === "environment.turbo")?.variants,
     ).not.toContain("TURBO_DAEMON");
+    expect(
+      ledger.rows.find((row) => row.id === "environment.turbo")?.variants,
+    ).not.toContain("TURBO_TELEMETRY_MESSAGE_DISABLED");
+    expect(
+      ledger.rows.find(
+        (row) => row.id === "environment.turbo-telemetry-message",
+      ),
+    ).toMatchObject({
+      status: "planned",
+      variants: ["TURBO_TELEMETRY_MESSAGE_DISABLED"],
+    });
     expect(
       ledger.rows.find((row) => row.id === "environment.turbo-daemon"),
     ).toMatchObject({

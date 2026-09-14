@@ -417,6 +417,7 @@ export const resolveOptions = (
   const configuredEnvironmentMode = environmentValue("TURBO_ENV_MODE");
   const configuredApiUrl = environmentValue("TURBO_API");
   const configuredTeamSlug = environmentValue("TURBO_TEAM");
+  const configuredToken = environmentValue("TURBO_TOKEN");
   const configuredRemoteTimeout = environmentValue(
     "TURBO_REMOTE_CACHE_TIMEOUT",
   );
@@ -486,8 +487,12 @@ export const resolveOptions = (
     : joinPath(root, cacheDirectoryValue);
   const cachePolicy = parseCachePolicy(parsed, environmentValue);
   const remoteConfiguration = value.remoteCache ?? global?.remoteCache;
+  const explicitToken = parsed.token ?? configuredToken;
   const token =
-    parsed.token ?? environmentValue("TURBO_TOKEN") ?? storedCredentials.token;
+    explicitToken ??
+    (storedCredentials.project?.apiUrl === undefined
+      ? undefined
+      : storedCredentials.token);
   const apiUrl =
     parsed.apiUrl ??
     configuredApiUrl ??
@@ -685,7 +690,7 @@ export const resolveOptions = (
     outputLogs: parsed.outputLogs,
     only: parsed.only,
     parallel: parsed.parallel,
-    remoteToken: token,
+    remoteToken: explicitToken ?? storedCredentials.token,
     remote,
     colorEnabled: !parsed.noColor && environmentValue("NO_COLOR") === undefined,
     json: parsed.json,
@@ -3577,21 +3582,24 @@ export const executeRun = (
     );
     const environmentValue = (name: string): string | undefined =>
       configuredEnvironmentValue(environment, name, platform === "win32");
+    const ordinaryRun =
+      parsed.graph === undefined && parsed.dryRun === undefined;
     const preliminaryCachePolicy = parseCachePolicy(parsed, environmentValue);
     const configuredRemoteCache =
       configuration.value.remoteCache ??
       configuration.value.global?.remoteCache;
     const remoteCacheActive =
+      ordinaryRun &&
       configuredRemoteCache?.enabled !== false &&
       (preliminaryCachePolicy.remoteRead || preliminaryCachePolicy.remoteWrite);
     const openTelemetryEnabled =
       parsed.openTelemetry.enabled ??
       environmentValue("TURBO_EXPERIMENTAL_OTEL_ENABLED") === "true";
+    const explicitRemoteToken = parsed.token ?? environmentValue("TURBO_TOKEN");
     const telemetryNeedsStoredToken =
       openTelemetryEnabled &&
       parsed.openTelemetry.useRemoteCacheToken === true &&
-      parsed.token === undefined &&
-      environmentValue("TURBO_TOKEN") === undefined;
+      explicitRemoteToken === undefined;
     const credentialService =
       remoteCacheActive || telemetryNeedsStoredToken
         ? yield* CredentialService
@@ -3599,8 +3607,12 @@ export const executeRun = (
     const projectCredentials = remoteCacheActive
       ? yield* credentialService!.readProjectConfiguration(preliminaryRoot)
       : undefined;
+    const remoteCacheNeedsStoredToken =
+      remoteCacheActive &&
+      explicitRemoteToken === undefined &&
+      projectCredentials?.apiUrl !== undefined;
     const userCredentials =
-      remoteCacheActive || telemetryNeedsStoredToken
+      remoteCacheNeedsStoredToken || telemetryNeedsStoredToken
         ? yield* credentialService!.readUserConfiguration
         : undefined;
     const availableParallelism = yield* concurrencyService.availableParallelism;
@@ -3613,8 +3625,9 @@ export const executeRun = (
       platform === "win32",
       { token: userCredentials?.token, project: projectCredentials },
     );
+    const activeRemote = ordinaryRun ? unresolvedOptions.remote : undefined;
     const remoteSessionId =
-      unresolvedOptions.remote === undefined
+      activeRemote === undefined
         ? undefined
         : yield* (yield* RandomnessService).uuidV7;
     const [canonicalRoot, canonicalCacheDirectory] = yield* Effect.all([
@@ -3642,9 +3655,9 @@ export const executeRun = (
     const options: ResolvedRunOptions = {
       ...unresolvedOptions,
       remote:
-        unresolvedOptions.remote === undefined
+        activeRemote === undefined
           ? undefined
-          : { ...unresolvedOptions.remote, sessionId: remoteSessionId },
+          : { ...activeRemote, sessionId: remoteSessionId },
       ui: resolveRunUiMode(
         unresolvedOptions.ui,
         stdinIsTerminal,
@@ -3863,8 +3876,6 @@ export const executeRun = (
           : joinPath(options.root, requestedPath);
     const clock = yield* ClockService;
     const runStartedAt = yield* clock.now;
-    const ordinaryRun =
-      parsed.graph === undefined && parsed.dryRun === undefined;
     const summaryIsEmitted =
       parsed.summarize || parsed.json || parsed.logFile !== undefined;
     const runId = summaryIsEmitted

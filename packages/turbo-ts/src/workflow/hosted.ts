@@ -241,7 +241,9 @@ const resolveHostedSettings = (
       options.common.token ??
       (yield* configuredValue("TURBO_TOKEN")) ??
       stored?.token;
-    const teamId = yield* configuredValue("TURBO_TEAMID");
+    const environmentTeamId = yield* configuredValue("TURBO_TEAMID");
+    const teamId =
+      options.common.team === undefined ? environmentTeamId : undefined;
     const teamSlug =
       options.common.team ?? (yield* configuredValue("TURBO_TEAM"));
     const apiValue =

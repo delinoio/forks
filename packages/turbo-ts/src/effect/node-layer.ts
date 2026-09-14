@@ -3071,6 +3071,8 @@ const compressionError = (cause: unknown): BoundaryError =>
 
 class HttpResponseBodyLimitError extends Error {}
 
+class HttpRedirectPolicyError extends TypeError {}
+
 class CompressionOutputLimitError extends Error {}
 
 const validateResponseContentLength = async (
@@ -3271,7 +3273,7 @@ const fetchWithSafeRedirects = async (
     if (!redirectStatuses.has(response.status)) return response;
     if (redirects >= 5) {
       await response.body?.cancel();
-      throw new TypeError("HTTP redirect limit exceeded");
+      throw new HttpRedirectPolicyError("HTTP redirect limit exceeded");
     }
     const location = response.headers.get("location");
     if (location === null) return response;
@@ -3280,19 +3282,23 @@ const fetchWithSafeRedirects = async (
       destination = new URL(location, url);
     } catch {
       await response.body?.cancel();
-      throw new TypeError("HTTP redirect location is invalid");
+      throw new HttpRedirectPolicyError("HTTP redirect location is invalid");
     }
     if (destination.username !== "" || destination.password !== "") {
       await response.body?.cancel();
-      throw new TypeError("HTTP redirect contains credentials");
+      throw new HttpRedirectPolicyError("HTTP redirect contains credentials");
     }
     if (url.protocol === "https:" && destination.protocol !== "https:") {
       await response.body?.cancel();
-      throw new TypeError("HTTP redirect would downgrade transport security");
+      throw new HttpRedirectPolicyError(
+        "HTTP redirect would downgrade transport security",
+      );
     }
     if (destination.protocol !== "http:" && destination.protocol !== "https:") {
       await response.body?.cancel();
-      throw new TypeError("HTTP redirect protocol is unsupported");
+      throw new HttpRedirectPolicyError(
+        "HTTP redirect protocol is unsupported",
+      );
     }
     if (destination.origin !== url.origin) {
       headers = Object.fromEntries(
@@ -3456,7 +3462,9 @@ const httpLayer = Layer.succeed(HttpService, {
         new BoundaryError({
           boundary: "http",
           message: String(cause),
-          retryable: !(cause instanceof HttpResponseBodyLimitError),
+          retryable:
+            !(cause instanceof HttpResponseBodyLimitError) &&
+            !(cause instanceof HttpRedirectPolicyError),
         }),
     }),
   downloadToFile: (request, destination) =>
@@ -3492,7 +3500,9 @@ const httpLayer = Layer.succeed(HttpService, {
         new BoundaryError({
           boundary: "http",
           message: String(cause),
-          retryable: !(cause instanceof HttpResponseBodyLimitError),
+          retryable:
+            !(cause instanceof HttpResponseBodyLimitError) &&
+            !(cause instanceof HttpRedirectPolicyError),
         }),
     }),
 });

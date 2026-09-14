@@ -945,8 +945,9 @@ disables framework environment inference for task hashing and execution.
 
 Gate 4 hosted and secondary surfaces have automated ledger evidence except for
 runtime verbosity logging, workspace example-path selection, and workspace
-dependency selection, which remain planned while `--verbosity`,
-`--example-path`, and `--show-all-dependencies` are only parsed.
+dependency selection, plus telemetry-notice suppression. These remain planned
+while `--verbosity`, `--example-path`, and `--show-all-dependencies` are only
+parsed and `TURBO_TELEMETRY_MESSAGE_DISABLED` is not consumed.
 `login`,
 `link`, `logout`, and `unlink` share the official user configuration under the
 platform configuration directory and the repository `.turbo/config.json`.
@@ -974,7 +975,8 @@ scopes, and prompts interactive users to select a scope when none is configured.
 Linking requires confirmation unless `--yes` is supplied; a non-interactive
 link must supply a scope and `--yes`. The command persists the selected identity
 and validated API URL, and keeps `.turbo` ignored unless `--no-gitignore` is
-requested. Logout invalidates the current
+requested. An explicit link `--team` slug suppresses `TURBO_TEAMID` before scope
+selection and validation. Logout invalidates the current
 token only against an API selected explicitly or persisted by the linked
 project. When the issuing API is unavailable, it skips remote invalidation
 before removing the token while retaining unrelated shared configuration
@@ -987,9 +989,14 @@ redirects, idempotent retries for transient and rate-limit responses, event
 records, and optional HMAC signatures. Redirects reject credentials,
 unsupported protocols, and HTTPS downgrades, and remove authorization,
 cookies, tokens, credentials, secrets, and signatures before crossing an
-origin. A `HEAD` request remains `HEAD` across a 303 redirect. Local-only,
-configuration-disabled remote, and no-cache runs do not
-load remote credentials or probe hosted status. An explicit team slug
+origin. Redirect-policy failures are non-retryable. A `HEAD` request remains
+`HEAD` across a 303 redirect. Local-only, configuration-disabled remote,
+no-cache, graph, and dry runs do not load remote credentials or probe hosted
+status; explicit OTLP token reuse may still read the shared user token without
+activating remote cache. A shared stored token activates remote cache only for
+a project configuration with a persisted linked API URL; an absent or empty
+project configuration does not activate it. Explicit CLI and environment
+tokens may activate the default API. An explicit team slug
 suppresses lower-precedence stored team IDs. Hosted and OTLP requests identify
 as `turbo-ts/0.1.0`. Runtime remote API selection uses CLI, environment, linked
 project, root configuration, and default values in descending precedence, so a
@@ -1036,7 +1043,7 @@ package-selector semantics. `--ignore=prompt` asks once before ignoring found
 violations, accepts only `y` or `yes`, skips prompting when no violation exists,
 and fails safely without an interactive terminal. Hidden `config` suppresses
 lower-precedence team IDs when a CLI or environment team slug is selected and
-validates the effective API URL before rendering it.
+validates the effective API and login URLs before rendering them.
 Remote download and upload timeouts use CLI, environment, configuration, and
 default values in descending precedence and reject negative, empty, or
 non-finite environment values. Microfrontend configuration is selected only

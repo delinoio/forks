@@ -1088,6 +1088,36 @@ version = "1.0.0"
     expect(environmentOptions.remote?.teamId).toBeUndefined();
   });
 
+  it("requires an explicit token or linked project before using a stored token", () => {
+    const model = repository([]);
+    const parsed = parseRunArguments(["run", "build"]);
+    for (const project of [undefined, {}] as const) {
+      const unlinked = resolveOptions(
+        parsed,
+        model.root,
+        {},
+        model.rootConfiguration,
+        8,
+        false,
+        { token: "stored-token", project },
+      );
+      expect(unlinked.remote).toBeUndefined();
+      expect(unlinked.remoteToken).toBe("stored-token");
+    }
+
+    const explicit = resolveOptions(
+      parseRunArguments(["run", "build", "--token=explicit-token"]),
+      model.root,
+      {},
+      model.rootConfiguration,
+      8,
+    );
+    expect(explicit.remote).toMatchObject({
+      apiUrl: "https://vercel.com/api",
+      token: "explicit-token",
+    });
+  });
+
   it("prefers linked project remote settings over root configuration", () => {
     const model = repository([]);
     const configuration = {

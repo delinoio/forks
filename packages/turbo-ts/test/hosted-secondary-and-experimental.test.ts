@@ -680,6 +680,7 @@ describe("hosted compatibility", () => {
             }).pipe(Effect.provide(nodeFoundationLayer)),
           );
           let answers: Array<string> = [];
+          let environmentTeamId: string | undefined;
           let output = "";
           const prompts: Array<string> = [];
           let storedProject:
@@ -701,7 +702,10 @@ describe("hosted compatibility", () => {
           const environmentLayer = Layer.succeed(EnvironmentService, {
             ...services.environment,
             cwd: Effect.succeed(root),
-            get: () => Effect.succeed(undefined),
+            get: (name) =>
+              Effect.succeed(
+                name === "TURBO_TEAMID" ? environmentTeamId : undefined,
+              ),
           });
           const terminalLayer = (interactive: boolean) =>
             Layer.succeed(TerminalService, {
@@ -799,6 +803,21 @@ describe("hosted compatibility", () => {
           });
           expect(prompts).toEqual([]);
           expect(storedProject).toBeUndefined();
+
+          environmentTeamId = "team_stale";
+          expect(
+            await execute(
+              ["--team=synthetic", "--yes", ...commonArguments],
+              false,
+            ),
+          ).toBe(0);
+          expect(storedProject).toEqual({
+            apiUrl: new URL(baseUrl).toString(),
+            teamId: "team_synthetic",
+          });
+          expect(requests.at(-1)?.path).toBe(
+            "/v8/artifacts/status?teamId=team_synthetic&slug=synthetic",
+          );
         },
       );
     } finally {
@@ -1183,7 +1202,7 @@ describe("hosted compatibility", () => {
     }
   });
 
-  it("does not load credentials or probe hosted status for local-only runs", async () => {
+  it("does not initialize remote cache for local-only and non-executing runs", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-local-only-"));
     const root = join(directory, "repository");
     const configurationHome = join(directory, "configuration");
@@ -1196,6 +1215,23 @@ describe("hosted compatibility", () => {
     await writeFile(projectPath, "invalid project credentials");
     if (process.platform !== "win32") await chmod(userPath, 0o600);
     try {
+      for (const mode of ["--dry-run=json", "--graph"] as const) {
+        const nonExecuting = await runCandidate(
+          ["run", "build", "--filter=synthetic-app", mode, `--cwd=${root}`],
+          root,
+          { XDG_CONFIG_HOME: configurationHome },
+        );
+        expect(nonExecuting.code, nonExecuting.stderr).toBe(0);
+      }
+
+      await writeFile(projectPath, "{}");
+      const unlinked = await runCandidate(
+        ["run", "build", "--filter=synthetic-app", `--cwd=${root}`],
+        root,
+        { XDG_CONFIG_HOME: configurationHome },
+      );
+      expect(unlinked.code, unlinked.stderr).toBe(0);
+
       await writeFile(
         join(root, "turbo.json"),
         JSON.stringify({
@@ -1236,6 +1272,18 @@ describe("hosted compatibility", () => {
           );
           if (process.platform !== "win32") await chmod(userPath, 0o600);
           await writeFile(projectPath, JSON.stringify({ apiUrl: baseUrl }));
+          await writeFile(
+            join(root, "turbo.json"),
+            JSON.stringify({ tasks: { build: {} } }),
+          );
+          for (const mode of ["--dry-run=json", "--graph"] as const) {
+            const nonExecuting = await runCandidate(
+              ["run", "build", "--filter=synthetic-app", mode, `--cwd=${root}`],
+              root,
+              { XDG_CONFIG_HOME: configurationHome },
+            );
+            expect(nonExecuting.code, nonExecuting.stderr).toBe(0);
+          }
           const localOnly = await runCandidate(
             [
               "run",
@@ -1976,6 +2024,41 @@ describe("secondary command and parser compatibility", () => {
     }
   });
 
+  it("validates effective login URLs before rendering config", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-config-login-"));
+    const root = join(directory, "repository");
+    const credential = "synthetic-login-password";
+    const unsafeLoginUrl = `https://user:${credential}@example.test`;
+    await prepareRepository(root);
+    const assertRejected = async (
+      arguments_: ReadonlyArray<string>,
+      environment: NodeJS.ProcessEnv = {},
+    ) => {
+      const result = await runCandidate(arguments_, root, environment);
+      expect(result.code).toBe(1);
+      expect(`${result.stdout}${result.stderr}`).not.toContain(credential);
+    };
+    try {
+      await assertRejected([
+        "config",
+        `--login=${unsafeLoginUrl}`,
+        `--cwd=${root}`,
+      ]);
+      await assertRejected(["config", `--cwd=${root}`], {
+        TURBO_LOGIN: unsafeLoginUrl,
+      });
+      const configurationPath = join(root, "turbo.json");
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as Record<string, unknown>;
+      configuration.remoteCache = { loginUrl: unsafeLoginUrl };
+      await writeFile(configurationPath, JSON.stringify(configuration));
+      await assertRejected(["config", `--cwd=${root}`]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it(evidenceId.telemetryCompatibility, async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-telemetry-"));
     const root = join(directory, "repository");
@@ -2665,9 +2748,15 @@ describe("hosted protocols and experimental transports", () => {
           });
           await writeFile(userPath, JSON.stringify({ token: "stored-token" }));
           if (process.platform !== "win32") await chmod(userPath, 0o600);
+          await mkdir(join(root, ".turbo"), { recursive: true });
+          await writeFile(
+            join(root, ".turbo/config.json"),
+            "invalid project credentials",
+          );
           const storedToken = await runCandidate(
             [
               ...commonArguments,
+              "--dry-run=json",
               "--experimental-otel-metrics-run-summary=false",
               "--experimental-otel-metrics-task-details=true",
             ],
@@ -2725,6 +2814,90 @@ describe("hosted protocols and experimental transports", () => {
         );
       },
     );
+  });
+
+  it("does not retry deterministic redirect policy failures", async () => {
+    await withServer(
+      () => [
+        302,
+        {
+          location: "https://user:synthetic-redirect-secret@example.test/cache",
+        },
+        "redirect",
+      ],
+      async (baseUrl, requests) => {
+        const outcome = await Effect.runPromise(
+          Effect.either(
+            verifyRemoteCacheStatus({
+              apiUrl: baseUrl,
+              timeoutMilliseconds: 1_000,
+              uploadTimeoutMilliseconds: 1_000,
+              preflight: false,
+              requireSignature: false,
+              token: "synthetic-token",
+            }).pipe(Effect.provide(nodeFoundationLayer)),
+          ),
+        );
+        expect(outcome._tag).toBe("Left");
+        if (outcome._tag === "Right") {
+          throw new Error("expected credential redirect rejection");
+        }
+        expect(outcome.left.retryable).toBe(false);
+        expect(requests).toHaveLength(1);
+      },
+    );
+
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-redirect-"));
+    try {
+      await withServer(
+        () => [302, { location: "ftp://example.test/cache" }, "redirect"],
+        async (baseUrl, requests) => {
+          const outcome = await Effect.runPromise(
+            Effect.either(
+              HttpService.pipe(
+                Effect.flatMap((http) =>
+                  http.downloadToFile(
+                    { url: baseUrl, method: "GET" },
+                    join(directory, "artifact.tgz"),
+                  ),
+                ),
+                Effect.provide(nodeFoundationLayer),
+              ),
+            ),
+          );
+          expect(outcome._tag).toBe("Left");
+          if (outcome._tag === "Right") {
+            throw new Error("expected protocol redirect rejection");
+          }
+          expect(outcome.left.retryable).toBe(false);
+          expect(requests).toHaveLength(1);
+        },
+      );
+
+      await withServer(
+        () => [302, { location: "/redirect-loop" }, "redirect"],
+        async (baseUrl, requests) => {
+          const outcome = await Effect.runPromise(
+            Effect.either(
+              HttpService.pipe(
+                Effect.flatMap((http) =>
+                  http.request({ url: baseUrl, method: "GET" }),
+                ),
+                Effect.provide(nodeFoundationLayer),
+              ),
+            ),
+          );
+          expect(outcome._tag).toBe("Left");
+          if (outcome._tag === "Right") {
+            throw new Error("expected redirect limit rejection");
+          }
+          expect(outcome.left.retryable).toBe(false);
+          expect(requests).toHaveLength(6);
+        },
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("strips secrets on cross-origin redirects and enforces timeouts", async () => {

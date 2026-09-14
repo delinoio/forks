@@ -168,11 +168,13 @@ const executeConfig = (
       30;
     const output = {
       apiUrl,
-      loginUrl:
+      loginUrl: hostedUrl(
         parsed.options.loginUrl ??
-        (yield* environmentValue("TURBO_LOGIN")) ??
-        remoteConfiguration?.loginUrl ??
-        "https://vercel.com",
+          (yield* environmentValue("TURBO_LOGIN")) ??
+          remoteConfiguration?.loginUrl ??
+          "https://vercel.com",
+        "login",
+      ).toString(),
       teamSlug:
         parsed.options.team ??
         environmentTeamSlug ??

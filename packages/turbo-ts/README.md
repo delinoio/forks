@@ -25,11 +25,11 @@ Vercel-compatible cache control traffic, telemetry consent, OTLP metrics,
 documentation search, internal generation, devtools, boundaries, and
 microfrontend ports. Only passing automated ledger rows are compatibility
 claims; runtime `--verbosity` logging and workspace `--example-path` selection
-remain planned. Gate 2 is not closed
-because the independent composed task-hash serializer does not yet match the
-official 2.10.12 keys. The bidirectional cache tests prove archive and artifact
-transport compatibility using oracle-provided hashes, not end-to-end cache-key
-identity.
+and `TURBO_TELEMETRY_MESSAGE_DISABLED` handling remain planned. Gate 2 is not
+closed because the independent composed task-hash serializer does not yet match
+the official 2.10.12 keys. The bidirectional cache tests prove archive and
+artifact transport compatibility using oracle-provided hashes, not end-to-end
+cache-key identity.
 
 Repository workflow inputs are bounded before retained or effectful work:
 daemon payloads are limited to 1 MiB, output registrations cap hashes and glob
