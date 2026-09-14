@@ -3676,7 +3676,7 @@ export const executeRun = (
     };
     context.onRemoteTokenResolved?.(options.remoteToken);
     if (
-      options.remote?.token !== undefined &&
+      options.remote !== undefined &&
       (options.cachePolicy.remoteRead || options.cachePolicy.remoteWrite)
     ) {
       const remoteEnabled = yield* verifyRemoteCacheStatus(options.remote).pipe(

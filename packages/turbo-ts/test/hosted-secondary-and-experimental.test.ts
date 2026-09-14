@@ -2543,6 +2543,61 @@ describe("hosted protocols and experimental transports", () => {
     }
   }, 30_000);
 
+  it("probes configured tokenless remotes before artifact traffic", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-tokenless-status-gate-"),
+    );
+    const root = join(directory, "repository");
+    await prepareRepository(root);
+    try {
+      await withServer(
+        (request) =>
+          request.url?.startsWith("/v8/artifacts/status") === true
+            ? [
+                200,
+                { "content-type": "application/json" },
+                '{"status":"disabled"}',
+              ]
+            : [500, {}, "unexpected remote artifact request"],
+        async (baseUrl, requests) => {
+          await writeFile(
+            join(root, "turbo.json"),
+            JSON.stringify({
+              remoteCache: { apiUrl: baseUrl },
+              tasks: { build: {} },
+            }),
+          );
+          const result = await runCandidate(
+            [
+              "run",
+              "build",
+              "--filter=synthetic-app",
+              "--cache=remote:rw",
+              "--output-logs=none",
+              `--cwd=${root}`,
+            ],
+            root,
+            { TURBO_API: undefined, TURBO_TOKEN: undefined },
+          );
+          expect(result.code, result.stderr).toBe(0);
+          expect(
+            requests.filter((request) =>
+              request.path.startsWith("/v8/artifacts/"),
+            ),
+          ).toEqual([
+            expect.objectContaining({
+              method: "GET",
+              path: "/v8/artifacts/status",
+            }),
+          ]);
+          expect(requests[0]?.headers.authorization).toBeUndefined();
+        },
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it(evidenceId.observabilityCompatibility, async () => {
     const requests: Array<HttpRequest> = [];
     const httpLayer = Layer.succeed(HttpService, {

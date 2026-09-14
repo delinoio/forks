@@ -13738,6 +13738,11 @@ describe("cache interoperability and safety", () => {
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
         response.writeHead(200, {
           "content-type": "application/octet-stream",
         });
@@ -13783,6 +13788,11 @@ describe("cache interoperability and safety", () => {
       const chunks: Array<Buffer> = [];
       request.on("data", (chunk: Buffer) => chunks.push(chunk));
       request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
         if (request.method === "PUT") {
           artifact = new Uint8Array(Buffer.concat(chunks));
           response.writeHead(201);
@@ -13867,6 +13877,11 @@ describe("cache interoperability and safety", () => {
       const chunks: Array<Buffer> = [];
       request.on("data", (chunk: Buffer) => chunks.push(chunk));
       request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
         if (request.method === "PUT") {
           artifact = new Uint8Array(Buffer.concat(chunks));
           response.writeHead(201);
@@ -13960,6 +13975,11 @@ describe("cache interoperability and safety", () => {
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
         if (request.method === "HEAD") {
           response.writeHead(404);
           response.end();
@@ -14011,6 +14031,11 @@ describe("cache interoperability and safety", () => {
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
         if (request.method === "HEAD") {
           methods.push("HEAD");
           response.writeHead(headFails ? 403 : artifactExists ? 200 : 404);
@@ -14073,6 +14098,11 @@ describe("cache interoperability and safety", () => {
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
         if (request.method === "HEAD") {
           response.writeHead(404);
           response.end();
@@ -14555,6 +14585,11 @@ describe("cache interoperability and safety", () => {
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
         if (request.method === "HEAD") {
           response.writeHead(404);
           response.end();
