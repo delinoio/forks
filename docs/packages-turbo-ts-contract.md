@@ -944,8 +944,9 @@ unique node identifiers without truncated-hash collisions. `--skip-infer`
 disables framework environment inference for task hashing and execution.
 
 Gate 4 hosted and secondary surfaces have automated ledger evidence except for
-runtime verbosity logging, which remains planned while `--verbosity` is only
-parsed. `login`,
+runtime verbosity logging and workspace dependency selection, which remain
+planned while `--verbosity` and `--show-all-dependencies` are only parsed.
+`login`,
 `link`, `logout`, and `unlink` share the official user configuration under the
 platform configuration directory and the repository `.turbo/config.json`.
 `login` updates only the user credential file and never creates or rewrites a
@@ -967,8 +968,11 @@ Project configuration writes reject symlinked `.turbo` directories before
 creating or replacing `config.json`.
 Link discovery uses the hosted user and team endpoints, verifies artifact
 status is exactly `enabled`, offers the personal user scope alongside team
-scopes, persists the selected identity and validated API URL, and keeps `.turbo`
-ignored unless `--no-gitignore` is requested. Logout invalidates the current
+scopes, and prompts interactive users to select a scope when none is configured.
+Linking requires confirmation unless `--yes` is supplied; a non-interactive
+link must supply a scope and `--yes`. The command persists the selected identity
+and validated API URL, and keeps `.turbo` ignored unless `--no-gitignore` is
+requested. Logout invalidates the current
 token only against an API selected explicitly or persisted by the linked
 project. When the issuing API is unavailable, it skips remote invalidation
 before removing the token while retaining unrelated shared configuration
@@ -981,13 +985,15 @@ redirects, idempotent retries for transient and rate-limit responses, event
 records, and optional HMAC signatures. Redirects reject credentials,
 unsupported protocols, and HTTPS downgrades, and remove authorization,
 cookies, tokens, credentials, secrets, and signatures before crossing an
-origin. Local-only, configuration-disabled remote, and no-cache runs do not
+origin. A `HEAD` request remains `HEAD` across a 303 redirect. Local-only,
+configuration-disabled remote, and no-cache runs do not
 load remote credentials or probe hosted status. An explicit team slug
 suppresses lower-precedence stored team IDs. Hosted and OTLP requests identify
 as `turbo-ts/0.1.0`. Runtime remote API selection uses CLI, environment, linked
 project, root configuration, and default values in descending precedence, so a
 linked project's stored token is never redirected by a lower-precedence root
-API setting. Remote cache hit events are emitted only after signature
+API setting. A linked project's team ID likewise takes precedence over a root
+remote-cache team ID. Remote cache hit events are emitted only after signature
 verification, decompression, and archive restoration succeed.
 Write-only remote publication issues an artifact HEAD request before upload,
 skips PUT when the artifact already exists, and warns but continues to PUT when
@@ -1040,7 +1046,8 @@ require an object `package.json`, preserve its other fields, and atomically
 rewrite `name` to the requested workspace name. Failed template copies or
 manifest rewrites remove the partial destination only when the generator
 acquired that destination exclusively, so a concurrently created destination
-is preserved. Update
+is preserved. Workspace dependency selection, including the visibility change
+requested by `--show-all-dependencies`, remains planned. Update
 checks remain disabled by default; the explicit
 test-only forced check reads stable upstream tags and reports against the fixed
 2.10.12 baseline. Aube and Nub native or delegated lockfiles retain their
@@ -1048,8 +1055,9 @@ declared command identity, and tool identity is probed through scoped mocked
 process boundaries in conformance tests. Cargo/rustc 1.97.1 and uv 0.12.7
 remain the fixed experimental matrix entries.
 
-Daemon preference forwarding remains planned until the runtime consumes or
-rejects the resolved startup and idle-time options.
+Daemon preference forwarding through `--daemon`, `--no-daemon`, and
+`TURBO_DAEMON` remains planned until the runtime consumes or rejects the
+resolved startup and idle-time options.
 
 Only behavior with automated ledger evidence is a compatibility claim. The
 project-wide composed task-hash row remains planned as documented above; no

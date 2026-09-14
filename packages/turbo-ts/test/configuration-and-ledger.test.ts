@@ -522,6 +522,9 @@ describe("configuration generation and compatibility ledger", () => {
       variants: ["--daemon", "--no-daemon"],
     });
     expect(
+      ledger.rows.find((row) => row.id === "cli.secondary-options")?.variants,
+    ).not.toContain("--show-all-dependencies");
+    expect(
       ledger.rows.filter(
         (row) => row.targetGate === 4 && row.status === "planned",
       ),
@@ -530,7 +533,20 @@ describe("configuration generation and compatibility ledger", () => {
         id: "cli.global-verbosity",
         variants: ["--verbosity"],
       }),
+      expect.objectContaining({
+        id: "cli.generate-workspace-dependencies",
+        variants: ["--show-all-dependencies"],
+      }),
     ]);
+    expect(
+      ledger.rows.find((row) => row.id === "environment.turbo")?.variants,
+    ).not.toContain("TURBO_DAEMON");
+    expect(
+      ledger.rows.find((row) => row.id === "environment.turbo-daemon"),
+    ).toMatchObject({
+      status: "planned",
+      variants: ["TURBO_DAEMON"],
+    });
     expect(() =>
       parseCompatibilityLedger(
         ledgerSource.replace(

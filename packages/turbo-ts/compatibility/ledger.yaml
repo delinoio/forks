@@ -209,7 +209,6 @@ rows:
       - -t
       - --example-path
       - -p
-      - --show-all-dependencies
       - --output
       - --no-gitignore
       - --scope
@@ -229,6 +228,13 @@ rows:
       - test-only-arguments
     tests: [secondary.compatibility, hosted.compatibility, telemetry.compatibility, repository.workflows]
     source: black-box-help-and-issue-3
+  - id: cli.generate-workspace-dependencies
+    category: option
+    subject: workspace generator dependency selection visibility
+    targetGate: 4
+    status: planned
+    variants: [--show-all-dependencies]
+    source: public-documentation-and-black-box-help
   - id: environment.turbo
     category: environment
     subject: Turbo configuration, cache, SCM, telemetry, update, and testing environment
@@ -244,7 +250,6 @@ rows:
       - TURBO_CACHE_DIR
       - TURBO_CACHE_WORKERS
       - TURBO_CONCURRENCY
-      - TURBO_DAEMON
       - TURBO_FORCE
       - TURBO_LOG_ORDER
       - TURBO_LOG_PREFIX
@@ -261,6 +266,13 @@ rows:
       - TURBO_ROOT_TURBO_JSON
       - TURBO_DANGEROUSLY_DISABLE_PACKAGE_MANAGER_CHECK
     tests: [secondary.compatibility, hosted.compatibility, telemetry.compatibility, core.execution]
+    source: public-documentation-and-black-box
+  - id: environment.turbo-daemon
+    category: environment
+    subject: run daemon preference environment
+    targetGate: 3
+    status: planned
+    variants: [TURBO_DAEMON]
     source: public-documentation-and-black-box
   - id: environment.core
     category: environment

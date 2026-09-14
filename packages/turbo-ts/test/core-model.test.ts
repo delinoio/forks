@@ -1088,7 +1088,7 @@ version = "1.0.0"
     expect(environmentOptions.remote?.teamId).toBeUndefined();
   });
 
-  it("prefers linked project APIs over root remote-cache configuration", () => {
+  it("prefers linked project remote settings over root configuration", () => {
     const model = repository([]);
     const configuration = {
       ...model.rootConfiguration,
@@ -1096,12 +1096,16 @@ version = "1.0.0"
         remoteCache: {
           apiUrl: "https://root.example.test/api",
           enabled: true,
+          teamId: "root-team-id",
         },
       },
     };
     const storedCredentials = {
       token: "synthetic-token",
-      project: { apiUrl: "https://linked.example.test/api" },
+      project: {
+        apiUrl: "https://linked.example.test/api",
+        teamId: "linked-team-id",
+      },
     };
     const linked = resolveOptions(
       parseRunArguments(["run", "build"]),
@@ -1113,6 +1117,7 @@ version = "1.0.0"
       storedCredentials,
     );
     expect(linked.remote?.apiUrl).toBe("https://linked.example.test/api");
+    expect(linked.remote?.teamId).toBe("linked-team-id");
 
     const environment = resolveOptions(
       parseRunArguments(["run", "build"]),

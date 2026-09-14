@@ -604,8 +604,8 @@ export const resolveOptions = (
         parsed.team === undefined
           ? (environmentValue("TURBO_TEAMID") ??
             (configuredTeamSlug === undefined
-              ? (remoteConfiguration?.teamId ??
-                storedCredentials.project?.teamId ??
+              ? (storedCredentials.project?.teamId ??
+                remoteConfiguration?.teamId ??
                 undefined)
               : undefined))
           : undefined,

@@ -3282,7 +3282,7 @@ const fetchWithSafeRedirects = async (
       );
     }
     if (
-      response.status === 303 ||
+      (response.status === 303 && method !== "HEAD") ||
       ((response.status === 301 || response.status === 302) &&
         method === "POST")
     ) {

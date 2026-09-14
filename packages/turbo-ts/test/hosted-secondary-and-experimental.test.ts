@@ -639,6 +639,170 @@ describe("hosted compatibility", () => {
     }
   }, 60_000);
 
+  it("selects and confirms a link scope interactively", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-link-scope-"));
+    const root = join(directory, "repository");
+    const token = "synthetic-link-token";
+    await prepareRepository(root);
+    try {
+      await withServer(
+        (request) =>
+          request.url === "/v2/user"
+            ? [
+                200,
+                { "content-type": "application/json" },
+                '{"user":{"id":"user_synthetic","username":"synthetic-user","name":"Synthetic User"}}',
+              ]
+            : request.url === "/v2/teams?limit=100"
+              ? [
+                  200,
+                  { "content-type": "application/json" },
+                  '{"teams":[{"id":"team_synthetic","slug":"synthetic","name":"Synthetic Team"}]}',
+                ]
+              : request.url?.startsWith("/v8/artifacts/status") === true
+                ? [
+                    200,
+                    { "content-type": "application/json" },
+                    '{"status":"enabled"}',
+                  ]
+                : [404, {}, "not found"],
+        async (baseUrl, requests) => {
+          const services = await Effect.runPromise(
+            Effect.gen(function* () {
+              return {
+                credentials: yield* CredentialService,
+                environment: yield* EnvironmentService,
+                terminal: yield* TerminalService,
+              };
+            }).pipe(Effect.provide(nodeFoundationLayer)),
+          );
+          let answers: Array<string> = [];
+          let output = "";
+          const prompts: Array<string> = [];
+          let storedProject:
+            | {
+                readonly apiUrl?: string;
+                readonly teamId?: string;
+                readonly teamSlug?: string;
+              }
+            | undefined;
+          const credentialsLayer = Layer.succeed(CredentialService, {
+            ...services.credentials,
+            readUserConfiguration: Effect.succeed({ token }),
+            readProjectConfiguration: () => Effect.succeed(undefined),
+            writeProjectConfiguration: (_root, configuration) =>
+              Effect.sync(() => {
+                storedProject = configuration;
+              }),
+          });
+          const environmentLayer = Layer.succeed(EnvironmentService, {
+            ...services.environment,
+            cwd: Effect.succeed(root),
+            get: () => Effect.succeed(undefined),
+          });
+          const terminalLayer = (interactive: boolean) =>
+            Layer.succeed(TerminalService, {
+              ...services.terminal,
+              stdinIsTerminal: Effect.succeed(interactive),
+              readLine: (prompt) =>
+                Effect.sync(() => {
+                  prompts.push(prompt);
+                  return answers.shift() ?? "";
+                }),
+              writeStdout: (text) =>
+                Effect.sync(() => {
+                  output += text;
+                }),
+              writeStderr: () => Effect.void,
+            });
+          const execute = (
+            arguments_: ReadonlyArray<string>,
+            interactive: boolean,
+          ) =>
+            Effect.runPromise(
+              executeHostedCommand("link", arguments_).pipe(
+                Effect.provide(
+                  Layer.mergeAll(
+                    credentialsLayer,
+                    environmentLayer,
+                    terminalLayer(interactive),
+                  ),
+                ),
+                Effect.provide(nodeFoundationLayer),
+              ),
+            );
+          const commonArguments = [
+            `--api=${baseUrl}`,
+            `--cwd=${root}`,
+            "--no-gitignore",
+          ];
+
+          answers = ["2", "yes"];
+          expect(await execute(commonArguments, true)).toBe(0);
+          expect(output).toContain(
+            "1. Synthetic User (synthetic-user)\n  2. Synthetic Team (synthetic)",
+          );
+          expect(prompts).toEqual([
+            "Enter a scope [1-2]: ",
+            "Enable Remote Caching for Synthetic Team? [y/N] ",
+          ]);
+          expect(storedProject).toEqual({
+            apiUrl: new URL(baseUrl).toString(),
+            teamId: "team_synthetic",
+          });
+          expect(
+            requests.some(
+              (request) =>
+                request.path ===
+                "/v8/artifacts/status?teamId=team_synthetic&slug=synthetic",
+            ),
+          ).toBe(true);
+
+          storedProject = undefined;
+          output = "";
+          prompts.length = 0;
+          answers = ["no"];
+          expect(
+            await execute(["--scope=synthetic", ...commonArguments], true),
+          ).toBe(0);
+          expect(storedProject).toBeUndefined();
+          expect(output).toContain("Remote Caching link cancelled.");
+          expect(prompts).toEqual([
+            "Enable Remote Caching for Synthetic Team? [y/N] ",
+          ]);
+
+          prompts.length = 0;
+          answers = [];
+          const nonInteractive = await Effect.runPromise(
+            Effect.either(
+              executeHostedCommand("link", ["--yes", ...commonArguments]).pipe(
+                Effect.provide(
+                  Layer.mergeAll(
+                    credentialsLayer,
+                    environmentLayer,
+                    terminalLayer(false),
+                  ),
+                ),
+                Effect.provide(nodeFoundationLayer),
+              ),
+            ),
+          );
+          expect(nonInteractive).toMatchObject({
+            _tag: "Left",
+            left: {
+              message:
+                "link requires --scope, --team, TURBO_TEAM, or TURBO_TEAMID in non-interactive mode",
+            },
+          });
+          expect(prompts).toEqual([]);
+          expect(storedProject).toBeUndefined();
+        },
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("quotes complete browser URLs for the Windows command interpreter", () => {
     const url =
       "https://login.example.test/turborepo/token?redirect_uri=http%3A%2F%2F127.0.0.1%3A1234%2F&state=synthetic-state";
@@ -2367,6 +2531,42 @@ describe("hosted protocols and experimental transports", () => {
       await rm(directory, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it("preserves HEAD requests across 303 redirects", async () => {
+    await withServer(
+      (request) =>
+        request.method === "HEAD"
+          ? [200, {}, ""]
+          : [200, {}, "unexpected redirected response body"],
+      async (destination, destinationRequests) => {
+        await withServer(
+          () => [303, { location: destination }, "redirect"],
+          async (source, sourceRequests) => {
+            const response = await Effect.runPromise(
+              HttpService.pipe(
+                Effect.flatMap((http) =>
+                  http.request({
+                    url: source,
+                    method: "HEAD",
+                    timeoutMilliseconds: 1_000,
+                    maxResponseBodyBytes: 0,
+                  }),
+                ),
+                Effect.provide(nodeFoundationLayer),
+              ),
+            );
+            expect(response.status).toBe(200);
+            expect(sourceRequests.map((request) => request.method)).toEqual([
+              "HEAD",
+            ]);
+            expect(
+              destinationRequests.map((request) => request.method),
+            ).toEqual(["HEAD"]);
+          },
+        );
+      },
+    );
+  });
 
   it("strips secrets on cross-origin redirects and enforces timeouts", async () => {
     for (const redirectStatus of [307, 308]) {

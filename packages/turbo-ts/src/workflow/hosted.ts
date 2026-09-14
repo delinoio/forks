@@ -651,18 +651,79 @@ export const executeHostedCommand = (
         fail("not logged in; run `turbo-ts login` first"),
       );
     }
-    const scope = options.scope ?? settings.teamId ?? settings.teamSlug;
-    if (scope === undefined) {
-      return yield* Effect.fail(
-        fail("link requires --scope, --team, TURBO_TEAM, or TURBO_TEAMID"),
-      );
-    }
     const teams = yield* availableHostedTeams(settings, token);
-    const team = teams.find(
-      (candidate) => candidate.id === scope || candidate.slug === scope,
-    );
-    if (team === undefined) {
-      return yield* Effect.fail(fail(`unknown remote caching scope: ${scope}`));
+    const configuredScope =
+      options.scope ?? settings.teamId ?? settings.teamSlug;
+    let team: HostedTeam | undefined;
+    if (configuredScope === undefined) {
+      if (teams.length === 0) {
+        return yield* Effect.fail(
+          fail("no remote caching scopes are available"),
+        );
+      }
+      const stdinIsTerminal =
+        terminal.stdinIsTerminal === undefined
+          ? false
+          : yield* terminal.stdinIsTerminal;
+      const readLine = terminal.readLine;
+      if (!stdinIsTerminal || readLine === undefined) {
+        return yield* Effect.fail(
+          fail(
+            "link requires --scope, --team, TURBO_TEAM, or TURBO_TEAMID in non-interactive mode",
+          ),
+        );
+      }
+      yield* terminal.writeStdout(
+        `Select a Remote Caching scope:\n${teams
+          .map(
+            (candidate, index) =>
+              `  ${index + 1}. ${candidate.name} (${candidate.slug})`,
+          )
+          .join("\n")}\n`,
+      );
+      const answer = yield* readLine(`Enter a scope [1-${teams.length}]: `);
+      const selectedIndex = Number(answer.trim()) - 1;
+      if (!Number.isSafeInteger(selectedIndex) || selectedIndex < 0) {
+        return yield* Effect.fail(
+          fail("invalid remote caching scope selection"),
+        );
+      }
+      team = teams[selectedIndex];
+      if (team === undefined) {
+        return yield* Effect.fail(
+          fail("invalid remote caching scope selection"),
+        );
+      }
+    } else {
+      team = teams.find(
+        (candidate) =>
+          candidate.id === configuredScope ||
+          candidate.slug === configuredScope,
+      );
+      if (team === undefined) {
+        return yield* Effect.fail(
+          fail(`unknown remote caching scope: ${configuredScope}`),
+        );
+      }
+    }
+    if (!options.yes) {
+      const stdinIsTerminal =
+        terminal.stdinIsTerminal === undefined
+          ? false
+          : yield* terminal.stdinIsTerminal;
+      const readLine = terminal.readLine;
+      if (!stdinIsTerminal || readLine === undefined) {
+        return yield* Effect.fail(
+          fail("link confirmation requires an interactive terminal or --yes"),
+        );
+      }
+      const answer = yield* readLine(
+        `Enable Remote Caching for ${team.name}? [y/N] `,
+      );
+      if (!new Set(["y", "yes"]).has(answer.trim().toLowerCase())) {
+        yield* terminal.writeStdout("Remote Caching link cancelled.\n");
+        return 0;
+      }
     }
     const selected = {
       ...settings,
