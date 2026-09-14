@@ -14870,17 +14870,20 @@ describe("cache interoperability and safety", () => {
     }
   }, 30_000);
 
-  it("lets TURBO_TEAMID override the configured remote-cache team ID", async () => {
+  it("applies environment team selection precedence to remote requests", async () => {
     const directory = await makeFixture();
-    const teamIds: Array<string | null> = [];
+    const teamSelectors: Array<{
+      readonly teamId: string | null;
+      readonly teamSlug: string | null;
+    }> = [];
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
-        teamIds.push(
-          new URL(request.url ?? "/", "http://127.0.0.1").searchParams.get(
-            "teamId",
-          ),
-        );
+        const url = new URL(request.url ?? "/", "http://127.0.0.1");
+        teamSelectors.push({
+          teamId: url.searchParams.get("teamId"),
+          teamSlug: url.searchParams.get("slug"),
+        });
         response.writeHead(201);
         response.end();
       });
@@ -14905,22 +14908,37 @@ describe("cache interoperability and safety", () => {
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
       );
-      const result = await run(
-        process.execPath,
-        [
-          candidateEntrypoint,
-          "run",
-          "build",
-          "--cwd",
-          directory,
-          "--filter=synthetic-library",
-          "--cache=remote:w",
-        ],
-        repositoryRoot,
-        { TURBO_TEAMID: "team_environment" },
-      );
-      expect(result.exitCode).toBe(0);
-      expect(teamIds).toEqual(["team_environment"]);
+      const runWithEnvironment = (environment: NodeJS.ProcessEnv) =>
+        run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "build",
+            "--cwd",
+            directory,
+            "--filter=synthetic-library",
+            "--cache=remote:w",
+          ],
+          repositoryRoot,
+          environment,
+        );
+      expect(
+        (await runWithEnvironment({ TURBO_TEAMID: "team_environment" }))
+          .exitCode,
+      ).toBe(0);
+      expect(
+        (
+          await runWithEnvironment({
+            TURBO_TEAM: "environment-team",
+            TURBO_TEAMID: "team_stale",
+          })
+        ).exitCode,
+      ).toBe(0);
+      expect(teamSelectors).toEqual([
+        { teamId: "team_environment", teamSlug: null },
+        { teamId: null, teamSlug: "environment-team" },
+      ]);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(directory, { force: true, recursive: true });

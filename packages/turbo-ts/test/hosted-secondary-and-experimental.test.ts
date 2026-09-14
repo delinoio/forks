@@ -532,6 +532,7 @@ describe("hosted compatibility", () => {
           ).toEqual({
             apiUrl: configuredApiUrl,
             teamId: "team_synthetic",
+            teamSlug: "synthetic",
           });
           const linkedConfiguration = await runCandidate(
             ["config", `--cwd=${root}`],
@@ -565,6 +566,7 @@ describe("hosted compatibility", () => {
           ).toEqual({
             apiUrl: configuredApiUrl,
             teamId: "team_later",
+            teamSlug: "later",
           });
 
           expect(
@@ -612,6 +614,7 @@ describe("hosted compatibility", () => {
           ).toEqual({
             apiUrl: configuredApiUrl,
             teamId: "user_synthetic",
+            teamSlug: "synthetic-user",
           });
           const disabledLink = await runCandidate(
             [
@@ -635,6 +638,7 @@ describe("hosted compatibility", () => {
           ).toEqual({
             apiUrl: configuredApiUrl,
             teamId: "user_synthetic",
+            teamSlug: "synthetic-user",
           });
           const disabledLogin = await runCandidate(
             [
@@ -785,7 +789,11 @@ describe("hosted compatibility", () => {
           const credentialsLayer = Layer.succeed(CredentialService, {
             ...services.credentials,
             readUserConfiguration: Effect.succeed({ token }),
-            readProjectConfiguration: () => Effect.succeed(undefined),
+            readProjectConfiguration: () =>
+              Effect.succeed({
+                teamSlug: "stale-team",
+                retained: "synthetic-value",
+              }),
             writeProjectConfiguration: (_root, configuration) =>
               Effect.sync(() => {
                 storedProject = configuration;
@@ -847,7 +855,9 @@ describe("hosted compatibility", () => {
           ]);
           expect(storedProject).toEqual({
             apiUrl: new URL(baseUrl).toString(),
+            retained: "synthetic-value",
             teamId: "team_later",
+            teamSlug: "later",
           });
           expect(
             requests.some(
@@ -899,16 +909,18 @@ describe("hosted compatibility", () => {
           environmentTeamId = "team_stale";
           expect(
             await execute(
-              ["--team=synthetic", "--yes", ...commonArguments],
+              ["--team=synthetic-user", "--yes", ...commonArguments],
               false,
             ),
           ).toBe(0);
           expect(storedProject).toEqual({
             apiUrl: new URL(baseUrl).toString(),
-            teamId: "team_synthetic",
+            retained: "synthetic-value",
+            teamId: "user_synthetic",
+            teamSlug: "synthetic-user",
           });
           expect(requests.at(-1)?.path).toBe(
-            "/v8/artifacts/status?teamId=team_synthetic&slug=synthetic",
+            "/v8/artifacts/status?teamId=user_synthetic&slug=synthetic-user",
           );
         },
       );
@@ -2835,6 +2847,23 @@ describe("hosted protocols and experimental transports", () => {
     );
     expect(requests.at(-1)?.url).toBe(
       "https://collector.example.test/otel/v1/metrics",
+    );
+
+    await Effect.runPromise(
+      exportRunMetrics(
+        {
+          enabled: true,
+          protocol: "http-json",
+          endpoint: "https://collector.example.test/cli-prefix/",
+          headers: [],
+          resources: [],
+        },
+        undefined,
+        summary,
+      ).pipe(Effect.provide(observabilityLayer)),
+    );
+    expect(requests.at(-1)?.url).toBe(
+      "https://collector.example.test/cli-prefix/v1/metrics",
     );
 
     for (const configuredTimeout of [

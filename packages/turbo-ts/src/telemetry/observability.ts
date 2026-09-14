@@ -405,7 +405,7 @@ export const exportRunMetrics = (
         endpointFor(
           endpoint,
           protocol,
-          options.endpoint === undefined && environmentEndpoint !== undefined,
+          options.endpoint !== undefined || environmentEndpoint !== undefined,
         ),
       catch: () =>
         new BoundaryError({

@@ -606,13 +606,11 @@ export const resolveOptions = (
       apiUrl,
       token,
       teamId:
-        parsed.team === undefined
+        parsed.team === undefined && configuredTeamSlug === undefined
           ? (environmentValue("TURBO_TEAMID") ??
-            (configuredTeamSlug === undefined
-              ? (storedCredentials.project?.teamId ??
-                remoteConfiguration?.teamId ??
-                undefined)
-              : undefined))
+            storedCredentials.project?.teamId ??
+            remoteConfiguration?.teamId ??
+            undefined)
           : undefined,
       teamSlug:
         parsed.team ??
@@ -2358,17 +2356,12 @@ type CachePublicationPermit = <A, E, R>(
   publication: Effect.Effect<A, E, R>,
 ) => Effect.Effect<A, E, R>;
 
-const cachePublicationPermit = (
-  permits = 1,
-): Effect.Effect<CachePublicationPermit> =>
-  Effect.makeSemaphore(permits).pipe(
+export const makeCachePublicationPermit: Effect.Effect<CachePublicationPermit> =
+  Effect.makeSemaphore(1).pipe(
     Effect.map(
       (semaphore) => (publication) => semaphore.withPermits(1)(publication),
     ),
   );
-
-export const makeCachePublicationPermit: Effect.Effect<CachePublicationPermit> =
-  cachePublicationPermit();
 
 const prepareTaskLogPath = (
   logPath: string,
@@ -4523,9 +4516,7 @@ export const executeRun = (
     const foregroundSemaphore = yield* Effect.makeSemaphore(
       options.concurrency,
     );
-    const withCachePublicationPermit = yield* cachePublicationPermit(
-      options.cacheWorkers,
-    );
+    const withCachePublicationPermit = yield* makeCachePublicationPermit;
     const outputSemaphore = yield* Effect.makeSemaphore(1);
     const withOutputPermit: OutputPermit = (output) =>
       options.logOrder === "grouped"

@@ -1013,7 +1013,7 @@ version = "1.0.0"
       remote: {
         apiUrl: "https://cache.example.test/api",
         token: "token",
-        teamId: "team-id",
+        teamId: undefined,
         teamSlug: "team-slug",
         timeoutMilliseconds: 4_000,
         uploadTimeoutMilliseconds: 5_000,
@@ -1071,7 +1071,10 @@ version = "1.0.0"
         "--token=token",
       ]),
       model.root,
-      { TURBO_TEAM: "environment-team" },
+      {
+        TURBO_TEAM: "environment-team",
+        TURBO_TEAMID: "stale-environment-team-id",
+      },
       model.rootConfiguration,
       8,
       false,

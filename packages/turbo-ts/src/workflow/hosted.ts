@@ -804,6 +804,7 @@ export const executeHostedCommand = (
       ...existing,
       apiUrl: settings.api.toString(),
       teamId: team.id,
+      teamSlug: team.slug,
     });
     if (!options.noGitignore) yield* updateGitIgnore(root);
     yield* terminal.writeStdout(
