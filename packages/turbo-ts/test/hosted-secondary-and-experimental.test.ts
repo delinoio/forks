@@ -1160,8 +1160,11 @@ describe("hosted compatibility", () => {
             }),
             Layer.succeed(ProcessService, {
               ...services.processes,
-              spawnDetached: (request) =>
-                Effect.sync(() => {
+              run: (request) => {
+                if (request.command !== "xdg-open") {
+                  return services.processes.run(request);
+                }
+                return Effect.sync(() => {
                   const url = request.args.find((argument) =>
                     argument.startsWith("https://"),
                   );
@@ -1169,8 +1172,15 @@ describe("hosted compatibility", () => {
                     throw new Error("login URL was not passed to the browser");
                   }
                   resolveOpened?.(url);
-                  return 12_346;
-                }),
+                  return {
+                    exitCode: 0,
+                    stdout: "",
+                    stderr: "",
+                    combinedOutput: "",
+                  };
+                });
+              },
+              spawnDetached: undefined,
             }),
             Layer.succeed(RandomnessService, {
               uuidV7: Effect.succeed(state),
@@ -1254,6 +1264,116 @@ describe("hosted compatibility", () => {
           }
         },
       );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("fails interactive login when the browser launcher fails", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-login-browser-failure-"),
+    );
+    const root = join(directory, "repository");
+    const state = "018f05c9-7b4a-7cc0-98c4-66395a148004";
+    await prepareRepository(root);
+    try {
+      const services = await Effect.runPromise(
+        Effect.gen(function* () {
+          return {
+            credentials: yield* CredentialService,
+            environment: yield* EnvironmentService,
+            processes: yield* ProcessService,
+            terminal: yield* TerminalService,
+          };
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      for (const mode of ["error", "nonzero"] as const) {
+        let output = "";
+        let wroteCredentials = false;
+        const overrides = Layer.mergeAll(
+          Layer.succeed(CredentialService, {
+            ...services.credentials,
+            readUserConfiguration: Effect.succeed(undefined),
+            writeUserConfiguration: () =>
+              Effect.sync(() => {
+                wroteCredentials = true;
+              }),
+          }),
+          Layer.succeed(EnvironmentService, {
+            ...services.environment,
+            cwd: Effect.succeed(root),
+            platform: Effect.succeed("linux" as NodeJS.Platform),
+            get: () => Effect.succeed(undefined),
+          }),
+          Layer.succeed(ProcessService, {
+            ...services.processes,
+            run: (request) =>
+              request.command !== "xdg-open"
+                ? services.processes.run(request)
+                : mode === "error"
+                  ? Effect.fail(
+                      new ProcessExecutionError({
+                        command: request.command,
+                        message: "synthetic browser launch failure",
+                      }),
+                    )
+                  : Effect.succeed({
+                      exitCode: 1,
+                      stdout: "",
+                      stderr: "synthetic browser launch failure",
+                      combinedOutput: "synthetic browser launch failure",
+                    }),
+            spawnDetached: () => Effect.succeed(12_347),
+          }),
+          Layer.succeed(RandomnessService, {
+            uuidV7: Effect.succeed(state),
+          }),
+          Layer.succeed(TerminalService, {
+            ...services.terminal,
+            stdinIsTerminal: Effect.succeed(true),
+            writeStdout: (text) =>
+              Effect.sync(() => {
+                output += text;
+              }),
+            writeStderr: () => Effect.void,
+          }),
+        );
+        const fiber = Effect.runFork(
+          Effect.either(
+            executeHostedCommand("login", [
+              "--login=https://login.example.test",
+              `--cwd=${root}`,
+            ]).pipe(
+              Effect.provide(overrides),
+              Effect.provide(nodeFoundationLayer),
+            ),
+          ),
+        );
+        try {
+          const result = await Promise.race([
+            Effect.runPromise(Fiber.join(fiber)),
+            new Promise<never>((_, reject) =>
+              setTimeout(
+                () => reject(new Error("failed browser login remained open")),
+                10_000,
+              ),
+            ),
+          ]);
+          expect(result).toMatchObject({
+            _tag: "Left",
+            left: {
+              message:
+                "interactive login cannot open a browser; use --manual with --token or TURBO_TOKEN",
+            },
+          });
+          expect(wroteCredentials).toBe(false);
+          expect(output).toContain("Opening browser for turbo-ts login.");
+          expect(output).not.toContain(state);
+          expect(output).not.toContain("login.example.test");
+        } finally {
+          await Effect.runPromise(Fiber.interrupt(fiber));
+        }
+      }
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -2291,6 +2411,85 @@ describe("secondary command and parser compatibility", () => {
       await rm(directory, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it("cleans up a workspace destination after malformed template JSON", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-generator-malformed-template-"),
+    );
+    const root = join(directory, "repository");
+    const template = join(root, "templates/malformed");
+    const destination = join(root, "packages/generated-malformed");
+    await prepareRepository(root);
+    await mkdir(template, { recursive: true });
+    await writeFile(join(template, "package.json"), "{malformed");
+    const arguments_ = [
+      "generate",
+      "workspace",
+      "--name=generated-malformed",
+      "--copy=templates/malformed",
+      "--destination=packages/generated-malformed",
+      `--root=${root}`,
+    ];
+    try {
+      const failed = await runCandidate(arguments_, root);
+      expect(failed.code).toBe(1);
+      await expect(access(destination)).rejects.toThrow();
+
+      await writeFile(
+        join(template, "package.json"),
+        JSON.stringify({ private: true }),
+      );
+      const retried = await runCandidate(arguments_, root);
+      expect(retried.code, retried.stderr).toBe(0);
+      expect(
+        JSON.parse(await readFile(join(destination, "package.json"), "utf8")),
+      ).toEqual({ private: true, name: "generated-malformed" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects invalid explicit generator roots before materialization", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-generator-invalid-root-"),
+    );
+    const missingRoot = join(directory, "missing-root");
+    const fileRoot = join(directory, "file-root");
+    await writeFile(fileRoot, "not a directory\n");
+    try {
+      const missing = await runCandidate(
+        [
+          "generate",
+          "workspace",
+          "--name=generated-missing-root",
+          "--empty",
+          `--root=${missingRoot}`,
+        ],
+        directory,
+      );
+      expect(missing.code).toBe(1);
+      expect(missing.stderr).toContain("working directory does not exist");
+      await expect(access(missingRoot)).rejects.toThrow();
+
+      const notDirectory = await runCandidate(
+        [
+          "generate",
+          "workspace",
+          "--name=generated-file-root",
+          "--empty",
+          `--root=${fileRoot}`,
+        ],
+        directory,
+      );
+      expect(notDirectory.code).toBe(1);
+      expect(notDirectory.stderr).toContain(
+        "working directory is not a directory",
+      );
+      expect(await readFile(fileRoot, "utf8")).toBe("not a directory\n");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 
   it("collects unresolved generator prompts before evaluating actions", async () => {
     const directory = await mkdtemp(

@@ -319,13 +319,6 @@ const requestInteractiveLoginToken = (
       const processes = yield* ProcessService;
       const randomness = yield* RandomnessService;
       const terminal = yield* TerminalService;
-      if (processes.spawnDetached === undefined) {
-        return yield* Effect.fail(
-          fail(
-            "interactive login cannot open a browser; use --manual with --token or TURBO_TOKEN",
-          ),
-        );
-      }
       const state = yield* randomness.uuidV7;
       const token = yield* Deferred.make<string>();
       const server = yield* loopback.serve(0, (request) => {
@@ -357,12 +350,27 @@ const requestInteractiveLoginToken = (
       const platform = yield* environment.platform;
       const cwd = yield* environment.cwd;
       yield* terminal.writeStdout("Opening browser for turbo-ts login.\n");
-      yield* processes.spawnDetached({
-        ...browserInvocation(platform, authorization.toString()),
-        cwd,
-        inheritEnvironment: true,
-      });
-      return yield* Deferred.await(token);
+      const browserLaunchFailure = () =>
+        fail(
+          "interactive login cannot open a browser; use --manual with --token or TURBO_TOKEN",
+        );
+      const browserLaunch = processes
+        .run({
+          ...browserInvocation(platform, authorization.toString()),
+          cwd,
+          inheritEnvironment: true,
+          maxCapturedOutputCharacters: 64 * 1024,
+          stdio: "capture",
+        })
+        .pipe(
+          Effect.catchAll(() => Effect.fail(browserLaunchFailure())),
+          Effect.flatMap((result) =>
+            result.exitCode === 0
+              ? Effect.never
+              : Effect.fail(browserLaunchFailure()),
+          ),
+        );
+      return yield* Effect.raceFirst(Deferred.await(token), browserLaunch);
     }),
   );
 

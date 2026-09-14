@@ -960,7 +960,9 @@ Tokenless `login` requires an interactive terminal, opens the configured login
 origin at `/turborepo/token`, and accepts a token through a scoped loopback
 callback protected by a fresh UUID v7 state value. The callback response is
 sent before the token is validated and persisted, and neither the state nor the
-token is written to terminal output. An explicit `--sso-team` adds the team slug
+token is written to terminal output. Browser launcher errors and nonzero exits
+fail with manual-token guidance instead of waiting indefinitely for a callback.
+An explicit `--sso-team` adds the team slug
 to the browser authorization request and suppresses lower-precedence team IDs
 during validation. Manual and non-interactive login continue
 to require `--token` or `TURBO_TOKEN`; every login attempt ignores the persisted
@@ -1073,10 +1075,12 @@ path normalization. The repository root package remains eligible to own the
 selected microfrontend configuration.
 Generator destinations are validated through canonical existing ancestors,
 and recursive copies whose source contains their destination are rejected.
+Explicit generator roots must resolve from an existing directory through
+repository discovery before any destination is created.
 Requested workspace names must be npm-compatible. The `--empty` workspace flag
 is valueless and rejects attached values. Copied workspace templates require an
 object `package.json`, preserve its other fields, and atomically rewrite `name`
-to the requested workspace name. Failed template copies or
+to the requested workspace name. Failed template validation, copies, or
 manifest rewrites remove the partial destination only when the generator
 acquired that destination exclusively, so a concurrently created destination
 is preserved. Configured generators collect unresolved prompt answers through

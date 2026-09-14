@@ -399,10 +399,11 @@ const executeWorkspaceGenerator = (
           failure("workspace template must contain a package.json object"),
         );
       }
-      const manifest = parseJsonConfiguration(
-        yield* fileSystem.readText(manifestPath),
-        manifestPath,
-      );
+      const manifestSource = yield* fileSystem.readText(manifestPath);
+      const manifest = yield* Effect.try({
+        try: () => parseJsonConfiguration(manifestSource, manifestPath),
+        catch: (cause) => cause,
+      });
       if (
         typeof manifest !== "object" ||
         manifest === null ||
@@ -457,13 +458,9 @@ export const executeGenerate = (
       const fileSystem = yield* FileSystemService;
       const processService = yield* ProcessService;
       const terminal = yield* TerminalService;
-      const processCwd = yield* environment.cwd;
-      const root =
-        options.root === undefined
-          ? yield* resolveWorkflowRepositoryRoot({ cwd: options.common.cwd })
-          : isAbsolutePath(options.root)
-            ? options.root
-            : joinPath(processCwd, options.root);
+      const root = yield* resolveWorkflowRepositoryRoot({
+        cwd: options.root ?? options.common.cwd,
+      });
       if (options.workspace)
         return yield* executeWorkspaceGenerator(root, options);
       const generatorName = options.generatorName;
