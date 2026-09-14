@@ -48,6 +48,16 @@ interface HostedTeam {
   readonly slug: string;
 }
 
+const renderTerminalSafeText = (value: string): string =>
+  [...value]
+    .map((character) => {
+      const codePoint = character.charCodeAt(0);
+      return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)
+        ? `\\u${codePoint.toString(16).padStart(4, "0")}`
+        : character;
+    })
+    .join("");
+
 const fail = (message: string): ConfigurationError =>
   new ConfigurationError({ path: "<arguments>", message });
 
@@ -265,10 +275,12 @@ const resolveHostedSettings = (
       (yield* configuredValue("TURBO_TOKEN")) ??
       fallbacks.token;
     const environmentTeamId = yield* configuredValue("TURBO_TEAMID");
+    const environmentTeamSlug = yield* configuredValue("TURBO_TEAM");
     const teamId =
-      options.common.team === undefined ? environmentTeamId : undefined;
-    const teamSlug =
-      options.common.team ?? (yield* configuredValue("TURBO_TEAM"));
+      options.common.team === undefined && environmentTeamSlug === undefined
+        ? environmentTeamId
+        : undefined;
+    const teamSlug = options.common.team ?? environmentTeamSlug;
     const apiValue =
       options.common.apiUrl ??
       (yield* configuredValue("TURBO_API")) ??
@@ -776,7 +788,7 @@ export const executeHostedCommand = (
         `Select a Remote Caching scope:\n${teams
           .map(
             (candidate, index) =>
-              `  ${index + 1}. ${candidate.name} (${candidate.slug})`,
+              `  ${index + 1}. ${renderTerminalSafeText(candidate.name)} (${renderTerminalSafeText(candidate.slug)})`,
           )
           .join("\n")}\n`,
       );
@@ -817,7 +829,7 @@ export const executeHostedCommand = (
         );
       }
       const answer = yield* readLine(
-        `Enable Remote Caching for ${team.name}? [y/N] `,
+        `Enable Remote Caching for ${renderTerminalSafeText(team.name)}? [y/N] `,
       );
       if (!new Set(["y", "yes"]).has(answer.trim().toLowerCase())) {
         yield* terminal.writeStdout("Remote Caching link cancelled.\n");
@@ -838,7 +850,7 @@ export const executeHostedCommand = (
       teamSlug: team.slug,
     });
     yield* terminal.writeStdout(
-      `>>> Enabled Remote Caching for ${team.name}\n`,
+      `>>> Enabled Remote Caching for ${renderTerminalSafeText(team.name)}\n`,
     );
     return 0;
   });

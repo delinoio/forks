@@ -2995,7 +2995,11 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
                   response.writeHead(exit.value.status, exit.value.headers);
                   response.end(exit.value.body, () => {
                     if (exit.value.afterSent !== undefined) {
-                      Effect.runFork(exit.value.afterSent);
+                      exit.value.afterSent.pipe(
+                        Effect.forkIn(scope),
+                        Effect.flatMap(Fiber.await),
+                        Effect.runFork,
+                      );
                     }
                   });
                   return;

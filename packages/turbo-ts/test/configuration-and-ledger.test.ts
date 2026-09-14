@@ -522,6 +522,12 @@ describe("configuration generation and compatibility ledger", () => {
       variants: ["--daemon", "--no-daemon"],
     });
     expect(
+      ledger.rows.find((row) => row.id === "security.automated"),
+    ).toMatchObject({
+      targetGate: 5,
+      status: "planned",
+    });
+    expect(
       ledger.rows.find((row) => row.id === "cli.secondary-options")?.variants,
     ).not.toContain("--show-all-dependencies");
     expect(

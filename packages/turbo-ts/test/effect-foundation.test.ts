@@ -499,6 +499,63 @@ describe("Effect foundation", () => {
     expect(await request).toBe("closed");
   });
 
+  it("interrupts loopback post-response effects with their server scope", async () => {
+    let publishPort: ((port: number) => void) | undefined;
+    const port = new Promise<number>((resolve) => {
+      publishPort = resolve;
+    });
+    let markAfterSentStarted: (() => void) | undefined;
+    const afterSentStarted = new Promise<void>((resolve) => {
+      markAfterSentStarted = resolve;
+    });
+    let markAfterSentFinalized: (() => void) | undefined;
+    const afterSentFinalized = new Promise<void>((resolve) => {
+      markAfterSentFinalized = resolve;
+    });
+    const serverFiber = Effect.runFork(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const http = yield* LoopbackHttpService;
+          const server = yield* http.serve(0, () =>
+            Effect.succeed({
+              status: 200,
+              body: "ok",
+              afterSent: Effect.scoped(
+                Effect.acquireRelease(
+                  Effect.sync(() => markAfterSentStarted?.()),
+                  () => Effect.sync(() => markAfterSentFinalized?.()),
+                ).pipe(Effect.zipRight(Effect.never)),
+              ),
+            }),
+          );
+          publishPort?.(server.port);
+          yield* Effect.never;
+        }),
+      ).pipe(Effect.provide(nodeFoundationLayer)),
+    );
+    try {
+      const response = await fetch(`http://127.0.0.1:${await port}`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("ok");
+      await Promise.race([
+        afterSentStarted,
+        delay(1_000).then(() => {
+          throw new Error("loopback post-response effect did not start");
+        }),
+      ]);
+    } finally {
+      await Effect.runPromise(Fiber.interrupt(serverFiber));
+    }
+    await Promise.race([
+      afterSentFinalized,
+      delay(1_000).then(() => {
+        throw new Error(
+          "loopback post-response effect remained active after shutdown",
+        );
+      }),
+    ]);
+  });
+
   it("isolates loopback client resets before request bodies finish", async () => {
     let publishPort: ((port: number) => void) | undefined;
     const port = new Promise<number>((resolve) => {

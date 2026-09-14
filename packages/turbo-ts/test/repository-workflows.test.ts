@@ -3238,10 +3238,10 @@ describe("repository workflow gate", () => {
         '[project]\nname = "synthetic-daemon-python"\nversion = "0.1.0"\ndependencies = []\n',
       );
       await runCandidate(
+        "--root-turbo-json=custom-turbo.json",
         "daemon",
         "start",
         "--idle-time=30s",
-        "--turbo-json-path=custom-turbo.json",
       );
       await expect(
         runCandidate("daemon", "serve", "--idle-time=30s"),

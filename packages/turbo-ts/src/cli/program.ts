@@ -184,6 +184,9 @@ const runOptionConsumesAdjacent = (
 
 const existingWorkflowArguments = (
   arguments_: ReadonlyArray<string>,
+  rootTurboJsonOption:
+    | "--root-turbo-json"
+    | "--turbo-json-path" = "--root-turbo-json",
 ): ReadonlyArray<string> => {
   const parsed = parseCommonArguments(arguments_);
   return [
@@ -193,7 +196,7 @@ const existingWorkflowArguments = (
       : [`--cwd=${parsed.options.cwd}`]),
     ...(parsed.options.rootTurboJson === undefined
       ? []
-      : [`--root-turbo-json=${parsed.options.rootTurboJson}`]),
+      : [`${rootTurboJsonOption}=${parsed.options.rootTurboJson}`]),
     ...(parsed.options.color === false ? ["--no-color"] : []),
     ...(parsed.options.noUpdateNotifier ? ["--no-update-notifier"] : []),
   ];
@@ -370,7 +373,9 @@ export const cliProgram = Effect.gen(function* () {
     if (first === "daemon") {
       return Effect.try({
         try: () =>
-          parseDaemonArguments(existingWorkflowArguments(commandArguments)),
+          parseDaemonArguments(
+            existingWorkflowArguments(commandArguments, "--turbo-json-path"),
+          ),
         catch: (cause) => cause,
       }).pipe(Effect.flatMap(executeDaemon)) as Effect.Effect<
         number,

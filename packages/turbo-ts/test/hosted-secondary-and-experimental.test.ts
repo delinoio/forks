@@ -954,7 +954,7 @@ describe("hosted compatibility", () => {
                 ? [
                     200,
                     { "content-type": "application/json" },
-                    '{"teams":[{"id":"team_later","slug":"later","name":"Later Team"}],"pagination":{"next":null}}',
+                    '{"teams":[{"id":"team_later","slug":"later","name":"Later Team"},{"id":"team_unsafe","slug":"unsafe\\u001b[31m","name":"Unsafe\\u001b]52;c;c3ludGhldGlj\\u0007 Team"}],"pagination":{"next":null}}',
                   ]
                 : request.url?.startsWith("/v8/artifacts/status") === true
                   ? [
@@ -975,6 +975,7 @@ describe("hosted compatibility", () => {
           );
           let answers: Array<string> = [];
           let environmentTeamId: string | undefined;
+          let environmentTeamSlug: string | undefined;
           let output = "";
           const prompts: Array<string> = [];
           let storedProject:
@@ -1002,7 +1003,11 @@ describe("hosted compatibility", () => {
             cwd: Effect.succeed(root),
             get: (name) =>
               Effect.succeed(
-                name === "TURBO_TEAMID" ? environmentTeamId : undefined,
+                name === "TURBO_TEAMID"
+                  ? environmentTeamId
+                  : name === "TURBO_TEAM"
+                    ? environmentTeamSlug
+                    : undefined,
               ),
           });
           const terminalLayer = (interactive: boolean) =>
@@ -1048,7 +1053,7 @@ describe("hosted compatibility", () => {
             "1. Synthetic User (synthetic-user)\n  2. Synthetic Team (synthetic)\n  3. Later Team (later)",
           );
           expect(prompts).toEqual([
-            "Enter a scope [1-3]: ",
+            "Enter a scope [1-4]: ",
             "Enable Remote Caching for Later Team? [y/N] ",
           ]);
           expect(storedProject).toEqual({
@@ -1120,6 +1125,51 @@ describe("hosted compatibility", () => {
           expect(requests.at(-1)?.path).toBe(
             "/v8/artifacts/status?teamId=user_synthetic&slug=synthetic-user",
           );
+
+          storedProject = undefined;
+          environmentTeamSlug = "later";
+          expect(await execute(["--yes", ...commonArguments], false)).toBe(0);
+          expect(storedProject).toEqual({
+            apiUrl: new URL(baseUrl).toString(),
+            retained: "synthetic-value",
+            teamId: "team_later",
+            teamSlug: "later",
+          });
+          expect(requests.at(-1)?.path).toBe(
+            "/v8/artifacts/status?teamId=team_later&slug=later",
+          );
+
+          environmentTeamId = undefined;
+          environmentTeamSlug = undefined;
+          storedProject = undefined;
+          output = "";
+          prompts.length = 0;
+          answers = ["4", "yes"];
+          expect(await execute(commonArguments, true)).toBe(0);
+          expect(output).not.toContain("\u001B");
+          expect(output).not.toContain("\u0007");
+          expect(output).toContain(
+            "Unsafe\\u001b]52;c;c3ludGhldGlj\\u0007 Team (unsafe\\u001b[31m)",
+          );
+          expect(output).toContain(
+            ">>> Enabled Remote Caching for Unsafe\\u001b]52;c;c3ludGhldGlj\\u0007 Team",
+          );
+          expect(prompts).toEqual([
+            "Enter a scope [1-4]: ",
+            "Enable Remote Caching for Unsafe\\u001b]52;c;c3ludGhldGlj\\u0007 Team? [y/N] ",
+          ]);
+          expect(storedProject).toEqual({
+            apiUrl: new URL(baseUrl).toString(),
+            retained: "synthetic-value",
+            teamId: "team_unsafe",
+            teamSlug: "unsafe\u001b[31m",
+          });
+          const unsafeStatusQuery = new URL(
+            requests.at(-1)?.path ?? "",
+            "http://127.0.0.1",
+          ).searchParams;
+          expect(unsafeStatusQuery.get("teamId")).toBe("team_unsafe");
+          expect(unsafeStatusQuery.get("slug")).toBe("unsafe\u001b[31m");
         },
       );
     } finally {

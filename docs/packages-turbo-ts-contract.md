@@ -960,9 +960,10 @@ configuration directory.
 Tokenless `login` requires an interactive terminal, opens the configured login
 origin at `/turborepo/token`, and accepts a token through a scoped loopback
 callback protected by a fresh UUID v7 state value. The callback response is
-sent before the token is validated and persisted, and neither the state nor the
-token is written to terminal output. Browser launcher errors and nonzero exits
-fail with manual-token guidance instead of waiting indefinitely for a callback.
+sent before the token is validated and persisted, post-response work remains
+supervised by the loopback server scope, and neither the state nor the token is
+written to terminal output. Browser launcher errors and nonzero exits fail with
+manual-token guidance instead of waiting indefinitely for a callback.
 An explicit `--sso-team` adds the team slug
 to the browser authorization request and suppresses lower-precedence team IDs
 during validation. Manual and non-interactive login continue
@@ -988,8 +989,10 @@ and validated API URL, and keeps `.turbo` ignored unless `--no-gitignore` is
 requested. Relinking selects its API from CLI, environment, the persisted
 project link, and the public default in descending precedence. The project link
 is persisted only after the required `.gitignore` update succeeds. An explicit
-link `--team` slug suppresses `TURBO_TEAMID` before scope selection and
-validation. Logout invalidates the current
+link team slug from `--team` or `TURBO_TEAM` suppresses `TURBO_TEAMID` before
+scope selection and validation. Hosted team names and slugs encode terminal
+control characters before display without changing the identities used for
+selection, validation, or persistence. Logout invalidates the current
 token only against an API selected explicitly or persisted by the linked
 project. When the issuing API is unavailable, it skips remote invalidation
 before removing the token while retaining unrelated shared configuration

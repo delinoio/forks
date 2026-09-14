@@ -678,7 +678,7 @@ rows:
     category: security
     subject: required adversarial and shared-state cases
     targetGate: 5
-    status: passing
+    status: planned
     variants:
       - archive-traversal
       - escaping-symlink
