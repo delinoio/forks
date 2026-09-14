@@ -133,12 +133,19 @@ export const executeDevtools = (
         const platform = yield* environment.platform;
         const invocation = browserInvocation(platform, authenticatedUrl);
         yield* processes
-          .spawnDetached({
+          .run({
             ...invocation,
             cwd: repository.root,
             inheritEnvironment: true,
+            maxCapturedOutputCharacters: 64 * 1024,
+            stdio: "capture",
           })
-          .pipe(Effect.catchAll(() => printAuthenticatedUrl));
+          .pipe(
+            Effect.flatMap((result) =>
+              result.exitCode === 0 ? Effect.void : printAuthenticatedUrl,
+            ),
+            Effect.catchAll(() => printAuthenticatedUrl),
+          );
       }
       return yield* Effect.never;
     }),

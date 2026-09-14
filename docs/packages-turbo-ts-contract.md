@@ -963,9 +963,12 @@ sent before the token is validated and persisted, and neither the state nor the
 token is written to terminal output. An explicit `--sso-team` adds the team slug
 to the browser authorization request and suppresses lower-precedence team IDs
 during validation. Manual and non-interactive login continue
-to require `--token` or `TURBO_TOKEN`. Windows browser launches quote the full
-callback URL before handing it to `cmd.exe`. Unlink resolves only the repository
-configuration path and does not read shared hosted settings or user credentials.
+to require `--token` or `TURBO_TOKEN`; every login attempt ignores the persisted
+user token. Only tokenless interactive login resolves and validates the login
+URL, so explicit-token login, link, and logout do not read an unused login URL.
+Windows browser launches quote the full callback URL before handing it to
+`cmd.exe`. Unlink resolves only the repository configuration path and does not
+read shared hosted settings or user credentials.
 User credentials use private directories, `0600` files on POSIX, atomic
 replacement, no-follow handle-based regular-file checks, reads bounded to 1
 MiB from the validated handle, and secret-safe diagnostics.
@@ -979,8 +982,11 @@ interactive users to select a scope when none is configured.
 Linking requires confirmation unless `--yes` is supplied; a non-interactive
 link must supply a scope and `--yes`. The command persists the selected identity
 and validated API URL, and keeps `.turbo` ignored unless `--no-gitignore` is
-requested. An explicit link `--team` slug suppresses `TURBO_TEAMID` before scope
-selection and validation. Logout invalidates the current
+requested. Relinking selects its API from CLI, environment, the persisted
+project link, and the public default in descending precedence. The project link
+is persisted only after the required `.gitignore` update succeeds. An explicit
+link `--team` slug suppresses `TURBO_TEAMID` before scope selection and
+validation. Logout invalidates the current
 token only against an API selected explicitly or persisted by the linked
 project. When the issuing API is unavailable, it skips remote invalidation
 before removing the token while retaining unrelated shared configuration

@@ -31,10 +31,14 @@ interface HostedCommandOptions {
 
 interface ResolvedHostedSettings {
   readonly api: URL;
-  readonly login: URL;
   readonly teamId?: string;
   readonly teamSlug?: string;
   readonly timeoutMilliseconds: number;
+  readonly token?: string;
+}
+
+interface HostedSettingsFallbacks {
+  readonly apiUrl?: string;
   readonly token?: string;
 }
 
@@ -248,19 +252,18 @@ export const resolveHostedTimeoutMilliseconds = (
 
 const resolveHostedSettings = (
   options: HostedCommandOptions,
+  fallbacks: HostedSettingsFallbacks = {},
 ): Effect.Effect<
   ResolvedHostedSettings,
-  ConfigurationError | BoundaryError,
-  CredentialService | EnvironmentService
+  ConfigurationError,
+  EnvironmentService
 > =>
   Effect.gen(function* () {
-    const credentials = yield* CredentialService;
     const environment = yield* EnvironmentService;
-    const stored = yield* credentials.readUserConfiguration;
     const token =
       options.common.token ??
       (yield* configuredValue("TURBO_TOKEN")) ??
-      stored?.token;
+      fallbacks.token;
     const environmentTeamId = yield* configuredValue("TURBO_TEAMID");
     const teamId =
       options.common.team === undefined ? environmentTeamId : undefined;
@@ -269,17 +272,13 @@ const resolveHostedSettings = (
     const apiValue =
       options.common.apiUrl ??
       (yield* configuredValue("TURBO_API")) ??
+      fallbacks.apiUrl ??
       "https://vercel.com/api";
-    const loginValue =
-      options.common.loginUrl ??
-      (yield* configuredValue("TURBO_LOGIN")) ??
-      "https://vercel.com";
     const environmentTimeout = yield* environment.get(
       "TURBO_REMOTE_CACHE_TIMEOUT",
     );
     return {
       api: hostedUrl(apiValue, "API"),
-      login: hostedUrl(loginValue, "login"),
       teamId,
       teamSlug,
       timeoutMilliseconds: resolveHostedTimeoutMilliseconds(
@@ -290,8 +289,19 @@ const resolveHostedSettings = (
     };
   });
 
+const resolveHostedLoginUrl = (
+  options: HostedCommandOptions,
+): Effect.Effect<URL, ConfigurationError, EnvironmentService> =>
+  Effect.gen(function* () {
+    const value =
+      options.common.loginUrl ??
+      (yield* configuredValue("TURBO_LOGIN")) ??
+      "https://vercel.com";
+    return hostedUrl(value, "login");
+  });
+
 const requestInteractiveLoginToken = (
-  settings: ResolvedHostedSettings,
+  login: URL,
   ssoTeam: string | undefined,
 ): Effect.Effect<
   string,
@@ -338,7 +348,7 @@ const requestInteractiveLoginToken = (
         });
       });
       const callback = new URL(`http://127.0.0.1:${server.port}/`);
-      const authorization = withPath(settings.login, "/turborepo/token");
+      const authorization = withPath(login, "/turborepo/token");
       authorization.searchParams.set("redirect_uri", callback.toString());
       authorization.searchParams.set("state", state);
       if (ssoTeam !== undefined) {
@@ -640,9 +650,8 @@ export const executeHostedCommand = (
       return 0;
     }
 
-    const settings = yield* resolveHostedSettings(options);
-
     if (command === "login") {
+      const settings = yield* resolveHostedSettings(options);
       const selected =
         options.ssoTeam === undefined
           ? settings
@@ -669,7 +678,8 @@ export const executeHostedCommand = (
             ),
           );
         }
-        token = yield* requestInteractiveLoginToken(settings, options.ssoTeam);
+        const login = yield* resolveHostedLoginUrl(options);
+        token = yield* requestInteractiveLoginToken(login, options.ssoTeam);
       }
       yield* validateRemoteCaching(selected, token);
       const existing = (yield* credentials.readUserConfiguration) ?? {};
@@ -680,6 +690,9 @@ export const executeHostedCommand = (
 
     if (command === "logout") {
       const existing = (yield* credentials.readUserConfiguration) ?? {};
+      const settings = yield* resolveHostedSettings(options, {
+        token: existing.token,
+      });
       const token = settings.token;
       if (options.invalidate && token !== undefined) {
         const invalidationApi = yield* resolveLogoutInvalidationApi(
@@ -712,6 +725,13 @@ export const executeHostedCommand = (
 
     const root = yield* resolveWorkflowRepositoryRoot({
       cwd: options.common.cwd,
+    });
+    const existingUser = (yield* credentials.readUserConfiguration) ?? {};
+    const existingProject =
+      (yield* credentials.readProjectConfiguration(root)) ?? {};
+    const settings = yield* resolveHostedSettings(options, {
+      apiUrl: existingProject.apiUrl,
+      token: existingUser.token,
     });
     const token = settings.token;
     if (token === undefined) {
@@ -799,14 +819,13 @@ export const executeHostedCommand = (
       teamSlug: team.slug,
     };
     yield* validateRemoteCaching(selected, token);
-    const existing = (yield* credentials.readProjectConfiguration(root)) ?? {};
+    if (!options.noGitignore) yield* updateGitIgnore(root);
     yield* credentials.writeProjectConfiguration(root, {
-      ...existing,
+      ...existingProject,
       apiUrl: settings.api.toString(),
       teamId: team.id,
       teamSlug: team.slug,
     });
-    if (!options.noGitignore) yield* updateGitIgnore(root);
     yield* terminal.writeStdout(
       `>>> Enabled Remote Caching for ${team.name}\n`,
     );

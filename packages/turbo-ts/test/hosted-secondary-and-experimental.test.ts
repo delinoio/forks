@@ -232,7 +232,12 @@ const prepareRepository = async (root: string): Promise<void> => {
   );
 };
 
-type DevtoolsLaunchMode = "browser" | "failure" | "no-open" | "unavailable";
+type DevtoolsLaunchMode =
+  | "browser"
+  | "failure"
+  | "no-open"
+  | "nonzero"
+  | "unavailable";
 
 const exerciseDevtools = async (
   root: string,
@@ -277,30 +282,37 @@ const exerciseDevtools = async (
     }),
     Layer.succeed(ProcessService, {
       ...services.processes,
+      run: (request) => {
+        if (request.command !== "xdg-open") {
+          return services.processes.run(request);
+        }
+        launchAttempts += 1;
+        if (mode === "failure") {
+          return Effect.fail(
+            new ProcessExecutionError({
+              command: request.command,
+              message: "synthetic browser launch failure",
+            }),
+          );
+        }
+        return Effect.sync(() => {
+          const url = request.args.find((argument) =>
+            argument.startsWith("http://"),
+          );
+          if (url === undefined) {
+            throw new Error("browser URL was not passed");
+          }
+          resolveOpened?.(url);
+          return {
+            exitCode: mode === "nonzero" ? 1 : 0,
+            stdout: "",
+            stderr: "",
+            combinedOutput: "",
+          };
+        });
+      },
       spawnDetached:
-        mode === "unavailable"
-          ? undefined
-          : (request) => {
-              launchAttempts += 1;
-              if (mode === "failure") {
-                return Effect.fail(
-                  new ProcessExecutionError({
-                    command: request.command,
-                    message: "synthetic browser launch failure",
-                  }),
-                );
-              }
-              return Effect.sync(() => {
-                const url = request.args.find((argument) =>
-                  argument.startsWith("http://"),
-                );
-                if (url === undefined) {
-                  throw new Error("browser URL was not passed");
-                }
-                resolveOpened?.(url);
-                return 12_345;
-              });
-            },
+        mode === "unavailable" ? undefined : services.processes.spawnDetached,
     }),
     Layer.succeed(RandomnessService, {
       uuidV7: Effect.succeed(token),
@@ -356,7 +368,9 @@ const exerciseDevtools = async (
       expect(output).toContain(
         `turbo-ts devtools authenticated: ${authenticatedUrl}`,
       );
-      expect(launchAttempts).toBe(mode === "failure" ? 1 : 0);
+      expect(launchAttempts).toBe(
+        mode === "failure" || mode === "nonzero" ? 1 : 0,
+      );
     }
     const authorized = new URL(accessedUrl);
     expect(authorized.searchParams.get("token")).toBe(token);
@@ -459,7 +473,13 @@ describe("hosted compatibility", () => {
                     : [404, {}, "not found"],
         async (baseUrl, requests) => {
           const configuredApiUrl = new URL(baseUrl).toString();
-          const environment = { XDG_CONFIG_HOME: configurationHome };
+          const environment = {
+            XDG_CONFIG_HOME: configurationHome,
+          };
+          const unusedLoginEnvironment = {
+            ...environment,
+            TURBO_LOGIN: "not-a-url",
+          };
           const login = await runCandidate(
             [
               "login",
@@ -470,7 +490,7 @@ describe("hosted compatibility", () => {
               `--cwd=${root}`,
             ],
             root,
-            environment,
+            unusedLoginEnvironment,
           );
           expect(login.code).toBe(0);
           expect(`${login.stdout}${login.stderr}`).not.toContain(token);
@@ -484,6 +504,28 @@ describe("hosted compatibility", () => {
           if (process.platform !== "win32") {
             expect((await stat(userPath)).mode & 0o777).toBe(0o600);
           }
+
+          const storedManualLogin = await runCandidate(
+            ["login", "--manual", `--api=${baseUrl}`, `--cwd=${root}`],
+            root,
+            unusedLoginEnvironment,
+          );
+          expect(storedManualLogin.code).toBe(1);
+          expect(storedManualLogin.stderr).toContain(
+            "manual login requires a token from --token or TURBO_TOKEN",
+          );
+          const storedNonInteractiveLogin = await runCandidate(
+            ["login", `--api=${baseUrl}`, `--cwd=${root}`],
+            root,
+            unusedLoginEnvironment,
+          );
+          expect(storedNonInteractiveLogin.code).toBe(1);
+          expect(storedNonInteractiveLogin.stderr).toContain(
+            "login requires a token from --token or TURBO_TOKEN in non-interactive mode",
+          );
+          expect(JSON.parse(await readFile(userPath, "utf8"))).toEqual({
+            token,
+          });
 
           // The official client must be able to retain and update the same
           // independently-created shared credential document.
@@ -508,7 +550,7 @@ describe("hosted compatibility", () => {
                   `--cwd=${root}`,
                 ],
                 root,
-                environment,
+                unusedLoginEnvironment,
               )
             ).code,
           ).toBe(0);
@@ -521,7 +563,7 @@ describe("hosted compatibility", () => {
               `--cwd=${root}`,
             ],
             root,
-            environment,
+            unusedLoginEnvironment,
           );
           expect(link.code).toBe(0);
           expect(`${link.stdout}${link.stderr}`).not.toContain(token);
@@ -548,15 +590,9 @@ describe("hosted compatibility", () => {
           );
 
           const paginatedLink = await runCandidate(
-            [
-              "link",
-              "--scope=later",
-              "--yes",
-              `--api=${baseUrl}`,
-              `--cwd=${root}`,
-            ],
+            ["link", "--scope=later", "--yes", `--cwd=${root}`],
             root,
-            environment,
+            unusedLoginEnvironment,
           );
           expect(paginatedLink.code, paginatedLink.stderr).toBe(0);
           expect(
@@ -662,7 +698,7 @@ describe("hosted compatibility", () => {
           const logout = await runCandidate(
             ["logout", `--cwd=${root}`],
             root,
-            environment,
+            unusedLoginEnvironment,
           );
           expect(logout.code).toBe(0);
           expect(`${logout.stdout}${logout.stderr}`).not.toContain(token);
@@ -731,6 +767,68 @@ describe("hosted compatibility", () => {
       await rm(directory, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it("does not persist link state when the gitignore update fails", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-link-atomic-"));
+    const root = join(directory, "repository");
+    const configurationHome = join(directory, "configuration");
+    const projectPath = join(root, ".turbo/config.json");
+    const existingProject = {
+      apiUrl: "https://previous.example.test/api",
+      retained: "synthetic-value",
+      teamId: "team_previous",
+      teamSlug: "previous",
+    };
+    await prepareRepository(root);
+    await mkdir(join(root, ".turbo"), { recursive: true });
+    await writeFile(projectPath, JSON.stringify(existingProject));
+    await mkdir(join(root, ".gitignore"));
+    try {
+      await withServer(
+        (request) =>
+          request.url === "/v2/user"
+            ? [
+                200,
+                { "content-type": "application/json" },
+                '{"user":{"id":"user_synthetic","username":"synthetic-user","name":"Synthetic User"}}',
+              ]
+            : request.url === "/v2/teams?limit=100"
+              ? [200, { "content-type": "application/json" }, '{"teams":[]}']
+              : request.url?.startsWith("/v8/artifacts/status") === true
+                ? [
+                    200,
+                    { "content-type": "application/json" },
+                    '{"status":"enabled"}',
+                  ]
+                : [404, {}, "not found"],
+        async (baseUrl, requests) => {
+          const result = await runCandidate(
+            [
+              "link",
+              "--scope=synthetic-user",
+              "--yes",
+              "--token=synthetic-token",
+              `--api=${baseUrl}`,
+              `--cwd=${root}`,
+            ],
+            root,
+            { XDG_CONFIG_HOME: configurationHome },
+          );
+          expect(result.code).toBe(1);
+          expect(
+            requests.some((request) =>
+              request.path.startsWith("/v8/artifacts/status"),
+            ),
+          ).toBe(true);
+          expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual(
+            existingProject,
+          );
+        },
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 
   it("selects and confirms a link scope interactively", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-link-scope-"));
@@ -1042,7 +1140,10 @@ describe("hosted compatibility", () => {
           const overrides = Layer.mergeAll(
             Layer.succeed(CredentialService, {
               ...services.credentials,
-              readUserConfiguration: Effect.succeed(undefined),
+              readUserConfiguration: Effect.succeed({
+                retained: "synthetic-value",
+                token: "stale-login-token",
+              }),
               writeUserConfiguration: (configuration) =>
                 Effect.sync(() => {
                   storedConfiguration = configuration;
@@ -1135,7 +1236,10 @@ describe("hosted compatibility", () => {
             expect((await invokeCallback()).status).toBe(200);
 
             expect(await Effect.runPromise(Fiber.join(fiber))).toBe(0);
-            expect(storedConfiguration).toEqual({ token });
+            expect(storedConfiguration).toEqual({
+              retained: "synthetic-value",
+              token,
+            });
             expect(output).not.toContain(token);
             expect(output).not.toContain(state);
             expect(output).not.toContain(openedUrl);
@@ -2115,6 +2219,7 @@ describe("secondary command and parser compatibility", () => {
         "no-open",
         "unavailable",
         "failure",
+        "nonzero",
       ] as const) {
         await exerciseDevtools(root, mode);
       }
