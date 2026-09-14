@@ -33,6 +33,15 @@ const protocolFromEnvironment = (
   return undefined;
 };
 
+const decodeEnvironmentHeaderComponent = (value: string): string => {
+  const trimmed = value.trim();
+  try {
+    return decodeURIComponent(trimmed);
+  } catch {
+    return trimmed;
+  }
+};
+
 const parseEnvironmentHeaders = (
   value: string | undefined,
 ): ReadonlyArray<readonly [string, string]> =>
@@ -42,8 +51,8 @@ const parseEnvironmentHeaders = (
       ? []
       : [
           [
-            entry.slice(0, separator).trim(),
-            entry.slice(separator + 1).trim(),
+            decodeEnvironmentHeaderComponent(entry.slice(0, separator)),
+            decodeEnvironmentHeaderComponent(entry.slice(separator + 1)),
           ] as const,
         ];
   });

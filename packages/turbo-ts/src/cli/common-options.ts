@@ -1,4 +1,7 @@
-import { parseNodeTimerSeconds } from "../core/time.js";
+import {
+  maximumNodeTimerMilliseconds,
+  parseNodeTimerSeconds,
+} from "../core/time.js";
 import { ConfigurationError } from "../effect/errors.js";
 
 export type OtlpProtocol = "grpc" | "http-json" | "http-protobuf";
@@ -183,6 +186,9 @@ export const parseCommonArguments = (
         [rootTurboJson, index] = requiredValue(arguments_, index, name);
         break;
       case "--skip-infer":
+        if (argument !== name) {
+          throw configurationFailure(`${name} does not accept a value`);
+        }
         skipInfer = true;
         break;
       case "--team":
@@ -240,6 +246,9 @@ export const parseCommonArguments = (
         let value: string;
         [value, index] = requiredValue(arguments_, index, name);
         otelTimeout = nonNegativeInteger(value, "OTLP timeout");
+        if (otelTimeout > maximumNodeTimerMilliseconds) {
+          throw configurationFailure(`invalid OTLP timeout: ${value}`);
+        }
         break;
       }
       case "--experimental-otel-interval-ms": {

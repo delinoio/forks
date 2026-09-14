@@ -948,8 +948,9 @@ one child workspace and false in explicit single-package mode.
 Persisted, stdout, and
 newline-delimited summaries from one run share one canonical UUID v7 identifier.
 Mermaid graphs assign stable,
-unique node identifiers without truncated-hash collisions. `--skip-infer`
-disables framework environment inference for task hashing and execution.
+unique node identifiers without truncated-hash collisions. The valueless
+`--skip-infer` flag disables framework environment inference for task hashing
+and execution; attached values are rejected.
 
 Gate 4 hosted and secondary surfaces have automated ledger evidence except for
 runtime verbosity logging, workspace example-path selection, and workspace
@@ -997,7 +998,8 @@ Linking requires confirmation unless the valueless `--yes` or `-y` flag is
 supplied; attached values are rejected. A non-interactive link must supply a
 scope and the confirmation flag. The command persists the selected identity and
 validated API URL, and keeps `.turbo` ignored unless `--no-gitignore` is
-requested. Relinking selects its API from CLI, environment, the persisted
+requested. `--no-gitignore` is valueless and rejects attached values. Relinking
+selects its API from CLI, environment, the persisted
 project link, and the public default in descending precedence. The project link
 is persisted only after the required `.gitignore` update succeeds. An explicit
 link team slug from `--team` or `TURBO_TEAM` suppresses `TURBO_TEAMID` before
@@ -1059,8 +1061,12 @@ gauge point carries the export observation time in Unix nanoseconds. Task-detail
 metrics report actual execution and cache outcomes. Periodic snapshots omit
 tasks that have not reached an outcome, while final and non-executing snapshots
 identify tasks that were actually bypassed as skipped. Numeric task and run
-attributes use OTLP integer values for every protocol. Empty and zero OTLP timeouts use the
-finite default. A generic HTTP OTLP endpoint preserves its
+attributes use OTLP integer values for every protocol. Environment header names
+and values are percent-decoded after comma-separated entries are split, so an
+encoded comma remains part of its header value. Malformed percent encodings are
+preserved literally. Empty and zero OTLP timeouts use the finite default, and
+CLI timeout values above Node's 2,147,483,647-millisecond timer limit are
+rejected during argument parsing. A generic HTTP OTLP endpoint preserves its
 path prefix and appends `/v1/metrics`. A positive metric interval emits scoped,
 sequential in-progress snapshots and a final snapshot; zero or an absent
 interval emits only the final snapshot. Graph and dry runs report the resolved

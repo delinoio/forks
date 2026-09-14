@@ -2035,6 +2035,15 @@ describe("secondary command and parser compatibility", () => {
         "does not accept a value",
       );
     }
+    for (const attachedNoGitignore of [
+      "--no-gitignore=",
+      "--no-gitignore=false",
+      "--no-gitignore=true",
+    ]) {
+      expect(() => parseHostedArguments("link", [attachedNoGitignore])).toThrow(
+        "does not accept a value",
+      );
+    }
     for (const attachedBypass of [
       "--dangerously-disable-package-manager-check=false",
       "--dangerously-disable-package-manager-check=true",
@@ -2043,6 +2052,22 @@ describe("secondary command and parser compatibility", () => {
         "does not accept a value",
       );
     }
+    for (const attachedSkipInfer of [
+      "--skip-infer=",
+      "--skip-infer=false",
+      "--skip-infer=true",
+    ]) {
+      expect(() => parseCommonArguments([attachedSkipInfer])).toThrow(
+        "does not accept a value",
+      );
+    }
+    expect(
+      parseCommonArguments(["--experimental-otel-timeout-ms=2147483647"])
+        .options.openTelemetry.timeoutMilliseconds,
+    ).toBe(2_147_483_647);
+    expect(() =>
+      parseCommonArguments(["--experimental-otel-timeout-ms=2147483648"]),
+    ).toThrow("invalid OTLP timeout: 2147483648");
     expect(resolveHostedTimeoutMilliseconds(undefined, "12.5")).toBe(12_500);
     expect(resolveHostedTimeoutMilliseconds(1.25, "12.5")).toBe(1_250);
     expect(resolveHostedTimeoutMilliseconds(undefined, undefined)).toBe(30_000);
@@ -3258,7 +3283,7 @@ describe("hosted protocols and experimental transports", () => {
       get: (name) =>
         Effect.succeed(
           name === "OTEL_EXPORTER_OTLP_HEADERS"
-            ? "Content-Type=text/plain"
+            ? "Content%2DType=text%2Fplain,x%2Denvironment=Bearer%20credential%2Cwith%20comma,x-malformed=literal%ZZ"
             : undefined,
         ),
       entries: Effect.succeed({}),
@@ -3327,6 +3352,8 @@ describe("hosted protocols and experimental transports", () => {
       expect(request.headers).toMatchObject({
         authorization: "Bearer synthetic-token",
         "user-agent": "turbo-ts/0.1.0",
+        "x-environment": "Bearer credential,with comma",
+        "x-malformed": "literal%ZZ",
         "x-synthetic": "yes",
       });
     }

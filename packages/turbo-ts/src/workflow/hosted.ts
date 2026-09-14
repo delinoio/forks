@@ -119,6 +119,9 @@ export const parseHostedArguments = (
         break;
       case "--no-gitignore":
         if (command !== "link") throw fail(`unknown option: ${argument}`);
+        if (argument !== name) {
+          throw fail(`${name} does not accept a value`);
+        }
         noGitignore = true;
         break;
       case "--scope":
