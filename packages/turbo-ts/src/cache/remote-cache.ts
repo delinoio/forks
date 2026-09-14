@@ -119,7 +119,7 @@ const preflight = (
 
 export const verifyRemoteCacheStatus = (
   options: RemoteCacheOptions,
-): Effect.Effect<void, CacheError, HttpService | RetryScheduleService> =>
+): Effect.Effect<boolean, CacheError, HttpService | RetryScheduleService> =>
   Effect.gen(function* () {
     const url = remoteRouteUrl(options, "/v8/artifacts/status");
     yield* preflight(url, options);
@@ -162,6 +162,18 @@ export const verifyRemoteCacheStatus = (
         ),
       );
     }
+    let document: unknown;
+    try {
+      document = JSON.parse(new TextDecoder().decode(response.body));
+    } catch {
+      document = undefined;
+    }
+    return (
+      typeof document === "object" &&
+      document !== null &&
+      "status" in document &&
+      document.status === "enabled"
+    );
   });
 
 export const headRemoteCache = (

@@ -10,6 +10,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import {
+  type BigIntStats,
   createReadStream,
   createWriteStream,
   constants as fileSystemConstants,
@@ -1771,35 +1772,97 @@ const userConfigurationPath = (): string =>
 const projectConfigurationPath = (root: string): string =>
   join(root, ".turbo", "config.json");
 
+const maximumConfigurationFileBytes = 1024 * 1024;
+
+const sameFileIdentity = (left: BigIntStats, right: BigIntStats): boolean =>
+  left.dev === right.dev && left.ino === right.ino;
+
+export const readBoundedConfigurationHandle = async (
+  handle: Awaited<ReturnType<typeof open>>,
+): Promise<string> => {
+  const contents = Buffer.alloc(maximumConfigurationFileBytes + 1);
+  let length = 0;
+  while (length < contents.length) {
+    const { bytesRead } = await handle.read(
+      contents,
+      length,
+      contents.length - length,
+      length,
+    );
+    if (bytesRead === 0) break;
+    length += bytesRead;
+    if (length > maximumConfigurationFileBytes) {
+      throw new TypeError("configuration file exceeds the 1 MiB limit");
+    }
+  }
+  return contents.subarray(0, length).toString("utf8");
+};
+
 const readConfigurationObject = async <A extends object>(
   path: string,
   privateFile: boolean,
 ): Promise<A | undefined> => {
-  let metadata: Awaited<ReturnType<typeof lstat>>;
+  let windowsPathMetadata: BigIntStats | undefined;
+  if (process.platform === "win32") {
+    try {
+      windowsPathMetadata = await lstat(path, { bigint: true });
+    } catch (cause) {
+      if (isMissingFileError(cause)) return undefined;
+      throw cause;
+    }
+    if (!windowsPathMetadata.isFile()) {
+      throw new TypeError("configuration path is not a regular file");
+    }
+  }
+  let handle: Awaited<ReturnType<typeof open>>;
   try {
-    metadata = await lstat(path);
+    handle = await open(
+      path,
+      fileSystemConstants.O_RDONLY |
+        (process.platform === "win32" ? 0 : fileSystemConstants.O_NOFOLLOW),
+    );
   } catch (cause) {
-    if (isMissingFileError(cause)) return undefined;
+    if (windowsPathMetadata === undefined && isMissingFileError(cause)) {
+      return undefined;
+    }
     throw cause;
   }
-  if (!metadata.isFile()) {
-    throw new TypeError("configuration path is not a regular file");
+  try {
+    const metadata = await handle.stat({ bigint: true });
+    if (!metadata.isFile()) {
+      throw new TypeError("configuration path is not a regular file");
+    }
+    if (process.platform === "win32") {
+      const currentPathMetadata = await lstat(path, { bigint: true });
+      if (
+        windowsPathMetadata === undefined ||
+        !currentPathMetadata.isFile() ||
+        !sameFileIdentity(windowsPathMetadata, metadata) ||
+        !sameFileIdentity(currentPathMetadata, metadata)
+      ) {
+        throw new TypeError("configuration path changed while being opened");
+      }
+    }
+    if (
+      privateFile &&
+      process.platform !== "win32" &&
+      (metadata.mode & 0o077n) !== 0n
+    ) {
+      throw new TypeError("credential file permissions must be 0600");
+    }
+    if (metadata.size > BigInt(maximumConfigurationFileBytes)) {
+      throw new TypeError("configuration file exceeds the 1 MiB limit");
+    }
+    const value = JSON.parse(
+      await readBoundedConfigurationHandle(handle),
+    ) as unknown;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new TypeError("configuration file must contain a JSON object");
+    }
+    return value as A;
+  } finally {
+    await handle.close();
   }
-  if (
-    privateFile &&
-    process.platform !== "win32" &&
-    (metadata.mode & 0o077) !== 0
-  ) {
-    throw new TypeError("credential file permissions must be 0600");
-  }
-  if (metadata.size > 1024 * 1024) {
-    throw new TypeError("configuration file exceeds the 1 MiB limit");
-  }
-  const value = JSON.parse(await readFile(path, "utf8")) as unknown;
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new TypeError("configuration file must contain a JSON object");
-  }
-  return value as A;
 };
 
 const writeConfigurationObject = async (
@@ -3241,8 +3304,12 @@ const compressionLayer = Layer.succeed(CompressionService, {
 });
 
 const redirectStatuses = new Set([301, 302, 303, 307, 308]);
-const sensitiveRedirectHeader =
-  /authorization|cookie|credential|secret|signature|token|^x-artifact-tag$/i;
+const safeCrossOriginRedirectHeaders = new Set([
+  "accept",
+  "content-encoding",
+  "content-type",
+  "user-agent",
+]);
 
 const fetchWithSafeRedirects = async (
   request: {
@@ -3302,8 +3369,8 @@ const fetchWithSafeRedirects = async (
     }
     if (destination.origin !== url.origin) {
       headers = Object.fromEntries(
-        Object.entries(headers).filter(
-          ([name]) => !sensitiveRedirectHeader.test(name),
+        Object.entries(headers).filter(([name]) =>
+          safeCrossOriginRedirectHeaders.has(name.toLowerCase()),
         ),
       );
     }

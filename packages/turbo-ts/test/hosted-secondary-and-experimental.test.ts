@@ -4,7 +4,9 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  open,
   readFile,
+  rename,
   rm,
   stat,
   symlink,
@@ -32,6 +34,7 @@ import { evidenceId } from "../src/compatibility/ledger.js";
 import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import {
   nodeFoundationLayer,
+  readBoundedConfigurationHandle,
   resolveUserConfigurationDirectory,
 } from "../src/effect/node-layer.js";
 import {
@@ -71,6 +74,7 @@ import {
 import {
   executeHostedCommand,
   parseHostedArguments,
+  resolveHostedTimeoutMilliseconds,
 } from "../src/workflow/hosted.js";
 import {
   executeSecondaryCommand,
@@ -228,7 +232,12 @@ const prepareRepository = async (root: string): Promise<void> => {
   );
 };
 
-const exerciseDevtools = async (root: string): Promise<void> => {
+type DevtoolsLaunchMode = "browser" | "failure" | "no-open" | "unavailable";
+
+const exerciseDevtools = async (
+  root: string,
+  mode: DevtoolsLaunchMode,
+): Promise<void> => {
   const reservation = createServer();
   await new Promise<void>((resolve, reject) => {
     reservation.once("error", reject);
@@ -255,6 +264,11 @@ const exerciseDevtools = async (root: string): Promise<void> => {
   const opened = new Promise<string>((resolve) => {
     resolveOpened = resolve;
   });
+  let resolveFallback: (() => void) | undefined;
+  const fallback = new Promise<void>((resolve) => {
+    resolveFallback = resolve;
+  });
+  let launchAttempts = 0;
   const token = "018f05c9-7b4a-7cc0-98c4-66395a148002";
   const overrides = Layer.mergeAll(
     Layer.succeed(EnvironmentService, {
@@ -263,15 +277,30 @@ const exerciseDevtools = async (root: string): Promise<void> => {
     }),
     Layer.succeed(ProcessService, {
       ...services.processes,
-      spawnDetached: (request) =>
-        Effect.sync(() => {
-          const url = request.args.find((argument) =>
-            argument.startsWith("http://"),
-          );
-          if (url === undefined) throw new Error("browser URL was not passed");
-          resolveOpened?.(url);
-          return 12_345;
-        }),
+      spawnDetached:
+        mode === "unavailable"
+          ? undefined
+          : (request) => {
+              launchAttempts += 1;
+              if (mode === "failure") {
+                return Effect.fail(
+                  new ProcessExecutionError({
+                    command: request.command,
+                    message: "synthetic browser launch failure",
+                  }),
+                );
+              }
+              return Effect.sync(() => {
+                const url = request.args.find((argument) =>
+                  argument.startsWith("http://"),
+                );
+                if (url === undefined) {
+                  throw new Error("browser URL was not passed");
+                }
+                resolveOpened?.(url);
+                return 12_345;
+              });
+            },
     }),
     Layer.succeed(RandomnessService, {
       uuidV7: Effect.succeed(token),
@@ -281,30 +310,55 @@ const exerciseDevtools = async (root: string): Promise<void> => {
       writeStdout: (text) =>
         Effect.sync(() => {
           output += text;
+          if (text.startsWith("turbo-ts devtools authenticated:")) {
+            resolveFallback?.();
+          }
         }),
       writeStderr: () => Effect.void,
     }),
   );
+  const arguments_ = [`--port=${port}`, `--cwd=${root}`];
+  if (mode === "no-open") arguments_.push("--no-open");
   const fiber = Effect.runFork(
-    executeDevtools([`--port=${port}`, `--cwd=${root}`]).pipe(
+    executeDevtools(arguments_).pipe(
       Effect.provide(overrides),
       Effect.provide(nodeFoundationLayer),
     ),
   );
   try {
-    const openedUrl = await Promise.race([
-      opened,
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error("devtools browser launch timed out")),
-          10_000,
-        ),
-      ),
-    ]);
     const publicUrl = `http://127.0.0.1:${port}/`;
+    const authenticatedUrl = `${publicUrl}?token=${token}`;
+    const accessedUrl =
+      mode === "browser"
+        ? await Promise.race([
+            opened,
+            new Promise<never>((_, reject) =>
+              setTimeout(
+                () => reject(new Error("devtools browser launch timed out")),
+                10_000,
+              ),
+            ),
+          ])
+        : await Promise.race([
+            fallback.then(() => authenticatedUrl),
+            new Promise<never>((_, reject) =>
+              setTimeout(
+                () => reject(new Error("devtools fallback URL timed out")),
+                10_000,
+              ),
+            ),
+          ]);
     expect(output).toContain(`turbo-ts devtools: ${publicUrl}`);
-    expect(output).not.toContain(token);
-    const authorized = new URL(openedUrl);
+    if (mode === "browser") {
+      expect(output).not.toContain(token);
+      expect(launchAttempts).toBe(1);
+    } else {
+      expect(output).toContain(
+        `turbo-ts devtools authenticated: ${authenticatedUrl}`,
+      );
+      expect(launchAttempts).toBe(mode === "failure" ? 1 : 0);
+    }
+    const authorized = new URL(accessedUrl);
     expect(authorized.searchParams.get("token")).toBe(token);
     const pageResponse = await fetch(authorized);
     expect(pageResponse.status).toBe(200);
@@ -383,20 +437,26 @@ describe("hosted compatibility", () => {
               ? [
                   200,
                   { "content-type": "application/json" },
-                  '{"teams":[{"id":"team_synthetic","slug":"synthetic","name":"Synthetic Team"},{"id":"team_disabled","slug":"disabled","name":"Disabled Team"}]}',
+                  '{"teams":[{"id":"team_synthetic","slug":"synthetic","name":"Synthetic Team"},{"id":"team_disabled","slug":"disabled","name":"Disabled Team"}],"pagination":{"next":123}}',
                 ]
-              : request.url?.startsWith("/v8/artifacts/status") === true
+              : request.url === "/v2/teams?limit=100&until=123"
                 ? [
                     200,
                     { "content-type": "application/json" },
-                    request.url.includes("teamId=team_disabled") ||
-                    request.url.includes("slug=disabled")
-                      ? '{"status":"disabled"}'
-                      : '{"status":"enabled"}',
+                    '{"teams":[{"id":"team_later","slug":"later","name":"Later Team"}],"pagination":{"next":null}}',
                   ]
-                : request.url === "/v3/user/tokens/current"
-                  ? [200, { "content-type": "application/json" }, "{}"]
-                  : [404, {}, "not found"],
+                : request.url?.startsWith("/v8/artifacts/status") === true
+                  ? [
+                      200,
+                      { "content-type": "application/json" },
+                      request.url.includes("teamId=team_disabled") ||
+                      request.url.includes("slug=disabled")
+                        ? '{"status":"disabled"}'
+                        : '{"status":"enabled"}',
+                    ]
+                  : request.url === "/v3/user/tokens/current"
+                    ? [200, { "content-type": "application/json" }, "{}"]
+                    : [404, {}, "not found"],
         async (baseUrl, requests) => {
           const configuredApiUrl = new URL(baseUrl).toString();
           const environment = { XDG_CONFIG_HOME: configurationHome };
@@ -485,6 +545,27 @@ describe("hosted compatibility", () => {
           expect(await readFile(join(root, ".gitignore"), "utf8")).toContain(
             ".turbo",
           );
+
+          const paginatedLink = await runCandidate(
+            [
+              "link",
+              "--scope=later",
+              "--yes",
+              `--api=${baseUrl}`,
+              `--cwd=${root}`,
+            ],
+            root,
+            environment,
+          );
+          expect(paginatedLink.code, paginatedLink.stderr).toBe(0);
+          expect(
+            JSON.parse(
+              await readFile(join(root, ".turbo/config.json"), "utf8"),
+            ),
+          ).toEqual({
+            apiUrl: configuredApiUrl,
+            teamId: "team_later",
+          });
 
           expect(
             (await runCandidate(["unlink", `--cwd=${root}`], root, environment))
@@ -627,6 +708,11 @@ describe("hosted compatibility", () => {
           expect(
             requests.some((request) => request.path === "/v2/teams?limit=100"),
           ).toBe(true);
+          expect(
+            requests.some(
+              (request) => request.path === "/v2/teams?limit=100&until=123",
+            ),
+          ).toBe(true);
           expect(requests.at(-1)).toMatchObject({
             method: "DELETE",
             path: "/v3/user/tokens/current",
@@ -660,15 +746,21 @@ describe("hosted compatibility", () => {
               ? [
                   200,
                   { "content-type": "application/json" },
-                  '{"teams":[{"id":"team_synthetic","slug":"synthetic","name":"Synthetic Team"}]}',
+                  '{"teams":[{"id":"team_synthetic","slug":"synthetic","name":"Synthetic Team"}],"pagination":{"next":123}}',
                 ]
-              : request.url?.startsWith("/v8/artifacts/status") === true
+              : request.url === "/v2/teams?limit=100&until=123"
                 ? [
                     200,
                     { "content-type": "application/json" },
-                    '{"status":"enabled"}',
+                    '{"teams":[{"id":"team_later","slug":"later","name":"Later Team"}],"pagination":{"next":null}}',
                   ]
-                : [404, {}, "not found"],
+                : request.url?.startsWith("/v8/artifacts/status") === true
+                  ? [
+                      200,
+                      { "content-type": "application/json" },
+                      '{"status":"enabled"}',
+                    ]
+                  : [404, {}, "not found"],
         async (baseUrl, requests) => {
           const services = await Effect.runPromise(
             Effect.gen(function* () {
@@ -744,24 +836,24 @@ describe("hosted compatibility", () => {
             "--no-gitignore",
           ];
 
-          answers = ["2", "yes"];
+          answers = ["3", "yes"];
           expect(await execute(commonArguments, true)).toBe(0);
           expect(output).toContain(
-            "1. Synthetic User (synthetic-user)\n  2. Synthetic Team (synthetic)",
+            "1. Synthetic User (synthetic-user)\n  2. Synthetic Team (synthetic)\n  3. Later Team (later)",
           );
           expect(prompts).toEqual([
-            "Enter a scope [1-2]: ",
-            "Enable Remote Caching for Synthetic Team? [y/N] ",
+            "Enter a scope [1-3]: ",
+            "Enable Remote Caching for Later Team? [y/N] ",
           ]);
           expect(storedProject).toEqual({
             apiUrl: new URL(baseUrl).toString(),
-            teamId: "team_synthetic",
+            teamId: "team_later",
           });
           expect(
             requests.some(
               (request) =>
                 request.path ===
-                "/v8/artifacts/status?teamId=team_synthetic&slug=synthetic",
+                "/v8/artifacts/status?teamId=team_later&slug=later",
             ),
           ).toBe(true);
 
@@ -820,6 +912,64 @@ describe("hosted compatibility", () => {
           );
         },
       );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects invalid and repeated hosted team pagination cursors", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-team-pages-"));
+    const root = join(directory, "repository");
+    await prepareRepository(root);
+    try {
+      for (const scenario of ["invalid", "repeated"] as const) {
+        await withServer(
+          (request) =>
+            request.url === "/v2/user"
+              ? [
+                  200,
+                  { "content-type": "application/json" },
+                  '{"user":{"id":"user_synthetic","username":"synthetic-user","name":"Synthetic User"}}',
+                ]
+              : request.url?.startsWith("/v2/teams?") === true
+                ? [
+                    200,
+                    { "content-type": "application/json" },
+                    JSON.stringify({
+                      teams: [],
+                      pagination: {
+                        next: scenario === "invalid" ? "invalid" : 123,
+                      },
+                    }),
+                  ]
+                : [404, {}, "not found"],
+          async (baseUrl, requests) => {
+            const result = await runCandidate(
+              [
+                "link",
+                "--scope=missing",
+                "--yes",
+                "--no-gitignore",
+                "--token=synthetic-token",
+                `--api=${baseUrl}`,
+                `--cwd=${root}`,
+              ],
+              root,
+            );
+            expect(result.code).toBe(1);
+            expect(result.stderr).toContain(
+              scenario === "invalid"
+                ? "invalid pagination cursor"
+                : "repeated pagination cursor",
+            );
+            expect(
+              requests.filter((request) =>
+                request.path.startsWith("/v2/teams?"),
+              ),
+            ).toHaveLength(scenario === "invalid" ? 1 : 2);
+          },
+        );
+      }
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -1044,6 +1194,62 @@ describe("hosted compatibility", () => {
       );
       if (process.platform !== "win32") expect(result.code).toBe(1);
       expect(`${result.stdout}${result.stderr}`).not.toContain(secret);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reads configuration through one bounded validated handle", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-config-handle-"));
+    const root = join(directory, "repository");
+    const configurationHome = join(directory, "configuration");
+    const credentialDirectory = join(configurationHome, "turborepo");
+    const credentialPath = join(credentialDirectory, "config.json");
+    const replacementPath = join(directory, "replacement.json");
+    const original = JSON.stringify({ value: "original" });
+    await prepareRepository(root);
+    await mkdir(credentialDirectory, { recursive: true });
+    await writeFile(credentialPath, original);
+    await writeFile(replacementPath, JSON.stringify({ value: "replacement" }));
+    const originalHandle = await open(credentialPath, "r");
+    try {
+      await rename(replacementPath, credentialPath);
+      expect(await readBoundedConfigurationHandle(originalHandle)).toBe(
+        original,
+      );
+    } finally {
+      await originalHandle.close();
+    }
+
+    const oversizedPath = join(directory, "oversized.json");
+    await writeFile(oversizedPath, Buffer.alloc(1024 * 1024 + 1, "x"));
+    const oversizedHandle = await open(oversizedPath, "r");
+    try {
+      await expect(
+        readBoundedConfigurationHandle(oversizedHandle),
+      ).rejects.toThrow("configuration file exceeds the 1 MiB limit");
+    } finally {
+      await oversizedHandle.close();
+    }
+
+    try {
+      if (process.platform !== "win32") {
+        const outsidePath = join(directory, "outside.json");
+        const secret = "synthetic-symlink-secret";
+        await writeFile(outsidePath, JSON.stringify({ token: secret }));
+        await rm(credentialPath);
+        await symlink(outsidePath, credentialPath, "file");
+        const symlinked = await runCandidate(
+          ["logout", "--invalidate=false", `--cwd=${root}`],
+          root,
+          { XDG_CONFIG_HOME: configurationHome },
+        );
+        expect(symlinked.code).toBe(1);
+        expect(symlinked.stderr).toContain(
+          "credential configuration operation failed",
+        );
+        expect(`${symlinked.stdout}${symlinked.stderr}`).not.toContain(secret);
+      }
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -1387,6 +1593,15 @@ describe("secondary command and parser compatibility", () => {
     expect(
       parseHostedArguments("logout", ["--invalidate", "false"]),
     ).toMatchObject({ invalidate: false });
+    expect(resolveHostedTimeoutMilliseconds(undefined, "12.5")).toBe(12_500);
+    expect(resolveHostedTimeoutMilliseconds(1.25, "12.5")).toBe(1_250);
+    expect(resolveHostedTimeoutMilliseconds(undefined, undefined)).toBe(30_000);
+    expect(resolveHostedTimeoutMilliseconds(undefined, "0")).toBe(0);
+    for (const invalid of ["", "-1", "NaN", "Infinity"]) {
+      expect(() =>
+        resolveHostedTimeoutMilliseconds(undefined, invalid),
+      ).toThrow("invalid remote cache timeout");
+    }
     expect(
       parseGenerateArguments([
         "workspace",
@@ -1878,7 +2093,14 @@ describe("secondary command and parser compatibility", () => {
       expect(filteredBoundaries.stderr).not.toContain(
         "denylist for `synthetic-library`",
       );
-      await exerciseDevtools(root);
+      for (const mode of [
+        "browser",
+        "no-open",
+        "unavailable",
+        "failure",
+      ] as const) {
+        await exerciseDevtools(root, mode);
+      }
 
       await withServer(
         (request) =>
@@ -2201,7 +2423,12 @@ describe("hosted protocols and experimental transports", () => {
           requests.push(request);
           if (request.method === "GET" && request.url.includes("/status")) {
             statusAttempts += 1;
-            return emptyResponse(statusAttempts < 3 ? 429 : 200);
+            return statusAttempts < 3
+              ? emptyResponse(429)
+              : {
+                  ...emptyResponse(),
+                  body: new TextEncoder().encode('{"status":"enabled"}'),
+                };
           }
           if (request.method === "HEAD") return emptyResponse(404);
           return emptyResponse(201);
@@ -2227,17 +2454,17 @@ describe("hosted protocols and experimental transports", () => {
     };
     const result = await Effect.runPromise(
       Effect.gen(function* () {
-        yield* verifyRemoteCacheStatus(options);
+        const enabled = yield* verifyRemoteCacheStatus(options);
         const present = yield* headRemoteCache(options, "synthetic-hash");
         yield* headRemoteCache(
           { ...options, teamId: undefined, teamSlug: "other-synthetic" },
           "synthetic-hash",
         );
         yield* recordRemoteCacheEvent(options, "synthetic-hash", "MISS");
-        return present;
+        return { enabled, present };
       }).pipe(Effect.provide(Layer.merge(httpLayer, deterministicRetryLayer))),
     );
-    expect(result).toBe(false);
+    expect(result).toEqual({ enabled: true, present: false });
     expect(statusAttempts).toBe(3);
     expect(requests.some((request) => request.method === "OPTIONS")).toBe(true);
     expect(requests.some((request) => request.method === "HEAD")).toBe(true);
@@ -2263,6 +2490,58 @@ describe("hosted protocols and experimental transports", () => {
       "user-agent": "turbo-ts/0.1.0",
     });
   });
+
+  it("disables remote artifact traffic unless status is exactly enabled", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-status-gate-"));
+    const root = join(directory, "repository");
+    await prepareRepository(root);
+    try {
+      for (const statusResponse of [
+        [200, '{"status":"disabled"}'],
+        [200, "malformed"],
+        [401, '{"error":"unauthorized"}'],
+      ] as const) {
+        await withServer(
+          (request) =>
+            request.url?.startsWith("/v8/artifacts/status") === true
+              ? [
+                  statusResponse[0],
+                  { "content-type": "application/json" },
+                  statusResponse[1],
+                ]
+              : [500, {}, "unexpected remote artifact request"],
+          async (baseUrl, requests) => {
+            const result = await runCandidate(
+              [
+                "run",
+                "build",
+                "--filter=synthetic-app",
+                "--cache=remote:rw",
+                "--output-logs=none",
+                "--token=synthetic-token",
+                `--api=${baseUrl}`,
+                `--cwd=${root}`,
+              ],
+              root,
+            );
+            expect(result.code, result.stderr).toBe(0);
+            expect(
+              requests.filter((request) =>
+                request.path.startsWith("/v8/artifacts/"),
+              ),
+            ).toEqual([
+              expect.objectContaining({
+                method: "GET",
+                path: "/v8/artifacts/status",
+              }),
+            ]);
+          },
+        );
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it(evidenceId.observabilityCompatibility, async () => {
     const requests: Array<HttpRequest> = [];
@@ -2916,7 +3195,10 @@ describe("hosted protocols and experimental transports", () => {
                       method: "PUT",
                       headers: {
                         authorization: "Bearer synthetic-token",
+                        "content-type": "application/octet-stream",
+                        "x-api-key": "synthetic-api-key",
                         "x-artifact-tag": "synthetic-artifact-tag",
+                        "x-synthetic": "synthetic-custom-value",
                       },
                       body: "synthetic-body",
                       timeoutMilliseconds: 1_000,
@@ -2936,11 +3218,42 @@ describe("hosted protocols and experimental transports", () => {
               expect(
                 destinationRequests[0]?.headers["x-artifact-tag"],
               ).toBeUndefined();
+              expect(
+                destinationRequests[0]?.headers["x-api-key"],
+              ).toBeUndefined();
+              expect(
+                destinationRequests[0]?.headers["x-synthetic"],
+              ).toBeUndefined();
+              expect(destinationRequests[0]?.headers["content-type"]).toBe(
+                "application/octet-stream",
+              );
             },
           );
         },
       );
     }
+
+    await withServer(
+      (request) =>
+        request.url === "/same-origin"
+          ? [200, {}, "ok"]
+          : [307, { location: "/same-origin" }, "redirect"],
+      async (baseUrl, requests) => {
+        await Effect.runPromise(
+          HttpService.pipe(
+            Effect.flatMap((http) =>
+              http.request({
+                url: baseUrl,
+                method: "GET",
+                headers: { "x-api-key": "same-origin-key" },
+              }),
+            ),
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+        expect(requests[1]?.headers["x-api-key"]).toBe("same-origin-key");
+      },
+    );
 
     await withServer(
       async () => {

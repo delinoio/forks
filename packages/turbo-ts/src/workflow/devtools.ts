@@ -124,7 +124,12 @@ export const executeDevtools = (
       const publicUrl = `http://127.0.0.1:${server.port}/`;
       const authenticatedUrl = `${publicUrl}?token=${token}`;
       yield* terminal.writeStdout(`turbo-ts devtools: ${publicUrl}\n`);
-      if (!options.noOpen && processes.spawnDetached !== undefined) {
+      const printAuthenticatedUrl = terminal.writeStdout(
+        `turbo-ts devtools authenticated: ${authenticatedUrl}\n`,
+      );
+      if (options.noOpen || processes.spawnDetached === undefined) {
+        yield* printAuthenticatedUrl;
+      } else {
         const platform = yield* environment.platform;
         const invocation = browserInvocation(platform, authenticatedUrl);
         yield* processes
@@ -133,7 +138,7 @@ export const executeDevtools = (
             cwd: repository.root,
             inheritEnvironment: true,
           })
-          .pipe(Effect.catchAll(() => Effect.void));
+          .pipe(Effect.catchAll(() => printAuthenticatedUrl));
       }
       return yield* Effect.never;
     }),

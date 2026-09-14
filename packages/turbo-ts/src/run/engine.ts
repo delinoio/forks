@@ -3652,7 +3652,7 @@ export const executeRun = (
       terminal.stdoutIsTerminal === undefined
         ? false
         : yield* terminal.stdoutIsTerminal;
-    const options: ResolvedRunOptions = {
+    let options: ResolvedRunOptions = {
       ...unresolvedOptions,
       remote:
         activeRemote === undefined
@@ -3679,7 +3679,12 @@ export const executeRun = (
       options.remote?.token !== undefined &&
       (options.cachePolicy.remoteRead || options.cachePolicy.remoteWrite)
     ) {
-      yield* verifyRemoteCacheStatus(options.remote).pipe(Effect.ignore);
+      const remoteEnabled = yield* verifyRemoteCacheStatus(options.remote).pipe(
+        Effect.catchAll(() => Effect.succeed(false)),
+      );
+      if (!remoteEnabled) {
+        options = { ...options, remote: undefined };
+      }
     }
     const repository = yield* discoverRepository(options.root, configuration, {
       singlePackage: parsed.singlePackage,

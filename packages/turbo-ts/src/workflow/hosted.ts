@@ -227,6 +227,25 @@ const configuredValue = (
     return value === "" ? undefined : value;
   });
 
+export const resolveHostedTimeoutMilliseconds = (
+  option: number | undefined,
+  environmentValue: string | undefined,
+): number => {
+  const value = option ?? environmentValue ?? 30;
+  const seconds = Number(value);
+  if (
+    (typeof value === "string" && value.trim() === "") ||
+    !Number.isFinite(seconds) ||
+    seconds < 0
+  ) {
+    throw new ConfigurationError({
+      path: option === undefined ? "TURBO_REMOTE_CACHE_TIMEOUT" : "<arguments>",
+      message: `invalid remote cache timeout: ${String(value)}`,
+    });
+  }
+  return Math.round(seconds * 1_000);
+};
+
 const resolveHostedSettings = (
   options: HostedCommandOptions,
 ): Effect.Effect<
@@ -236,6 +255,7 @@ const resolveHostedSettings = (
 > =>
   Effect.gen(function* () {
     const credentials = yield* CredentialService;
+    const environment = yield* EnvironmentService;
     const stored = yield* credentials.readUserConfiguration;
     const token =
       options.common.token ??
@@ -254,13 +274,17 @@ const resolveHostedSettings = (
       options.common.loginUrl ??
       (yield* configuredValue("TURBO_LOGIN")) ??
       "https://vercel.com";
+    const environmentTimeout = yield* environment.get(
+      "TURBO_REMOTE_CACHE_TIMEOUT",
+    );
     return {
       api: hostedUrl(apiValue, "API"),
       login: hostedUrl(loginValue, "login"),
       teamId,
       teamSlug,
-      timeoutMilliseconds: Math.round(
-        (options.common.remoteCacheTimeoutSeconds ?? 30) * 1_000,
+      timeoutMilliseconds: resolveHostedTimeoutMilliseconds(
+        options.common.remoteCacheTimeoutSeconds,
+        environmentTimeout,
       ),
       token,
     };
@@ -470,50 +494,92 @@ const availableHostedTeams = (
       userId === undefined || userSlug === undefined || userName === undefined
         ? []
         : [{ id: userId, slug: userSlug, name: userName }];
-    const teamsUrl = withPath(settings.api, "/v2/teams");
-    teamsUrl.searchParams.set("limit", "100");
-    const teamsResponse = yield* requestHosted(
-      teamsUrl,
-      "GET",
-      token,
-      settings.timeoutMilliseconds,
-    );
-    if (teamsResponse.status < 200 || teamsResponse.status >= 300) {
-      return yield* Effect.fail(
-        new BoundaryError({
-          boundary: "hosted",
-          message: `team lookup failed with status ${teamsResponse.status}`,
-          retryable: false,
+    const teams: Array<HostedTeam> = [];
+    const seenCursors = new Set<number>();
+    let cursor: number | undefined;
+    for (;;) {
+      const teamsUrl = withPath(settings.api, "/v2/teams");
+      teamsUrl.searchParams.set("limit", "100");
+      if (cursor !== undefined) {
+        teamsUrl.searchParams.set("until", String(cursor));
+      }
+      const teamsResponse = yield* requestHosted(
+        teamsUrl,
+        "GET",
+        token,
+        settings.timeoutMilliseconds,
+      );
+      if (teamsResponse.status < 200 || teamsResponse.status >= 300) {
+        return yield* Effect.fail(
+          new BoundaryError({
+            boundary: "hosted",
+            message: `team lookup failed with status ${teamsResponse.status}`,
+            retryable: false,
+          }),
+        );
+      }
+      let document: unknown;
+      try {
+        document = JSON.parse(new TextDecoder().decode(teamsResponse.body));
+      } catch {
+        document = undefined;
+      }
+      const pageTeams =
+        typeof document === "object" &&
+        document !== null &&
+        "teams" in document &&
+        Array.isArray(document.teams)
+          ? document.teams
+          : [];
+      teams.push(
+        ...pageTeams.flatMap((team) => {
+          if (typeof team !== "object" || team === null) return [];
+          const id = "id" in team ? team.id : undefined;
+          const slug = "slug" in team ? team.slug : undefined;
+          const name = "name" in team ? team.name : undefined;
+          return typeof id === "string" &&
+            typeof slug === "string" &&
+            typeof name === "string"
+            ? [{ id, slug, name }]
+            : [];
         }),
       );
+      const pagination =
+        typeof document === "object" &&
+        document !== null &&
+        "pagination" in document &&
+        typeof document.pagination === "object" &&
+        document.pagination !== null
+          ? document.pagination
+          : undefined;
+      const next =
+        pagination !== undefined && "next" in pagination
+          ? pagination.next
+          : undefined;
+      if (next === undefined || next === null) break;
+      if (!Number.isSafeInteger(next) || Number(next) < 0) {
+        return yield* Effect.fail(
+          new BoundaryError({
+            boundary: "hosted",
+            message: "team lookup returned an invalid pagination cursor",
+            retryable: false,
+          }),
+        );
+      }
+      const nextCursor = Number(next);
+      if (seenCursors.has(nextCursor)) {
+        return yield* Effect.fail(
+          new BoundaryError({
+            boundary: "hosted",
+            message: "team lookup returned a repeated pagination cursor",
+            retryable: false,
+          }),
+        );
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
     }
-    let document: unknown;
-    try {
-      document = JSON.parse(new TextDecoder().decode(teamsResponse.body));
-    } catch {
-      document = undefined;
-    }
-    const teams =
-      typeof document === "object" &&
-      document !== null &&
-      "teams" in document &&
-      Array.isArray(document.teams)
-        ? document.teams
-        : [];
-    return [
-      ...personalScope,
-      ...teams.flatMap((team) => {
-        if (typeof team !== "object" || team === null) return [];
-        const id = "id" in team ? team.id : undefined;
-        const slug = "slug" in team ? team.slug : undefined;
-        const name = "name" in team ? team.name : undefined;
-        return typeof id === "string" &&
-          typeof slug === "string" &&
-          typeof name === "string"
-          ? [{ id, slug, name }]
-          : [];
-      }),
-    ];
+    return [...personalScope, ...teams];
   });
 
 const updateGitIgnore = (

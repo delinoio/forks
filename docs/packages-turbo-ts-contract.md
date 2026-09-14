@@ -966,12 +966,15 @@ to require `--token` or `TURBO_TOKEN`. Windows browser launches quote the full
 callback URL before handing it to `cmd.exe`. Unlink resolves only the repository
 configuration path and does not read shared hosted settings or user credentials.
 User credentials use private directories, `0600` files on POSIX, atomic
-replacement, regular-file checks, bounded reads, and secret-safe diagnostics.
+replacement, no-follow handle-based regular-file checks, reads bounded to 1
+MiB from the validated handle, and secret-safe diagnostics.
 Project configuration writes reject symlinked `.turbo` directories before
 creating or replacing `config.json`.
 Link discovery uses the hosted user and team endpoints, verifies artifact
 status is exactly `enabled`, offers the personal user scope alongside team
-scopes, and prompts interactive users to select a scope when none is configured.
+scopes, follows the hosted teams endpoint's `pagination.next` cursor through
+the `until` query parameter until every page is collected, and prompts
+interactive users to select a scope when none is configured.
 Linking requires confirmation unless `--yes` is supplied; a non-interactive
 link must supply a scope and `--yes`. The command persists the selected identity
 and validated API URL, and keeps `.turbo` ignored unless `--no-gitignore` is
@@ -988,9 +991,14 @@ preflight, bounded responses, separate download and upload timeouts, safe
 redirects, idempotent retries for transient and rate-limit responses, event
 records, and optional HMAC signatures. Redirects reject credentials,
 unsupported protocols, and HTTPS downgrades, and remove authorization,
-cookies, tokens, credentials, secrets, and signatures before crossing an
-origin. Redirect-policy failures are non-retryable. A `HEAD` request remains
-`HEAD` across a 303 redirect. Local-only, configuration-disabled remote,
+cookies, API keys, tokens, credentials, secrets, signatures, and all other
+caller-provided custom headers before crossing an origin. Only safe
+representation headers and the user agent are retained. Redirect-policy
+failures are non-retryable. A `HEAD` request remains `HEAD` across a 303
+redirect. A remote status probe enables artifact traffic only when its bounded
+JSON document reports `status` exactly `enabled`; any other response or probe
+failure disables remote transport for that run while local execution
+continues. Local-only, configuration-disabled remote,
 no-cache, graph, and dry runs do not load remote credentials or probe hosted
 status; explicit OTLP token reuse may still read the shared user token without
 activating remote cache. A shared stored token activates remote cache only for
@@ -1034,23 +1042,26 @@ workspace and configured generation without `@turbo/gen`, token-protected
 loopback devtools, boundary diagnostics, deterministic microfrontend ports,
 `bin`, hidden `config`, deprecated `scan`, and the remaining daemon, alias, and
 parser surfaces. Documentation output honors both `NO_COLOR` and `--no-color`.
-Devtools prints only its token-free loopback URL; its bearer URL is passed only
-to the browser launcher, and `--no-open` does not expose that URL. The
-authenticated root page renders the package and dependency graph exposed by
-the JSON graph route. Boundary
-filters select the packages that own the evaluated rules using normal
-package-selector semantics. `--ignore=prompt` asks once before ignoring found
-violations, accepts only `y` or `yes`, skips prompting when no violation exists,
-and fails safely without an interactive terminal. Hidden `config` suppresses
-lower-precedence team IDs when a CLI or environment team slug is selected and
-validates the effective API and login URLs before rendering them.
+During a successful automatic launch, devtools prints only its token-free
+loopback URL and passes its bearer URL only to the browser launcher. When
+`--no-open` is selected, the launcher is unavailable, or launch fails, devtools
+prints the authenticated loopback URL once for manual access. The authenticated
+root page renders the package and dependency graph exposed by the JSON graph
+route. Boundary filters select the packages that own the evaluated rules using
+normal package-selector semantics. `--ignore=prompt` asks once before ignoring
+found violations, accepts only `y` or `yes`, skips prompting when no violation
+exists, and fails safely without an interactive terminal. Hidden `config`
+suppresses lower-precedence team IDs when a CLI or environment team slug is
+selected and validates the effective API and login URLs before rendering them.
 Remote download and upload timeouts use CLI, environment, configuration, and
 default values in descending precedence and reject negative, empty, or
-non-finite environment values. Microfrontend configuration is selected only
-from the explicit `--cwd`, or the process working directory when the option is
-absent, and its package ancestors after platform-aware canonical path
-normalization. The repository root package remains eligible to own the selected
-microfrontend configuration.
+non-finite environment values. Networked hosted commands use the remote cache
+timeout CLI option, `TURBO_REMOTE_CACHE_TIMEOUT`, and the 30-second default in
+descending precedence with the same validation. Microfrontend configuration is
+selected only from the explicit `--cwd`, or the process working directory when
+the option is absent, and its package ancestors after platform-aware canonical
+path normalization. The repository root package remains eligible to own the
+selected microfrontend configuration.
 Generator destinations are validated through canonical existing ancestors,
 and recursive copies whose source contains their destination are rejected.
 Requested workspace names must be npm-compatible. Copied workspace templates
