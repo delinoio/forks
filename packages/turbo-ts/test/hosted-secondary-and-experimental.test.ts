@@ -17,6 +17,7 @@ import {
   createServer as createHttp2Server,
   constants as http2Constants,
 } from "node:http2";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -166,6 +167,30 @@ const requestBody = (request: IncomingMessage): Promise<string> =>
     });
     request.once("end", () => resolve(body));
     request.once("error", reject);
+  });
+
+const rawLoopbackStatus = (port: number, target: string): Promise<number> =>
+  new Promise((resolve, reject) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    let response = "";
+    socket.setEncoding("utf8");
+    socket.once("connect", () => {
+      socket.write(
+        `GET ${target} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`,
+      );
+    });
+    socket.on("data", (chunk: string) => {
+      response += chunk;
+    });
+    socket.once("end", () => {
+      const status = /^HTTP\/1\.1 (\d{3})/.exec(response)?.[1];
+      if (status === undefined) {
+        reject(new Error(`loopback response omitted a status: ${response}`));
+        return;
+      }
+      resolve(Number(status));
+    });
+    socket.once("error", reject);
   });
 
 const withServer = async <A>(
@@ -376,6 +401,9 @@ const exerciseDevtools = async (
     }
     const authorized = new URL(accessedUrl);
     expect(authorized.searchParams.get("token")).toBe(token);
+    if (mode === "browser") {
+      expect(await rawLoopbackStatus(port, "http://[")).toBe(400);
+    }
     const pageResponse = await fetch(authorized);
     expect(pageResponse.status).toBe(200);
     const page = await pageResponse.text();
@@ -1178,12 +1206,13 @@ describe("hosted compatibility", () => {
     }
   });
 
-  it("rejects invalid and repeated hosted team pagination cursors", async () => {
+  it("rejects invalid, repeated, and unbounded hosted team pagination cursors", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-team-pages-"));
     const root = join(directory, "repository");
     await prepareRepository(root);
     try {
-      for (const scenario of ["invalid", "repeated"] as const) {
+      for (const scenario of ["invalid", "repeated", "unbounded"] as const) {
+        let page = 0;
         await withServer(
           (request) =>
             request.url === "/v2/user"
@@ -1199,7 +1228,12 @@ describe("hosted compatibility", () => {
                     JSON.stringify({
                       teams: [],
                       pagination: {
-                        next: scenario === "invalid" ? "invalid" : 123,
+                        next:
+                          scenario === "invalid"
+                            ? "invalid"
+                            : scenario === "repeated"
+                              ? 123
+                              : ++page,
                       },
                     }),
                   ]
@@ -1221,20 +1255,24 @@ describe("hosted compatibility", () => {
             expect(result.stderr).toContain(
               scenario === "invalid"
                 ? "invalid pagination cursor"
-                : "repeated pagination cursor",
+                : scenario === "repeated"
+                  ? "repeated pagination cursor"
+                  : "exceeded the 100 page limit",
             );
             expect(
               requests.filter((request) =>
                 request.path.startsWith("/v2/teams?"),
               ),
-            ).toHaveLength(scenario === "invalid" ? 1 : 2);
+            ).toHaveLength(
+              scenario === "invalid" ? 1 : scenario === "repeated" ? 2 : 100,
+            );
           },
         );
       }
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   it("passes complete browser URLs without Windows command expansion", () => {
     const url =
@@ -1380,6 +1418,9 @@ describe("hosted compatibility", () => {
             expect((await Effect.runPromise(Fiber.poll(fiber)))._tag).toBe(
               "None",
             );
+            expect(
+              await rawLoopbackStatus(Number(callback.port), "http://["),
+            ).toBe(400);
             const invokeCallback = async (): Promise<Response> => {
               try {
                 return await fetch(callback);
@@ -3715,7 +3756,7 @@ describe("hosted protocols and experimental transports", () => {
     await withServer(
       (request) =>
         request.method === "HEAD"
-          ? [200, {}, ""]
+          ? [200, { "content-length": "128" }, ""]
           : [200, {}, "unexpected redirected response body"],
       async (destination, destinationRequests) => {
         await withServer(

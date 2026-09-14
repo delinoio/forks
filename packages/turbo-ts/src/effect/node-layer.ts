@@ -3164,8 +3164,8 @@ const readResponseBody = async (
   response: Response,
   maxBytes: number | undefined,
 ): Promise<Uint8Array> => {
-  await validateResponseContentLength(response, maxBytes);
   if (response.body === null) return new Uint8Array();
+  await validateResponseContentLength(response, maxBytes);
   const reader = response.body.getReader();
   const chunks: Array<Uint8Array> = [];
   let length = 0;
@@ -3200,11 +3200,11 @@ const writeResponseBodyToFile = async (
   maxBytes: number | undefined,
   signal: AbortSignal,
 ): Promise<void> => {
-  await validateResponseContentLength(response, maxBytes);
   if (response.body === null) {
     await writeFile(destination, new Uint8Array());
     return;
   }
+  await validateResponseContentLength(response, maxBytes);
   let length = 0;
   const limiter = new Transform({
     transform(chunk: Buffer, _encoding, callback) {

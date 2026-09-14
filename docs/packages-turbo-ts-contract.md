@@ -962,8 +962,10 @@ origin at `/turborepo/token`, and accepts a token through a scoped loopback
 callback protected by a fresh UUID v7 state value. The callback response is
 sent before the token is validated and persisted, post-response work remains
 supervised by the loopback server scope, and neither the state nor the token is
-written to terminal output. Browser launcher errors and nonzero exits fail with
-manual-token guidance instead of waiting indefinitely for a callback.
+written to terminal output. Malformed callback request targets return HTTP 400
+without terminating the login process. Browser launcher errors and nonzero
+exits fail with manual-token guidance instead of waiting indefinitely for a
+callback.
 An explicit `--sso-team` adds the team slug
 to the browser authorization request and suppresses lower-precedence team IDs
 during validation. Manual and non-interactive login continue
@@ -982,7 +984,8 @@ creating or replacing `config.json`.
 Link discovery uses the hosted user and team endpoints, verifies artifact
 status is exactly `enabled`, offers the personal user scope alongside team
 scopes, follows the hosted teams endpoint's `pagination.next` cursor through
-the `until` query parameter until every page is collected, and prompts
+the `until` query parameter until every page is collected, and fails before
+requesting a 101st team page. It prompts
 interactive users to select a scope when none is configured.
 Linking requires confirmation unless the valueless `--yes` or `-y` flag is
 supplied; attached values are rejected. A non-interactive link must supply a
@@ -1010,9 +1013,11 @@ cookies, API keys, tokens, credentials, secrets, signatures, and all other
 caller-provided custom headers before crossing an origin. Only safe
 representation headers and the user agent are retained. Redirect-policy
 failures are non-retryable. A `HEAD` request remains `HEAD` across a 303
-redirect. A remote status probe enables artifact traffic only when its bounded
-JSON document reports `status` exactly `enabled`; any other response or probe
-failure disables remote transport for that run while local execution
+redirect, and a bodyless HEAD response ignores a representation
+`Content-Length` when enforcing its zero-byte body limit. A remote status probe
+enables artifact traffic only when its bounded JSON document reports `status`
+exactly `enabled`; any other response or probe failure disables remote
+transport for that run while local execution
 continues. Local-only, configuration-disabled remote,
 no-cache, graph, and dry runs do not load remote credentials or probe hosted
 status; explicit OTLP token reuse may still read the shared user token without
@@ -1068,7 +1073,8 @@ loopback URL and passes its bearer URL only to the browser launcher. When
 `--no-open` is selected, the launcher is unavailable, or launch fails, devtools
 prints the authenticated loopback URL once for manual access. The authenticated
 root page renders the package and dependency graph exposed by the JSON graph
-route. Boundary filters select the packages that own the evaluated rules using
+Malformed devtools request targets return HTTP 400 without terminating the
+server. Boundary filters select the packages that own the evaluated rules using
 normal package-selector semantics. `--ignore=prompt` asks once before ignoring
 found violations, accepts only `y` or `yes`, skips prompting when no violation
 exists, and fails safely without an interactive terminal. Hidden `config`

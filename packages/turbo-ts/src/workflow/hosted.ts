@@ -16,6 +16,7 @@ import {
 } from "../effect/services.js";
 import { packageVersion } from "../version.js";
 import { browserInvocation } from "./browser.js";
+import { parseLoopbackRequestTarget } from "./loopback.js";
 import { resolveWorkflowRepositoryRoot } from "./repository.js";
 
 type HostedCommand = "link" | "login" | "logout" | "unlink";
@@ -48,6 +49,8 @@ interface HostedTeam {
   readonly name: string;
   readonly slug: string;
 }
+
+const maximumHostedTeamPages = 100;
 
 const fail = (message: string): ConfigurationError =>
   new ConfigurationError({ path: "<arguments>", message });
@@ -328,7 +331,10 @@ const requestInteractiveLoginToken = (
       const state = yield* randomness.uuidV7;
       const token = yield* Deferred.make<string>();
       const server = yield* loopback.serve(0, (request) => {
-        const callback = new URL(request.path, "http://127.0.0.1");
+        const callback = parseLoopbackRequestTarget(request.path);
+        if (callback === undefined) {
+          return Effect.succeed({ status: 400, body: "Bad Request" });
+        }
         if (request.method !== "GET" || callback.pathname !== "/") {
           return Effect.succeed({ status: 404, body: "Not Found" });
         }
@@ -521,7 +527,18 @@ const availableHostedTeams = (
     const teams: Array<HostedTeam> = [];
     const seenCursors = new Set<number>();
     let cursor: number | undefined;
+    let pageCount = 0;
     for (;;) {
+      if (pageCount >= maximumHostedTeamPages) {
+        return yield* Effect.fail(
+          new BoundaryError({
+            boundary: "hosted",
+            message: `team lookup exceeded the ${maximumHostedTeamPages} page limit`,
+            retryable: false,
+          }),
+        );
+      }
+      pageCount += 1;
       const teamsUrl = withPath(settings.api, "/v2/teams");
       teamsUrl.searchParams.set("limit", "100");
       if (cursor !== undefined) {

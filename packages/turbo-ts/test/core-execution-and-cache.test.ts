@@ -14038,7 +14038,10 @@ describe("cache interoperability and safety", () => {
         }
         if (request.method === "HEAD") {
           methods.push("HEAD");
-          response.writeHead(headFails ? 403 : artifactExists ? 200 : 404);
+          response.writeHead(
+            headFails ? 403 : artifactExists ? 200 : 404,
+            artifactExists ? { "content-length": "1024" } : {},
+          );
           response.end();
           return;
         }

@@ -10,6 +10,7 @@ import {
   TerminalService,
 } from "../effect/services.js";
 import { browserInvocation } from "./browser.js";
+import { parseLoopbackRequestTarget } from "./loopback.js";
 import { loadWorkflowRepository } from "./repository.js";
 
 interface DevtoolsOptions {
@@ -99,7 +100,10 @@ export const executeDevtools = (
       const graph = JSON.stringify(graphDocument);
       const page = `<!doctype html><title>turbo-ts devtools</title><main><h1>turbo-ts package graph</h1><pre>${escapeHtml(JSON.stringify(graphDocument, undefined, 2))}</pre></main>`;
       const server = yield* http.serve(options.port, (request) => {
-        const url = new URL(request.path, "http://127.0.0.1");
+        const url = parseLoopbackRequestTarget(request.path);
+        if (url === undefined) {
+          return Effect.succeed({ status: 400, body: "Bad Request" });
+        }
         if (url.searchParams.get("token") !== token) {
           return Effect.succeed({ status: 403, body: "Forbidden" });
         }
