@@ -1,4 +1,5 @@
 import { Effect } from "effect";
+import validateNpmPackageName from "validate-npm-package-name";
 import { parseCommonArguments } from "../cli/common-options.js";
 import { parseJsonConfiguration } from "../config/runtime.js";
 import {
@@ -300,31 +301,8 @@ const copyTree = (
     }
   });
 
-const workspaceNameSegmentPattern = /^[a-z0-9._~-]+$/;
-
-const validWorkspaceNameSegment = (
-  value: string,
-  allowLeadingDotOrUnderscore: boolean,
-): boolean =>
-  value !== "." &&
-  value !== ".." &&
-  workspaceNameSegmentPattern.test(value) &&
-  (allowLeadingDotOrUnderscore || !/^[._]/.test(value));
-
-const validWorkspaceName = (name: string): boolean => {
-  if (name.length === 0 || name.length > 214 || name !== name.toLowerCase()) {
-    return false;
-  }
-  if (!name.startsWith("@")) {
-    return validWorkspaceNameSegment(name, false);
-  }
-  const separator = name.indexOf("/");
-  if (separator <= 1 || separator !== name.lastIndexOf("/")) return false;
-  return (
-    validWorkspaceNameSegment(name.slice(1, separator), false) &&
-    validWorkspaceNameSegment(name.slice(separator + 1), true)
-  );
-};
+const validWorkspaceName = (name: string): boolean =>
+  validateNpmPackageName(name).validForNewPackages;
 
 const executeWorkspaceGenerator = (
   root: string,

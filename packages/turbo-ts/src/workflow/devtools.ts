@@ -44,6 +44,9 @@ export const parseDevtoolsArguments = (
     const argument = parsed.remaining[index]!;
     const name = argument.split("=", 1)[0]!;
     if (name === "--no-open") {
+      if (argument !== name) {
+        throw failure(`${name} does not accept a value`);
+      }
       noOpen = true;
       continue;
     }

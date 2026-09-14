@@ -1064,9 +1064,10 @@ identify tasks that were actually bypassed as skipped. Numeric task and run
 attributes use OTLP integer values for every protocol. Environment header names
 and values are percent-decoded after comma-separated entries are split, so an
 encoded comma remains part of its header value. Malformed percent encodings are
-preserved literally. Empty and zero OTLP timeouts use the finite default, and
-CLI timeout values above Node's 2,147,483,647-millisecond timer limit are
-rejected during argument parsing. A generic HTTP OTLP endpoint preserves its
+preserved literally. Empty, zero, non-finite, and over-limit environment OTLP
+timeouts use the finite default. CLI timeout values above Node's
+2,147,483,647-millisecond timer limit are rejected during argument parsing. A
+generic HTTP OTLP endpoint preserves its
 path prefix and appends `/v1/metrics`. A positive metric interval emits scoped,
 sequential in-progress snapshots and a final snapshot; zero or an absent
 interval emits only the final snapshot. Graph and dry runs report the resolved
@@ -1082,9 +1083,10 @@ and encodes C0 and C1 controls in remote result titles and URLs before terminal
 display. Malformed result URLs are omitted independently so one invalid remote
 record does not suppress otherwise valid documentation results.
 During a successful automatic launch, devtools prints only its token-free
-loopback URL and passes its bearer URL only to the browser launcher. When
-`--no-open` is selected, the launcher is unavailable, or launch fails, devtools
-prints the authenticated loopback URL once for manual access. The authenticated
+loopback URL and passes its bearer URL only to the browser launcher. The
+`--no-open` flag is valueless and rejects attached values. When it is selected,
+the launcher is unavailable, or launch fails, devtools prints the authenticated
+loopback URL once for manual access. The authenticated
 root page renders the package and dependency graph exposed by the JSON graph
 Malformed devtools request targets return HTTP 400 without terminating the
 server. Boundary filters select the packages that own the evaluated rules using
@@ -1106,8 +1108,9 @@ Generator destinations are validated through canonical existing ancestors,
 and recursive copies whose source contains their destination are rejected.
 Explicit generator roots must resolve from an existing directory through
 repository discovery before any destination is created.
-Requested workspace names must be npm-compatible. The `--empty` workspace flag
-is valueless and rejects attached values. Copied workspace templates require an
+Requested workspace names must be valid for new npm packages, including
+reserved-name and core-module exclusions. The `--empty` workspace flag is
+valueless and rejects attached values. Copied workspace templates require an
 object `package.json`, preserve its other fields, and atomically rewrite `name`
 to the requested workspace name. Workspace type accepts only `app` or `package`
 and is validated before a destination is created. Failed template validation,

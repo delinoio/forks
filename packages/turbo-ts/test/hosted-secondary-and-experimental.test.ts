@@ -2061,6 +2061,16 @@ describe("secondary command and parser compatibility", () => {
         "does not accept a value",
       );
     }
+    expect(parseDevtoolsArguments(["--no-open"]).noOpen).toBe(true);
+    for (const attachedNoOpen of [
+      "--no-open=",
+      "--no-open=false",
+      "--no-open=true",
+    ]) {
+      expect(() => parseDevtoolsArguments([attachedNoOpen])).toThrow(
+        "does not accept a value",
+      );
+    }
     expect(
       parseCommonArguments(["--experimental-otel-timeout-ms=2147483647"])
         .options.openTelemetry.timeoutMilliseconds,
@@ -2261,6 +2271,33 @@ describe("secondary command and parser compatibility", () => {
           "workspace generation requires a valid --name",
         );
         await expect(access(join(root, destination))).rejects.toThrow();
+      }
+      for (const name of [
+        "node_modules",
+        "favicon.ico",
+        "http",
+        "workspace~name",
+      ]) {
+        const destination = join(
+          root,
+          "packages",
+          name.replace(/^@[^/]+\//, ""),
+        );
+        const invalidName = await runCandidate(
+          [
+            "generate",
+            "workspace",
+            `--name=${name}`,
+            "--empty",
+            `--root=${root}`,
+          ],
+          root,
+        );
+        expect(invalidName.code).toBe(1);
+        expect(invalidName.stderr).toContain(
+          "workspace generation requires a valid --name",
+        );
+        await expect(access(destination)).rejects.toThrow();
       }
       const scopedWorkspace = await runCandidate(
         [
@@ -3513,9 +3550,15 @@ describe("hosted protocols and experimental transports", () => {
     );
 
     for (const configuredTimeout of [
-      { option: 0, environment: undefined },
-      { option: undefined, environment: "" },
-      { option: undefined, environment: "0" },
+      { option: 0, environment: undefined, expected: 10_000 },
+      { option: undefined, environment: "", expected: 10_000 },
+      { option: undefined, environment: "0", expected: 10_000 },
+      {
+        option: undefined,
+        environment: "2147483647",
+        expected: 2_147_483_647,
+      },
+      { option: undefined, environment: "2147483648", expected: 10_000 },
     ] as const) {
       await Effect.runPromise(
         exportRunMetrics(
@@ -3548,7 +3591,9 @@ describe("hosted protocols and experimental transports", () => {
           Effect.provide(clockLayer),
         ),
       );
-      expect(requests.at(-1)?.timeoutMilliseconds).toBe(10_000);
+      expect(requests.at(-1)?.timeoutMilliseconds).toBe(
+        configuredTimeout.expected,
+      );
     }
   });
 

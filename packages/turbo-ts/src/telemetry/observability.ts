@@ -3,6 +3,7 @@ import type {
   OpenTelemetryOptions,
   OtlpProtocol,
 } from "../cli/common-options.js";
+import { maximumNodeTimerMilliseconds } from "../core/time.js";
 import { BoundaryError } from "../effect/errors.js";
 import {
   ClockService,
@@ -361,7 +362,9 @@ export const exportRunMetrics = (
     );
     const configuredTimeout = options.timeoutMilliseconds ?? environmentTimeout;
     const timeoutMilliseconds =
-      Number.isFinite(configuredTimeout) && configuredTimeout > 0
+      Number.isFinite(configuredTimeout) &&
+      configuredTimeout > 0 &&
+      configuredTimeout <= maximumNodeTimerMilliseconds
         ? configuredTimeout
         : 10_000;
     const reservedHeaderNames = new Set([
