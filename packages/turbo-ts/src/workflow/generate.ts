@@ -136,6 +136,9 @@ export const parseGenerateArguments = (
         break;
       case "--empty":
       case "-b":
+        if (argument !== option) {
+          throw failure(`${option} does not accept a value`);
+        }
         empty = true;
         break;
       case "--example-path":

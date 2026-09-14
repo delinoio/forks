@@ -3611,9 +3611,12 @@ export const executeRun = (
       remoteCacheActive &&
       explicitRemoteToken === undefined &&
       projectCredentials?.apiUrl !== undefined;
-    const userCredentials =
-      remoteCacheNeedsStoredToken || telemetryNeedsStoredToken
-        ? yield* credentialService!.readUserConfiguration
+    const userCredentials = remoteCacheNeedsStoredToken
+      ? yield* credentialService!.readUserConfiguration
+      : telemetryNeedsStoredToken
+        ? yield* credentialService!.readUserConfiguration.pipe(
+            Effect.catchAll(() => Effect.succeed(undefined)),
+          )
         : undefined;
     const availableParallelism = yield* concurrencyService.availableParallelism;
     const unresolvedOptions = resolveOptions(

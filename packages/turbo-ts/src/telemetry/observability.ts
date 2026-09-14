@@ -355,12 +355,16 @@ export const exportRunMetrics = (
       Number.isFinite(configuredTimeout) && configuredTimeout > 0
         ? configuredTimeout
         : 10_000;
+    const reservedHeaderNames = new Set([
+      "content-type",
+      ...(protocol === "grpc" ? ["te"] : []),
+    ]);
     const configuredHeaders = [
       ...parseEnvironmentHeaders(
         yield* environment.get("OTEL_EXPORTER_OTLP_HEADERS"),
       ),
       ...options.headers,
-    ];
+    ].filter(([name]) => !reservedHeaderNames.has(name.toLowerCase()));
     const headers: Record<string, string> = {
       "content-type":
         protocol === "grpc"

@@ -910,8 +910,9 @@ patterns are merged into task hash inputs, and their repository-relative Git
 blob hashes are reported in summary `globalCacheInputs.files`, including when a
 valid requested task is filtered to a successful no-op. Dry runs do not perform local
 cache eviction, and
-`info` derives WSL status from the Linux kernel release. Log-prefix selection
-applies to live and cached output. Summaries record
+`info` derives WSL status from the Linux kernel release and honors the custom
+root Turbo configuration path. Log-prefix selection applies to live and cached
+output. Summaries record
 the actual local or remote cache source and saved duration, and summaries and
 profiles use each task's scheduling timestamps. Generated profiles omit tasks
 that were never scheduled, while summary task entries represent them with a
@@ -1001,16 +1002,17 @@ failure disables remote transport for that run while local execution
 continues. Local-only, configuration-disabled remote,
 no-cache, graph, and dry runs do not load remote credentials or probe hosted
 status; explicit OTLP token reuse may still read the shared user token without
-activating remote cache. A shared stored token activates remote cache only for
-a project configuration with a persisted linked API URL; an absent or empty
-project configuration does not activate it. Explicit CLI and environment
-tokens may activate the default API. An explicit team slug
-suppresses lower-precedence stored team IDs. Hosted and OTLP requests identify
-as `turbo-ts/0.1.0`. Runtime remote API selection uses CLI, environment, linked
-project, root configuration, and default values in descending precedence, so a
-linked project's stored token is never redirected by a lower-precedence root
-API setting. A linked project's team ID likewise takes precedence over a root
-remote-cache team ID, and its team slug takes precedence over a root
+activating remote cache. A shared credential read needed only for optional OTLP
+token reuse is best-effort and cannot prevent task execution. A shared stored
+token activates remote cache only for a project configuration with a persisted
+linked API URL; an absent or empty project configuration does not activate it.
+Explicit CLI and environment tokens may activate the default API. An explicit
+team slug suppresses lower-precedence stored team IDs. Hosted and OTLP requests
+identify as `turbo-ts/0.1.0`. Runtime remote API selection uses CLI,
+environment, linked project, root configuration, and default values in
+descending precedence, so a linked project's stored token is never redirected
+by a lower-precedence root API setting. A linked project's team ID likewise
+takes precedence over a root remote-cache team ID, and its team slug takes precedence over a root
 remote-cache team slug. Remote cache hit events are emitted only after signature
 verification, decompression, and archive restoration succeed.
 Write-only remote publication issues an artifact HEAD request before upload,
@@ -1024,12 +1026,13 @@ the persisted preference. OTLP run metrics support HTTP/JSON,
 HTTP/Protobuf, and HTTP/2 gRPC framing with required successful gRPC trailers,
 bounded request timeouts, environment and CLI headers, resource attributes,
 run-summary and task-detail selection, and an explicit opt-in to reuse the
-resolved remote cache token. Every exported run and task gauge point carries
-the export observation time in Unix nanoseconds. Task-detail metrics report
-actual execution and cache outcomes. Periodic snapshots omit tasks that have
-not reached an outcome, while final and non-executing snapshots identify tasks
-that were actually bypassed as skipped. Numeric task and run attributes use
-OTLP integer values for every protocol. Empty and zero OTLP timeouts use the
+resolved remote cache token. Configured headers cannot replace the required
+content type or gRPC trailer negotiation header. Every exported run and task
+gauge point carries the export observation time in Unix nanoseconds. Task-detail
+metrics report actual execution and cache outcomes. Periodic snapshots omit
+tasks that have not reached an outcome, while final and non-executing snapshots
+identify tasks that were actually bypassed as skipped. Numeric task and run
+attributes use OTLP integer values for every protocol. Empty and zero OTLP timeouts use the
 finite default. A generic HTTP OTLP endpoint preserves its
 path prefix and appends `/v1/metrics`. A positive metric interval emits scoped,
 sequential in-progress snapshots and a final snapshot; zero or an absent
@@ -1064,9 +1067,10 @@ path normalization. The repository root package remains eligible to own the
 selected microfrontend configuration.
 Generator destinations are validated through canonical existing ancestors,
 and recursive copies whose source contains their destination are rejected.
-Requested workspace names must be npm-compatible. Copied workspace templates
-require an object `package.json`, preserve its other fields, and atomically
-rewrite `name` to the requested workspace name. Failed template copies or
+Requested workspace names must be npm-compatible. The `--empty` workspace flag
+is valueless and rejects attached values. Copied workspace templates require an
+object `package.json`, preserve its other fields, and atomically rewrite `name`
+to the requested workspace name. Failed template copies or
 manifest rewrites remove the partial destination only when the generator
 acquired that destination exclusively, so a concurrently created destination
 is preserved. Configured generators collect unresolved prompt answers through

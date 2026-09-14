@@ -800,6 +800,24 @@ describe("repository workflow gate", () => {
       await expect(
         execFilePromise(process.execPath, [candidate, "info", "--cwd"]),
       ).rejects.toThrow(/--cwd requires a value/);
+      const defaultTurboJsonPath = join(directory, "turbo.json");
+      const defaultTurboJson = await readFile(defaultTurboJsonPath, "utf8");
+      const infoTurboJson = "info-turbo.json";
+      await writeFile(join(directory, infoTurboJson), defaultTurboJson);
+      await writeFile(defaultTurboJsonPath, "invalid default configuration");
+      const configuredInfo = await executeDifferentialCommand(
+        process.execPath,
+        [
+          candidate,
+          "--cwd",
+          directory,
+          "--root-turbo-json",
+          infoTurboJson,
+          "info",
+        ],
+      );
+      await writeFile(defaultTurboJsonPath, defaultTurboJson);
+      expect(configuredInfo.stdout).toContain("Package manager: pnpm9");
       const listed = await executeDifferentialCommand(process.execPath, [
         candidate,
         "--cwd",

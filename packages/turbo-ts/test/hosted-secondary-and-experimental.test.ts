@@ -1619,6 +1619,11 @@ describe("secondary command and parser compatibility", () => {
       type: "app",
       workspace: true,
     });
+    for (const attachedEmpty of ["--empty=false", "-b=false"]) {
+      expect(() =>
+        parseGenerateArguments(["workspace", attachedEmpty]),
+      ).toThrow("does not accept a value");
+    }
     expect(
       selectCurrentPackage(
         [
@@ -2619,7 +2624,12 @@ describe("hosted protocols and experimental transports", () => {
       argv: Effect.succeed([]),
       cwd: Effect.succeed("/synthetic"),
       platform: Effect.succeed(process.platform),
-      get: () => Effect.succeed(undefined),
+      get: (name) =>
+        Effect.succeed(
+          name === "OTEL_EXPORTER_OTLP_HEADERS"
+            ? "Content-Type=text/plain"
+            : undefined,
+        ),
       entries: Effect.succeed({}),
     });
     const observationTimeMilliseconds = 1_700_000_000_123;
@@ -2656,7 +2666,10 @@ describe("hosted protocols and experimental transports", () => {
             enabled: true,
             protocol,
             endpoint: "http://127.0.0.1:4318",
-            headers: [["x-synthetic", "yes"]],
+            headers: [
+              ["CONTENT-TYPE", "application/octet-stream"],
+              ["x-synthetic", "yes"],
+            ],
             resources: [["deployment.environment", "test"]],
             useRemoteCacheToken: true,
           },
@@ -2668,6 +2681,13 @@ describe("hosted protocols and experimental transports", () => {
     expect(
       requests.map((request) => request.headers?.["content-type"]),
     ).toEqual(["application/json", "application/x-protobuf"]);
+    for (const request of requests) {
+      expect(
+        Object.keys(request.headers ?? {}).filter(
+          (name) => name.toLowerCase() === "content-type",
+        ),
+      ).toEqual(["content-type"]);
+    }
     expect(requests.map((request) => request.url)).toEqual([
       "http://127.0.0.1:4318/v1/metrics",
       "http://127.0.0.1:4318/v1/metrics",
@@ -3014,7 +3034,11 @@ describe("hosted protocols and experimental transports", () => {
       enabled: true,
       protocol: "grpc" as const,
       endpoint: `http://127.0.0.1:${address.port}`,
-      headers: [["x-synthetic", "yes"]] as const,
+      headers: [
+        ["Content-Type", "text/plain"],
+        ["TE", "identity"],
+        ["x-synthetic", "yes"],
+      ] as const,
       resources: [],
     };
     const summary = { exitCode: 0, taskCount: 0, tasks: [] };
@@ -3030,6 +3054,10 @@ describe("hosted protocols and experimental transports", () => {
       expect(requests[0]?.headers[http2Constants.HTTP2_HEADER_PATH]).toBe(
         "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
       );
+      expect(
+        requests[0]?.headers[http2Constants.HTTP2_HEADER_CONTENT_TYPE],
+      ).toBe("application/grpc");
+      expect(requests[0]?.headers.te).toBe("trailers");
       expect(requests[0]?.body[0]).toBe(0);
 
       grpcStatus = "7";
@@ -3055,7 +3083,11 @@ describe("hosted protocols and experimental transports", () => {
     await prepareRepository(root);
     try {
       await withServer(
-        () => [200, { "content-type": "application/json" }, "{}"],
+        (request) => [
+          request.headers.authorization === undefined ? 401 : 200,
+          { "content-type": "application/json" },
+          "{}",
+        ],
         async (baseUrl, requests) => {
           const commonArguments = [
             "run",
@@ -3107,6 +3139,13 @@ describe("hosted protocols and experimental transports", () => {
             metrics.map((metric: { readonly name: string }) => metric.name),
           ).toEqual(["turbo.task"]);
           expect(JSON.stringify(metrics)).toContain("synthetic-app#build");
+
+          await writeFile(userPath, "invalid user credentials");
+          const invalidStoredToken = await runCandidate(commonArguments, root, {
+            XDG_CONFIG_HOME: configurationHome,
+          });
+          expect(invalidStoredToken.code, invalidStoredToken.stderr).toBe(0);
+          expect(requests[2]?.headers.authorization).toBeUndefined();
         },
       );
     } finally {

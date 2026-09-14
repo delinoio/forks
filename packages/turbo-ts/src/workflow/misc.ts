@@ -79,41 +79,22 @@ export const executeInfo = (
   | TerminalService
 > =>
   Effect.gen(function* () {
-    let cwd: string | undefined;
-    for (let index = 0; index < arguments_.length; index += 1) {
-      const argument = arguments_[index]!;
-      if (argument === "--cwd" || argument.startsWith("--cwd=")) {
-        if (argument.includes("=")) {
-          cwd = argument.slice(argument.indexOf("=") + 1);
-        } else {
-          const value = arguments_[index + 1];
-          if (value === undefined || value.startsWith("-")) {
-            return yield* Effect.fail(
-              new ConfigurationError({
-                path: "<arguments>",
-                message: "--cwd requires a value",
-              }),
-            );
-          }
-          cwd = value;
-          index += 1;
-        }
-      } else if (
-        argument !== "--no-color" &&
-        argument !== "--no-update-notifier"
-      ) {
-        return yield* Effect.fail(
-          new ConfigurationError({
-            path: "<arguments>",
-            message: `unknown option: ${argument}`,
-          }),
-        );
-      }
+    const parsed = parseCommonArguments(arguments_);
+    if (parsed.remaining.length > 0) {
+      return yield* Effect.fail(
+        new ConfigurationError({
+          path: "<arguments>",
+          message: `unknown option: ${parsed.remaining[0]}`,
+        }),
+      );
     }
     const terminal = yield* TerminalService;
     const environment = yield* EnvironmentService;
     const system = yield* SystemService;
-    const repository = yield* loadWorkflowRepository({ cwd });
+    const repository = yield* loadWorkflowRepository({
+      cwd: parsed.options.cwd,
+      rootTurboJson: parsed.options.rootTurboJson,
+    });
     const daemonRunning = yield* daemonIsRunning(repository.root);
     const information = yield* system.information;
     const executable =
