@@ -1379,12 +1379,12 @@ describe("core CLI execution", () => {
     }
   }, 20_000);
 
-  it("serializes cache publication across concurrent task completions", async () => {
+  it("limits cache publication to the configured worker count", async () => {
     let activePublications = 0;
     let maximumActivePublications = 0;
     await Effect.runPromise(
       Effect.gen(function* () {
-        const withCachePublicationPermit = yield* makeCachePublicationPermit;
+        const withCachePublicationPermit = yield* makeCachePublicationPermit(2);
         const publication = withCachePublicationPermit(
           Effect.acquireUseRelease(
             Effect.sync(() => {
@@ -1401,12 +1401,12 @@ describe("core CLI execution", () => {
               }),
           ),
         );
-        yield* Effect.all([publication, publication], {
+        yield* Effect.all([publication, publication, publication], {
           concurrency: "unbounded",
         });
       }),
     );
-    expect(maximumActivePublications).toBe(1);
+    expect(maximumActivePublications).toBe(2);
   });
 
   it("preserves task success when cache output collection fails", async () => {

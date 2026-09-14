@@ -320,9 +320,10 @@ are skipped before contents are read. Sequential bounded reads enforce the
 remaining aggregate budget when an output grows after metadata collection; an
 over-limit read skips publication with a warning that preserves the successful
 task result.
-Output collection and cache publication are serialized within a run so
-concurrent task completion cannot multiply the archive writer's bounded memory
-footprint.
+The `--cache-workers` option overrides `TURBO_CACHE_WORKERS`, defaults to 10,
+and limits concurrent output collection and cache publication within a run.
+Worker counts must be positive integers, so archive writer memory remains
+bounded by the configured concurrency and per-archive limits.
 Tar headers, padding, PAX metadata, and end markers have an independent 64 MiB
 preflight limit that is enforced before archive chunks are constructed.
 Companion task hashes participate in the owning task's cache key. Local eviction

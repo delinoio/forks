@@ -975,6 +975,7 @@ version = "1.0.0"
     const parsed = parseRunArguments(["run", "build"]);
     const environment = {
       turbo_cache: "local:rw,remote:rw",
+      turbo_cache_workers: "3",
       turbo_remote_only: "1",
       turbo_remote_cache_read_only: "1",
       turbo_concurrency: "2",
@@ -1002,6 +1003,7 @@ version = "1.0.0"
       concurrency: 2,
       environmentMode: "loose",
       cacheDirectory: "/repo/.cache",
+      cacheWorkers: 3,
       cachePolicy: {
         localRead: false,
         localWrite: false,
@@ -1030,6 +1032,7 @@ version = "1.0.0"
       ),
     ).toMatchObject({
       cacheDirectory: "/repo/.turbo/cache",
+      cacheWorkers: 10,
       force: false,
       colorEnabled: true,
       remote: undefined,

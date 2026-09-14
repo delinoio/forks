@@ -713,8 +713,11 @@ export const executeHostedCommand = (
             "DELETE",
             token,
             settings.timeoutMilliseconds,
-          );
-          if (response.status < 200 || response.status >= 300) {
+          ).pipe(Effect.catchAll(() => Effect.succeed(undefined)));
+          if (
+            response !== undefined &&
+            (response.status < 200 || response.status >= 300)
+          ) {
             return yield* Effect.fail(
               new BoundaryError({
                 boundary: "hosted",

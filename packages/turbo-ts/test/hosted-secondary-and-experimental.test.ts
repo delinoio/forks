@@ -48,6 +48,7 @@ import {
   HttpService,
   ProcessService,
   RandomnessService,
+  type StoredUserConfiguration,
   TerminalService,
 } from "../src/effect/services.js";
 import { redactRecord, redactText } from "../src/logging/redaction.js";
@@ -767,6 +768,105 @@ describe("hosted compatibility", () => {
       await rm(directory, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it("removes the local token when persisted invalidation is unavailable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-logout-"));
+    const root = join(directory, "repository");
+    const token = "synthetic-logout-token";
+    await prepareRepository(root);
+    try {
+      const services = await Effect.runPromise(
+        Effect.gen(function* () {
+          return {
+            credentials: yield* CredentialService,
+            environment: yield* EnvironmentService,
+            http: yield* HttpService,
+            terminal: yield* TerminalService,
+          };
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      let storedUser: StoredUserConfiguration = {
+        retained: "synthetic-value",
+        token,
+      };
+      let invalidationUnavailable = true;
+      let output = "";
+      const requests: Array<HttpRequest> = [];
+      const overrides = Layer.mergeAll(
+        Layer.succeed(CredentialService, {
+          ...services.credentials,
+          readUserConfiguration: Effect.sync(() => storedUser),
+          writeUserConfiguration: (value) =>
+            Effect.sync(() => {
+              storedUser = value;
+            }),
+          readProjectConfiguration: () =>
+            Effect.succeed({ apiUrl: "https://api.example.test" }),
+        }),
+        Layer.succeed(EnvironmentService, {
+          ...services.environment,
+          cwd: Effect.succeed(root),
+          get: () => Effect.succeed(undefined),
+        }),
+        Layer.succeed(HttpService, {
+          ...services.http,
+          request: (request) =>
+            Effect.suspend(() => {
+              requests.push(request);
+              return invalidationUnavailable
+                ? Effect.fail(
+                    new BoundaryError({
+                      boundary: "http",
+                      message: "synthetic issuing API unavailable",
+                      retryable: true,
+                    }),
+                  )
+                : Effect.succeed({
+                    status: 401,
+                    headers: {},
+                    body: new Uint8Array(),
+                  });
+            }),
+        }),
+        Layer.succeed(TerminalService, {
+          ...services.terminal,
+          writeStdout: (text) =>
+            Effect.sync(() => {
+              output += text;
+            }),
+        }),
+      );
+      const logout = () =>
+        executeHostedCommand("logout", [`--cwd=${root}`]).pipe(
+          Effect.provide(overrides),
+          Effect.provide(nodeFoundationLayer),
+        );
+
+      expect(await Effect.runPromise(logout())).toBe(0);
+      expect(requests).toHaveLength(3);
+      expect(requests[0]).toMatchObject({
+        method: "DELETE",
+        url: "https://api.example.test/v3/user/tokens/current",
+      });
+      expect(storedUser).toEqual({ retained: "synthetic-value" });
+      expect(output).toContain(">>> Logged out");
+
+      storedUser = { retained: "synthetic-value", token };
+      invalidationUnavailable = false;
+      output = "";
+      requests.length = 0;
+      const rejected = await Effect.runPromise(Effect.either(logout()));
+      expect(rejected).toMatchObject({
+        _tag: "Left",
+        left: { message: "token invalidation failed with status 401" },
+      });
+      expect(requests).toHaveLength(1);
+      expect(storedUser).toEqual({ retained: "synthetic-value", token });
+      expect(output).toBe("");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 
   it("does not persist link state when the gitignore update fails", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-link-atomic-"));
