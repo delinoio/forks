@@ -18,6 +18,7 @@ import {
 } from "../effect/services.js";
 import { selectPackages } from "../graph/task-graph.js";
 import { packageVersion } from "../version.js";
+import { hostedUrl } from "./hosted.js";
 import { boundaryDiagnostics } from "./query.js";
 import {
   loadWorkflowRepository,
@@ -146,12 +147,14 @@ const executeConfig = (
       "TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT",
     );
     const remoteConfiguration = global?.remoteCache;
-    const apiUrl =
+    const apiUrl = hostedUrl(
       parsed.options.apiUrl ??
-      (yield* environmentValue("TURBO_API")) ??
-      project?.apiUrl ??
-      remoteConfiguration?.apiUrl ??
-      "https://vercel.com/api";
+        (yield* environmentValue("TURBO_API")) ??
+        project?.apiUrl ??
+        remoteConfiguration?.apiUrl ??
+        "https://vercel.com/api",
+      "API",
+    ).toString();
     const timeoutValue =
       parsed.options.remoteCacheTimeoutSeconds ??
       environmentTimeout ??
@@ -551,10 +554,7 @@ const readMicrofrontendPort = (
       repository.root,
       windowsPathSeparators,
     );
-    if (
-      currentPackage === undefined ||
-      currentPackage === repository.rootPackage
-    ) {
+    if (currentPackage === undefined) {
       return yield* Effect.fail(
         argumentError(
           "current directory does not belong to a named JavaScript package",

@@ -534,6 +534,10 @@ describe("configuration generation and compatibility ledger", () => {
         variants: ["--verbosity"],
       }),
       expect.objectContaining({
+        id: "cli.generate-workspace-example-path",
+        variants: ["--example-path", "-p"],
+      }),
+      expect.objectContaining({
         id: "cli.generate-workspace-dependencies",
         variants: ["--show-all-dependencies"],
       }),

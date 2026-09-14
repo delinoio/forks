@@ -24,7 +24,8 @@ artifacts. Hosted support includes shared credentials, link state,
 Vercel-compatible cache control traffic, telemetry consent, OTLP metrics,
 documentation search, internal generation, devtools, boundaries, and
 microfrontend ports. Only passing automated ledger rows are compatibility
-claims; runtime `--verbosity` logging behavior remains planned. Gate 2 is not closed
+claims; runtime `--verbosity` logging and workspace `--example-path` selection
+remain planned. Gate 2 is not closed
 because the independent composed task-hash serializer does not yet match the
 official 2.10.12 keys. The bidirectional cache tests prove archive and artifact
 transport compatibility using oracle-provided hashes, not end-to-end cache-key

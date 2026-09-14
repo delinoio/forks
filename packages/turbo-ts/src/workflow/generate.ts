@@ -26,11 +26,25 @@ interface GeneratorAction {
   readonly skipIfExists?: boolean;
 }
 
-interface LoadedGenerator {
+interface GeneratorPrompt {
+  readonly message: string;
+  readonly name: string;
+}
+
+interface LoadedGeneratorReady {
+  readonly kind: "ready";
   readonly description?: string;
   readonly actions: ReadonlyArray<GeneratorAction | string>;
   readonly answers: Readonly<Record<string, unknown>>;
 }
+
+interface LoadedGeneratorPrompts {
+  readonly kind: "prompts";
+  readonly answers: Readonly<Record<string, unknown>>;
+  readonly prompts: ReadonlyArray<GeneratorPrompt>;
+}
+
+type LoadedGenerator = LoadedGeneratorReady | LoadedGeneratorPrompts;
 
 interface GenerateOptions {
   readonly answers: Readonly<Record<string, string>>;
@@ -204,10 +218,15 @@ await module.default(api);
 const definition = generators.get(requestedName);
 if (definition === undefined) throw new TypeError("unknown generator: " + requestedName);
 const answers = { ...Object.fromEntries((definition.prompts ?? []).flatMap((prompt) => prompt && typeof prompt === "object" && typeof prompt.name === "string" && prompt.default !== undefined ? [[prompt.name, prompt.default]] : [])), ...supplied };
-const actions = typeof definition.actions === "function" ? await definition.actions(answers) : (definition.actions ?? []);
-const resolved = [];
-for (const action of actions) resolved.push(typeof action === "function" ? await action(answers) : action);
-process.stdout.write(JSON.stringify({ description: definition.description, actions: resolved, answers }));
+const unresolved = (definition.prompts ?? []).flatMap((prompt) => prompt && typeof prompt === "object" && typeof prompt.name === "string" && !Object.hasOwn(answers, prompt.name) ? [{ name: prompt.name, message: typeof prompt.message === "string" ? prompt.message : prompt.name }] : []);
+if (unresolved.length > 0) {
+  process.stdout.write(JSON.stringify({ kind: "prompts", prompts: unresolved, answers }));
+} else {
+  const actions = typeof definition.actions === "function" ? await definition.actions(answers) : (definition.actions ?? []);
+  const resolved = [];
+  for (const action of actions) resolved.push(typeof action === "function" ? await action(answers) : action);
+  process.stdout.write(JSON.stringify({ kind: "ready", description: definition.description, actions: resolved, answers }));
+}
 `;
 
 const locateGeneratorConfiguration = (
@@ -444,46 +463,76 @@ export const executeGenerate = (
             : joinPath(processCwd, options.root);
       if (options.workspace)
         return yield* executeWorkspaceGenerator(root, options);
-      if (options.generatorName === undefined) {
+      const generatorName = options.generatorName;
+      if (generatorName === undefined) {
         return yield* Effect.fail(failure("a generator name is required"));
       }
       const configuration = yield* locateGeneratorConfiguration(
         root,
         options.config,
       );
-      const encodedAnswers = JSON.stringify(options.answers);
       const executable =
         environment.executablePath === undefined
           ? "node"
           : yield* environment.executablePath;
-      const loadedResult = yield* processService.run({
-        command: executable,
-        args: [
-          "--input-type=module",
-          "--eval",
-          generatorLoader,
-          configuration,
-          options.generatorName,
-          encodedAnswers,
-        ],
-        cwd: root,
-        inheritEnvironment: true,
-        maxCapturedOutputCharacters: 1024 * 1024,
-      });
-      if (loadedResult.exitCode !== 0) {
-        return yield* Effect.fail(
-          new BoundaryError({
-            boundary: "generator",
-            message: "generator configuration failed",
-            retryable: false,
-          }),
-        );
-      }
-      let loaded: LoadedGenerator;
-      try {
-        loaded = JSON.parse(loadedResult.stdout) as LoadedGenerator;
-      } catch {
-        return yield* Effect.fail(failure("generator returned invalid output"));
+      const loadGenerator = (answers: Readonly<Record<string, unknown>>) =>
+        Effect.gen(function* () {
+          const loadedResult = yield* processService.run({
+            command: executable,
+            args: [
+              "--input-type=module",
+              "--eval",
+              generatorLoader,
+              configuration,
+              generatorName,
+              JSON.stringify(answers),
+            ],
+            cwd: root,
+            inheritEnvironment: true,
+            maxCapturedOutputCharacters: 1024 * 1024,
+          });
+          if (loadedResult.exitCode !== 0) {
+            return yield* Effect.fail(
+              new BoundaryError({
+                boundary: "generator",
+                message: "generator configuration failed",
+                retryable: false,
+              }),
+            );
+          }
+          try {
+            return JSON.parse(loadedResult.stdout) as LoadedGenerator;
+          } catch {
+            return yield* Effect.fail(
+              failure("generator returned invalid output"),
+            );
+          }
+        });
+      let loaded = yield* loadGenerator(options.answers);
+      if (loaded.kind === "prompts") {
+        const interactive =
+          terminal.stdinIsTerminal === undefined
+            ? false
+            : yield* terminal.stdinIsTerminal;
+        if (!interactive || terminal.readLine === undefined) {
+          return yield* Effect.fail(
+            failure(
+              "generator prompts require an interactive terminal or supplied --args",
+            ),
+          );
+        }
+        const answers: Record<string, unknown> = { ...loaded.answers };
+        for (const prompt of loaded.prompts) {
+          answers[prompt.name] = yield* terminal.readLine(
+            `${prompt.message}: `,
+          );
+        }
+        loaded = yield* loadGenerator(answers);
+        if (loaded.kind === "prompts") {
+          return yield* Effect.fail(
+            failure("generator prompts remain unresolved"),
+          );
+        }
       }
       const configurationDirectory = parentPath(configuration);
       const canonicalRoot = yield* canonicalExistingAncestorPath(

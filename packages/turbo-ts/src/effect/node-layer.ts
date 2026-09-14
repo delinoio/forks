@@ -52,7 +52,7 @@ import {
   tmpdir,
   userInfo,
 } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, posix, win32 } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { Readable, Transform, type Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -1727,23 +1727,43 @@ const credentialError = (_cause: unknown): BoundaryError =>
     retryable: false,
   });
 
-const userConfigurationDirectory = (): string => {
-  const configured = process.env.XDG_CONFIG_HOME;
-  if (configured !== undefined && configured !== "" && isAbsolute(configured)) {
-    return join(configured, "turborepo");
+export const resolveUserConfigurationDirectory = (
+  environment: Readonly<Record<string, string | undefined>>,
+  platform: NodeJS.Platform,
+  systemHome: string,
+): string => {
+  const paths = platform === "win32" ? win32 : posix;
+  if (!paths.isAbsolute(systemHome)) {
+    throw new TypeError("system home directory must be absolute");
   }
-  const home = process.env.HOME ?? userInfo().homedir;
-  if (process.platform === "darwin") {
-    return join(home, "Library", "Application Support", "turborepo");
+  const absoluteEnvironmentPath = (name: string): string | undefined => {
+    const value = environment[name];
+    return value !== undefined && value !== "" && paths.isAbsolute(value)
+      ? value
+      : undefined;
+  };
+  const configured = absoluteEnvironmentPath("XDG_CONFIG_HOME");
+  if (configured !== undefined) return paths.join(configured, "turborepo");
+  const home = absoluteEnvironmentPath("HOME") ?? systemHome;
+  if (platform === "darwin") {
+    return paths.join(home, "Library", "Application Support", "turborepo");
   }
-  if (process.platform === "win32") {
-    return join(
-      process.env.APPDATA ?? join(home, "AppData", "Roaming"),
+  if (platform === "win32") {
+    return paths.join(
+      absoluteEnvironmentPath("APPDATA") ??
+        paths.join(home, "AppData", "Roaming"),
       "turborepo",
     );
   }
-  return join(home, ".config", "turborepo");
+  return paths.join(home, ".config", "turborepo");
 };
+
+const userConfigurationDirectory = (): string =>
+  resolveUserConfigurationDirectory(
+    process.env,
+    process.platform,
+    userInfo().homedir,
+  );
 
 const userConfigurationPath = (): string =>
   join(userConfigurationDirectory(), "config.json");

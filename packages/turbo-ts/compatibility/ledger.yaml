@@ -207,8 +207,6 @@ rows:
       - -d
       - --type
       - -t
-      - --example-path
-      - -p
       - --output
       - --no-gitignore
       - --scope
@@ -228,6 +226,13 @@ rows:
       - test-only-arguments
     tests: [secondary.compatibility, hosted.compatibility, telemetry.compatibility, repository.workflows]
     source: black-box-help-and-issue-3
+  - id: cli.generate-workspace-example-path
+    category: option
+    subject: workspace generator example template path selection
+    targetGate: 4
+    status: planned
+    variants: [--example-path, -p]
+    source: public-documentation-and-black-box-help
   - id: cli.generate-workspace-dependencies
     category: option
     subject: workspace generator dependency selection visibility

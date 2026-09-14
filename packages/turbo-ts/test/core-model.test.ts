@@ -1097,6 +1097,7 @@ version = "1.0.0"
           apiUrl: "https://root.example.test/api",
           enabled: true,
           teamId: "root-team-id",
+          teamSlug: "root-team-slug",
         },
       },
     };
@@ -1105,6 +1106,7 @@ version = "1.0.0"
       project: {
         apiUrl: "https://linked.example.test/api",
         teamId: "linked-team-id",
+        teamSlug: "linked-team-slug",
       },
     };
     const linked = resolveOptions(
@@ -1118,6 +1120,7 @@ version = "1.0.0"
     );
     expect(linked.remote?.apiUrl).toBe("https://linked.example.test/api");
     expect(linked.remote?.teamId).toBe("linked-team-id");
+    expect(linked.remote?.teamSlug).toBe("linked-team-slug");
 
     const environment = resolveOptions(
       parseRunArguments(["run", "build"]),

@@ -944,14 +944,16 @@ unique node identifiers without truncated-hash collisions. `--skip-infer`
 disables framework environment inference for task hashing and execution.
 
 Gate 4 hosted and secondary surfaces have automated ledger evidence except for
-runtime verbosity logging and workspace dependency selection, which remain
-planned while `--verbosity` and `--show-all-dependencies` are only parsed.
+runtime verbosity logging, workspace example-path selection, and workspace
+dependency selection, which remain planned while `--verbosity`,
+`--example-path`, and `--show-all-dependencies` are only parsed.
 `login`,
 `link`, `logout`, and `unlink` share the official user configuration under the
 platform configuration directory and the repository `.turbo/config.json`.
 `login` updates only the user credential file and never creates or rewrites a
-repository configuration file. Relative `XDG_CONFIG_HOME` values are ignored in
-favor of the platform configuration directory.
+repository configuration file. Relative `XDG_CONFIG_HOME`, `HOME`, and Windows
+`APPDATA` values are ignored in favor of the absolute system home and platform
+configuration directory.
 Tokenless `login` requires an interactive terminal, opens the configured login
 origin at `/turborepo/token`, and accepts a token through a scoped loopback
 callback protected by a fresh UUID v7 state value. The callback response is
@@ -993,7 +995,8 @@ as `turbo-ts/0.1.0`. Runtime remote API selection uses CLI, environment, linked
 project, root configuration, and default values in descending precedence, so a
 linked project's stored token is never redirected by a lower-precedence root
 API setting. A linked project's team ID likewise takes precedence over a root
-remote-cache team ID. Remote cache hit events are emitted only after signature
+remote-cache team ID, and its team slug takes precedence over a root
+remote-cache team slug. Remote cache hit events are emitted only after signature
 verification, decompression, and archive restoration succeed.
 Write-only remote publication issues an artifact HEAD request before upload,
 skips PUT when the artifact already exists, and warns but continues to PUT when
@@ -1032,13 +1035,15 @@ filters select the packages that own the evaluated rules using normal
 package-selector semantics. `--ignore=prompt` asks once before ignoring found
 violations, accepts only `y` or `yes`, skips prompting when no violation exists,
 and fails safely without an interactive terminal. Hidden `config` suppresses
-lower-precedence team IDs when a CLI or environment team slug is selected.
+lower-precedence team IDs when a CLI or environment team slug is selected and
+validates the effective API URL before rendering it.
 Remote download and upload timeouts use CLI, environment, configuration, and
 default values in descending precedence and reject negative, empty, or
 non-finite environment values. Microfrontend configuration is selected only
 from the explicit `--cwd`, or the process working directory when the option is
 absent, and its package ancestors after platform-aware canonical path
-normalization.
+normalization. The repository root package remains eligible to own the selected
+microfrontend configuration.
 Generator destinations are validated through canonical existing ancestors,
 and recursive copies whose source contains their destination are rejected.
 Requested workspace names must be npm-compatible. Copied workspace templates
@@ -1046,8 +1051,11 @@ require an object `package.json`, preserve its other fields, and atomically
 rewrite `name` to the requested workspace name. Failed template copies or
 manifest rewrites remove the partial destination only when the generator
 acquired that destination exclusively, so a concurrently created destination
-is preserved. Workspace dependency selection, including the visibility change
-requested by `--show-all-dependencies`, remains planned. Update
+is preserved. Configured generators collect unresolved prompt answers through
+the terminal before evaluating actions and fail without writing when those
+answers are unavailable non-interactively. Workspace example template path
+selection and workspace dependency selection, including the visibility change
+requested by `--show-all-dependencies`, remain planned. Update
 checks remain disabled by default; the explicit
 test-only forced check reads stable upstream tags and reports against the fixed
 2.10.12 baseline. Aube and Nub native or delegated lockfiles retain their

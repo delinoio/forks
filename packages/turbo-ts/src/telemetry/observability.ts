@@ -396,12 +396,22 @@ export const exportRunMetrics = (
     const grpcHeader = new Uint8Array(5);
     new DataView(grpcHeader.buffer).setUint32(1, payload.length, false);
     const body = protocol === "grpc" ? concat(grpcHeader, payload) : payload;
+    const requestUrl = yield* Effect.try({
+      try: () =>
+        endpointFor(
+          endpoint,
+          protocol,
+          options.endpoint === undefined && environmentEndpoint !== undefined,
+        ),
+      catch: () =>
+        new BoundaryError({
+          boundary: "observability",
+          message: "invalid OTLP endpoint",
+          retryable: false,
+        }),
+    });
     const response = yield* http.request({
-      url: endpointFor(
-        endpoint,
-        protocol,
-        options.endpoint === undefined && environmentEndpoint !== undefined,
-      ),
+      url: requestUrl,
       method: "POST",
       transport: protocol === "grpc" ? "http2" : undefined,
       headers,

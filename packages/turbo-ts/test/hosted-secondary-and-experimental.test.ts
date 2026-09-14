@@ -30,7 +30,10 @@ import {
 import { parseCommonArguments } from "../src/cli/common-options.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
-import { nodeFoundationLayer } from "../src/effect/node-layer.js";
+import {
+  nodeFoundationLayer,
+  resolveUserConfigurationDirectory,
+} from "../src/effect/node-layer.js";
 import {
   ClockService,
   CredentialService,
@@ -1080,6 +1083,40 @@ describe("hosted compatibility", () => {
     }
   });
 
+  it("requires absolute credential configuration directories", () => {
+    expect(
+      resolveUserConfigurationDirectory(
+        { HOME: ".", XDG_CONFIG_HOME: ".config" },
+        "linux",
+        "/system/home",
+      ),
+    ).toBe("/system/home/.config/turborepo");
+    expect(
+      resolveUserConfigurationDirectory(
+        { HOME: ".", XDG_CONFIG_HOME: ".config" },
+        "darwin",
+        "/system/home",
+      ),
+    ).toBe("/system/home/Library/Application Support/turborepo");
+    expect(
+      resolveUserConfigurationDirectory(
+        { APPDATA: ".appdata", HOME: "." },
+        "win32",
+        "C:\\system-home",
+      ),
+    ).toBe("C:\\system-home\\AppData\\Roaming\\turborepo");
+    expect(
+      resolveUserConfigurationDirectory(
+        { XDG_CONFIG_HOME: "/custom/configuration" },
+        "linux",
+        "/system/home",
+      ),
+    ).toBe("/custom/configuration/turborepo");
+    expect(() =>
+      resolveUserConfigurationDirectory({}, "linux", ".system-home"),
+    ).toThrow("system home directory must be absolute");
+  });
+
   it("rejects symlinked project configuration directories", async () => {
     if (process.platform === "win32") return;
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-project-config-"));
@@ -1377,6 +1414,10 @@ describe("secondary command and parser compatibility", () => {
       join(root, "microfrontends.json"),
       JSON.stringify({
         applications: {
+          "synthetic-hosted-root": {
+            packageName: "//",
+            development: { local: { port: 4000 } },
+          },
           "synthetic-app": { development: { local: { port: 4001 } } },
         },
       }),
@@ -1654,6 +1695,11 @@ describe("secondary command and parser compatibility", () => {
         root,
       );
       expect(inheritedMfe).toMatchObject({ code: 0, stdout: "4001\n" });
+      const rootMfe = await runCandidate(
+        ["get-mfe-port", `--cwd=${root}`],
+        root,
+      );
+      expect(rootMfe).toMatchObject({ code: 0, stdout: "4000\n" });
 
       const configuration = await runCandidate(
         ["config", `--cwd=${root}`],
@@ -1668,7 +1714,31 @@ describe("secondary command and parser compatibility", () => {
         uploadTimeout: 30,
         ui: "stream",
       });
+      const apiCredential = "synthetic-api-password";
+      const unsafeEnvironmentConfiguration = await runCandidate(
+        ["config", `--cwd=${root}`],
+        root,
+        { TURBO_API: `https://user:${apiCredential}@example.test` },
+      );
+      expect(unsafeEnvironmentConfiguration.code).toBe(1);
+      expect(
+        `${unsafeEnvironmentConfiguration.stdout}${unsafeEnvironmentConfiguration.stderr}`,
+      ).not.toContain(apiCredential);
       await mkdir(join(root, ".turbo"), { recursive: true });
+      await writeFile(
+        join(root, ".turbo/config.json"),
+        JSON.stringify({
+          apiUrl: `https://user:${apiCredential}@example.test`,
+        }),
+      );
+      const unsafeProjectConfiguration = await runCandidate(
+        ["config", `--cwd=${root}`],
+        root,
+      );
+      expect(unsafeProjectConfiguration.code).toBe(1);
+      expect(
+        `${unsafeProjectConfiguration.stdout}${unsafeProjectConfiguration.stderr}`,
+      ).not.toContain(apiCredential);
       await writeFile(
         join(root, ".turbo/config.json"),
         JSON.stringify({ teamId: "stored-team-id", teamSlug: "stored-team" }),
@@ -1829,6 +1899,82 @@ describe("secondary command and parser compatibility", () => {
       await rm(directory, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it("collects unresolved generator prompts before evaluating actions", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-generator-prompt-"),
+    );
+    const root = join(directory, "repository");
+    await prepareRepository(root);
+    await mkdir(join(root, "turbo/generators"), { recursive: true });
+    await writeFile(
+      join(root, "turbo/generators/config.mjs"),
+      `export default (api) => api.setGenerator("prompted", {
+  prompts: [{ type: "input", name: "feature", message: "Feature name" }],
+  actions: (answers) => [{ type: "add", path: "generated/{{feature}}.txt", template: "{{feature}}" }],
+});\n`,
+    );
+    try {
+      const terminal = await Effect.runPromise(
+        TerminalService.pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const prompts: Array<string> = [];
+      const terminalLayer = (interactive: boolean, answer = "") =>
+        Layer.succeed(TerminalService, {
+          ...terminal,
+          stdinIsTerminal: Effect.succeed(interactive),
+          readLine: (prompt) =>
+            Effect.sync(() => {
+              prompts.push(prompt);
+              return answer;
+            }),
+          writeStdout: () => Effect.void,
+          writeStderr: () => Effect.void,
+        });
+      const execute = (
+        arguments_: ReadonlyArray<string>,
+        interactive: boolean,
+        answer?: string,
+      ) =>
+        Effect.runPromise(
+          Effect.either(
+            executeGenerate([...arguments_, `--root=${root}`]).pipe(
+              Effect.provide(terminalLayer(interactive, answer)),
+              Effect.provide(nodeFoundationLayer),
+            ),
+          ),
+        );
+
+      const nonInteractive = await execute(["prompted"], false);
+      expect(nonInteractive).toMatchObject({
+        _tag: "Left",
+        left: {
+          message:
+            "generator prompts require an interactive terminal or supplied --args",
+        },
+      });
+      await expect(access(join(root, "generated/.txt"))).rejects.toThrow();
+
+      const interactive = await execute(["prompted"], true, "widget");
+      expect(interactive).toMatchObject({ _tag: "Right", right: 0 });
+      expect(prompts).toEqual(["Feature name: "]);
+      expect(await readFile(join(root, "generated/widget.txt"), "utf8")).toBe(
+        "widget",
+      );
+
+      const supplied = await execute(
+        ["prompted", "--args=feature=supplied"],
+        false,
+      );
+      expect(supplied).toMatchObject({ _tag: "Right", right: 0 });
+      expect(prompts).toEqual(["Feature name: "]);
+      expect(await readFile(join(root, "generated/supplied.txt"), "utf8")).toBe(
+        "supplied",
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 
   it(evidenceId.telemetryCompatibility, async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-telemetry-"));
@@ -2298,6 +2444,19 @@ describe("hosted protocols and experimental transports", () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-otel-interval-"));
     const root = join(directory, "repository");
     await prepareRepository(root);
+    const malformedEndpoint = await runCandidate(
+      [
+        "run",
+        "build",
+        "--filter=synthetic-app",
+        "--no-cache",
+        "--experimental-otel-enabled=true",
+        "--experimental-otel-endpoint=not-a-url",
+        `--cwd=${root}`,
+      ],
+      root,
+    );
+    expect(malformedEndpoint.code, malformedEndpoint.stderr).toBe(0);
     await mkdir(join(root, "packages/library"), { recursive: true });
     const delayedScript = 'node -e "setTimeout(() => {}, 250)"';
     await writeFile(

@@ -140,7 +140,7 @@ export const parseHostedArguments = (
   };
 };
 
-const hostedUrl = (value: string, name: string): URL => {
+export const hostedUrl = (value: string, name: string): URL => {
   let url: URL;
   try {
     url = new URL(value);

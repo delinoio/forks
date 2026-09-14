@@ -612,8 +612,8 @@ export const resolveOptions = (
       teamSlug:
         parsed.team ??
         configuredTeamSlug ??
-        remoteConfiguration?.teamSlug ??
         storedCredentials.project?.teamSlug ??
+        remoteConfiguration?.teamSlug ??
         undefined,
       timeoutMilliseconds: 1_000 * remoteTimeoutSeconds,
       uploadTimeoutMilliseconds: 1_000 * remoteUploadTimeoutSeconds,
