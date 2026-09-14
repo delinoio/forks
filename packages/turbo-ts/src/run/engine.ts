@@ -37,6 +37,7 @@ import {
   parentPath,
   relativePath,
 } from "../core/path.js";
+import { parseNodeTimerSeconds } from "../core/time.js";
 import {
   CacheRollbackError,
   ConfigurationError,
@@ -579,12 +580,8 @@ export const resolveOptions = (
       path: string,
       label: string,
     ): number => {
-      const seconds = Number(input);
-      if (
-        (typeof input === "string" && input.trim() === "") ||
-        !Number.isFinite(seconds) ||
-        seconds < 0
-      ) {
+      const seconds = parseNodeTimerSeconds(input);
+      if (seconds === undefined) {
         throw new ConfigurationError({
           path,
           message: `invalid ${label}: ${String(input)}`,

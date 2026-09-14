@@ -100,6 +100,8 @@ Git changes beneath a contained workspace symlink's canonical target map back
 to that workspace for package and task-aware affected selection, including
 `ls --affected`. `--single-package` skips child workspace discovery and treats
 the repository root as the only runnable package.
+`--dangerously-disable-package-manager-check` is valueless and rejects attached
+values instead of treating them as an enabled bypass.
 Tasks owned by a logical workspace path containing a symlink component execute
 without local or remote caching because restoration intentionally rejects
 symlink parents. Task scopes whose hashes depend on those tasks, including
@@ -256,7 +258,8 @@ Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
 reject malformed entries. Remote artifact routes preserve configured API path
 prefixes. Active remote URLs must use HTTP or HTTPS, must not contain username
 or password credentials, and URLs and timeout values are validated before cache
-or task work begins; blank download and upload timeout strings are invalid.
+or task work begins; blank download and upload timeout strings are invalid, and
+timeouts above Node's 2,147,483,647-millisecond timer limit are rejected.
 Signature-key requirements
 apply only when a remote transport is active; disabled remotes and
 configurations without an API URL do not require a signing key. Every active
@@ -744,7 +747,10 @@ package identities, and same-named cross-ecosystem edge endpoints use qualified
 identities. Affected collections include the root package for root changes and
 when it depends on an affected workspace without allowing the root path to
 claim workspace-owned files. `query affected`, `query
-ls`, and `ls` share repository discovery and stable ordering. GraphQL documents
+ls`, and `ls` share repository discovery and stable ordering.
+The `--root-turbo-json` override is preserved across `ls`, `prune`, `query`,
+`query ls`, and `query affected` repository discovery.
+GraphQL documents
 are limited to 4,096 lexer tokens, 512 expanded selections, and a field depth
 of 16 before resolver execution; fragment spreads count each expanded
 selection. Package-predicate variables are limited to 512 nodes and a depth of
@@ -1067,7 +1073,8 @@ loopback devtools, boundary diagnostics, deterministic microfrontend ports,
 `bin`, hidden `config`, deprecated `scan`, and the remaining daemon, alias, and
 parser surfaces. Documentation output honors both `NO_COLOR` and `--no-color`,
 and encodes C0 and C1 controls in remote result titles and URLs before terminal
-display.
+display. Malformed result URLs are omitted independently so one invalid remote
+record does not suppress otherwise valid documentation results.
 During a successful automatic launch, devtools prints only its token-free
 loopback URL and passes its bearer URL only to the browser launcher. When
 `--no-open` is selected, the launcher is unavailable, or launch fails, devtools
@@ -1096,12 +1103,13 @@ repository discovery before any destination is created.
 Requested workspace names must be npm-compatible. The `--empty` workspace flag
 is valueless and rejects attached values. Copied workspace templates require an
 object `package.json`, preserve its other fields, and atomically rewrite `name`
-to the requested workspace name. Failed template validation, copies, or
-manifest rewrites remove the partial destination only when the generator
-acquired that destination exclusively, so a concurrently created destination
-is preserved. Configured generators collect unresolved prompt answers through
-the terminal before evaluating actions and fail without writing when those
-answers are unavailable non-interactively. Workspace example template path
+to the requested workspace name. Workspace type accepts only `app` or `package`
+and is validated before a destination is created. Failed template validation,
+copies, or manifest rewrites remove the partial destination only when the
+generator acquired that destination exclusively, so a concurrently created
+destination is preserved. Configured generators collect unresolved prompt
+answers through the terminal before evaluating actions and fail without writing
+when those answers are unavailable non-interactively. Workspace example template path
 selection and workspace dependency selection, including the visibility change
 requested by `--show-all-dependencies`, remain planned. Update
 checks remain disabled by default; the explicit

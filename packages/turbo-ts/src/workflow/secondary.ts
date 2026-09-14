@@ -8,6 +8,7 @@ import {
   joinPath,
   normalizePath,
 } from "../core/path.js";
+import { parseNodeTimerSeconds } from "../core/time.js";
 import { BoundaryError, ConfigurationError } from "../effect/errors.js";
 import {
   CredentialService,
@@ -70,12 +71,8 @@ const resolvedRemoteTimeout = (
   path: string,
   label: string,
 ): number => {
-  const seconds = Number(input);
-  if (
-    (typeof input === "string" && input.trim() === "") ||
-    !Number.isFinite(seconds) ||
-    seconds < 0
-  ) {
+  const seconds = parseNodeTimerSeconds(input);
+  if (seconds === undefined) {
     throw new ConfigurationError({
       path,
       message: `invalid ${label}: ${String(input)}`,
@@ -450,33 +447,38 @@ const executeDocs = (
           Array.isArray(document.results)
         ? document.results
         : [];
-    const results = unfilteredResults.filter(
-      (result) =>
-        typeof result === "object" &&
-        result !== null &&
-        (!("type" in result) || result.type === "page"),
-    );
-    yield* terminal.writeStdout(
-      `Found ${results.length} results for '${query.join(" ")}':\n`,
-    );
-    let renderedIndex = 0;
-    for (const result of results) {
-      if (typeof result !== "object" || result === null) continue;
-      renderedIndex += 1;
+    const results = unfilteredResults.flatMap((result) => {
+      if (
+        typeof result !== "object" ||
+        result === null ||
+        ("type" in result && result.type !== "page")
+      ) {
+        return [];
+      }
       const title =
         "title" in result
           ? String(result.title)
           : "content" in result
             ? String(result.content)
             : "Turborepo documentation";
-      const url =
-        "url" in result
-          ? new URL(String(result.url), endpoint.origin).toString()
-          : "href" in result
-            ? new URL(String(result.href), endpoint.origin).toString()
-            : "";
+      try {
+        const url =
+          "url" in result
+            ? new URL(String(result.url), endpoint.origin).toString()
+            : "href" in result
+              ? new URL(String(result.href), endpoint.origin).toString()
+              : "";
+        return [{ title, url }];
+      } catch {
+        return [];
+      }
+    });
+    yield* terminal.writeStdout(
+      `Found ${results.length} results for '${query.join(" ")}':\n`,
+    );
+    for (const [index, result] of results.entries()) {
       yield* terminal.writeStdout(
-        `\n${renderedIndex}. ${renderTerminalSafeText(title)}: ${renderTerminalSafeText(url)}\n`,
+        `\n${index + 1}. ${renderTerminalSafeText(result.title)}: ${renderTerminalSafeText(result.url)}\n`,
       );
     }
     const colorEnabled =

@@ -1039,6 +1039,48 @@ version = "1.0.0"
     });
   });
 
+  it("rejects remote cache timeouts above the Node timer limit", () => {
+    const model = repository([]);
+    const parsed = parseRunArguments([
+      "run",
+      "build",
+      "--api=https://cache.example.test/api",
+      "--token=token",
+    ]);
+    for (const [name, message] of [
+      ["TURBO_REMOTE_CACHE_TIMEOUT", "invalid remote cache timeout"],
+      [
+        "TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT",
+        "invalid remote cache upload timeout",
+      ],
+    ] as const) {
+      expect(() =>
+        resolveOptions(
+          parsed,
+          model.root,
+          { [name]: "2147483.648" },
+          model.rootConfiguration,
+          8,
+        ),
+      ).toThrow(message);
+    }
+    expect(
+      resolveOptions(
+        parsed,
+        model.root,
+        {
+          TURBO_REMOTE_CACHE_TIMEOUT: "2147483.647",
+          TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: "2147483.647",
+        },
+        model.rootConfiguration,
+        8,
+      ).remote,
+    ).toMatchObject({
+      timeoutMilliseconds: 2_147_483_647,
+      uploadTimeoutMilliseconds: 2_147_483_647,
+    });
+  });
+
   it("does not combine explicit team slugs with stored team IDs", () => {
     const model = repository([]);
     const options = resolveOptions(
@@ -1541,8 +1583,8 @@ version = "1.0.0"
     ).toBe(false);
   });
 
-  it("rejects blank remote cache timeout arguments", () => {
-    for (const value of ["", "   "]) {
+  it("rejects blank and over-limit remote cache timeout arguments", () => {
+    for (const value of ["", "   ", "2147483.648"]) {
       expect(() =>
         parseRunArguments(["run", "build", `--remote-cache-timeout=${value}`]),
       ).toThrow(/invalid remote cache timeout/);
@@ -1551,6 +1593,10 @@ version = "1.0.0"
       parseRunArguments(["run", "build", "--remote-cache-timeout=0"])
         .remoteCacheTimeoutSeconds,
     ).toBe(0);
+    expect(
+      parseRunArguments(["run", "build", "--remote-cache-timeout=2147483.647"])
+        .remoteCacheTimeoutSeconds,
+    ).toBe(2_147_483.647);
   });
 
   it("uses available parallelism and preserves Cargo pass-through arguments", () => {

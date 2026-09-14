@@ -38,6 +38,7 @@ import { loadWorkflowRepository } from "./repository.js";
 export interface PruneOptions {
   readonly scopes: ReadonlyArray<string>;
   readonly cwd?: string;
+  readonly rootTurboJson?: string;
   readonly outputDirectory: string;
   readonly docker: boolean;
   readonly production: boolean;
@@ -63,6 +64,7 @@ export const parsePruneArguments = (
 ): PruneOptions => {
   const scopes: Array<string> = [];
   let cwd: string | undefined;
+  let rootTurboJson: string | undefined;
   let outputDirectory = "out";
   let docker = false;
   let production = false;
@@ -88,6 +90,9 @@ export const parsePruneArguments = (
     switch (argument.split("=", 1)[0]) {
       case "--cwd":
         cwd = takeValue();
+        break;
+      case "--root-turbo-json":
+        rootTurboJson = takeValue();
         break;
       case "--out-dir":
         outputDirectory = takeValue();
@@ -120,6 +125,7 @@ export const parsePruneArguments = (
   return {
     scopes,
     cwd,
+    rootTurboJson,
     outputDirectory,
     docker,
     production,

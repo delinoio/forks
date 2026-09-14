@@ -31,6 +31,8 @@ interface GeneratorPrompt {
   readonly name: string;
 }
 
+type WorkspaceType = "app" | "package";
+
 interface LoadedGeneratorReady {
   readonly kind: "ready";
   readonly description?: string;
@@ -58,7 +60,7 @@ interface GenerateOptions {
   readonly name?: string;
   readonly root?: string;
   readonly showAllDependencies: boolean;
-  readonly type?: string;
+  readonly type?: WorkspaceType;
   readonly workspace: boolean;
 }
 
@@ -97,7 +99,7 @@ export const parseGenerateArguments = (
   let name: string | undefined;
   let root: string | undefined;
   let showAllDependencies = false;
-  let type: string | undefined;
+  let type: WorkspaceType | undefined;
   let collectingAnswers = false;
   for (let index = 0; index < parsed.remaining.length; index += 1) {
     const argument = parsed.remaining[index]!;
@@ -157,9 +159,15 @@ export const parseGenerateArguments = (
         showAllDependencies = true;
         break;
       case "--type":
-      case "-t":
-        [type, index] = nextValue(parsed.remaining, index, option);
+      case "-t": {
+        let value: string;
+        [value, index] = nextValue(parsed.remaining, index, option);
+        if (value !== "app" && value !== "package") {
+          throw failure(`invalid workspace type: ${value}`);
+        }
+        type = value;
         break;
+      }
       default:
         if (argument.startsWith("-")) {
           throw failure(`unknown option: ${argument}`);

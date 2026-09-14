@@ -1,3 +1,4 @@
+import { parseNodeTimerSeconds } from "../core/time.js";
 import { ConfigurationError } from "../effect/errors.js";
 
 export type OtlpProtocol = "grpc" | "http-json" | "http-protobuf";
@@ -81,14 +82,6 @@ const optionalBoolean = (
   return [true, index];
 };
 
-const nonNegativeNumber = (value: string, name: string): number => {
-  const parsed = Number(value);
-  if (value.trim() === "" || !Number.isFinite(parsed) || parsed < 0) {
-    throw configurationFailure(`invalid ${name}: ${value}`);
-  }
-  return parsed;
-};
-
 const nonNegativeInteger = (value: string, name: string): number => {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 0) {
@@ -157,6 +150,9 @@ export const parseCommonArguments = (
         [cwd, index] = requiredValue(arguments_, index, name);
         break;
       case "--dangerously-disable-package-manager-check":
+        if (argument !== name) {
+          throw configurationFailure(`${name} does not accept a value`);
+        }
         dangerouslyDisablePackageManagerCheck = true;
         break;
       case "--heap":
@@ -177,10 +173,10 @@ export const parseCommonArguments = (
         }
         let value: string;
         [value, index] = requiredValue(arguments_, index, name);
-        remoteCacheTimeoutSeconds = nonNegativeNumber(
-          value,
-          "remote cache timeout",
-        );
+        remoteCacheTimeoutSeconds = parseNodeTimerSeconds(value);
+        if (remoteCacheTimeoutSeconds === undefined) {
+          throw configurationFailure(`invalid remote cache timeout: ${value}`);
+        }
         break;
       }
       case "--root-turbo-json":

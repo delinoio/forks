@@ -2035,11 +2035,22 @@ describe("secondary command and parser compatibility", () => {
         "does not accept a value",
       );
     }
+    for (const attachedBypass of [
+      "--dangerously-disable-package-manager-check=false",
+      "--dangerously-disable-package-manager-check=true",
+    ]) {
+      expect(() => parseCommonArguments([attachedBypass])).toThrow(
+        "does not accept a value",
+      );
+    }
     expect(resolveHostedTimeoutMilliseconds(undefined, "12.5")).toBe(12_500);
     expect(resolveHostedTimeoutMilliseconds(1.25, "12.5")).toBe(1_250);
     expect(resolveHostedTimeoutMilliseconds(undefined, undefined)).toBe(30_000);
     expect(resolveHostedTimeoutMilliseconds(undefined, "0")).toBe(0);
-    for (const invalid of ["", "-1", "NaN", "Infinity"]) {
+    expect(resolveHostedTimeoutMilliseconds(undefined, "2147483.647")).toBe(
+      2_147_483_647,
+    );
+    for (const invalid of ["", "-1", "NaN", "Infinity", "2147483.648"]) {
       expect(() =>
         resolveHostedTimeoutMilliseconds(undefined, invalid),
       ).toThrow("invalid remote cache timeout");
@@ -2065,6 +2076,11 @@ describe("secondary command and parser compatibility", () => {
       expect(() =>
         parseGenerateArguments(["workspace", attachedEmpty]),
       ).toThrow("does not accept a value");
+    }
+    for (const invalidType of ["--type=service", "-t=service"]) {
+      expect(() => parseGenerateArguments(["workspace", invalidType])).toThrow(
+        "invalid workspace type: service",
+      );
     }
     expect(
       selectCurrentPackage(
@@ -2180,6 +2196,25 @@ describe("secondary command and parser compatibility", () => {
           ),
         ),
       ).toMatchObject({ name: "generated-library", private: true });
+
+      const invalidTypeDestination = "packages/generated-service";
+      const invalidType = await runCandidate(
+        [
+          "generate",
+          "workspace",
+          "--name=generated-service",
+          "--empty",
+          "--type=service",
+          `--destination=${invalidTypeDestination}`,
+          `--root=${root}`,
+        ],
+        root,
+      );
+      expect(invalidType.code).toBe(1);
+      expect(invalidType.stderr).toContain("invalid workspace type: service");
+      await expect(
+        access(join(root, invalidTypeDestination)),
+      ).rejects.toThrow();
 
       for (const [name, destination] of [
         ["@bad scope/pkg", "packages/invalid-scoped-space"],
@@ -2485,6 +2520,15 @@ describe("secondary command and parser compatibility", () => {
       expect(invalidConfigTimeout.stderr).toContain(
         "invalid remote cache upload timeout",
       );
+      const overLimitConfigTimeout = await runCandidate(
+        ["config", `--cwd=${root}`],
+        root,
+        { TURBO_REMOTE_CACHE_TIMEOUT: "2147483.648" },
+      );
+      expect(overLimitConfigTimeout.code).toBe(1);
+      expect(overLimitConfigTimeout.stderr).toContain(
+        "invalid remote cache timeout",
+      );
       const invalidEnvironment = await runCandidate(
         ["run", "build", `--cwd=${root}`],
         root,
@@ -2559,6 +2603,10 @@ describe("secondary command and parser compatibility", () => {
                 JSON.stringify({
                   results: [
                     {
+                      title: "Malformed remote result",
+                      url: "http://[",
+                    },
+                    {
                       title:
                         "Synthetic\u001b]52;c;payload\u0007\u009b31m guide",
                       url: "https://example.invalid/guide",
@@ -2583,6 +2631,7 @@ describe("secondary command and parser compatibility", () => {
           expect(docs.stdout).toContain(
             "Found 1 results for 'synthetic query'",
           );
+          expect(docs.stdout).not.toContain("Malformed remote result");
           expect(docs.stdout).toContain(
             "Synthetic\\u001b]52;c;payload\\u0007\\u009b31m guide",
           );

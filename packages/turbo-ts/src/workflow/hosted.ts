@@ -2,6 +2,7 @@ import { Deferred, Effect, Schedule } from "effect";
 import { parseCommonArguments } from "../cli/common-options.js";
 import { renderTerminalSafeText } from "../cli/terminal-text.js";
 import { joinPath } from "../core/path.js";
+import { parseNodeTimerSeconds } from "../core/time.js";
 import { BoundaryError, ConfigurationError } from "../effect/errors.js";
 import {
   CredentialService,
@@ -243,12 +244,8 @@ export const resolveHostedTimeoutMilliseconds = (
   environmentValue: string | undefined,
 ): number => {
   const value = option ?? environmentValue ?? 30;
-  const seconds = Number(value);
-  if (
-    (typeof value === "string" && value.trim() === "") ||
-    !Number.isFinite(seconds) ||
-    seconds < 0
-  ) {
+  const seconds = parseNodeTimerSeconds(value);
+  if (seconds === undefined) {
     throw new ConfigurationError({
       path: option === undefined ? "TURBO_REMOTE_CACHE_TIMEOUT" : "<arguments>",
       message: `invalid remote cache timeout: ${String(value)}`,

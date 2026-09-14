@@ -308,6 +308,7 @@ interface RepositoryFileContents {
 
 export interface QueryOptions {
   readonly cwd?: string;
+  readonly rootTurboJson?: string;
   readonly query?: string;
   readonly variables?: Readonly<Record<string, unknown>>;
   readonly schema: boolean;
@@ -336,6 +337,7 @@ export const parseQueryArguments = (
   arguments_: ReadonlyArray<string>,
 ): QueryOptions => {
   let cwd: string | undefined;
+  let rootTurboJson: string | undefined;
   let query: string | undefined;
   let variables: Record<string, unknown> | undefined;
   let schema = false;
@@ -368,6 +370,9 @@ export const parseQueryArguments = (
       case "--cwd":
         cwd = takeValue();
         break;
+      case "--root-turbo-json":
+        rootTurboJson = takeValue();
+        break;
       case "--variables":
       case "-V":
         variables = jsonObject(takeValue(), argument);
@@ -395,7 +400,7 @@ export const parseQueryArguments = (
         });
     }
   }
-  return { cwd, query, variables, schema, port };
+  return { cwd, rootTurboJson, query, variables, schema, port };
 };
 
 interface PackageView {
@@ -1645,6 +1650,7 @@ export const executeQuery = (
 
 interface AffectedOptions {
   readonly cwd?: string;
+  readonly rootTurboJson?: string;
   readonly base: string;
   readonly head: string;
   readonly packages: boolean;
@@ -1656,6 +1662,7 @@ const parseAffectedArguments = (
   arguments_: ReadonlyArray<string>,
 ): AffectedOptions => {
   let cwd: string | undefined;
+  let rootTurboJson: string | undefined;
   let base = "main";
   let head = "HEAD";
   let packages = false;
@@ -1678,6 +1685,9 @@ const parseAffectedArguments = (
     switch (argument.split("=", 1)[0]) {
       case "--cwd":
         cwd = takeValue();
+        break;
+      case "--root-turbo-json":
+        rootTurboJson = takeValue();
         break;
       case "--base":
         base = takeValue();
@@ -1707,7 +1717,7 @@ const parseAffectedArguments = (
         }
     }
   }
-  return { cwd, base, head, packages, fields, exitCode };
+  return { cwd, rootTurboJson, base, head, packages, fields, exitCode };
 };
 
 export const executeQueryAffected = (

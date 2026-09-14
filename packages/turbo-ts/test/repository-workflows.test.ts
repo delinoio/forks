@@ -82,7 +82,7 @@ import {
   parseDaemonArguments,
   watcherPathsMatch,
 } from "../src/workflow/daemon.js";
-import { executeList } from "../src/workflow/list.js";
+import { executeList, parseListArguments } from "../src/workflow/list.js";
 import {
   executeInfo,
   isWindowsSubsystemForLinux,
@@ -91,6 +91,7 @@ import { executePrune, parsePruneArguments } from "../src/workflow/prune.js";
 import {
   executeQuery,
   executeQueryAffected,
+  parseQueryArguments,
   repositoryQuerySchema,
 } from "../src/workflow/query.js";
 import {
@@ -746,6 +747,15 @@ describe("repository workflow gate", () => {
     expect(
       parsePruneArguments(["app", "--docker", "--production"]),
     ).toMatchObject({ scopes: ["app"], docker: true, production: true });
+    expect(parseListArguments(["--root-turbo-json=custom.json"])).toMatchObject(
+      { rootTurboJson: "custom.json" },
+    );
+    expect(
+      parsePruneArguments(["app", "--root-turbo-json=custom.json"]),
+    ).toMatchObject({ rootTurboJson: "custom.json" });
+    expect(
+      parseQueryArguments(["--root-turbo-json=custom.json"]),
+    ).toMatchObject({ rootTurboJson: "custom.json" });
 
     const commands =
       "bin boundaries completion config daemon devtools docs generate get-mfe-port info link login logout ls prune query run scan telemetry unlink watch";
@@ -1131,6 +1141,92 @@ describe("repository workflow gate", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 60_000);
+
+  it("uses custom root configurations in repository workflows", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-workflow-root-config-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const defaultConfigurationPath = join(directory, "turbo.json");
+      const defaultConfiguration = await readFile(
+        defaultConfigurationPath,
+        "utf8",
+      );
+      const customConfiguration = "custom-turbo.json";
+      await writeFile(
+        join(directory, customConfiguration),
+        defaultConfiguration,
+      );
+      await writeFile(
+        defaultConfigurationPath,
+        "invalid default configuration",
+      );
+      const configuredList = await executeDifferentialCommand(
+        process.execPath,
+        [
+          candidate,
+          "--cwd",
+          directory,
+          "--root-turbo-json",
+          customConfiguration,
+          "ls",
+          "--output=json",
+        ],
+      );
+      const configuredQueryList = await executeDifferentialCommand(
+        process.execPath,
+        [
+          candidate,
+          "query",
+          "ls",
+          "--cwd",
+          directory,
+          "--root-turbo-json",
+          customConfiguration,
+          "--output=json",
+        ],
+      );
+      const configuredQuery = await executeDifferentialCommand(
+        process.execPath,
+        [
+          candidate,
+          "query",
+          "{ packages { length } }",
+          "--cwd",
+          directory,
+          "--root-turbo-json",
+          customConfiguration,
+        ],
+      );
+      expect(JSON.parse(configuredList.stdout)).toMatchObject({
+        packages: { count: 2 },
+      });
+      expect(configuredQueryList.stdout).toBe(configuredList.stdout);
+      expect(JSON.parse(configuredQuery.stdout)).toEqual({
+        data: { packages: { length: 3 } },
+      });
+      await writeFile(defaultConfigurationPath, defaultConfiguration);
+      const configuredPrune = await executeDifferentialCommand(
+        process.execPath,
+        [
+          candidate,
+          "prune",
+          "synthetic-app",
+          "--cwd",
+          directory,
+          "--root-turbo-json",
+          customConfiguration,
+          "--out-dir=configured-prune",
+        ],
+      );
+      expect(configuredPrune.stdout).toContain(
+        "Generating pruned monorepo for synthetic-app",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
 
   it("does not assert a stream channel for cached plain-log replay", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-level-"));
@@ -10083,6 +10179,11 @@ importers:
         configurationPath,
         `${JSON.stringify(configuration, undefined, 2)}\n`,
       );
+      const customConfiguration = "custom-turbo.json";
+      await writeFile(
+        join(directory, customConfiguration),
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
       await mkdir(javascriptDirectory, { recursive: true });
       await writeFile(
         join(javascriptDirectory, "package.json"),
@@ -10231,6 +10332,8 @@ importers:
               "--head=HEAD",
               "--cwd",
               directory,
+              "--root-turbo-json",
+              customConfiguration,
             ]).pipe(
               Effect.provide(
                 Layer.mergeAll(

@@ -17,6 +17,7 @@ import {
 
 export interface ListOptions {
   readonly cwd?: string;
+  readonly rootTurboJson?: string;
   readonly filters: ReadonlyArray<string>;
   readonly output: "pretty" | "json";
   readonly affected: boolean;
@@ -27,6 +28,7 @@ export const parseListArguments = (
 ): ListOptions => {
   const filters: Array<string> = [];
   let cwd: string | undefined;
+  let rootTurboJson: string | undefined;
   let output: "pretty" | "json" = "pretty";
   let affected = false;
   for (let index = 0; index < arguments_.length; index += 1) {
@@ -46,6 +48,9 @@ export const parseListArguments = (
     switch (argument.split("=", 1)[0]) {
       case "--cwd":
         cwd = takeValue();
+        break;
+      case "--root-turbo-json":
+        rootTurboJson = takeValue();
         break;
       case "--filter":
       case "-F":
@@ -75,7 +80,7 @@ export const parseListArguments = (
         });
     }
   }
-  return { cwd, filters, output, affected };
+  return { cwd, rootTurboJson, filters, output, affected };
 };
 
 export const executeList = (
