@@ -68,6 +68,21 @@ const makeTelemetryState = (): Effect.Effect<
     };
   });
 
+const decodeTelemetryState = (
+  stored: TelemetryState | undefined,
+): Effect.Effect<TelemetryState | undefined, ConfigurationError> =>
+  Effect.try({
+    try: () =>
+      stored === undefined
+        ? undefined
+        : Schema.decodeUnknownSync(TelemetryStateSchema)(stored),
+    catch: () =>
+      new ConfigurationError({
+        path: "telemetry.json",
+        message: "telemetry state is invalid",
+      }),
+  });
+
 export const executeTelemetry = (
   arguments_: ReadonlyArray<string>,
 ): Effect.Effect<
@@ -85,21 +100,12 @@ export const executeTelemetry = (
     const environment = yield* EnvironmentService;
     const telemetry = yield* TelemetryService;
     const terminal = yield* TerminalService;
-    const stored = yield* telemetry.read;
-    let persisted: TelemetryState | undefined;
-    try {
-      persisted =
-        stored === undefined
-          ? undefined
-          : Schema.decodeUnknownSync(TelemetryStateSchema)(stored);
-    } catch {
-      return yield* Effect.fail(
-        new ConfigurationError({
-          path: "telemetry.json",
-          message: "telemetry state is invalid",
-        }),
-      );
-    }
+    const readPersisted = telemetry.read.pipe(
+      Effect.flatMap(decodeTelemetryState),
+    );
+    const persisted = yield* command === "disable"
+      ? readPersisted.pipe(Effect.catchAll(() => Effect.succeed(undefined)))
+      : readPersisted;
     const state = persisted ?? (yield* makeTelemetryState());
     const environmentDisabled = environmentDisablesTelemetry(
       yield* environment.get("TURBO_TELEMETRY_DISABLED"),

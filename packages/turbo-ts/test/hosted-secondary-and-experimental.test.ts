@@ -30,6 +30,7 @@ import {
   verifyRemoteCacheStatus,
 } from "../src/cache/remote-cache.js";
 import { parseCommonArguments } from "../src/cli/common-options.js";
+import { renderTerminalSafeText } from "../src/cli/terminal-text.js";
 import { evidenceId } from "../src/compatibility/ledger.js";
 import { BoundaryError, ProcessExecutionError } from "../src/effect/errors.js";
 import {
@@ -1235,12 +1236,12 @@ describe("hosted compatibility", () => {
     }
   });
 
-  it("quotes complete browser URLs for the Windows command interpreter", () => {
+  it("passes complete browser URLs without Windows command expansion", () => {
     const url =
       "https://login.example.test/turborepo/token?redirect_uri=http%3A%2F%2F127.0.0.1%3A1234%2F&state=synthetic-state";
     expect(browserInvocation("win32", url)).toEqual({
-      command: "cmd.exe",
-      args: ["/d", "/s", "/v:off", "/c", "start", "", `"${url}"`],
+      command: "rundll32.exe",
+      args: ["url.dll,FileProtocolHandler", url],
     });
     expect(browserInvocation("darwin", url)).toEqual({
       command: "open",
@@ -1979,6 +1980,20 @@ describe("secondary command and parser compatibility", () => {
     expect(
       parseHostedArguments("logout", ["--invalidate", "false"]),
     ).toMatchObject({ invalidate: false });
+    expect(parseHostedArguments("link", ["--yes"])).toMatchObject({
+      yes: true,
+    });
+    expect(parseHostedArguments("link", ["-y"])).toMatchObject({ yes: true });
+    for (const attachedYes of [
+      "--yes=false",
+      "--yes=true",
+      "-y=false",
+      "-y=true",
+    ]) {
+      expect(() => parseHostedArguments("link", [attachedYes])).toThrow(
+        "does not accept a value",
+      );
+    }
     expect(resolveHostedTimeoutMilliseconds(undefined, "12.5")).toBe(12_500);
     expect(resolveHostedTimeoutMilliseconds(1.25, "12.5")).toBe(1_250);
     expect(resolveHostedTimeoutMilliseconds(undefined, undefined)).toBe(30_000);
@@ -2503,7 +2518,8 @@ describe("secondary command and parser compatibility", () => {
                 JSON.stringify({
                   results: [
                     {
-                      title: "Synthetic guide",
+                      title:
+                        "Synthetic\u001b]52;c;payload\u0007\u009b31m guide",
                       url: "https://example.invalid/guide",
                     },
                   ],
@@ -2526,8 +2542,12 @@ describe("secondary command and parser compatibility", () => {
           expect(docs.stdout).toContain(
             "Found 1 results for 'synthetic query'",
           );
-          expect(docs.stdout).toContain("Synthetic guide");
+          expect(docs.stdout).toContain(
+            "Synthetic\\u001b]52;c;payload\\u0007\\u009b31m guide",
+          );
           expect(docs.stdout).not.toContain("\u001B");
+          expect(docs.stdout).not.toContain("\u0007");
+          expect(docs.stdout).not.toContain("\u009B");
           const explicitlyPlainDocs = await runCandidate(
             ["docs", "synthetic query", "--no-color"],
             root,
@@ -2808,6 +2828,61 @@ describe("secondary command and parser compatibility", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("recovers telemetry opt-out from invalid persisted state", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-telemetry-invalid-"),
+    );
+    const root = join(directory, "repository");
+    const configurationHome = join(directory, "configuration");
+    const environment = {
+      XDG_CONFIG_HOME: configurationHome,
+      TURBO_TELEMETRY_DISABLED: "0",
+    };
+    const path = join(configurationHome, "turborepo/telemetry.json");
+    await prepareRepository(root);
+    await mkdir(join(configurationHome, "turborepo"), { recursive: true });
+    try {
+      for (const [invalidState, strictCommand] of [
+        ["{", "status"],
+        [JSON.stringify({ telemetry_enabled: "invalid" }), "enable"],
+      ] as const) {
+        await writeFile(path, invalidState);
+        const strict = await runCandidate(
+          ["telemetry", strictCommand],
+          root,
+          environment,
+        );
+        expect(strict.code).toBe(1);
+        const recovered = await runCandidate(
+          ["telemetry", "disable"],
+          root,
+          environment,
+        );
+        expect(recovered.code).toBe(0);
+        expect(recovered.stdout).toContain("Status: Disabled");
+        expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
+          telemetry_enabled: false,
+          telemetry_id: expect.stringMatching(/^[0-9a-f]{64}$/),
+          telemetry_salt: expect.stringMatching(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+          ),
+        });
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 10_000);
+});
+
+describe("terminal-safe text", () => {
+  it("encodes C0 and C1 controls in remote display values", () => {
+    expect(
+      renderTerminalSafeText(
+        "https://example.invalid/\u0000\u001b\u007f\u009bguide",
+      ),
+    ).toBe("https://example.invalid/\\u0000\\u001b\\u007f\\u009bguide");
   });
 });
 

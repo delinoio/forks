@@ -1,5 +1,6 @@
 import { Effect } from "effect";
 import { parseCommonArguments } from "../cli/common-options.js";
+import { renderTerminalSafeText } from "../cli/terminal-text.js";
 import { parseJsonConfiguration } from "../config/runtime.js";
 import {
   isAbsolutePath,
@@ -474,7 +475,9 @@ const executeDocs = (
           : "href" in result
             ? new URL(String(result.href), endpoint.origin).toString()
             : "";
-      yield* terminal.writeStdout(`\n${renderedIndex}. ${title}: ${url}\n`);
+      yield* terminal.writeStdout(
+        `\n${renderedIndex}. ${renderTerminalSafeText(title)}: ${renderTerminalSafeText(url)}\n`,
+      );
     }
     const colorEnabled =
       parsed.options.color !== false && (yield* terminal.stdoutColorEnabled);

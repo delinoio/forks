@@ -1,5 +1,6 @@
 import { Deferred, Effect, Schedule } from "effect";
 import { parseCommonArguments } from "../cli/common-options.js";
+import { renderTerminalSafeText } from "../cli/terminal-text.js";
 import { joinPath } from "../core/path.js";
 import { BoundaryError, ConfigurationError } from "../effect/errors.js";
 import {
@@ -47,16 +48,6 @@ interface HostedTeam {
   readonly name: string;
   readonly slug: string;
 }
-
-const renderTerminalSafeText = (value: string): string =>
-  [...value]
-    .map((character) => {
-      const codePoint = character.charCodeAt(0);
-      return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)
-        ? `\\u${codePoint.toString(16).padStart(4, "0")}`
-        : character;
-    })
-    .join("");
 
 const fail = (message: string): ConfigurationError =>
   new ConfigurationError({ path: "<arguments>", message });
@@ -137,6 +128,9 @@ export const parseHostedArguments = (
       case "--yes":
       case "-y":
         if (command !== "link") throw fail(`unknown option: ${argument}`);
+        if (argument !== name) {
+          throw fail(`${name} does not accept a value`);
+        }
         yes = true;
         break;
       default:

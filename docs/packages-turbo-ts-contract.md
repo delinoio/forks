@@ -970,9 +970,10 @@ during validation. Manual and non-interactive login continue
 to require `--token` or `TURBO_TOKEN`; every login attempt ignores the persisted
 user token. Only tokenless interactive login resolves and validates the login
 URL, so explicit-token login, link, and logout do not read an unused login URL.
-Windows browser launches quote the full callback URL before handing it to
-`cmd.exe`. Unlink resolves only the repository configuration path and does not
-read shared hosted settings or user credentials.
+Windows browser launches pass the full callback URL directly to the system URL
+protocol handler without command-interpreter expansion. Unlink resolves only
+the repository configuration path and does not read shared hosted settings or
+user credentials.
 User credentials use private directories, `0600` files on POSIX, atomic
 replacement, no-follow handle-based regular-file checks, reads bounded to 1
 MiB from the validated handle, and secret-safe diagnostics.
@@ -983,9 +984,10 @@ status is exactly `enabled`, offers the personal user scope alongside team
 scopes, follows the hosted teams endpoint's `pagination.next` cursor through
 the `until` query parameter until every page is collected, and prompts
 interactive users to select a scope when none is configured.
-Linking requires confirmation unless `--yes` is supplied; a non-interactive
-link must supply a scope and `--yes`. The command persists the selected identity
-and validated API URL, and keeps `.turbo` ignored unless `--no-gitignore` is
+Linking requires confirmation unless the valueless `--yes` or `-y` flag is
+supplied; attached values are rejected. A non-interactive link must supply a
+scope and the confirmation flag. The command persists the selected identity and
+validated API URL, and keeps `.turbo` ignored unless `--no-gitignore` is
 requested. Relinking selects its API from CLI, environment, the persisted
 project link, and the public default in descending precedence. The project link
 is persisted only after the required `.gitignore` update succeeds. An explicit
@@ -1032,9 +1034,11 @@ skips PUT when the artifact already exists, and warns but continues to PUT when
 the existence check fails.
 
 Telemetry state remains compatible with official state that omits the optional
-alert timestamp, preserves identity across enable and disable operations, and
-applies `TURBO_TELEMETRY_DISABLED` as an effective opt-out without destroying
-the persisted preference. OTLP run metrics support HTTP/JSON,
+alert timestamp, preserves valid identity across enable and disable operations,
+and applies `TURBO_TELEMETRY_DISABLED` as an effective opt-out without
+destroying the persisted preference. Disabling telemetry replaces unreadable or
+schema-invalid persisted state with a fresh disabled identity; enabling and
+status inspection continue to reject invalid state. OTLP run metrics support HTTP/JSON,
 HTTP/Protobuf, and HTTP/2 gRPC framing with required successful gRPC trailers,
 bounded request timeouts, environment and CLI headers, resource attributes,
 run-summary and task-detail selection, and an explicit opt-in to reuse the
@@ -1056,7 +1060,9 @@ The secondary command set includes versioned documentation search, internal
 workspace and configured generation without `@turbo/gen`, token-protected
 loopback devtools, boundary diagnostics, deterministic microfrontend ports,
 `bin`, hidden `config`, deprecated `scan`, and the remaining daemon, alias, and
-parser surfaces. Documentation output honors both `NO_COLOR` and `--no-color`.
+parser surfaces. Documentation output honors both `NO_COLOR` and `--no-color`,
+and encodes C0 and C1 controls in remote result titles and URLs before terminal
+display.
 During a successful automatic launch, devtools prints only its token-free
 loopback URL and passes its bearer URL only to the browser launcher. When
 `--no-open` is selected, the launcher is unavailable, or launch fails, devtools
