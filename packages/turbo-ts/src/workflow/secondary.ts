@@ -20,7 +20,7 @@ import {
 } from "../effect/services.js";
 import { selectPackages } from "../graph/task-graph.js";
 import { packageVersion } from "../version.js";
-import { hostedUrl } from "./hosted.js";
+import { hostedUrl, resolveHostedTimeoutMilliseconds } from "./hosted.js";
 import { boundaryDiagnostics } from "./query.js";
 import {
   loadWorkflowRepository,
@@ -411,6 +411,9 @@ const executeDocs = (
     const http = yield* HttpService;
     const environment = yield* EnvironmentService;
     const terminal = yield* TerminalService;
+    const environmentTimeout = yield* environment.get(
+      "TURBO_REMOTE_CACHE_TIMEOUT",
+    );
     const endpoint = new URL(
       (yield* environment.get("TURBO_TS_DOCS_ENDPOINT")) ??
         `https://v${docsVersion.replaceAll(".", "-")}.turborepo.dev/api/search`,
@@ -420,8 +423,9 @@ const executeDocs = (
       url: endpoint.toString(),
       method: "GET",
       headers: { "user-agent": `turbo-ts/${packageVersion}` },
-      timeoutMilliseconds: Math.round(
-        (parsed.options.remoteCacheTimeoutSeconds ?? 30) * 1_000,
+      timeoutMilliseconds: resolveHostedTimeoutMilliseconds(
+        parsed.options.remoteCacheTimeoutSeconds,
+        environmentTimeout,
       ),
       maxResponseBodyBytes: 1024 * 1024,
     });

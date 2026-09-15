@@ -2010,6 +2010,66 @@ describe("secondary command and parser compatibility", () => {
     }
   });
 
+  it("uses the environment timeout for documentation requests", async () => {
+    const services = await Effect.runPromise(
+      Effect.gen(function* () {
+        return {
+          environment: yield* EnvironmentService,
+          http: yield* HttpService,
+          terminal: yield* TerminalService,
+        };
+      }).pipe(Effect.provide(nodeFoundationLayer)),
+    );
+    const requests: Array<HttpRequest> = [];
+    const runDocs = (timeout: string) =>
+      Effect.runPromise(
+        executeSecondaryCommand("docs", ["synthetic query"]).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.succeed(EnvironmentService, {
+                ...services.environment,
+                get: (name) =>
+                  Effect.succeed(
+                    name === "TURBO_REMOTE_CACHE_TIMEOUT"
+                      ? timeout
+                      : name === "TURBO_TS_DOCS_ENDPOINT"
+                        ? "https://docs.example.test/search"
+                        : undefined,
+                  ),
+              }),
+              Layer.succeed(HttpService, {
+                ...services.http,
+                request: (request) =>
+                  Effect.sync(() => {
+                    requests.push(request);
+                    return {
+                      status: 200,
+                      headers: {},
+                      body: new TextEncoder().encode('{"results":[]}'),
+                    };
+                  }),
+              }),
+              Layer.succeed(TerminalService, {
+                ...services.terminal,
+                writeStdout: () => Effect.void,
+              }),
+            ),
+          ),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+
+    const success = await runDocs("0.0004");
+    expect(success).toBe(0);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.timeoutMilliseconds).toBe(1);
+
+    await expect(runDocs("invalid")).rejects.toThrow(
+      "invalid remote cache timeout",
+    );
+    expect(requests).toHaveLength(1);
+  });
+
   it(evidenceId.secondaryCompatibility, async () => {
     const common = parseCommonArguments([
       "--skip-infer",
@@ -2166,6 +2226,8 @@ describe("secondary command and parser compatibility", () => {
     ).toThrow("invalid OTLP interval: 2147483648");
     expect(resolveHostedTimeoutMilliseconds(undefined, "12.5")).toBe(12_500);
     expect(resolveHostedTimeoutMilliseconds(1.25, "12.5")).toBe(1_250);
+    expect(resolveHostedTimeoutMilliseconds(0.0004, undefined)).toBe(1);
+    expect(resolveHostedTimeoutMilliseconds(undefined, "0.0004")).toBe(1);
     expect(resolveHostedTimeoutMilliseconds(undefined, undefined)).toBe(30_000);
     expect(resolveHostedTimeoutMilliseconds(undefined, "0")).toBe(0);
     expect(resolveHostedTimeoutMilliseconds(undefined, "2147483.647")).toBe(
@@ -2317,6 +2379,25 @@ describe("secondary command and parser compatibility", () => {
           ),
         ),
       ).toMatchObject({ name: "generated-library", private: true });
+
+      const absoluteDestination = join(root, "packages/generated-absolute");
+      const generatedAbsolute = await runCandidate(
+        [
+          "generate",
+          "workspace",
+          "--name=generated-absolute",
+          "--empty",
+          `--destination=${absoluteDestination}`,
+          `--root=${root}`,
+        ],
+        root,
+      );
+      expect(generatedAbsolute.code, generatedAbsolute.stderr).toBe(0);
+      expect(
+        JSON.parse(
+          await readFile(join(absoluteDestination, "package.json"), "utf8"),
+        ),
+      ).toMatchObject({ name: "generated-absolute", private: true });
 
       const invalidTypeDestination = "packages/generated-service";
       const invalidType = await runCandidate(

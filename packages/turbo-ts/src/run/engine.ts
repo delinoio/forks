@@ -4201,11 +4201,12 @@ export const executeRun = (
       left.id.localeCompare(right.id),
     );
     const outcomes = new Map<string, TaskOutcome>();
+    const metricOutcomes = new Map<string, TaskOutcome>();
     const reportTaskMetrics = (includeUnresolved = false): void =>
       context.onTaskMetricsResolved?.({
         taskCount: orderedNodes.length,
         tasks: orderedNodes.flatMap((node) => {
-          const outcome = outcomes.get(node.id);
+          const outcome = metricOutcomes.get(node.id);
           if (outcome === undefined && !includeUnresolved) return [];
           return [
             {
@@ -4834,6 +4835,8 @@ export const executeRun = (
                       Effect.tap((outcome) =>
                         Effect.sync(() => {
                           groupOutcomes.set(outcome.id, outcome);
+                          metricOutcomes.set(outcome.id, outcome);
+                          reportTaskMetrics();
                         }),
                       ),
                     ),
@@ -4946,6 +4949,7 @@ export const executeRun = (
           const results = yield* Fiber.join(fiber);
           for (const result of results) {
             outcomes.set(result.id, result);
+            metricOutcomes.set(result.id, result);
           }
           reportTaskMetrics();
           if (

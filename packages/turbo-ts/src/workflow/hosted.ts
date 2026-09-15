@@ -257,7 +257,7 @@ export const resolveHostedTimeoutMilliseconds = (
       message: `invalid remote cache timeout: ${String(value)}`,
     });
   }
-  return Math.round(seconds * 1_000);
+  return seconds === 0 ? 0 : Math.max(1, Math.round(seconds * 1_000));
 };
 
 const resolveHostedSettings = (

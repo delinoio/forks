@@ -92,6 +92,7 @@ import {
   makeCachePublicationPermit,
   packageManagerCommand,
   planCargoWorkspaceTasks,
+  type RunMetricSnapshot,
   taskIdsWithUnrestorableCacheInputs,
   taskMatchesChangedFiles,
 } from "../src/run/engine.js";
@@ -7498,6 +7499,65 @@ dependencies = [
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toContain("check alongside serve");
       expect(result.stdout).toContain("serve alongside check");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  it("publishes completed task metrics before a with group finishes", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const snapshots: Array<RunMetricSnapshot> = [];
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.check = { cache: false, with: ["serve"] };
+      configuration.tasks.serve = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.check = 'node -e ""';
+      manifest.scripts.serve = 'node -e "setTimeout(() => {}, 250)"';
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+      const exitCode = await Effect.runPromise(
+        executeRun(
+          parseRunArguments([
+            "run",
+            "check",
+            "--cwd",
+            directory,
+            "--filter=synthetic-library",
+            "--concurrency=2",
+            "--no-cache",
+          ]),
+          {
+            onTaskMetricsResolved: (snapshot) => snapshots.push(snapshot),
+          },
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+
+      expect(exitCode).toBe(0);
+      expect(
+        snapshots.some(
+          (snapshot) =>
+            snapshot.tasks.some(
+              (task) =>
+                task.id === "synthetic-library#check" &&
+                task.status === "succeeded",
+            ) &&
+            !snapshot.tasks.some(
+              (task) => task.id === "synthetic-library#serve",
+            ),
+        ),
+      ).toBe(true);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

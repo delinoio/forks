@@ -1091,8 +1091,10 @@ generic HTTP OTLP endpoint preserves its
 path prefix and appends `/v1/metrics`. A positive metric interval emits scoped,
 sequential in-progress snapshots and a final snapshot; zero or an absent
 interval emits only the final snapshot. Graph and dry runs report the resolved
-task count rather than the number of requested task names. Export failure never
-changes task execution status.
+task count rather than the number of requested task names. Completed foreground
+task outcomes are available to in-progress snapshots without waiting for their
+entire `with` group to finish. Export failure never changes task execution
+status.
 
 The secondary command set includes versioned documentation search, internal
 workspace and configured generation without `@turbo/gen`, token-protected
@@ -1121,13 +1123,18 @@ Remote download and upload timeouts use CLI, environment, configuration, and
 default values in descending precedence and reject negative, empty, or
 non-finite environment values. Networked hosted commands use the remote cache
 timeout CLI option, `TURBO_REMOTE_CACHE_TIMEOUT`, and the 30-second default in
-descending precedence with the same validation. Microfrontend configuration is
-selected only from the explicit `--cwd`, or the process working directory when
-the option is absent, and its package ancestors after platform-aware canonical
-path normalization. The repository root package remains eligible to own the
-selected microfrontend configuration.
-Generator destinations are validated through canonical existing ancestors,
-and recursive copies whose source contains their destination are rejected.
+descending precedence with the same validation, and documentation search uses
+the same CLI, environment, and default chain. For those hosted and documentation
+requests, explicit zero disables the request timer, while every positive timeout
+is converted to at least one millisecond.
+Microfrontend configuration is selected only from the explicit `--cwd`, or the
+process working directory when the option is absent, and its package ancestors
+after platform-aware canonical path normalization. The repository root package
+remains eligible to own the selected microfrontend configuration.
+Absolute workspace generator destinations are used directly, while relative
+destinations resolve from the repository root. All generator destinations are
+validated through canonical existing ancestors, and recursive copies whose
+source contains their destination are rejected.
 Explicit generator roots must resolve from an existing directory through
 repository discovery before any destination is created.
 Requested workspace names must be valid for new npm packages, including

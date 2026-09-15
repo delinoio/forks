@@ -356,11 +356,12 @@ const executeWorkspaceGenerator = (
       );
     }
     const defaultParent = options.type === "app" ? "apps" : "packages";
-    const destination = joinPath(
-      root,
+    const requestedDestination =
       options.destination ??
-        joinPath(defaultParent, name.replace(/^@[^/]+\//, "")),
-    );
+      joinPath(defaultParent, name.replace(/^@[^/]+\//, ""));
+    const destination = isAbsolutePath(requestedDestination)
+      ? requestedDestination
+      : joinPath(root, requestedDestination);
     const [canonicalRoot, canonicalDestination] = yield* Effect.all([
       canonicalExistingAncestorPath(root, "generator repository"),
       canonicalExistingAncestorPath(destination, "workspace destination"),
