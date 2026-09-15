@@ -3,6 +3,7 @@ import type {
   OpenTelemetryOptions,
   OtlpProtocol,
 } from "../cli/common-options.js";
+import { renderTerminalSafeText } from "../cli/terminal-text.js";
 import { maximumNodeTimerMilliseconds } from "../core/time.js";
 import { BoundaryError } from "../effect/errors.js";
 import {
@@ -371,12 +372,16 @@ export const exportRunMetrics = (
       "content-type",
       ...(protocol === "grpc" ? ["te"] : []),
     ]);
-    const configuredHeaders = [
-      ...parseEnvironmentHeaders(
-        yield* environment.get("OTEL_EXPORTER_OTLP_HEADERS"),
-      ),
-      ...options.headers,
-    ].filter(([name]) => !reservedHeaderNames.has(name.toLowerCase()));
+    const configuredHeaders = new Map(
+      [
+        ...parseEnvironmentHeaders(
+          yield* environment.get("OTEL_EXPORTER_OTLP_HEADERS"),
+        ),
+        ...options.headers,
+      ]
+        .filter(([name]) => !reservedHeaderNames.has(name.toLowerCase()))
+        .map(([name, value]) => [name.toLowerCase(), value] as const),
+    );
     const headers: Record<string, string> = {
       "content-type":
         protocol === "grpc"
@@ -463,7 +468,7 @@ export const exportRunMetrics = (
       return yield* Effect.fail(
         new BoundaryError({
           boundary: "observability",
-          message: `OTLP gRPC export failed: ${message}`,
+          message: `OTLP gRPC export failed: ${renderTerminalSafeText(message)}`,
           retryable: false,
         }),
       );

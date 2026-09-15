@@ -798,7 +798,7 @@ describe("hosted compatibility", () => {
     }
   }, 60_000);
 
-  it("removes the local token when persisted invalidation is unavailable", async () => {
+  it("removes the local token when persisted invalidation is unavailable or rejected", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-logout-"));
     const root = join(directory, "repository");
     const token = "synthetic-logout-token";
@@ -818,7 +818,7 @@ describe("hosted compatibility", () => {
         retained: "synthetic-value",
         token,
       };
-      let invalidationUnavailable = true;
+      let invalidationStatus: number | undefined;
       let output = "";
       const requests: Array<HttpRequest> = [];
       const overrides = Layer.mergeAll(
@@ -842,7 +842,7 @@ describe("hosted compatibility", () => {
           request: (request) =>
             Effect.suspend(() => {
               requests.push(request);
-              return invalidationUnavailable
+              return invalidationStatus === undefined
                 ? Effect.fail(
                     new BoundaryError({
                       boundary: "http",
@@ -851,7 +851,7 @@ describe("hosted compatibility", () => {
                     }),
                   )
                 : Effect.succeed({
-                    status: 401,
+                    status: invalidationStatus,
                     headers: {},
                     body: new Uint8Array(),
                   });
@@ -880,18 +880,22 @@ describe("hosted compatibility", () => {
       expect(storedUser).toEqual({ retained: "synthetic-value" });
       expect(output).toContain(">>> Logged out");
 
-      storedUser = { retained: "synthetic-value", token };
-      invalidationUnavailable = false;
-      output = "";
-      requests.length = 0;
-      const rejected = await Effect.runPromise(Effect.either(logout()));
-      expect(rejected).toMatchObject({
-        _tag: "Left",
-        left: { message: "token invalidation failed with status 401" },
-      });
-      expect(requests).toHaveLength(1);
-      expect(storedUser).toEqual({ retained: "synthetic-value", token });
-      expect(output).toBe("");
+      for (const status of [401, 403]) {
+        storedUser = { retained: "synthetic-value", token };
+        invalidationStatus = status;
+        output = "";
+        requests.length = 0;
+        const rejected = await Effect.runPromise(Effect.either(logout()));
+        expect(rejected).toMatchObject({
+          _tag: "Left",
+          left: {
+            message: `token was removed locally, but remote invalidation failed with status ${status}`,
+          },
+        });
+        expect(requests).toHaveLength(1);
+        expect(storedUser).toEqual({ retained: "synthetic-value" });
+        expect(output).toBe("");
+      }
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -2975,6 +2979,45 @@ describe("secondary command and parser compatibility", () => {
     }
   });
 
+  it("separates configured generator output from its result protocol", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-generator-output-"),
+    );
+    const root = join(directory, "repository");
+    await prepareRepository(root);
+    await mkdir(join(root, "turbo/generators"), { recursive: true });
+    await writeFile(
+      join(root, "turbo/generators/config.mjs"),
+      `export default (api) => {
+  console.log("generator configuration log");
+  api.setGenerator("logged", {
+    actions: () => {
+      console.log("generator action log");
+      console.error("generator action warning");
+      return [{ type: "add", path: "generated/logged.txt", template: "logged" }];
+    },
+  });
+};
+`,
+    );
+    try {
+      const result = await runCandidate(
+        ["generate", "logged", `--root=${root}`],
+        root,
+      );
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stdout).toContain("generator configuration log");
+      expect(result.stdout).toContain("generator action log");
+      expect(result.stderr).toContain("generator action warning");
+      expect(result.stdout).not.toContain("turbo-ts-generator-result");
+      expect(await readFile(join(root, "generated/logged.txt"), "utf8")).toBe(
+        "logged",
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("validates effective login URLs before rendering config", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-config-login-"));
     const root = join(directory, "repository");
@@ -3410,7 +3453,7 @@ describe("hosted protocols and experimental transports", () => {
       get: (name) =>
         Effect.succeed(
           name === "OTEL_EXPORTER_OTLP_HEADERS"
-            ? "Content%2DType=text%2Fplain,x%2Denvironment=Bearer%20credential%2Cwith%20comma,x-malformed=literal%ZZ"
+            ? "Content%2DType=text%2Fplain,Authorization=Basic%20environment,x%2Denvironment=Bearer%20credential%2Cwith%20comma,x-malformed=literal%ZZ"
             : undefined,
         ),
       entries: Effect.succeed({}),
@@ -3451,6 +3494,7 @@ describe("hosted protocols and experimental transports", () => {
             endpoint: "http://127.0.0.1:4318",
             headers: [
               ["CONTENT-TYPE", "application/octet-stream"],
+              ["AUTHORIZATION", "Basic cli"],
               ["x-synthetic", "yes"],
             ],
             resources: [["deployment.environment", "test"]],
@@ -3470,6 +3514,11 @@ describe("hosted protocols and experimental transports", () => {
           (name) => name.toLowerCase() === "content-type",
         ),
       ).toEqual(["content-type"]);
+      expect(
+        Object.keys(request.headers ?? {}).filter(
+          (name) => name.toLowerCase() === "authorization",
+        ),
+      ).toEqual(["authorization"]);
     }
     expect(requests.map((request) => request.url)).toEqual([
       "http://127.0.0.1:4318/v1/metrics",
@@ -3807,6 +3856,7 @@ describe("hosted protocols and experimental transports", () => {
       readonly headers: Readonly<Record<string, unknown>>;
     }> = [];
     let grpcStatus = "0";
+    let grpcMessage = "permission%20denied";
     let statusInInitialHeaders = false;
     let responseBody = Buffer.alloc(5);
     const server = createHttp2Server();
@@ -3821,9 +3871,7 @@ describe("hosted protocols and experimental transports", () => {
           ...(statusInInitialHeaders
             ? {
                 "grpc-status": grpcStatus,
-                ...(grpcStatus === "0"
-                  ? {}
-                  : { "grpc-message": "permission%20denied" }),
+                ...(grpcStatus === "0" ? {} : { "grpc-message": grpcMessage }),
               }
             : {}),
         };
@@ -3834,9 +3882,7 @@ describe("hosted protocols and experimental transports", () => {
           stream.on("wantTrailers", () =>
             stream.sendTrailers({
               "grpc-status": grpcStatus,
-              ...(grpcStatus === "0"
-                ? {}
-                : { "grpc-message": "permission%20denied" }),
+              ...(grpcStatus === "0" ? {} : { "grpc-message": grpcMessage }),
             }),
           );
         }
@@ -3883,6 +3929,7 @@ describe("hosted protocols and experimental transports", () => {
       expect(requests[0]?.body[0]).toBe(0);
 
       grpcStatus = "7";
+      grpcMessage = "permission%20denied%1B%5D0%3Bunsafe%07%C2%9B31m";
       const failed = await Effect.runPromise(
         Effect.either(
           exportRunMetrics(options, undefined, summary).pipe(
@@ -3893,6 +3940,12 @@ describe("hosted protocols and experimental transports", () => {
       expect(failed._tag).toBe("Left");
       if (failed._tag === "Right") throw new Error("expected gRPC failure");
       expect(failed.left.message).toContain("permission denied");
+      expect(failed.left.message).toContain(
+        "\\u001b]0;unsafe\\u0007\\u009b31m",
+      );
+      expect(failed.left.message).not.toContain("\u001b");
+      expect(failed.left.message).not.toContain("\u0007");
+      expect(failed.left.message).not.toContain("\u009b");
 
       grpcStatus = "0";
       statusInInitialHeaders = true;

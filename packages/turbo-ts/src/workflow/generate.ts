@@ -14,6 +14,7 @@ import {
   EnvironmentService,
   FileSystemService,
   ProcessService,
+  RandomnessService,
   TerminalService,
 } from "../effect/services.js";
 import { canonicalExistingAncestorPath } from "../run/engine.js";
@@ -48,6 +49,11 @@ interface LoadedGeneratorPrompts {
 }
 
 type LoadedGenerator = LoadedGeneratorReady | LoadedGeneratorPrompts;
+
+interface DecodedGeneratorOutput {
+  readonly generator: LoadedGenerator;
+  readonly stdout: string;
+}
 
 interface GenerateOptions {
   readonly answers: Readonly<Record<string, string>>;
@@ -218,12 +224,44 @@ const renderTemplate = (
     String(answers[name] ?? ""),
   );
 
+const decodeGeneratorOutput = (
+  stdout: string,
+  marker: string,
+): DecodedGeneratorOutput | undefined => {
+  const markerIndex = stdout.lastIndexOf(marker);
+  if (markerIndex === -1) return undefined;
+  const lengthStart = markerIndex + marker.length;
+  const lengthEnd = stdout.indexOf(":", lengthStart);
+  if (lengthEnd === -1) return undefined;
+  const lengthSource = stdout.slice(lengthStart, lengthEnd);
+  if (!/^\d+$/.test(lengthSource)) return undefined;
+  const length = Number(lengthSource);
+  if (!Number.isSafeInteger(length)) return undefined;
+  const payloadStart = lengthEnd + 1;
+  const payloadEnd = payloadStart + length;
+  if (payloadEnd > stdout.length) return undefined;
+  try {
+    return {
+      generator: JSON.parse(
+        stdout.slice(payloadStart, payloadEnd),
+      ) as LoadedGenerator,
+      stdout: `${stdout.slice(0, markerIndex)}${stdout.slice(payloadEnd)}`,
+    };
+  } catch {
+    return undefined;
+  }
+};
+
 const generatorLoader = `
 const { pathToFileURL } = await import("node:url");
-const [configurationPath, requestedName, encodedAnswers] = process.argv.slice(1);
+const [configurationPath, requestedName, encodedAnswers, resultMarker] = process.argv.slice(1);
 const supplied = JSON.parse(encodedAnswers);
 const generators = new Map();
 const api = { setGenerator(name, definition) { generators.set(name, definition); } };
+const writeResult = (result) => {
+  const payload = JSON.stringify(result);
+  process.stdout.write(resultMarker + payload.length + ":" + payload);
+};
 const module = await import(pathToFileURL(configurationPath).href + "?turbo_ts=" + Date.now());
 if (typeof module.default !== "function") throw new TypeError("generator configuration must default-export a function");
 await module.default(api);
@@ -232,12 +270,12 @@ if (definition === undefined) throw new TypeError("unknown generator: " + reques
 const answers = { ...Object.fromEntries((definition.prompts ?? []).flatMap((prompt) => prompt && typeof prompt === "object" && typeof prompt.name === "string" && prompt.default !== undefined ? [[prompt.name, prompt.default]] : [])), ...supplied };
 const unresolved = (definition.prompts ?? []).flatMap((prompt) => prompt && typeof prompt === "object" && typeof prompt.name === "string" && !Object.hasOwn(answers, prompt.name) ? [{ name: prompt.name, message: typeof prompt.message === "string" ? prompt.message : prompt.name }] : []);
 if (unresolved.length > 0) {
-  process.stdout.write(JSON.stringify({ kind: "prompts", prompts: unresolved, answers }));
+  writeResult({ kind: "prompts", prompts: unresolved, answers });
 } else {
   const actions = typeof definition.actions === "function" ? await definition.actions(answers) : (definition.actions ?? []);
   const resolved = [];
   for (const action of actions) resolved.push(typeof action === "function" ? await action(answers) : action);
-  process.stdout.write(JSON.stringify({ kind: "ready", description: definition.description, actions: resolved, answers }));
+  writeResult({ kind: "ready", description: definition.description, actions: resolved, answers });
 }
 `;
 
@@ -435,7 +473,11 @@ export const executeGenerate = (
 ): Effect.Effect<
   number,
   unknown,
-  EnvironmentService | FileSystemService | ProcessService | TerminalService
+  | EnvironmentService
+  | FileSystemService
+  | ProcessService
+  | RandomnessService
+  | TerminalService
 > =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -443,6 +485,7 @@ export const executeGenerate = (
       const environment = yield* EnvironmentService;
       const fileSystem = yield* FileSystemService;
       const processService = yield* ProcessService;
+      const randomness = yield* RandomnessService;
       const terminal = yield* TerminalService;
       const root = yield* resolveWorkflowRepositoryRoot({
         cwd: options.root ?? options.common.cwd,
@@ -463,6 +506,7 @@ export const executeGenerate = (
           : yield* environment.executablePath;
       const loadGenerator = (answers: Readonly<Record<string, unknown>>) =>
         Effect.gen(function* () {
+          const resultMarker = `\u001eturbo-ts-generator-result:${yield* randomness.uuidV7}\u001e`;
           const loadedResult = yield* processService.run({
             command: executable,
             args: [
@@ -472,12 +516,19 @@ export const executeGenerate = (
               configuration,
               generatorName,
               JSON.stringify(answers),
+              resultMarker,
             ],
             cwd: root,
             inheritEnvironment: true,
             maxCapturedOutputCharacters: 1024 * 1024,
           });
           if (loadedResult.exitCode !== 0) {
+            if (loadedResult.stdout !== "") {
+              yield* terminal.writeStdout(loadedResult.stdout);
+            }
+            if (loadedResult.stderr !== "") {
+              yield* terminal.writeStderr(loadedResult.stderr);
+            }
             return yield* Effect.fail(
               new BoundaryError({
                 boundary: "generator",
@@ -486,13 +537,28 @@ export const executeGenerate = (
               }),
             );
           }
-          try {
-            return JSON.parse(loadedResult.stdout) as LoadedGenerator;
-          } catch {
+          const decoded = decodeGeneratorOutput(
+            loadedResult.stdout,
+            resultMarker,
+          );
+          if (decoded === undefined) {
+            if (loadedResult.stdout !== "") {
+              yield* terminal.writeStdout(loadedResult.stdout);
+            }
+            if (loadedResult.stderr !== "") {
+              yield* terminal.writeStderr(loadedResult.stderr);
+            }
             return yield* Effect.fail(
               failure("generator returned invalid output"),
             );
           }
+          if (decoded.stdout !== "") {
+            yield* terminal.writeStdout(decoded.stdout);
+          }
+          if (loadedResult.stderr !== "") {
+            yield* terminal.writeStderr(loadedResult.stderr);
+          }
+          return decoded.generator;
         });
       let loaded = yield* loadGenerator(options.answers);
       if (loaded.kind === "prompts") {

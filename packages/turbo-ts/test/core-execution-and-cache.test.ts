@@ -13848,6 +13848,109 @@ describe("cache interoperability and safety", () => {
     }
   }, 15_000);
 
+  it("bounds remote cache event draining when request timeouts are disabled", async () => {
+    const directory = await makeFixture();
+    const taskMarker = `${directory}/packages/library/event-task-complete`;
+    const manifestPath = `${directory}/packages/library/package.json`;
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    manifest.scripts.build =
+      "node -e \"require('node:fs').writeFileSync('event-task-complete', 'done')\"";
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    let markEventStarted = (): void => undefined;
+    const eventStarted = new Promise<void>((resolve) => {
+      markEventStarted = resolve;
+    });
+    const server = createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
+        if (request.url?.startsWith("/v8/artifacts/events") === true) {
+          markEventStarted();
+          return;
+        }
+        response.writeHead(404);
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    const execution = Effect.scoped(
+      Effect.gen(function* () {
+        const processService = yield* ProcessService;
+        return yield* processService.run({
+          command: process.execPath,
+          args: [
+            candidateEntrypoint,
+            "run",
+            "build",
+            `--cwd=${directory}`,
+            "--filter=synthetic-library",
+            "--cache=remote:r",
+            "--output-logs=none",
+            "--remote-cache-timeout=0",
+            `--api=http://127.0.0.1:${address.port}`,
+            "--token=synthetic-token",
+            "--team=synthetic-team",
+          ],
+          cwd: repositoryRoot,
+        });
+      }),
+    ).pipe(Effect.provide(nodeFoundationLayer));
+    const runFiber = Effect.runFork(execution);
+    const runPromise = Effect.runPromise(Fiber.join(runFiber));
+    try {
+      await Promise.race([
+        eventStarted,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("cache event did not start")),
+            3_000,
+          ),
+        ),
+      ]);
+      let taskCompleted = false;
+      for (let attempt = 0; attempt < 300; attempt += 1) {
+        try {
+          await readFile(taskMarker, "utf8");
+          taskCompleted = true;
+          break;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+      expect(taskCompleted).toBe(true);
+      const result = await Promise.race([
+        runPromise,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("cache event drain did not finish")),
+            4_000,
+          ),
+        ),
+      ]);
+      expect(result.exitCode, result.stderr).toBe(0);
+    } finally {
+      await Effect.runPromise(Fiber.interrupt(runFiber));
+      const closed = new Promise<void>((resolve) =>
+        server.close(() => resolve()),
+      );
+      server.closeAllConnections();
+      await closed;
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("falls back to execution when remote cache restoration fails", async () => {
     const directory = await makeFixture();
     const server = createServer((request, response) => {

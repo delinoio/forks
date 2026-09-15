@@ -190,6 +190,8 @@ type ReportRemoteCacheEvent = (
   event: "HIT" | "MISS",
 ) => Effect.Effect<void, never, HttpService | RetryScheduleService>;
 
+const maximumRemoteCacheEventDrainMilliseconds = 1_000;
+
 export const resolveRunUiMode = (
   requested: ResolvedRunOptions["ui"],
   stdinIsTerminal: boolean,
@@ -4551,7 +4553,19 @@ export const executeRun = (
     const tuiSemaphore = yield* Effect.makeSemaphore(1);
     const remoteCacheEventScope = yield* Effect.scope;
     const remoteCacheEventFibers: Array<Fiber.RuntimeFiber<void, never>> = [];
-    const remoteCacheEventOptions = options.remote;
+    const remoteCacheEventOptions =
+      options.remote === undefined
+        ? undefined
+        : {
+            ...options.remote,
+            timeoutMilliseconds:
+              options.remote.timeoutMilliseconds === 0
+                ? maximumRemoteCacheEventDrainMilliseconds
+                : Math.min(
+                    options.remote.timeoutMilliseconds,
+                    maximumRemoteCacheEventDrainMilliseconds,
+                  ),
+          };
     const reportRemoteCacheEvent: ReportRemoteCacheEvent =
       remoteCacheEventOptions === undefined
         ? () => Effect.void
@@ -4566,9 +4580,14 @@ export const executeRun = (
               ),
               Effect.asVoid,
             );
-    const flushRemoteCacheEvents = Effect.suspend(() =>
-      Fiber.joinAll(remoteCacheEventFibers).pipe(Effect.asVoid),
-    );
+    const flushRemoteCacheEvents = Effect.suspend(() => {
+      const fibers = [...remoteCacheEventFibers];
+      if (fibers.length === 0) return Effect.void;
+      return Effect.raceFirst(
+        Fiber.joinAll(fibers).pipe(Effect.asVoid),
+        Effect.sleep(`${maximumRemoteCacheEventDrainMilliseconds} millis`),
+      ).pipe(Effect.ensuring(Fiber.interruptAll(fibers)), Effect.asVoid);
+    });
     const updateTuiStatus = (
       id: string,
       status: RunTuiStatus,

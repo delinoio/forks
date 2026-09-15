@@ -728,6 +728,7 @@ export const executeHostedCommand = (
         token: existing.token,
       });
       const token = settings.token;
+      let invalidationFailure: BoundaryError | undefined;
       if (options.invalidate && token !== undefined) {
         const invalidationApi = yield* resolveLogoutInvalidationApi(
           options,
@@ -744,18 +745,19 @@ export const executeHostedCommand = (
             response !== undefined &&
             (response.status < 200 || response.status >= 300)
           ) {
-            return yield* Effect.fail(
-              new BoundaryError({
-                boundary: "hosted",
-                message: `token invalidation failed with status ${response.status}`,
-                retryable: false,
-              }),
-            );
+            invalidationFailure = new BoundaryError({
+              boundary: "hosted",
+              message: `token was removed locally, but remote invalidation failed with status ${response.status}`,
+              retryable: false,
+            });
           }
         }
       }
       const { token: _removed, ...retained } = existing;
       yield* credentials.writeUserConfiguration(retained);
+      if (invalidationFailure !== undefined) {
+        return yield* Effect.fail(invalidationFailure);
+      }
       yield* terminal.writeStdout(">>> Logged out\n");
       return 0;
     }

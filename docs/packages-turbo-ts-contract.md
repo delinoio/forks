@@ -1013,7 +1013,9 @@ token only against an API selected explicitly or persisted by the linked
 project. When the issuing API is unavailable, it skips remote invalidation
 before removing the token while retaining unrelated shared configuration
 fields. `logout --invalidate=false` removes the local token without resolving
-or validating hosted API and login URLs.
+or validating hosted API and login URLs. A non-success response from the
+issuing API still removes the local token and retains unrelated user
+configuration before reporting the remote invalidation failure.
 
 Remote cache control and artifact traffic supports team IDs and slugs,
 preflight, bounded responses, separate download and upload timeouts, safe
@@ -1051,7 +1053,9 @@ remote-cache team slug. Remote cache hit events are emitted only after signature
 verification, decompression, and archive restoration succeed. Remote cache hit
 and miss event reporting runs as supervised best-effort background work and does
 not delay restoration or local task execution. Pending event work is drained
-before the run scope closes.
+for at most one second before the run scope closes, after which unfinished
+event fibers are interrupted. This independent bound also applies when the
+remote cache request timeout is disabled.
 Write-only remote publication issues an artifact HEAD request before upload,
 skips PUT when the artifact already exists, and warns but continues to PUT when
 the existence check fails.
@@ -1076,7 +1080,11 @@ identify tasks that were actually bypassed as skipped. Numeric task and run
 attributes use OTLP integer values for every protocol. Environment header names
 and values are percent-decoded after comma-separated entries are split, so an
 encoded comma remains part of its header value. Malformed percent encodings are
-preserved literally. Empty, zero, non-finite, and over-limit environment OTLP
+preserved literally. Header names are normalized and deduplicated
+case-insensitively; CLI values override environment values and explicit remote
+cache token reuse overrides configured authorization. Decoded gRPC status
+messages encode terminal control characters before entering user-visible
+errors. Empty, zero, non-finite, and over-limit environment OTLP
 timeouts use the finite default. CLI timeout and interval values above Node's
 2,147,483,647-millisecond timer limit are rejected during argument parsing. A
 generic HTTP OTLP endpoint preserves its
@@ -1132,7 +1140,9 @@ copies, or manifest rewrites remove the partial destination only when the
 generator acquired that destination exclusively, so a concurrently created
 destination is preserved. Configured generators collect unresolved prompt
 answers through the terminal before evaluating actions and fail without writing
-when those answers are unavailable non-interactively. Workspace example template path
+when those answers are unavailable non-interactively. Generator results use a
+nonce-scoped length-delimited frame, while ordinary configuration and action
+stdout and stderr are forwarded separately. Workspace example template path
 selection and workspace dependency selection, including the visibility change
 requested by `--show-all-dependencies`, remain planned. Update
 checks remain disabled by default; the explicit
