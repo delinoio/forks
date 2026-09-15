@@ -1048,10 +1048,10 @@ token, and team identity, the lower-precedence project credential file is not
 read.
 Explicit CLI and environment tokens may activate the default API. An explicit
 team slug suppresses lower-precedence stored team IDs. Hosted and OTLP requests
-identify as `turbo-ts/0.1.0`. Runtime remote API selection uses CLI,
-environment, linked project, root configuration, and default values in
-descending precedence. An empty `TURBO_TEAM` value is treated as unset and does
-not suppress `TURBO_TEAMID`. A linked project's stored token is never redirected
+identify as `turbo-ts/0.1.0`. Runtime remote API selection and
+`config` output use CLI, environment, linked project, root configuration, and
+default values in descending precedence. An empty `TURBO_TEAM` value is treated
+as unset and does not suppress `TURBO_TEAMID`. A linked project's stored token is never redirected
 by a lower-precedence root API setting. A linked project's team ID likewise
 takes precedence over a root remote-cache team ID, and its team slug takes precedence over a root
 remote-cache team slug. Remote cache hit events are emitted only after signature

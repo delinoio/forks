@@ -2133,6 +2133,30 @@ describe("secondary command and parser compatibility", () => {
     }
   }, 30_000);
 
+  it("treats an empty TURBO_TEAM as unset in config output", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-config-team-"));
+    const root = join(directory, "repository");
+    await prepareRepository(root);
+    try {
+      const configuration = await runCandidate(
+        ["config", `--cwd=${root}`],
+        root,
+        {
+          XDG_CONFIG_HOME: join(directory, "configuration"),
+          TURBO_TEAM: "",
+          TURBO_TEAMID: "team_environment",
+        },
+      );
+      expect(configuration.code, configuration.stderr).toBe(0);
+      expect(JSON.parse(configuration.stdout)).toMatchObject({
+        teamId: "team_environment",
+        teamSlug: null,
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("uses TURBO_ROOT_TURBO_JSON for config output", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-config-root-"));
     const root = join(directory, "repository");

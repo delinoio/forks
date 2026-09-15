@@ -141,7 +141,9 @@ const executeConfig = (
       repository.root,
     );
     const environmentValue = (name: string) => environment.get(name);
-    const environmentTeamSlug = yield* environmentValue("TURBO_TEAM");
+    const environmentTeamSlugValue = yield* environmentValue("TURBO_TEAM");
+    const environmentTeamSlug =
+      environmentTeamSlugValue === "" ? undefined : environmentTeamSlugValue;
     const environmentTimeout = yield* environmentValue(
       "TURBO_REMOTE_CACHE_TIMEOUT",
     );
