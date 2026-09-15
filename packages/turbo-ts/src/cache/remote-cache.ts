@@ -74,7 +74,7 @@ const requestHeaders = (
   options: RemoteCacheOptions,
 ): Record<string, string> => ({
   "user-agent": `turbo-ts/${packageVersion}`,
-  ...(options.token === undefined
+  ...(options.token === undefined || options.token === ""
     ? {}
     : { authorization: `Bearer ${options.token}` }),
 });

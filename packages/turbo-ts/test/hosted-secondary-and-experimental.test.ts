@@ -2075,7 +2075,7 @@ describe("hosted compatibility", () => {
               `--cwd=${root}`,
             ],
             root,
-            { TURBO_TEAM: "", TURBO_TEAMID: undefined },
+            { TURBO_TEAM: "", TURBO_TEAMID: "" },
           );
           expect(emptyTeam.code, emptyTeam.stderr).toBe(0);
           expect(
@@ -3391,6 +3391,75 @@ describe("secondary command and parser compatibility", () => {
     }
   });
 
+  it("keeps workspace cleanup failures in the typed cause", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-generator-cleanup-failure-"),
+    );
+    const root = join(directory, "repository");
+    const template = join(root, "templates/cleanup-failure");
+    const destination = join(root, "packages/generated-cleanup-failure");
+    await prepareRepository(root);
+    await mkdir(template, { recursive: true });
+    await writeFile(
+      join(template, "package.json"),
+      JSON.stringify({ private: true }),
+    );
+    try {
+      const fileSystem = await Effect.runPromise(
+        FileSystemService.pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const failingFileSystemLayer = Layer.succeed(FileSystemService, {
+        ...fileSystem,
+        copyFile: () =>
+          Effect.fail(
+            new BoundaryError({
+              boundary: "filesystem",
+              message: "synthetic workspace materialization failure",
+              retryable: false,
+            }),
+          ),
+        remove: (path) =>
+          path === destination
+            ? Effect.fail(
+                new BoundaryError({
+                  boundary: "filesystem",
+                  message: "synthetic workspace cleanup failure",
+                  retryable: false,
+                }),
+              )
+            : fileSystem.remove(path),
+      });
+      const outcome = await Effect.runPromise(
+        executeGenerate([
+          "workspace",
+          "--name=generated-cleanup-failure",
+          "--copy=templates/cleanup-failure",
+          "--destination=packages/generated-cleanup-failure",
+          `--root=${root}`,
+        ]).pipe(
+          Effect.exit,
+          Effect.provide(failingFileSystemLayer),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(Exit.isFailure(outcome)).toBe(true);
+      if (Exit.isFailure(outcome)) {
+        expect(
+          Array.from(Cause.failures(outcome.cause), (error) =>
+            error instanceof BoundaryError ? error.message : String(error),
+          ),
+        ).toEqual([
+          "synthetic workspace materialization failure",
+          "synthetic workspace cleanup failure",
+        ]);
+        expect(Array.from(Cause.defects(outcome.cause))).toEqual([]);
+      }
+      await expect(access(destination)).resolves.toBeUndefined();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("rejects invalid explicit generator roots before materialization", async () => {
     const directory = await mkdtemp(
       join(tmpdir(), "turbo-ts-generator-invalid-root-"),
@@ -3904,7 +3973,7 @@ describe("hosted protocols and experimental transports", () => {
     }
   }, 30_000);
 
-  it("probes configured tokenless remotes before artifact traffic", async () => {
+  it("omits authorization for unset and empty remote cache tokens", async () => {
     const directory = await mkdtemp(
       join(tmpdir(), "turbo-ts-tokenless-status-gate-"),
     );
@@ -3928,30 +3997,36 @@ describe("hosted protocols and experimental transports", () => {
               tasks: { build: {} },
             }),
           );
-          const result = await runCandidate(
+          const baseArguments = [
+            "run",
+            "build",
+            "--filter=synthetic-app",
+            "--cache=remote:rw",
+            "--output-logs=none",
+            `--cwd=${root}`,
+          ];
+          for (const [arguments_, environment] of [
+            [baseArguments, { TURBO_API: undefined, TURBO_TOKEN: undefined }],
+            [baseArguments, { TURBO_API: undefined, TURBO_TOKEN: "" }],
             [
-              "run",
-              "build",
-              "--filter=synthetic-app",
-              "--cache=remote:rw",
-              "--output-logs=none",
-              `--cwd=${root}`,
+              [...baseArguments, "--token", ""],
+              { TURBO_API: undefined, TURBO_TOKEN: undefined },
             ],
-            root,
-            { TURBO_API: undefined, TURBO_TOKEN: undefined },
+          ] as const) {
+            const result = await runCandidate(arguments_, root, environment);
+            expect(result.code, result.stderr).toBe(0);
+          }
+          const remoteRequests = requests.filter((request) =>
+            request.path.startsWith("/v8/artifacts/"),
           );
-          expect(result.code, result.stderr).toBe(0);
-          expect(
-            requests.filter((request) =>
-              request.path.startsWith("/v8/artifacts/"),
-            ),
-          ).toEqual([
-            expect.objectContaining({
+          expect(remoteRequests).toHaveLength(3);
+          for (const request of remoteRequests) {
+            expect(request).toMatchObject({
               method: "GET",
               path: "/v8/artifacts/status",
-            }),
-          ]);
-          expect(requests[0]?.headers.authorization).toBeUndefined();
+            });
+            expect(request.headers.authorization).toBeUndefined();
+          }
         },
       );
     } finally {

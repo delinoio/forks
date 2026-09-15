@@ -1,4 +1,4 @@
-import { Effect, Exit } from "effect";
+import { Cause, Effect, Exit, Option, Ref } from "effect";
 import validateNpmPackageName from "validate-npm-package-name";
 import { parseCommonArguments } from "../cli/common-options.js";
 import { parseJsonConfiguration } from "../config/runtime.js";
@@ -438,16 +438,45 @@ const executeWorkspaceGenerator = (
       );
     });
     yield* fileSystem.makeDirectory(parentPath(destination));
-    yield* Effect.acquireUseRelease(
-      fileSystem.createExclusiveDirectory(destination),
-      (ownsDestination) =>
-        ownsDestination
-          ? materialize
-          : Effect.fail(failure("workspace destination already exists")),
-      (ownsDestination, exit) =>
-        ownsDestination && Exit.isFailure(exit)
-          ? fileSystem.remove(destination).pipe(Effect.orDie)
-          : Effect.void,
+    yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const cleanupResult = yield* Ref.make<
+          Option.Option<Exit.Exit<void, BoundaryError>>
+        >(Option.none());
+        const materializationResult = yield* Effect.acquireUseRelease(
+          fileSystem.createExclusiveDirectory(destination),
+          (ownsDestination) =>
+            restore(
+              ownsDestination
+                ? materialize
+                : Effect.fail(failure("workspace destination already exists")),
+            ),
+          (ownsDestination, exit) =>
+            ownsDestination && Exit.isFailure(exit)
+              ? fileSystem.remove(destination).pipe(
+                  Effect.exit,
+                  Effect.flatMap((cleanupExit) =>
+                    Ref.set(cleanupResult, Option.some(cleanupExit)),
+                  ),
+                )
+              : Effect.void,
+        ).pipe(Effect.exit);
+        const cleanup = yield* Ref.get(cleanupResult);
+        if (Option.isSome(cleanup) && Exit.isFailure(cleanup.value)) {
+          if (Exit.isFailure(materializationResult)) {
+            return yield* Effect.failCause(
+              Cause.sequential(
+                materializationResult.cause,
+                cleanup.value.cause,
+              ),
+            );
+          }
+          return yield* Effect.failCause(cleanup.value.cause);
+        }
+        if (Exit.isFailure(materializationResult)) {
+          return yield* Effect.failCause(materializationResult.cause);
+        }
+      }),
     );
     yield* terminal.writeStdout(
       `Generated workspace ${name} at ${destination}\n`,

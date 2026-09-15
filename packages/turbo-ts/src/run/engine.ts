@@ -429,6 +429,9 @@ export const resolveOptions = (
   const configuredTeamSlugValue = environmentValue("TURBO_TEAM");
   const configuredTeamSlug =
     configuredTeamSlugValue === "" ? undefined : configuredTeamSlugValue;
+  const configuredTeamIdValue = environmentValue("TURBO_TEAMID");
+  const configuredTeamId =
+    configuredTeamIdValue === "" ? undefined : configuredTeamIdValue;
   const configuredToken = environmentValue("TURBO_TOKEN");
   const configuredRemoteTimeout = environmentValue(
     "TURBO_REMOTE_CACHE_TIMEOUT",
@@ -622,7 +625,7 @@ export const resolveOptions = (
       token,
       teamId:
         parsed.team === undefined && configuredTeamSlug === undefined
-          ? (environmentValue("TURBO_TEAMID") ??
+          ? (configuredTeamId ??
             storedCredentials.project?.teamId ??
             (storedCredentials.project?.teamSlug === undefined
               ? (remoteConfiguration?.teamId ?? undefined)
@@ -3618,8 +3621,10 @@ export const executeRun = (
       explicitRemoteTeamSlugValue === ""
         ? undefined
         : explicitRemoteTeamSlugValue;
-    const explicitRemoteTeam =
-      explicitRemoteTeamSlug ?? environmentValue("TURBO_TEAMID");
+    const explicitRemoteTeamIdValue = environmentValue("TURBO_TEAMID");
+    const explicitRemoteTeamId =
+      explicitRemoteTeamIdValue === "" ? undefined : explicitRemoteTeamIdValue;
+    const explicitRemoteTeam = explicitRemoteTeamSlug ?? explicitRemoteTeamId;
     const remoteConnectionFullyExplicit =
       explicitRemoteApi !== undefined &&
       explicitRemoteToken !== undefined &&

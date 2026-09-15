@@ -1222,6 +1222,24 @@ version = "1.0.0"
       apiUrl: "https://vercel.com/api",
       token: "explicit-token",
     });
+
+    const emptyExplicit = resolveOptions(
+      parsed,
+      model.root,
+      { TURBO_TOKEN: "" },
+      model.rootConfiguration,
+      8,
+      false,
+      {
+        token: "stored-token",
+        project: { apiUrl: "https://linked.example.test/api" },
+      },
+    );
+    expect(emptyExplicit.remote).toMatchObject({
+      apiUrl: "https://linked.example.test/api",
+      token: "",
+    });
+    expect(emptyExplicit.remoteToken).toBe("");
   });
 
   it("prefers linked project remote settings over root configuration", () => {

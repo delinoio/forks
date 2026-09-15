@@ -1050,14 +1050,18 @@ When higher-precedence CLI or environment values fully specify the remote API,
 token, and team identity, the lower-precedence project credential file is not
 read.
 Explicit CLI and environment tokens may activate the default API. An explicit
-team slug suppresses lower-precedence stored team IDs. Hosted and OTLP requests
-identify as `turbo-ts/0.1.0`. Runtime remote API selection and
-`config` output use CLI, environment, linked project, root configuration, and
-default values in descending precedence. An empty `TURBO_TEAM` value is treated
-as unset and does not suppress `TURBO_TEAMID`. A linked project's stored token is never redirected
-by a lower-precedence root API setting. A linked project's team ID likewise
-takes precedence over a root remote-cache team ID, and its team slug takes precedence over a root
-remote-cache team slug. Remote cache hit events are emitted only after signature
+empty token does not emit a remote cache authorization header or fall back to a
+stored token. An explicit team slug suppresses lower-precedence stored team IDs.
+Hosted and OTLP requests identify as `turbo-ts/0.1.0`. Runtime remote API
+selection and `config` output use CLI, environment, linked project, root
+configuration, and default values in descending precedence. An empty
+`TURBO_TEAM` value is treated as unset and does not suppress `TURBO_TEAMID`. An
+empty `TURBO_TEAMID` value is likewise treated as unset both when deciding
+whether a remote connection is fully explicit and when selecting its tenant
+identity. A linked project's stored token is never redirected by a
+lower-precedence root API setting. A linked project's team ID likewise takes
+precedence over a root remote-cache team ID, and its team slug takes precedence
+over a root remote-cache team slug. Remote cache hit events are emitted only after signature
 verification, decompression, and archive restoration succeed. Remote cache hit
 and miss event reporting runs as supervised best-effort background work and does
 not delay restoration or local task execution. Pending event work is drained
@@ -1161,7 +1165,9 @@ to the requested workspace name. Workspace type accepts only `app` or `package`
 and is validated before a destination is created. Failed template validation,
 copies, manifest rewrites, or interruption remove the partial destination only
 when the generator acquired that destination exclusively, so a concurrently
-created destination is preserved. Configured generators collect unresolved
+created destination is preserved. Cleanup failures remain typed and are
+combined with the preceding materialization failure or interruption, leaving
+the partial destination observable. Configured generators collect unresolved
 prompt answers through the terminal before evaluating actions and fail without
 writing when those answers are unavailable non-interactively. Generator results
 use a nonce-scoped length-delimited frame, while ordinary configuration and action
