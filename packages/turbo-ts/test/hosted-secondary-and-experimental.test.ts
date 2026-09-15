@@ -6,6 +6,7 @@ import {
   mkdtemp,
   open,
   readFile,
+  readlink,
   rename,
   rm,
   stat,
@@ -16,6 +17,7 @@ import { createServer, type IncomingMessage } from "node:http";
 import {
   createServer as createHttp2Server,
   constants as http2Constants,
+  type ServerHttp2Session,
 } from "node:http2";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
@@ -956,6 +958,34 @@ describe("hosted compatibility", () => {
           expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual(
             existingProject,
           );
+          if (process.platform !== "win32") {
+            const ignorePath = join(root, ".gitignore");
+            const sharedIgnorePath = join(directory, "shared.gitignore");
+            await rm(ignorePath, { recursive: true });
+            await writeFile(sharedIgnorePath, "dist/\n");
+            await symlink("../shared.gitignore", ignorePath);
+            const symlinkResult = await runCandidate(
+              [
+                "link",
+                "--scope=synthetic-user",
+                "--yes",
+                "--token=synthetic-token",
+                `--api=${baseUrl}`,
+                `--cwd=${root}`,
+              ],
+              root,
+              { XDG_CONFIG_HOME: configurationHome },
+            );
+            expect(symlinkResult.code).toBe(1);
+            expect(symlinkResult.stderr).toContain(
+              "symlinked repository .gitignore",
+            );
+            expect(await readlink(ignorePath)).toBe("../shared.gitignore");
+            expect(await readFile(sharedIgnorePath, "utf8")).toBe("dist/\n");
+            expect(JSON.parse(await readFile(projectPath, "utf8"))).toEqual(
+              existingProject,
+            );
+          }
         },
       );
     } finally {
@@ -2069,6 +2099,39 @@ describe("secondary command and parser compatibility", () => {
     );
     expect(requests).toHaveLength(1);
   });
+
+  it("resolves and validates TURBO_UI for config output", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-config-ui-"));
+    const root = join(directory, "repository");
+    await prepareRepository(root);
+    try {
+      const environmentUi = await runCandidate(
+        ["config", `--cwd=${root}`],
+        root,
+        { TURBO_UI: "tui" },
+      );
+      expect(environmentUi.code).toBe(0);
+      expect(JSON.parse(environmentUi.stdout).ui).toBe("tui");
+
+      const invalidEnvironmentUi = await runCandidate(
+        ["config", `--cwd=${root}`],
+        root,
+        { TURBO_UI: "invalid" },
+      );
+      expect(invalidEnvironmentUi.code).toBe(1);
+      expect(invalidEnvironmentUi.stderr).toContain("invalid UI mode");
+
+      const explicitUi = await runCandidate(
+        ["config", "--ui=stream", `--cwd=${root}`],
+        root,
+        { TURBO_UI: "invalid" },
+      );
+      expect(explicitUi.code).toBe(0);
+      expect(JSON.parse(explicitUi.stdout).ui).toBe("stream");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it(evidenceId.secondaryCompatibility, async () => {
     const common = parseCommonArguments([
@@ -3941,6 +4004,11 @@ describe("hosted protocols and experimental transports", () => {
     let statusInInitialHeaders = false;
     let responseBody = Buffer.alloc(5);
     const server = createHttp2Server();
+    const activeSessions = new Set<ServerHttp2Session>();
+    server.on("session", (session) => {
+      activeSessions.add(session);
+      session.once("close", () => activeSessions.delete(session));
+    });
     server.on("stream", (stream, headers) => {
       const chunks: Array<Buffer> = [];
       stream.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -3992,6 +4060,19 @@ describe("hosted protocols and experimental transports", () => {
     };
     const summary = { exitCode: 0, taskCount: 0, tasks: [] };
     try {
+      const invalidHeader = await Effect.runPromise(
+        Effect.either(
+          exportRunMetrics(
+            { ...options, headers: [["bad header", "value"]] },
+            undefined,
+            summary,
+          ).pipe(Effect.provide(nodeFoundationLayer)),
+        ),
+      );
+      expect(invalidHeader._tag).toBe("Left");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(activeSessions.size).toBe(0);
+
       await Effect.runPromise(
         exportRunMetrics(options, undefined, summary).pipe(
           Effect.provide(nodeFoundationLayer),
@@ -4050,6 +4131,7 @@ describe("hosted protocols and experimental transports", () => {
         ),
       );
     } finally {
+      for (const session of activeSessions) session.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });

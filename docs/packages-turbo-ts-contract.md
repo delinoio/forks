@@ -1001,8 +1001,10 @@ Linking requires confirmation unless the valueless `--yes` or `-y` flag is
 supplied; attached values are rejected. A non-interactive link must supply a
 scope and the confirmation flag. The command persists the selected identity and
 validated API URL, and keeps `.turbo` ignored unless `--no-gitignore` is
-requested. `--no-gitignore` is valueless and rejects attached values. Relinking
-selects its API from CLI, environment, the persisted
+requested. `--no-gitignore` is valueless and rejects attached values. A
+symlinked `.gitignore` is rejected when adding `.turbo` would otherwise replace
+the link; its target and existing project configuration remain unchanged.
+Relinking selects its API from CLI, environment, the persisted
 project link, and the public default in descending precedence. The project link
 is persisted only after the required `.gitignore` update succeeds. An explicit
 link team slug from `--team` or `TURBO_TEAM` suppresses `TURBO_TEAMID` before
@@ -1082,7 +1084,9 @@ and values are percent-decoded after comma-separated entries are split, so an
 encoded comma remains part of its header value. Malformed percent encodings are
 preserved literally. Header names are normalized and deduplicated
 case-insensitively; CLI values override environment values and explicit remote
-cache token reuse overrides configured authorization. Decoded gRPC status
+cache token reuse overrides configured authorization. Synchronous HTTP/2 stream
+construction failures destroy their session before surfacing an export error.
+Decoded gRPC status
 messages encode terminal control characters before entering user-visible
 errors. Empty, zero, non-finite, and over-limit environment OTLP
 timeouts use the finite default. CLI timeout and interval values above Node's
@@ -1116,9 +1120,9 @@ normal package-selector semantics. `--ignore=prompt` asks once before ignoring
 found violations, accepts only `y` or `yes`, skips prompting when no violation
 exists, and fails safely without an interactive terminal. Hidden `config`
 suppresses lower-precedence team IDs when a CLI or environment team slug is
-selected, applies `TURBO_CACHE_DIR` and `TURBO_CONCURRENCY` before repository
-configuration, and validates the effective API and login URLs before rendering
-them.
+selected, applies `TURBO_CACHE_DIR`, `TURBO_CONCURRENCY`, and `TURBO_UI` before
+repository configuration, validates the effective UI mode, and validates the
+effective API and login URLs before rendering them.
 Remote download and upload timeouts use CLI, environment, configuration, and
 default values in descending precedence and reject negative, empty, or
 non-finite environment values. Networked hosted commands use the remote cache

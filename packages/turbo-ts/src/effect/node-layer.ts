@@ -36,6 +36,7 @@ import {
 } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import {
+  type ClientHttp2Stream,
   connect as connectHttp2,
   createServer as createHttp2Server,
   type Http2Server,
@@ -3449,13 +3450,19 @@ const requestWithHttp2 = (
         ([name]) => !name.startsWith(":") && name.toLowerCase() !== "host",
       ),
     );
-    const stream = session.request({
-      [http2Constants.HTTP2_HEADER_METHOD]: request.method,
-      [http2Constants.HTTP2_HEADER_PATH]: `${url.pathname}${url.search}`,
-      [http2Constants.HTTP2_HEADER_SCHEME]: url.protocol.slice(0, -1),
-      [http2Constants.HTTP2_HEADER_AUTHORITY]: url.host,
-      ...regularHeaders,
-    });
+    let stream: ClientHttp2Stream;
+    try {
+      stream = session.request({
+        [http2Constants.HTTP2_HEADER_METHOD]: request.method,
+        [http2Constants.HTTP2_HEADER_PATH]: `${url.pathname}${url.search}`,
+        [http2Constants.HTTP2_HEADER_SCHEME]: url.protocol.slice(0, -1),
+        [http2Constants.HTTP2_HEADER_AUTHORITY]: url.host,
+        ...regularHeaders,
+      });
+    } catch (cause) {
+      complete(cause);
+      return;
+    }
     const recordHeaders = (
       headers: Readonly<Record<string, string | string[] | number | undefined>>,
       destination: Record<string, string>,

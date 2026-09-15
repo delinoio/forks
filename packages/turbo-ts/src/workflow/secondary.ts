@@ -147,6 +147,21 @@ const executeConfig = (
     const environmentCacheDirectory =
       yield* environmentValue("TURBO_CACHE_DIR");
     const environmentConcurrency = yield* environmentValue("TURBO_CONCURRENCY");
+    const environmentUi =
+      parsed.options.ui === undefined
+        ? yield* environmentValue("TURBO_UI")
+        : undefined;
+    if (
+      environmentUi !== undefined &&
+      environmentUi !== "stream" &&
+      environmentUi !== "stream-with-experimental-timestamps" &&
+      environmentUi !== "tui"
+    ) {
+      throw new ConfigurationError({
+        path: "TURBO_UI",
+        message: `invalid UI mode: ${environmentUi}`,
+      });
+    }
     const remoteConfiguration = global?.remoteCache;
     const apiUrl = hostedUrl(
       parsed.options.apiUrl ??
@@ -207,7 +222,7 @@ const executeConfig = (
         "remote cache upload timeout",
       ),
       enabled: remoteConfiguration?.enabled ?? true,
-      ui: parsed.options.ui ?? global?.ui ?? "stream",
+      ui: parsed.options.ui ?? environmentUi ?? global?.ui ?? "stream",
       packageManager: repositoryPackageManagerLabel(repository),
       daemon: global?.daemon ?? null,
       envMode: global?.envMode ?? "strict",

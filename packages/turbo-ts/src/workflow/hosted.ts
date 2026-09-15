@@ -633,11 +633,21 @@ const updateGitIgnore = (
     const fileSystem = yield* FileSystemService;
     const path = joinPath(root, ".gitignore");
     const exists = yield* fileSystem.exists(path);
+    const metadata = exists ? yield* fileSystem.metadata(path) : undefined;
     const current = exists ? yield* fileSystem.readText(path) : "";
     const alreadyIgnored = current
       .split(/\r?\n/)
       .some((line) => /^\/?\.turbo\/?$/.test(line.trim()));
     if (alreadyIgnored) return;
+    if (metadata?.kind === "symlink") {
+      return yield* Effect.fail(
+        new BoundaryError({
+          boundary: "filesystem",
+          message: "cannot update a symlinked repository .gitignore",
+          retryable: false,
+        }),
+      );
+    }
     const prefix = current === "" || current.endsWith("\n") ? "" : "\n";
     yield* fileSystem.writeTextAtomic(
       path,
