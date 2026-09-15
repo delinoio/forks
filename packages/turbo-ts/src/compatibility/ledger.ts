@@ -17,14 +17,20 @@ export const evidenceId = {
   dependenciesRuntime: "dependencies.runtime",
   effectsScoped: "effects.scoped",
   fixturesSynthetic: "fixtures.synthetic",
+  hostedCompatibility: "hosted.compatibility",
+  hostedProtocol: "hosted.protocol",
+  hostedSecurity: "hosted.security",
   mockHostedScoped: "mock-hosted.scoped",
   nondeterminismEvidence: "nondeterminism.evidence",
   normalizersAllowlist: "normalizers.allowlist",
   normalizersDeterministic: "normalizers.deterministic",
   oracleExternal: "oracle.external",
+  observabilityCompatibility: "observability.compatibility",
   repositoryWorkflows: "repository.workflows",
   repositoryProtocol: "repository.protocol",
   repositorySecurity: "repository.security",
+  secondaryCompatibility: "secondary.compatibility",
+  telemetryCompatibility: "telemetry.compatibility",
 } as const;
 
 export type EvidenceId = (typeof evidenceId)[keyof typeof evidenceId];
@@ -89,6 +95,21 @@ export const evidenceRegistry = {
     file: "test/configuration-and-ledger.test.ts",
     binding: "fixturesSynthetic",
   },
+  [evidenceId.hostedCompatibility]: {
+    kind: "rstest",
+    file: "test/hosted-secondary-and-experimental.test.ts",
+    binding: "hostedCompatibility",
+  },
+  [evidenceId.hostedProtocol]: {
+    kind: "rstest",
+    file: "test/hosted-secondary-and-experimental.test.ts",
+    binding: "hostedProtocol",
+  },
+  [evidenceId.hostedSecurity]: {
+    kind: "rstest",
+    file: "test/hosted-secondary-and-experimental.test.ts",
+    binding: "hostedSecurity",
+  },
   [evidenceId.mockHostedScoped]: {
     kind: "rstest",
     file: "test/mock-hosted-service.test.ts",
@@ -114,6 +135,11 @@ export const evidenceRegistry = {
     file: "test/cli-and-oracle.test.ts",
     binding: "oracleExternal",
   },
+  [evidenceId.observabilityCompatibility]: {
+    kind: "rstest",
+    file: "test/hosted-secondary-and-experimental.test.ts",
+    binding: "observabilityCompatibility",
+  },
   [evidenceId.repositoryWorkflows]: {
     kind: "rstest",
     file: "test/repository-workflows.test.ts",
@@ -128,6 +154,16 @@ export const evidenceRegistry = {
     kind: "rstest",
     file: "test/repository-workflows.test.ts",
     binding: "repositorySecurity",
+  },
+  [evidenceId.secondaryCompatibility]: {
+    kind: "rstest",
+    file: "test/hosted-secondary-and-experimental.test.ts",
+    binding: "secondaryCompatibility",
+  },
+  [evidenceId.telemetryCompatibility]: {
+    kind: "rstest",
+    file: "test/hosted-secondary-and-experimental.test.ts",
+    binding: "telemetryCompatibility",
   },
 } as const satisfies Record<EvidenceId, EvidenceRegistration>;
 

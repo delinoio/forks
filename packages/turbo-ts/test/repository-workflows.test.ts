@@ -82,7 +82,7 @@ import {
   parseDaemonArguments,
   watcherPathsMatch,
 } from "../src/workflow/daemon.js";
-import { executeList } from "../src/workflow/list.js";
+import { executeList, parseListArguments } from "../src/workflow/list.js";
 import {
   executeInfo,
   isWindowsSubsystemForLinux,
@@ -91,6 +91,7 @@ import { executePrune, parsePruneArguments } from "../src/workflow/prune.js";
 import {
   executeQuery,
   executeQueryAffected,
+  parseQueryArguments,
   repositoryQuerySchema,
 } from "../src/workflow/query.js";
 import {
@@ -746,15 +747,24 @@ describe("repository workflow gate", () => {
     expect(
       parsePruneArguments(["app", "--docker", "--production"]),
     ).toMatchObject({ scopes: ["app"], docker: true, production: true });
+    expect(parseListArguments(["--root-turbo-json=custom.json"])).toMatchObject(
+      { rootTurboJson: "custom.json" },
+    );
+    expect(
+      parsePruneArguments(["app", "--root-turbo-json=custom.json"]),
+    ).toMatchObject({ rootTurboJson: "custom.json" });
+    expect(
+      parseQueryArguments(["--root-turbo-json=custom.json"]),
+    ).toMatchObject({ rootTurboJson: "custom.json" });
 
+    const commands =
+      "bin boundaries completion config daemon devtools docs generate get-mfe-port info link login logout ls prune query run scan telemetry unlink watch";
     const completionScripts = {
-      bash: "complete -W 'run watch daemon query ls prune info completion' turbo-ts\n",
-      elvish:
-        "set edit:completion:arg-completer[turbo-ts] = { |@words| put run watch daemon query ls prune info completion }\n",
-      fish: "complete -c turbo-ts -f -a 'run watch daemon query ls prune info completion'\n",
-      powershell:
-        "Register-ArgumentCompleter -Native -CommandName turbo-ts -ScriptBlock { 'run','watch','daemon','query','ls','prune','info','completion' }\n",
-      zsh: "#compdef turbo-ts\n_arguments '1:command:(run watch daemon query ls prune info completion)'\n",
+      bash: `complete -W '${commands}' turbo-ts\n`,
+      elvish: `set edit:completion:arg-completer[turbo-ts] = { |@words| put ${commands} }\n`,
+      fish: `complete -c turbo-ts -f -a '${commands}'\n`,
+      powershell: `Register-ArgumentCompleter -Native -CommandName turbo-ts -ScriptBlock { '${commands.replaceAll(" ", "','")}' }\n`,
+      zsh: `#compdef turbo-ts\n_arguments '1:command:(${commands})'\n`,
     } as const;
     for (const [shell, script] of Object.entries(completionScripts)) {
       const completion = await executeDifferentialCommand(process.execPath, [
@@ -800,6 +810,24 @@ describe("repository workflow gate", () => {
       await expect(
         execFilePromise(process.execPath, [candidate, "info", "--cwd"]),
       ).rejects.toThrow(/--cwd requires a value/);
+      const defaultTurboJsonPath = join(directory, "turbo.json");
+      const defaultTurboJson = await readFile(defaultTurboJsonPath, "utf8");
+      const infoTurboJson = "info-turbo.json";
+      await writeFile(join(directory, infoTurboJson), defaultTurboJson);
+      await writeFile(defaultTurboJsonPath, "invalid default configuration");
+      const configuredInfo = await executeDifferentialCommand(
+        process.execPath,
+        [
+          candidate,
+          "--cwd",
+          directory,
+          "--root-turbo-json",
+          infoTurboJson,
+          "info",
+        ],
+      );
+      await writeFile(defaultTurboJsonPath, defaultTurboJson);
+      expect(configuredInfo.stdout).toContain("Package manager: pnpm9");
       const listed = await executeDifferentialCommand(process.execPath, [
         candidate,
         "--cwd",
@@ -1113,6 +1141,92 @@ describe("repository workflow gate", () => {
       await rm(directory, { force: true, recursive: true });
     }
   }, 60_000);
+
+  it("uses custom root configurations in repository workflows", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-workflow-root-config-"),
+    );
+    try {
+      await prepareFixture(directory);
+      const defaultConfigurationPath = join(directory, "turbo.json");
+      const defaultConfiguration = await readFile(
+        defaultConfigurationPath,
+        "utf8",
+      );
+      const customConfiguration = "custom-turbo.json";
+      await writeFile(
+        join(directory, customConfiguration),
+        defaultConfiguration,
+      );
+      await writeFile(
+        defaultConfigurationPath,
+        "invalid default configuration",
+      );
+      const configuredList = await executeDifferentialCommand(
+        process.execPath,
+        [
+          candidate,
+          "--cwd",
+          directory,
+          "--root-turbo-json",
+          customConfiguration,
+          "ls",
+          "--output=json",
+        ],
+      );
+      const configuredQueryList = await executeDifferentialCommand(
+        process.execPath,
+        [
+          candidate,
+          "query",
+          "ls",
+          "--cwd",
+          directory,
+          "--root-turbo-json",
+          customConfiguration,
+          "--output=json",
+        ],
+      );
+      const configuredQuery = await executeDifferentialCommand(
+        process.execPath,
+        [
+          candidate,
+          "query",
+          "{ packages { length } }",
+          "--cwd",
+          directory,
+          "--root-turbo-json",
+          customConfiguration,
+        ],
+      );
+      expect(JSON.parse(configuredList.stdout)).toMatchObject({
+        packages: { count: 2 },
+      });
+      expect(configuredQueryList.stdout).toBe(configuredList.stdout);
+      expect(JSON.parse(configuredQuery.stdout)).toEqual({
+        data: { packages: { length: 3 } },
+      });
+      await writeFile(defaultConfigurationPath, defaultConfiguration);
+      const configuredPrune = await executeDifferentialCommand(
+        process.execPath,
+        [
+          candidate,
+          "prune",
+          "synthetic-app",
+          "--cwd",
+          directory,
+          "--root-turbo-json",
+          customConfiguration,
+          "--out-dir=configured-prune",
+        ],
+      );
+      expect(configuredPrune.stdout).toContain(
+        "Generating pruned monorepo for synthetic-app",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 30_000);
 
   it("does not assert a stream channel for cached plain-log replay", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-cache-level-"));
@@ -3220,10 +3334,10 @@ describe("repository workflow gate", () => {
         '[project]\nname = "synthetic-daemon-python"\nversion = "0.1.0"\ndependencies = []\n',
       );
       await runCandidate(
+        "--root-turbo-json=custom-turbo.json",
         "daemon",
         "start",
         "--idle-time=30s",
-        "--turbo-json-path=custom-turbo.json",
       );
       await expect(
         runCandidate("daemon", "serve", "--idle-time=30s"),
@@ -10065,6 +10179,11 @@ importers:
         configurationPath,
         `${JSON.stringify(configuration, undefined, 2)}\n`,
       );
+      const customConfiguration = "custom-turbo.json";
+      await writeFile(
+        join(directory, customConfiguration),
+        `${JSON.stringify(configuration, undefined, 2)}\n`,
+      );
       await mkdir(javascriptDirectory, { recursive: true });
       await writeFile(
         join(javascriptDirectory, "package.json"),
@@ -10213,6 +10332,8 @@ importers:
               "--head=HEAD",
               "--cwd",
               directory,
+              "--root-turbo-json",
+              customConfiguration,
             ]).pipe(
               Effect.provide(
                 Layer.mergeAll(

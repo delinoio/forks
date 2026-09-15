@@ -58,6 +58,9 @@ export interface FileSystemOperations {
     path: string,
   ) => Effect.Effect<FileMetadata, BoundaryError>;
   readonly makeDirectory: (path: string) => Effect.Effect<void, BoundaryError>;
+  readonly createExclusiveDirectory: (
+    path: string,
+  ) => Effect.Effect<boolean, BoundaryError>;
   readonly ensurePrivateDirectory: (
     path: string,
   ) => Effect.Effect<void, BoundaryError>;
@@ -179,6 +182,7 @@ export class ExitStatusService extends Context.Tag(
 export interface TerminalOperations {
   readonly writeStdout: (text: string) => Effect.Effect<void, BoundaryError>;
   readonly writeStderr: (text: string) => Effect.Effect<void, BoundaryError>;
+  readonly readLine?: (prompt: string) => Effect.Effect<string, BoundaryError>;
   readonly stdoutColorEnabled: Effect.Effect<boolean>;
   readonly stderrColorEnabled: Effect.Effect<boolean>;
   readonly stdinIsTerminal?: Effect.Effect<boolean>;
@@ -251,7 +255,8 @@ export class ConcurrencyService extends Context.Tag(
 )<ConcurrencyService, ConcurrencyOperations>() {}
 export interface HttpRequest {
   readonly url: string;
-  readonly method: "GET" | "HEAD" | "OPTIONS" | "POST" | "PUT";
+  readonly method: "DELETE" | "GET" | "HEAD" | "OPTIONS" | "POST" | "PUT";
+  readonly transport?: "http2";
   readonly headers?: Readonly<Record<string, string>>;
   readonly body?: Uint8Array | string;
   readonly timeoutMilliseconds?: number;
@@ -261,6 +266,7 @@ export interface HttpRequest {
 export interface HttpResponse {
   readonly status: number;
   readonly headers: Readonly<Record<string, string>>;
+  readonly trailers?: Readonly<Record<string, string>>;
   readonly body: Uint8Array;
 }
 
@@ -285,9 +291,44 @@ export class HttpService extends Context.Tag("turbo-ts/HttpService")<
   HttpService,
   HttpOperations
 >() {}
+
+export interface StoredUserConfiguration {
+  readonly token?: string;
+  readonly [name: string]: unknown;
+}
+
+export interface StoredProjectConfiguration {
+  readonly apiUrl?: string;
+  readonly teamId?: string;
+  readonly teamSlug?: string;
+  readonly [name: string]: unknown;
+}
+
+export interface CredentialOperations {
+  readonly userConfigurationPath: Effect.Effect<string, BoundaryError>;
+  readonly readUserConfiguration: Effect.Effect<
+    StoredUserConfiguration | undefined,
+    BoundaryError
+  >;
+  readonly writeUserConfiguration: (
+    value: StoredUserConfiguration,
+  ) => Effect.Effect<void, BoundaryError>;
+  readonly removeUserConfiguration: Effect.Effect<void, BoundaryError>;
+  readonly readProjectConfiguration: (
+    root: string,
+  ) => Effect.Effect<StoredProjectConfiguration | undefined, BoundaryError>;
+  readonly writeProjectConfiguration: (
+    root: string,
+    value: StoredProjectConfiguration,
+  ) => Effect.Effect<void, BoundaryError>;
+  readonly removeProjectConfiguration: (
+    root: string,
+  ) => Effect.Effect<void, BoundaryError>;
+}
+
 export class CredentialService extends Context.Tag(
   "turbo-ts/CredentialService",
-)<CredentialService, BoundaryOperations>() {}
+)<CredentialService, CredentialOperations>() {}
 export class CacheService extends Context.Tag("turbo-ts/CacheService")<
   CacheService,
   BoundaryOperations
@@ -405,6 +446,7 @@ export interface LoopbackHttpResponse {
   readonly status: number;
   readonly headers?: Readonly<Record<string, string>>;
   readonly body: Uint8Array | string;
+  readonly afterSent?: Effect.Effect<void, BoundaryError>;
 }
 
 export interface LoopbackHttpServer {
@@ -457,9 +499,22 @@ export class SystemService extends Context.Tag("turbo-ts/SystemService")<
   SystemService,
   SystemOperations
 >() {}
+
+export interface TelemetryState {
+  readonly telemetry_enabled: boolean;
+  readonly telemetry_id: string;
+  readonly telemetry_salt: string;
+  readonly telemetry_alerted?: string;
+}
+
+export interface TelemetryOperations {
+  readonly read: Effect.Effect<TelemetryState | undefined, BoundaryError>;
+  readonly write: (state: TelemetryState) => Effect.Effect<void, BoundaryError>;
+}
+
 export class TelemetryService extends Context.Tag("turbo-ts/TelemetryService")<
   TelemetryService,
-  BoundaryOperations
+  TelemetryOperations
 >() {}
 export class ObservabilityService extends Context.Tag(
   "turbo-ts/ObservabilityService",

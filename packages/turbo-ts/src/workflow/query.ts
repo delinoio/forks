@@ -308,6 +308,7 @@ interface RepositoryFileContents {
 
 export interface QueryOptions {
   readonly cwd?: string;
+  readonly rootTurboJson?: string;
   readonly query?: string;
   readonly variables?: Readonly<Record<string, unknown>>;
   readonly schema: boolean;
@@ -336,6 +337,7 @@ export const parseQueryArguments = (
   arguments_: ReadonlyArray<string>,
 ): QueryOptions => {
   let cwd: string | undefined;
+  let rootTurboJson: string | undefined;
   let query: string | undefined;
   let variables: Record<string, unknown> | undefined;
   let schema = false;
@@ -368,6 +370,9 @@ export const parseQueryArguments = (
       case "--cwd":
         cwd = takeValue();
         break;
+      case "--root-turbo-json":
+        rootTurboJson = takeValue();
+        break;
       case "--variables":
       case "-V":
         variables = jsonObject(takeValue(), argument);
@@ -395,7 +400,7 @@ export const parseQueryArguments = (
         });
     }
   }
-  return { cwd, query, variables, schema, port };
+  return { cwd, rootTurboJson, query, variables, schema, port };
 };
 
 interface PackageView {
@@ -709,7 +714,7 @@ const packageMatchesPredicate = (
   );
 };
 
-interface BoundaryDiagnostic {
+export interface BoundaryDiagnostic {
   readonly message: string;
   readonly reason: string | null;
   readonly path: string;
@@ -769,8 +774,9 @@ const boundaryRuleDiagnostics = (
   return [];
 };
 
-const boundaryDiagnostics = (
+export const boundaryDiagnostics = (
   repository: RepositoryModel,
+  ruleOwnerIdentities?: ReadonlySet<string>,
 ): ReadonlyArray<BoundaryDiagnostic> => {
   const models = [repository.rootPackage, ...repository.packages];
   const byIdentity = new Map(models.map((model) => [model.identity, model]));
@@ -810,10 +816,16 @@ const boundaryDiagnostics = (
       const target = byIdentity.get(dependencyIdentity);
       if (target === undefined) continue;
       const targetTags = target.tags ?? [];
-      const dependencyRules = [
-        configurationFor(source)?.dependencies,
-        ...sourceTags.map((tag) => rootBoundaries?.tags?.[tag]?.dependencies),
-      ].filter(activePermissions);
+      const dependencyRules =
+        ruleOwnerIdentities === undefined ||
+        ruleOwnerIdentities.has(source.identity)
+          ? [
+              configurationFor(source)?.dependencies,
+              ...sourceTags.map(
+                (tag) => rootBoundaries?.tags?.[tag]?.dependencies,
+              ),
+            ].filter(activePermissions)
+          : [];
       for (const permissions of dependencyRules) {
         record(
           boundaryRuleDiagnostics(
@@ -825,10 +837,16 @@ const boundaryDiagnostics = (
           ),
         );
       }
-      const dependentRules = [
-        configurationFor(target)?.dependents,
-        ...targetTags.map((tag) => rootBoundaries?.tags?.[tag]?.dependents),
-      ].filter(activePermissions);
+      const dependentRules =
+        ruleOwnerIdentities === undefined ||
+        ruleOwnerIdentities.has(target.identity)
+          ? [
+              configurationFor(target)?.dependents,
+              ...targetTags.map(
+                (tag) => rootBoundaries?.tags?.[tag]?.dependents,
+              ),
+            ].filter(activePermissions)
+          : [];
       for (const permissions of dependentRules) {
         record(
           boundaryRuleDiagnostics(
@@ -1632,6 +1650,7 @@ export const executeQuery = (
 
 interface AffectedOptions {
   readonly cwd?: string;
+  readonly rootTurboJson?: string;
   readonly base: string;
   readonly head: string;
   readonly packages: boolean;
@@ -1643,6 +1662,7 @@ const parseAffectedArguments = (
   arguments_: ReadonlyArray<string>,
 ): AffectedOptions => {
   let cwd: string | undefined;
+  let rootTurboJson: string | undefined;
   let base = "main";
   let head = "HEAD";
   let packages = false;
@@ -1665,6 +1685,9 @@ const parseAffectedArguments = (
     switch (argument.split("=", 1)[0]) {
       case "--cwd":
         cwd = takeValue();
+        break;
+      case "--root-turbo-json":
+        rootTurboJson = takeValue();
         break;
       case "--base":
         base = takeValue();
@@ -1694,7 +1717,7 @@ const parseAffectedArguments = (
         }
     }
   }
-  return { cwd, base, head, packages, fields, exitCode };
+  return { cwd, rootTurboJson, base, head, packages, fields, exitCode };
 };
 
 export const executeQueryAffected = (

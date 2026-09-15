@@ -512,7 +512,7 @@ describe("configuration generation and compatibility ledger", () => {
     expect(
       ledger.rows.find((row) => row.id === "cli.run-cache-workers"),
     ).toMatchObject({
-      status: "planned",
+      status: "passing",
       variants: ["--cache-workers"],
     });
     expect(
@@ -520,6 +520,57 @@ describe("configuration generation and compatibility ledger", () => {
     ).toMatchObject({
       status: "planned",
       variants: ["--daemon", "--no-daemon"],
+    });
+    expect(
+      ledger.rows.find((row) => row.id === "security.automated"),
+    ).toMatchObject({
+      targetGate: 5,
+      status: "planned",
+    });
+    expect(
+      ledger.rows.find((row) => row.id === "cli.secondary-options")?.variants,
+    ).not.toContain("--show-all-dependencies");
+    expect(
+      ledger.rows.filter(
+        (row) => row.targetGate === 4 && row.status === "planned",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        id: "cli.global-verbosity",
+        variants: ["--verbosity"],
+      }),
+      expect.objectContaining({
+        id: "cli.generate-workspace-example-path",
+        variants: ["--example-path", "-p"],
+      }),
+      expect.objectContaining({
+        id: "cli.generate-workspace-dependencies",
+        variants: ["--show-all-dependencies"],
+      }),
+      expect.objectContaining({
+        id: "environment.turbo-telemetry-message",
+        variants: ["TURBO_TELEMETRY_MESSAGE_DISABLED"],
+      }),
+    ]);
+    expect(
+      ledger.rows.find((row) => row.id === "environment.turbo")?.variants,
+    ).not.toContain("TURBO_DAEMON");
+    expect(
+      ledger.rows.find((row) => row.id === "environment.turbo")?.variants,
+    ).not.toContain("TURBO_TELEMETRY_MESSAGE_DISABLED");
+    expect(
+      ledger.rows.find(
+        (row) => row.id === "environment.turbo-telemetry-message",
+      ),
+    ).toMatchObject({
+      status: "planned",
+      variants: ["TURBO_TELEMETRY_MESSAGE_DISABLED"],
+    });
+    expect(
+      ledger.rows.find((row) => row.id === "environment.turbo-daemon"),
+    ).toMatchObject({
+      status: "planned",
+      variants: ["TURBO_DAEMON"],
     });
     expect(() =>
       parseCompatibilityLedger(

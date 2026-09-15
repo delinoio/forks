@@ -90,7 +90,7 @@ describe("CLI and external oracle", () => {
       ),
     );
     expect(exitStatuses).toEqual([1]);
-    expect(stderr).toContain("docs is not implemented");
+    expect(stderr).toContain("docs requires a search query");
     expect(stderr).not.toContain("\u001B[");
     expect(process.exitCode).toBe(previousExitCode);
   });

@@ -10,6 +10,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import {
+  type BigIntStats,
   createReadStream,
   createWriteStream,
   constants as fileSystemConstants,
@@ -35,6 +36,7 @@ import {
 } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import {
+  type ClientHttp2Stream,
   connect as connectHttp2,
   createServer as createHttp2Server,
   type Http2Server,
@@ -52,7 +54,8 @@ import {
   tmpdir,
   userInfo,
 } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, posix, win32 } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { Readable, Transform, type Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
@@ -60,6 +63,7 @@ import { writeHeapSnapshot } from "node:v8";
 import { createZstdDecompress, zstdCompress, zstdDecompress } from "node:zlib";
 import { Cause, Effect, Exit, Fiber, Layer, Option, Ref, Stream } from "effect";
 import { createXxhash64 } from "../hash/xxhash64.js";
+import { redactText } from "../logging/redaction.js";
 import { BoundaryError, ProcessExecutionError } from "./errors.js";
 import {
   type BinaryExecutionRequest,
@@ -83,6 +87,8 @@ import {
   FileSystemService,
   FileWatcherService,
   GitService,
+  type HttpRequest,
+  type HttpResponse,
   HttpService,
   type LoopbackHttpResponse,
   LoopbackHttpService,
@@ -94,8 +100,11 @@ import {
   RuntimeProfileService,
   SignalService,
   SigningService,
+  type StoredProjectConfiguration,
+  type StoredUserConfiguration,
   SystemService,
   TelemetryService,
+  type TelemetryState,
   type TerminalOperations,
   TerminalService,
 } from "./services.js";
@@ -956,6 +965,26 @@ const fileSystemLayer = Layer.succeed(FileSystemService, {
       },
       catch: filesystemError,
     }),
+  createExclusiveDirectory: (path) =>
+    Effect.tryPromise({
+      try: async () => {
+        try {
+          await mkdir(path);
+          return true;
+        } catch (cause) {
+          if (
+            typeof cause === "object" &&
+            cause !== null &&
+            "code" in cause &&
+            cause.code === "EEXIST"
+          ) {
+            return false;
+          }
+          throw cause;
+        }
+      },
+      catch: filesystemError,
+    }),
   ensurePrivateDirectory: (path) =>
     Effect.tryPromise({
       try: () => ensurePrivateDirectoryPath(path),
@@ -1656,6 +1685,22 @@ export const makeTerminalOperations = (
 ): TerminalOperations => ({
   writeStdout: makeTerminalWriter(stdout),
   writeStderr: makeTerminalWriter(stderr),
+  readLine: (prompt) =>
+    Effect.acquireUseRelease(
+      Effect.sync(() =>
+        createInterface({
+          input: process.stdin,
+          output: stderr,
+          terminal: process.stdin.isTTY === true,
+        }),
+      ),
+      (terminal) =>
+        Effect.tryPromise({
+          try: (signal) => terminal.question(prompt, { signal }),
+          catch: terminalError,
+        }),
+      (terminal) => Effect.sync(() => terminal.close()),
+    ),
   stdoutColorEnabled: Effect.sync(() => noColor() === undefined),
   stderrColorEnabled: Effect.sync(() => noColor() === undefined),
   stdinIsTerminal: Effect.sync(() => process.stdin.isTTY === true),
@@ -1677,6 +1722,277 @@ const terminalLayer = Layer.succeed(
     () => process.env.NO_COLOR,
   ),
 );
+
+const credentialError = (_cause: unknown): BoundaryError =>
+  new BoundaryError({
+    boundary: "credentials",
+    message: "credential configuration operation failed",
+    retryable: false,
+  });
+
+export const resolveUserConfigurationDirectory = (
+  environment: Readonly<Record<string, string | undefined>>,
+  platform: NodeJS.Platform,
+  systemHome: string,
+): string => {
+  const paths = platform === "win32" ? win32 : posix;
+  if (!paths.isAbsolute(systemHome)) {
+    throw new TypeError("system home directory must be absolute");
+  }
+  const absoluteEnvironmentPath = (name: string): string | undefined => {
+    const value = environment[name];
+    return value !== undefined && value !== "" && paths.isAbsolute(value)
+      ? value
+      : undefined;
+  };
+  const configured = absoluteEnvironmentPath("XDG_CONFIG_HOME");
+  if (configured !== undefined) return paths.join(configured, "turborepo");
+  const home = absoluteEnvironmentPath("HOME") ?? systemHome;
+  if (platform === "darwin") {
+    return paths.join(home, "Library", "Application Support", "turborepo");
+  }
+  if (platform === "win32") {
+    return paths.join(
+      absoluteEnvironmentPath("APPDATA") ??
+        paths.join(home, "AppData", "Roaming"),
+      "turborepo",
+    );
+  }
+  return paths.join(home, ".config", "turborepo");
+};
+
+const userConfigurationDirectory = (): string =>
+  resolveUserConfigurationDirectory(
+    process.env,
+    process.platform,
+    userInfo().homedir,
+  );
+
+const userConfigurationPath = (): string =>
+  join(userConfigurationDirectory(), "config.json");
+
+const projectConfigurationPath = (root: string): string =>
+  join(root, ".turbo", "config.json");
+
+const maximumConfigurationFileBytes = 1024 * 1024;
+
+const sameFileIdentity = (left: BigIntStats, right: BigIntStats): boolean =>
+  left.dev === right.dev && left.ino === right.ino;
+
+export const readBoundedConfigurationHandle = async (
+  handle: Awaited<ReturnType<typeof open>>,
+): Promise<string> => {
+  const contents = Buffer.alloc(maximumConfigurationFileBytes + 1);
+  let length = 0;
+  while (length < contents.length) {
+    const { bytesRead } = await handle.read(
+      contents,
+      length,
+      contents.length - length,
+      length,
+    );
+    if (bytesRead === 0) break;
+    length += bytesRead;
+    if (length > maximumConfigurationFileBytes) {
+      throw new TypeError("configuration file exceeds the 1 MiB limit");
+    }
+  }
+  return contents.subarray(0, length).toString("utf8");
+};
+
+const readConfigurationObject = async <A extends object>(
+  path: string,
+  privateFile: boolean,
+): Promise<A | undefined> => {
+  let windowsPathMetadata: BigIntStats | undefined;
+  if (process.platform === "win32") {
+    try {
+      windowsPathMetadata = await lstat(path, { bigint: true });
+    } catch (cause) {
+      if (isMissingFileError(cause)) return undefined;
+      throw cause;
+    }
+    if (!windowsPathMetadata.isFile()) {
+      throw new TypeError("configuration path is not a regular file");
+    }
+  }
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(
+      path,
+      fileSystemConstants.O_RDONLY |
+        (process.platform === "win32" ? 0 : fileSystemConstants.O_NOFOLLOW),
+    );
+  } catch (cause) {
+    if (windowsPathMetadata === undefined && isMissingFileError(cause)) {
+      return undefined;
+    }
+    throw cause;
+  }
+  try {
+    const metadata = await handle.stat({ bigint: true });
+    if (!metadata.isFile()) {
+      throw new TypeError("configuration path is not a regular file");
+    }
+    if (process.platform === "win32") {
+      const currentPathMetadata = await lstat(path, { bigint: true });
+      if (
+        windowsPathMetadata === undefined ||
+        !currentPathMetadata.isFile() ||
+        !sameFileIdentity(windowsPathMetadata, metadata) ||
+        !sameFileIdentity(currentPathMetadata, metadata)
+      ) {
+        throw new TypeError("configuration path changed while being opened");
+      }
+    }
+    if (
+      privateFile &&
+      process.platform !== "win32" &&
+      (metadata.mode & 0o077n) !== 0n
+    ) {
+      throw new TypeError("credential file permissions must be 0600");
+    }
+    if (metadata.size > BigInt(maximumConfigurationFileBytes)) {
+      throw new TypeError("configuration file exceeds the 1 MiB limit");
+    }
+    const value = JSON.parse(
+      await readBoundedConfigurationHandle(handle),
+    ) as unknown;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new TypeError("configuration file must contain a JSON object");
+    }
+    return value as A;
+  } finally {
+    await handle.close();
+  }
+};
+
+const writeConfigurationObject = async (
+  path: string,
+  value: object,
+  mode: number,
+  privateDirectory: boolean,
+): Promise<void> => {
+  const directory = dirname(path);
+  await mkdir(directory, {
+    recursive: true,
+    mode: privateDirectory ? 0o700 : 0o755,
+  });
+  if (privateDirectory) {
+    await ensurePrivateDirectoryPath(directory);
+  } else if (!(await lstat(directory)).isDirectory()) {
+    throw new TypeError(
+      "project configuration directory is not a real directory",
+    );
+  }
+  const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporary, "wx", mode);
+    await handle.writeFile(JSON.stringify(value), "utf8");
+    await handle.chmod(mode);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporary, path);
+    await syncParentDirectory(path);
+  } catch (cause) {
+    await handle?.close().catch(() => undefined);
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw cause;
+  }
+};
+
+const validateOptionalStringFields = <A extends object>(
+  value: A | undefined,
+  fields: ReadonlyArray<string>,
+): A | undefined => {
+  if (value === undefined) return undefined;
+  const record = value as Readonly<Record<string, unknown>>;
+  if (
+    fields.some(
+      (field) =>
+        record[field] !== undefined && typeof record[field] !== "string",
+    )
+  ) {
+    throw new TypeError("configuration field must be a string");
+  }
+  return value;
+};
+
+const credentialLayer = Layer.succeed(CredentialService, {
+  userConfigurationPath: Effect.sync(userConfigurationPath),
+  readUserConfiguration: Effect.tryPromise({
+    try: () =>
+      readConfigurationObject<StoredUserConfiguration>(
+        userConfigurationPath(),
+        true,
+      ).then((value) => validateOptionalStringFields(value, ["token"])),
+    catch: credentialError,
+  }),
+  writeUserConfiguration: (value) =>
+    Effect.tryPromise({
+      try: () =>
+        writeConfigurationObject(userConfigurationPath(), value, 0o600, true),
+      catch: credentialError,
+    }),
+  removeUserConfiguration: Effect.tryPromise({
+    try: () => rm(userConfigurationPath(), { force: true }),
+    catch: credentialError,
+  }),
+  readProjectConfiguration: (root) =>
+    Effect.tryPromise({
+      try: () =>
+        readConfigurationObject<StoredProjectConfiguration>(
+          projectConfigurationPath(root),
+          false,
+        ).then((value) =>
+          validateOptionalStringFields(value, ["apiUrl", "teamId", "teamSlug"]),
+        ),
+      catch: credentialError,
+    }),
+  writeProjectConfiguration: (root, value) =>
+    Effect.tryPromise({
+      try: () =>
+        writeConfigurationObject(
+          projectConfigurationPath(root),
+          value,
+          0o644,
+          false,
+        ),
+      catch: credentialError,
+    }),
+  removeProjectConfiguration: (root) =>
+    Effect.tryPromise({
+      try: () => rm(projectConfigurationPath(root), { force: true }),
+      catch: credentialError,
+    }),
+});
+
+const telemetryPath = (): string =>
+  join(userConfigurationDirectory(), "telemetry.json");
+
+const telemetryLayer = Layer.succeed(TelemetryService, {
+  read: Effect.tryPromise({
+    try: () => readConfigurationObject<TelemetryState>(telemetryPath(), false),
+    catch: (cause) =>
+      new BoundaryError({
+        boundary: "telemetry",
+        message: String(cause),
+        retryable: false,
+      }),
+  }),
+  write: (state) =>
+    Effect.tryPromise({
+      try: () => writeConfigurationObject(telemetryPath(), state, 0o644, true),
+      catch: (cause) =>
+        new BoundaryError({
+          boundary: "telemetry",
+          message: String(cause),
+          retryable: false,
+        }),
+    }),
+});
 
 const clockLayer = Layer.succeed(ClockService, {
   now: Effect.sync(() => Date.now()),
@@ -2679,7 +2995,15 @@ const loopbackHttpLayer = Layer.succeed(LoopbackHttpService, {
                 }
                 if (Exit.isSuccess(exit)) {
                   response.writeHead(exit.value.status, exit.value.headers);
-                  response.end(exit.value.body);
+                  response.end(exit.value.body, () => {
+                    if (exit.value.afterSent !== undefined) {
+                      exit.value.afterSent.pipe(
+                        Effect.forkIn(scope),
+                        Effect.flatMap(Fiber.await),
+                        Effect.runFork,
+                      );
+                    }
+                  });
                   return;
                 }
                 if (Cause.isInterruptedOnly(exit.cause)) return;
@@ -2816,6 +3140,8 @@ const compressionError = (cause: unknown): BoundaryError =>
 
 class HttpResponseBodyLimitError extends Error {}
 
+class HttpRedirectPolicyError extends TypeError {}
+
 class CompressionOutputLimitError extends Error {}
 
 const validateResponseContentLength = async (
@@ -2840,8 +3166,8 @@ const readResponseBody = async (
   response: Response,
   maxBytes: number | undefined,
 ): Promise<Uint8Array> => {
-  await validateResponseContentLength(response, maxBytes);
   if (response.body === null) return new Uint8Array();
+  await validateResponseContentLength(response, maxBytes);
   const reader = response.body.getReader();
   const chunks: Array<Uint8Array> = [];
   let length = 0;
@@ -2876,11 +3202,11 @@ const writeResponseBodyToFile = async (
   maxBytes: number | undefined,
   signal: AbortSignal,
 ): Promise<void> => {
-  await validateResponseContentLength(response, maxBytes);
   if (response.body === null) {
     await writeFile(destination, new Uint8Array());
     return;
   }
+  await validateResponseContentLength(response, maxBytes);
   let length = 0;
   const limiter = new Transform({
     transform(chunk: Buffer, _encoding, callback) {
@@ -2983,6 +3309,218 @@ const compressionLayer = Layer.succeed(CompressionService, {
     }),
 });
 
+const redirectStatuses = new Set([301, 302, 303, 307, 308]);
+const safeCrossOriginRedirectHeaders = new Set([
+  "accept",
+  "content-encoding",
+  "content-type",
+  "user-agent",
+]);
+
+const fetchWithSafeRedirects = async (
+  request: {
+    readonly url: string;
+    readonly method: string;
+    readonly headers?: Readonly<Record<string, string>>;
+    readonly body?: Uint8Array | string;
+  },
+  signal: AbortSignal,
+): Promise<Response> => {
+  let url = new URL(request.url);
+  let method = request.method;
+  let body = request.body;
+  let headers = { ...(request.headers ?? {}) };
+  for (let redirects = 0; ; redirects += 1) {
+    const response = await fetch(url, {
+      method,
+      headers,
+      body:
+        body === undefined
+          ? undefined
+          : typeof body === "string"
+            ? body
+            : Buffer.from(body),
+      redirect: "manual",
+      signal,
+    });
+    if (!redirectStatuses.has(response.status)) return response;
+    if (redirects >= 5) {
+      await response.body?.cancel();
+      throw new HttpRedirectPolicyError("HTTP redirect limit exceeded");
+    }
+    const location = response.headers.get("location");
+    if (location === null) return response;
+    let destination: URL;
+    try {
+      destination = new URL(location, url);
+    } catch {
+      await response.body?.cancel();
+      throw new HttpRedirectPolicyError("HTTP redirect location is invalid");
+    }
+    if (destination.username !== "" || destination.password !== "") {
+      await response.body?.cancel();
+      throw new HttpRedirectPolicyError("HTTP redirect contains credentials");
+    }
+    if (url.protocol === "https:" && destination.protocol !== "https:") {
+      await response.body?.cancel();
+      throw new HttpRedirectPolicyError(
+        "HTTP redirect would downgrade transport security",
+      );
+    }
+    if (destination.protocol !== "http:" && destination.protocol !== "https:") {
+      await response.body?.cancel();
+      throw new HttpRedirectPolicyError(
+        "HTTP redirect protocol is unsupported",
+      );
+    }
+    if (destination.origin !== url.origin) {
+      headers = Object.fromEntries(
+        Object.entries(headers).filter(([name]) =>
+          safeCrossOriginRedirectHeaders.has(name.toLowerCase()),
+        ),
+      );
+    }
+    if (
+      (response.status === 303 && method !== "HEAD") ||
+      ((response.status === 301 || response.status === 302) &&
+        method === "POST")
+    ) {
+      method = "GET";
+      body = undefined;
+      headers = Object.fromEntries(
+        Object.entries(headers).filter(
+          ([name]) => !/^content-(?:length|type)$/i.test(name),
+        ),
+      );
+    }
+    await response.body?.cancel();
+    url = destination;
+  }
+};
+
+const requestWithHttp2 = (
+  request: HttpRequest,
+  signal: AbortSignal,
+): Promise<HttpResponse> =>
+  new Promise((resolve, reject) => {
+    const url = new URL(request.url);
+    if (
+      (url.protocol !== "http:" && url.protocol !== "https:") ||
+      url.username !== "" ||
+      url.password !== ""
+    ) {
+      reject(new TypeError("HTTP/2 request URL is invalid"));
+      return;
+    }
+    const session = connectHttp2(url.origin);
+    let settled = false;
+    let status: number | undefined;
+    const responseHeaders: Record<string, string> = {};
+    const responseTrailers: Record<string, string> = {};
+    const chunks: Array<Buffer> = [];
+    let responseLength = 0;
+    const complete = (cause?: unknown) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      session.destroy();
+      if (cause !== undefined) {
+        reject(cause);
+        return;
+      }
+      if (status === undefined) {
+        reject(new TypeError("HTTP/2 response omitted its status"));
+        return;
+      }
+      resolve({
+        status,
+        headers: responseHeaders,
+        trailers: responseTrailers,
+        body: new Uint8Array(Buffer.concat(chunks)),
+      });
+    };
+    const abort = () => complete(signal.reason ?? new Error("request aborted"));
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    session.once("error", complete);
+    const regularHeaders = Object.fromEntries(
+      Object.entries(request.headers ?? {}).filter(
+        ([name]) => !name.startsWith(":") && name.toLowerCase() !== "host",
+      ),
+    );
+    let stream: ClientHttp2Stream;
+    try {
+      stream = session.request({
+        [http2Constants.HTTP2_HEADER_METHOD]: request.method,
+        [http2Constants.HTTP2_HEADER_PATH]: `${url.pathname}${url.search}`,
+        [http2Constants.HTTP2_HEADER_SCHEME]: url.protocol.slice(0, -1),
+        [http2Constants.HTTP2_HEADER_AUTHORITY]: url.host,
+        ...regularHeaders,
+      });
+    } catch (cause) {
+      complete(cause);
+      return;
+    }
+    const recordHeaders = (
+      headers: Readonly<Record<string, string | string[] | number | undefined>>,
+      destination: Record<string, string>,
+    ) => {
+      const responseStatus = headers[http2Constants.HTTP2_HEADER_STATUS];
+      if (typeof responseStatus === "number") status = responseStatus;
+      for (const [name, value] of Object.entries(headers)) {
+        if (name.startsWith(":") || value === undefined) continue;
+        destination[name.toLowerCase()] = Array.isArray(value)
+          ? value.join(", ")
+          : String(value);
+      }
+    };
+    stream.on("response", (headers) => recordHeaders(headers, responseHeaders));
+    stream.on("trailers", (headers) =>
+      recordHeaders(headers, responseTrailers),
+    );
+    stream.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      responseLength += chunk.length;
+      if (
+        request.maxResponseBodyBytes !== undefined &&
+        responseLength > request.maxResponseBodyBytes
+      ) {
+        stream.close(http2Constants.NGHTTP2_CANCEL);
+        complete(
+          new HttpResponseBodyLimitError(
+            `HTTP response body exceeds the ${request.maxResponseBodyBytes} byte limit`,
+          ),
+        );
+        return;
+      }
+      chunks.push(chunk);
+    });
+    stream.once("error", complete);
+    stream.once("end", () => complete());
+    stream.end(
+      request.body === undefined
+        ? undefined
+        : typeof request.body === "string"
+          ? request.body
+          : Buffer.from(request.body),
+    );
+  });
+
+const httpRequestError = (
+  request: Pick<HttpRequest, "headers">,
+  cause: unknown,
+): BoundaryError =>
+  new BoundaryError({
+    boundary: "http",
+    message: redactText(String(cause), Object.values(request.headers ?? {})),
+    retryable:
+      !(cause instanceof HttpResponseBodyLimitError) &&
+      !(cause instanceof HttpRedirectPolicyError),
+  });
+
 const httpLayer = Layer.succeed(HttpService, {
   request: (request) =>
     Effect.tryPromise({
@@ -2998,18 +3536,10 @@ const httpLayer = Layer.succeed(HttpService, {
             ? interruptionSignal
             : AbortSignal.any([interruptionSignal, controller.signal]);
         try {
-          const response = await fetch(request.url, {
-            method: request.method,
-            headers: request.headers,
-            body:
-              request.body === undefined
-                ? undefined
-                : typeof request.body === "string"
-                  ? request.body
-                  : Buffer.from(request.body),
-            redirect: "follow",
-            signal,
-          });
+          if (request.transport === "http2") {
+            return await requestWithHttp2(request, signal);
+          }
+          const response = await fetchWithSafeRedirects(request, signal);
           return {
             status: response.status,
             headers: Object.fromEntries(response.headers.entries()),
@@ -3024,12 +3554,7 @@ const httpLayer = Layer.succeed(HttpService, {
           }
         }
       },
-      catch: (cause) =>
-        new BoundaryError({
-          boundary: "http",
-          message: String(cause),
-          retryable: !(cause instanceof HttpResponseBodyLimitError),
-        }),
+      catch: (cause) => httpRequestError(request, cause),
     }),
   downloadToFile: (request, destination) =>
     Effect.tryPromise({
@@ -3045,12 +3570,7 @@ const httpLayer = Layer.succeed(HttpService, {
             ? interruptionSignal
             : AbortSignal.any([interruptionSignal, controller.signal]);
         try {
-          const response = await fetch(request.url, {
-            method: request.method,
-            headers: request.headers,
-            redirect: "follow",
-            signal,
-          });
+          const response = await fetchWithSafeRedirects(request, signal);
           await writeResponseBodyToFile(
             response,
             destination,
@@ -3065,12 +3585,7 @@ const httpLayer = Layer.succeed(HttpService, {
           if (timeout !== undefined) clearTimeout(timeout);
         }
       },
-      catch: (cause) =>
-        new BoundaryError({
-          boundary: "http",
-          message: String(cause),
-          retryable: !(cause instanceof HttpResponseBodyLimitError),
-        }),
+      catch: (cause) => httpRequestError(request, cause),
     }),
 });
 
@@ -3257,9 +3772,9 @@ export const nodeFoundationLayer = Layer.mergeAll(
   Layer.succeed(GitService, boundaryFailure("git")),
   Layer.succeed(PackageManagerService, boundaryFailure("package-manager")),
   concurrencyLayer,
-  Layer.succeed(CredentialService, boundaryFailure("credentials")),
+  credentialLayer,
   Layer.succeed(CacheService, boundaryFailure("cache")),
-  Layer.succeed(TelemetryService, boundaryFailure("telemetry")),
+  telemetryLayer,
   Layer.succeed(ObservabilityService, boundaryFailure("observability")),
   deterministicRetryLayer,
 );

@@ -1,3 +1,4 @@
+import type { Scope } from "effect";
 import { Effect, Fiber, Queue, Stream } from "effect";
 import { maximumCacheArchiveInputBytes } from "../cache/archive.js";
 import {
@@ -7,8 +8,11 @@ import {
   writeLocalCache,
 } from "../cache/local-cache.js";
 import {
+  headRemoteCache,
   type RemoteCacheOptions,
+  recordRemoteCacheEvent,
   restoreRemoteCache,
+  verifyRemoteCacheStatus,
   writeRemoteCache,
 } from "../cache/remote-cache.js";
 import {
@@ -35,6 +39,7 @@ import {
   parentPath,
   relativePath,
 } from "../core/path.js";
+import { parseNodeTimerSeconds } from "../core/time.js";
 import {
   CacheRollbackError,
   ConfigurationError,
@@ -44,6 +49,7 @@ import {
   ClockService,
   CompressionService,
   ConcurrencyService,
+  CredentialService,
   DigestService,
   EnvironmentService,
   FileSystemService,
@@ -53,6 +59,7 @@ import {
   RetryScheduleService,
   RuntimeProfileService,
   SigningService,
+  type StoredProjectConfiguration,
   TerminalService,
 } from "../effect/services.js";
 import type { OutputLogs } from "../generated/configuration.js";
@@ -148,6 +155,7 @@ interface ResolvedRunOptions {
   readonly globalDependencies: ReadonlyArray<string>;
   readonly affected: boolean;
   readonly concurrency: number;
+  readonly cacheWorkers: number;
   readonly continueMode: "always" | "dependencies-successful" | "never";
   readonly environmentMode: "loose" | "strict";
   readonly cacheDirectory: string;
@@ -160,6 +168,7 @@ interface ResolvedRunOptions {
   readonly outputLogs?: OutputLogs;
   readonly only: boolean;
   readonly parallel: boolean;
+  readonly remoteToken?: string;
   readonly remote?: RemoteCacheOptions;
   readonly colorEnabled: boolean;
   readonly json: boolean;
@@ -175,6 +184,13 @@ type WriteStructuredRecord = (
 type OutputPermit = <A, E, R>(
   output: Effect.Effect<A, E, R>,
 ) => Effect.Effect<A, E, R>;
+
+type ReportRemoteCacheEvent = (
+  hash: string,
+  event: "HIT" | "MISS",
+) => Effect.Effect<void, never, HttpService | RetryScheduleService>;
+
+const maximumRemoteCacheEventDrainMilliseconds = 1_000;
 
 export const resolveRunUiMode = (
   requested: ResolvedRunOptions["ui"],
@@ -232,6 +248,7 @@ export type RunRequirements =
   | ClockService
   | CompressionService
   | ConcurrencyService
+  | CredentialService
   | DigestService
   | EnvironmentService
   | FileSystemService
@@ -394,6 +411,10 @@ export const resolveOptions = (
   configuration: LoadedRootConfiguration,
   availableParallelism: number,
   caseInsensitiveEnvironmentNames = false,
+  storedCredentials: {
+    readonly token?: string;
+    readonly project?: StoredProjectConfiguration;
+  } = {},
 ): ResolvedRunOptions => {
   const value = configuration.value;
   const global = value.global;
@@ -405,12 +426,62 @@ export const resolveOptions = (
     );
   const configuredEnvironmentMode = environmentValue("TURBO_ENV_MODE");
   const configuredApiUrl = environmentValue("TURBO_API");
+  const configuredTeamSlugValue = environmentValue("TURBO_TEAM");
+  const configuredTeamSlug =
+    configuredTeamSlugValue === "" ? undefined : configuredTeamSlugValue;
+  const configuredTeamIdValue = environmentValue("TURBO_TEAMID");
+  const configuredTeamId =
+    configuredTeamIdValue === "" ? undefined : configuredTeamIdValue;
+  const configuredToken = environmentValue("TURBO_TOKEN");
   const configuredRemoteTimeout = environmentValue(
     "TURBO_REMOTE_CACHE_TIMEOUT",
   );
   const configuredRemoteUploadTimeout = environmentValue(
     "TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT",
   );
+  const configuredUi =
+    parsed.ui === undefined ? environmentValue("TURBO_UI") : undefined;
+  if (
+    configuredUi !== undefined &&
+    configuredUi !== "stream" &&
+    configuredUi !== "stream-with-experimental-timestamps" &&
+    configuredUi !== "tui"
+  ) {
+    throw new ConfigurationError({
+      path: "TURBO_UI",
+      message: `invalid UI mode: ${configuredUi}`,
+    });
+  }
+  const configuredLogOrder =
+    parsed.logOrder === undefined
+      ? environmentValue("TURBO_LOG_ORDER")
+      : undefined;
+  if (
+    configuredLogOrder !== undefined &&
+    configuredLogOrder !== "auto" &&
+    configuredLogOrder !== "stream" &&
+    configuredLogOrder !== "grouped"
+  ) {
+    throw new ConfigurationError({
+      path: "TURBO_LOG_ORDER",
+      message: `invalid log order: ${configuredLogOrder}`,
+    });
+  }
+  const configuredLogPrefix =
+    parsed.logPrefix === undefined
+      ? environmentValue("TURBO_LOG_PREFIX")
+      : undefined;
+  if (
+    configuredLogPrefix !== undefined &&
+    configuredLogPrefix !== "auto" &&
+    configuredLogPrefix !== "none" &&
+    configuredLogPrefix !== "task"
+  ) {
+    throw new ConfigurationError({
+      path: "TURBO_LOG_PREFIX",
+      message: `invalid log prefix: ${configuredLogPrefix}`,
+    });
+  }
   const concurrency =
     parsed.concurrency ??
     environmentValue("TURBO_CONCURRENCY") ??
@@ -436,13 +507,20 @@ export const resolveOptions = (
   const cacheDirectory = isAbsolutePath(cacheDirectoryValue)
     ? cacheDirectoryValue
     : joinPath(root, cacheDirectoryValue);
+  const cachePolicy = parseCachePolicy(parsed, environmentValue);
   const remoteConfiguration = value.remoteCache ?? global?.remoteCache;
+  const explicitToken = parsed.token ?? configuredToken;
+  const token =
+    explicitToken ??
+    (storedCredentials.project?.apiUrl === undefined
+      ? undefined
+      : storedCredentials.token);
   const apiUrl =
     parsed.apiUrl ??
     configuredApiUrl ??
+    storedCredentials.project?.apiUrl ??
     remoteConfiguration?.apiUrl ??
-    undefined;
-  const token = parsed.token ?? environmentValue("TURBO_TOKEN");
+    (token === undefined ? undefined : "https://vercel.com/api");
   const signatureKey = environmentValue("TURBO_REMOTE_CACHE_SIGNATURE_KEY");
   const remoteTimeoutValue =
     parsed.remoteCacheTimeoutSeconds ??
@@ -507,6 +585,11 @@ export const resolveOptions = (
       if (parsedApiUrl.username !== "" || parsedApiUrl.password !== "") {
         throw new TypeError("remote cache URL credentials are not supported");
       }
+      if (parsedApiUrl.search !== "" || parsedApiUrl.hash !== "") {
+        throw new TypeError(
+          "remote cache URL query and fragment are not supported",
+        );
+      }
     } catch {
       throw new ConfigurationError({
         path: apiUrlPath,
@@ -518,12 +601,8 @@ export const resolveOptions = (
       path: string,
       label: string,
     ): number => {
-      const seconds = Number(input);
-      if (
-        (typeof input === "string" && input.trim() === "") ||
-        !Number.isFinite(seconds) ||
-        seconds < 0
-      ) {
+      const seconds = parseNodeTimerSeconds(input);
+      if (seconds === undefined) {
         throw new ConfigurationError({
           path,
           message: `invalid ${label}: ${String(input)}`,
@@ -545,12 +624,17 @@ export const resolveOptions = (
       apiUrl,
       token,
       teamId:
-        environmentValue("TURBO_TEAMID") ??
-        remoteConfiguration?.teamId ??
-        undefined,
+        parsed.team === undefined && configuredTeamSlug === undefined
+          ? (configuredTeamId ??
+            storedCredentials.project?.teamId ??
+            (storedCredentials.project?.teamSlug === undefined
+              ? (remoteConfiguration?.teamId ?? undefined)
+              : undefined))
+          : undefined,
       teamSlug:
         parsed.team ??
-        environmentValue("TURBO_TEAM") ??
+        configuredTeamSlug ??
+        storedCredentials.project?.teamSlug ??
         remoteConfiguration?.teamSlug ??
         undefined,
       timeoutMilliseconds: 1_000 * remoteTimeoutSeconds,
@@ -571,6 +655,21 @@ export const resolveOptions = (
       concurrency ?? undefined,
       availableParallelism,
     ),
+    cacheWorkers: (() => {
+      const environmentWorkers = environmentValue("TURBO_CACHE_WORKERS");
+      const value = parsed.cacheWorkers ?? environmentWorkers ?? 10;
+      const count = Number(value);
+      if (!Number.isSafeInteger(count) || count <= 0) {
+        throw new ConfigurationError({
+          path:
+            parsed.cacheWorkers !== undefined
+              ? "<arguments>"
+              : "TURBO_CACHE_WORKERS",
+          message: `invalid cache worker count: ${String(value)}`,
+        });
+      }
+      return count;
+    })(),
     continueMode: parsed.continueMode ?? "never",
     environmentMode: environmentModeValue,
     cacheDirectory,
@@ -600,7 +699,7 @@ export const resolveOptions = (
         gib: 1_073_741_824,
       },
     ),
-    cachePolicy: parseCachePolicy(parsed, environmentValue),
+    cachePolicy,
     force:
       parsed.force ||
       environmentBoolean(environmentValue("TURBO_FORCE")) === true,
@@ -608,12 +707,24 @@ export const resolveOptions = (
     outputLogs: parsed.outputLogs,
     only: parsed.only,
     parallel: parsed.parallel,
+    remoteToken: explicitToken ?? storedCredentials.token,
     remote,
     colorEnabled: !parsed.noColor && environmentValue("NO_COLOR") === undefined,
     json: parsed.json,
-    ui: parsed.ui ?? value.ui ?? global?.ui ?? "stream",
-    logOrder: parsed.logOrder ?? "auto",
-    logPrefix: parsed.logPrefix ?? "auto",
+    ui:
+      parsed.ui ??
+      (configuredUi as ResolvedRunOptions["ui"] | undefined) ??
+      value.ui ??
+      global?.ui ??
+      "stream",
+    logOrder:
+      parsed.logOrder ??
+      (configuredLogOrder as ResolvedRunOptions["logOrder"] | undefined) ??
+      "auto",
+    logPrefix:
+      parsed.logPrefix ??
+      (configuredLogPrefix as ResolvedRunOptions["logPrefix"] | undefined) ??
+      "auto",
   };
 };
 
@@ -629,8 +740,26 @@ interface AffectedPackages {
   readonly rootChanged: boolean;
 }
 
+export interface RunMetricTaskDetail {
+  readonly cacheSource?: "local" | "remote";
+  readonly durationMilliseconds?: number;
+  readonly exitCode?: number;
+  readonly id: string;
+  readonly package: string;
+  readonly status: "failed" | "skipped" | "succeeded";
+  readonly task: string;
+}
+
+export interface RunMetricSnapshot {
+  readonly taskCount: number;
+  readonly tasks: ReadonlyArray<RunMetricTaskDetail>;
+}
+
 interface RunExecutionContext {
   readonly changedPaths?: ReadonlyArray<string>;
+  readonly onFinalTaskMetricsResolved?: (snapshot: RunMetricSnapshot) => void;
+  readonly onRemoteTokenResolved?: (token: string | undefined) => void;
+  readonly onTaskMetricsResolved?: (snapshot: RunMetricSnapshot) => void;
 }
 
 const packageRelativeChangedFile = (
@@ -2247,8 +2376,10 @@ type CachePublicationPermit = <A, E, R>(
   publication: Effect.Effect<A, E, R>,
 ) => Effect.Effect<A, E, R>;
 
-export const makeCachePublicationPermit: Effect.Effect<CachePublicationPermit> =
-  Effect.makeSemaphore(1).pipe(
+export const makeCachePublicationPermit = (
+  workerCount: number,
+): Effect.Effect<CachePublicationPermit> =>
+  Effect.makeSemaphore(workerCount).pipe(
     Effect.map(
       (semaphore) => (publication) => semaphore.withPermits(1)(publication),
     ),
@@ -2467,7 +2598,8 @@ const executeTask = (
   logIdentifier = node.task,
   withOutputPermit: OutputPermit = (output) => output,
   writeStructuredRecord: WriteStructuredRecord = () => Effect.void,
-): Effect.Effect<TaskExecutionResult, unknown, RunRequirements> =>
+  reportRemoteCacheEvent: ReportRemoteCacheEvent = () => Effect.void,
+): Effect.Effect<TaskExecutionResult, unknown, RunRequirements | Scope.Scope> =>
   Effect.gen(function* () {
     const terminal = yield* TerminalService;
     const fileSystem = yield* FileSystemService;
@@ -2688,6 +2820,9 @@ const executeTask = (
           cacheTimeSaved = duration;
         },
       ).pipe(
+        Effect.tap((restored) =>
+          reportRemoteCacheEvent(hash.hash, restored ? "HIT" : "MISS"),
+        ),
         Effect.catchTag("CacheError", (error) =>
           writeTaskWarning(
             `remote cache restore failed for ${taskLabel}; executing task locally: ${error.message}`,
@@ -2964,19 +3099,30 @@ const executeTask = (
             );
           }
           if (options.cachePolicy.remoteWrite && options.remote !== undefined) {
-            yield* writeRemoteCache(
-              options.remote,
-              hash.hash,
-              collected.entries,
-              duration,
-              platform === "win32",
-            ).pipe(
-              Effect.catchAll((error) =>
-                writeTaskWarning(
-                  `remote cache upload failed for ${taskLabel}; preserving successful task result: ${error.message}`,
-                ).pipe(Effect.ignore),
-              ),
-            );
+            const alreadyPublished = options.cachePolicy.remoteRead
+              ? false
+              : yield* headRemoteCache(options.remote, hash.hash).pipe(
+                  Effect.catchAll((error) =>
+                    writeTaskWarning(
+                      `remote cache existence check failed for ${taskLabel}; continuing with upload: ${error.message}`,
+                    ).pipe(Effect.ignore, Effect.as(false)),
+                  ),
+                );
+            if (!alreadyPublished) {
+              yield* writeRemoteCache(
+                options.remote,
+                hash.hash,
+                collected.entries,
+                duration,
+                platform === "win32",
+              ).pipe(
+                Effect.catchAll((error) =>
+                  writeTaskWarning(
+                    `remote cache upload failed for ${taskLabel}; preserving successful task result: ${error.message}`,
+                  ).pipe(Effect.ignore),
+                ),
+              );
+            }
           }
         }),
       );
@@ -3439,14 +3585,74 @@ export const executeRun = (
     const preliminaryRoot = yield* discoverRepositoryRoot(
       resolvedRequestedRoot ?? processCwd,
     );
+    const configuredRootTurboJson = configuredEnvironmentValue(
+      environment,
+      "TURBO_ROOT_TURBO_JSON",
+      platform === "win32",
+    );
+    const rootTurboJson = parsed.rootTurboJson ?? configuredRootTurboJson;
     const configuration = yield* loadRootConfiguration(
       preliminaryRoot,
-      parsed.rootTurboJson === undefined
+      rootTurboJson === undefined
         ? undefined
-        : isAbsolutePath(parsed.rootTurboJson)
-          ? parsed.rootTurboJson
-          : joinPath(preliminaryRoot, parsed.rootTurboJson),
+        : isAbsolutePath(rootTurboJson)
+          ? rootTurboJson
+          : joinPath(preliminaryRoot, rootTurboJson),
     );
+    const environmentValue = (name: string): string | undefined =>
+      configuredEnvironmentValue(environment, name, platform === "win32");
+    const ordinaryRun =
+      parsed.graph === undefined && parsed.dryRun === undefined;
+    const preliminaryCachePolicy = parseCachePolicy(parsed, environmentValue);
+    const configuredRemoteCache =
+      configuration.value.remoteCache ??
+      configuration.value.global?.remoteCache;
+    const remoteCacheActive =
+      ordinaryRun &&
+      configuredRemoteCache?.enabled !== false &&
+      (preliminaryCachePolicy.remoteRead || preliminaryCachePolicy.remoteWrite);
+    const openTelemetryEnabled =
+      parsed.openTelemetry.enabled ??
+      environmentValue("TURBO_EXPERIMENTAL_OTEL_ENABLED") === "true";
+    const explicitRemoteApi = parsed.apiUrl ?? environmentValue("TURBO_API");
+    const explicitRemoteToken = parsed.token ?? environmentValue("TURBO_TOKEN");
+    const explicitRemoteTeamSlugValue =
+      parsed.team ?? environmentValue("TURBO_TEAM");
+    const explicitRemoteTeamSlug =
+      explicitRemoteTeamSlugValue === ""
+        ? undefined
+        : explicitRemoteTeamSlugValue;
+    const explicitRemoteTeamIdValue = environmentValue("TURBO_TEAMID");
+    const explicitRemoteTeamId =
+      explicitRemoteTeamIdValue === "" ? undefined : explicitRemoteTeamIdValue;
+    const explicitRemoteTeam = explicitRemoteTeamSlug ?? explicitRemoteTeamId;
+    const remoteConnectionFullyExplicit =
+      explicitRemoteApi !== undefined &&
+      explicitRemoteToken !== undefined &&
+      explicitRemoteTeam !== undefined;
+    const telemetryNeedsStoredToken =
+      openTelemetryEnabled &&
+      parsed.openTelemetry.useRemoteCacheToken === true &&
+      explicitRemoteToken === undefined;
+    const credentialService =
+      remoteCacheActive || telemetryNeedsStoredToken
+        ? yield* CredentialService
+        : undefined;
+    const projectCredentials =
+      remoteCacheActive && !remoteConnectionFullyExplicit
+        ? yield* credentialService!.readProjectConfiguration(preliminaryRoot)
+        : undefined;
+    const remoteCacheNeedsStoredToken =
+      remoteCacheActive &&
+      explicitRemoteToken === undefined &&
+      projectCredentials?.apiUrl !== undefined;
+    const userCredentials = remoteCacheNeedsStoredToken
+      ? yield* credentialService!.readUserConfiguration
+      : telemetryNeedsStoredToken
+        ? yield* credentialService!.readUserConfiguration.pipe(
+            Effect.catchAll(() => Effect.succeed(undefined)),
+          )
+        : undefined;
     const availableParallelism = yield* concurrencyService.availableParallelism;
     const unresolvedOptions = resolveOptions(
       parsed,
@@ -3455,7 +3661,13 @@ export const executeRun = (
       configuration,
       availableParallelism,
       platform === "win32",
+      { token: userCredentials?.token, project: projectCredentials },
     );
+    const activeRemote = ordinaryRun ? unresolvedOptions.remote : undefined;
+    const remoteSessionId =
+      activeRemote === undefined
+        ? undefined
+        : yield* (yield* RandomnessService).uuidV7;
     const [canonicalRoot, canonicalCacheDirectory] = yield* Effect.all([
       canonicalExistingAncestorPath(unresolvedOptions.root),
       canonicalExistingAncestorPath(unresolvedOptions.cacheDirectory),
@@ -3478,8 +3690,12 @@ export const executeRun = (
       terminal.stdoutIsTerminal === undefined
         ? false
         : yield* terminal.stdoutIsTerminal;
-    const options: ResolvedRunOptions = {
+    let options: ResolvedRunOptions = {
       ...unresolvedOptions,
+      remote:
+        activeRemote === undefined
+          ? undefined
+          : { ...activeRemote, sessionId: remoteSessionId },
       ui: resolveRunUiMode(
         unresolvedOptions.ui,
         stdinIsTerminal,
@@ -3496,6 +3712,18 @@ export const executeRun = (
           )
         : unresolvedOptions.cacheDirectory,
     };
+    context.onRemoteTokenResolved?.(options.remoteToken);
+    if (
+      options.remote !== undefined &&
+      (options.cachePolicy.remoteRead || options.cachePolicy.remoteWrite)
+    ) {
+      const remoteEnabled = yield* verifyRemoteCacheStatus(options.remote).pipe(
+        Effect.catchAll(() => Effect.succeed(false)),
+      );
+      if (!remoteEnabled) {
+        options = { ...options, remote: undefined };
+      }
+    }
     const repository = yield* discoverRepository(options.root, configuration, {
       singlePackage: parsed.singlePackage,
     });
@@ -3691,8 +3919,6 @@ export const executeRun = (
           : joinPath(options.root, requestedPath);
     const clock = yield* ClockService;
     const runStartedAt = yield* clock.now;
-    const ordinaryRun =
-      parsed.graph === undefined && parsed.dryRun === undefined;
     const summaryIsEmitted =
       parsed.summarize || parsed.json || parsed.logFile !== undefined;
     const runId = summaryIsEmitted
@@ -3993,6 +4219,52 @@ export const executeRun = (
     const orderedNodes = [...graph.nodes.values()].sort((left, right) =>
       left.id.localeCompare(right.id),
     );
+    const outcomes = new Map<string, TaskOutcome>();
+    const metricOutcomes = new Map<string, TaskOutcome>();
+    const reportTaskMetrics = (
+      callback: ((snapshot: RunMetricSnapshot) => void) | undefined,
+      includeUnresolved = false,
+    ): void =>
+      callback?.({
+        taskCount: orderedNodes.length,
+        tasks: orderedNodes.flatMap((node) => {
+          const outcome = metricOutcomes.get(node.id);
+          if (outcome === undefined && !includeUnresolved) return [];
+          return [
+            {
+              id: node.id,
+              package: node.package.name,
+              task: node.task,
+              status:
+                outcome === undefined || outcome.skipped
+                  ? "skipped"
+                  : outcome.exitCode === 0
+                    ? "succeeded"
+                    : "failed",
+              ...(outcome === undefined
+                ? {}
+                : {
+                    exitCode: outcome.exitCode,
+                    durationMilliseconds: Math.max(
+                      0,
+                      outcome.endTime - outcome.startTime,
+                    ),
+                    ...(outcome.cacheSource === undefined
+                      ? {}
+                      : { cacheSource: outcome.cacheSource }),
+                  }),
+            },
+          ];
+        }),
+      });
+    const reportIncrementalTaskMetrics = (): void =>
+      reportTaskMetrics(context.onTaskMetricsResolved);
+    const reportFinalTaskMetrics = (): void =>
+      reportTaskMetrics(
+        context.onFinalTaskMetricsResolved ?? context.onTaskMetricsResolved,
+        true,
+      );
+    reportIncrementalTaskMetrics();
     const globalInputFileHashes =
       orderedNodes[0] === undefined
         ? yield* hashGlobalInputFiles(
@@ -4011,6 +4283,7 @@ export const executeRun = (
           normalizePath(repository.root, platform === "win32"),
       );
     if (parsed.graph !== undefined) {
+      reportFinalTaskMetrics();
       const edges = orderedNodes.flatMap((node) =>
         node.dependencies.length === 0
           ? ([[node.id, "___ROOT___"]] as const)
@@ -4113,6 +4386,7 @@ export const executeRun = (
         };
     const globalExternalDependenciesHash = externalDependencyHashes.global;
     if (parsed.dryRun !== undefined) {
+      reportFinalTaskMetrics();
       const terminal = yield* TerminalService;
       if (parsed.dryRun === "json") {
         yield* terminal.writeStdout(
@@ -4292,11 +4566,12 @@ export const executeRun = (
           );
     const groups = taskGroups(graph);
     const pending = new Map(groups.map((members) => [members[0]!, members]));
-    const outcomes = new Map<string, TaskOutcome>();
     const foregroundSemaphore = yield* Effect.makeSemaphore(
       options.concurrency,
     );
-    const withCachePublicationPermit = yield* makeCachePublicationPermit;
+    const withCachePublicationPermit = yield* makeCachePublicationPermit(
+      options.cacheWorkers,
+    );
     const outputSemaphore = yield* Effect.makeSemaphore(1);
     const withOutputPermit: OutputPermit = (output) =>
       options.logOrder === "grouped"
@@ -4306,6 +4581,43 @@ export const executeRun = (
       orderedNodes.map((node) => [node.id, "queued"]),
     );
     const tuiSemaphore = yield* Effect.makeSemaphore(1);
+    const remoteCacheEventScope = yield* Effect.scope;
+    const remoteCacheEventFibers: Array<Fiber.RuntimeFiber<void, never>> = [];
+    const remoteCacheEventOptions =
+      options.remote === undefined
+        ? undefined
+        : {
+            ...options.remote,
+            timeoutMilliseconds:
+              options.remote.timeoutMilliseconds === 0
+                ? maximumRemoteCacheEventDrainMilliseconds
+                : Math.min(
+                    options.remote.timeoutMilliseconds,
+                    maximumRemoteCacheEventDrainMilliseconds,
+                  ),
+          };
+    const reportRemoteCacheEvent: ReportRemoteCacheEvent =
+      remoteCacheEventOptions === undefined
+        ? () => Effect.void
+        : (hash, event) =>
+            recordRemoteCacheEvent(remoteCacheEventOptions, hash, event).pipe(
+              Effect.ignore,
+              Effect.forkIn(remoteCacheEventScope),
+              Effect.tap((fiber) =>
+                Effect.sync(() => {
+                  remoteCacheEventFibers.push(fiber);
+                }),
+              ),
+              Effect.asVoid,
+            );
+    const flushRemoteCacheEvents = Effect.suspend(() => {
+      const fibers = [...remoteCacheEventFibers];
+      if (fibers.length === 0) return Effect.void;
+      return Effect.raceFirst(
+        Fiber.joinAll(fibers).pipe(Effect.asVoid),
+        Effect.sleep(`${maximumRemoteCacheEventDrainMilliseconds} millis`),
+      ).pipe(Effect.ensuring(Fiber.interruptAll(fibers)), Effect.asVoid);
+    });
     const updateTuiStatus = (
       id: string,
       status: RunTuiStatus,
@@ -4329,7 +4641,11 @@ export const executeRun = (
       const taskStartedAt = new Map<string, number>();
       const runNode = (
         id: string,
-      ): Effect.Effect<TaskOutcome, CacheRollbackError, RunRequirements> =>
+      ): Effect.Effect<
+        TaskOutcome,
+        CacheRollbackError,
+        RunRequirements | Scope.Scope
+      > =>
         Effect.gen(function* () {
           const clock = yield* ClockService;
           const startTime = yield* clock.now;
@@ -4362,6 +4678,7 @@ export const executeRun = (
                   logIdentifiers.get(id),
                   withOutputPermit,
                   writeStructuredRecord,
+                  reportRemoteCacheEvent,
                 ).pipe(
                   Effect.catchAll((cause) =>
                     cause instanceof CacheRollbackError
@@ -4547,6 +4864,8 @@ export const executeRun = (
                       Effect.tap((outcome) =>
                         Effect.sync(() => {
                           groupOutcomes.set(outcome.id, outcome);
+                          metricOutcomes.set(outcome.id, outcome);
+                          reportIncrementalTaskMetrics();
                         }),
                       ),
                     ),
@@ -4659,7 +4978,9 @@ export const executeRun = (
           const results = yield* Fiber.join(fiber);
           for (const result of results) {
             outcomes.set(result.id, result);
+            metricOutcomes.set(result.id, result);
           }
+          reportIncrementalTaskMetrics();
           if (
             options.continueMode === "never" &&
             results.some((result) => result.exitCode !== 0)
@@ -4668,7 +4989,7 @@ export const executeRun = (
           }
         }
       }),
-    );
+    ).pipe(Effect.ensuring(flushRemoteCacheEvents));
     const runFinishedAt = yield* (yield* ClockService).now;
     const exitCode = [...outcomes.values()].some(
       (outcome) => outcome.exitCode !== 0,
@@ -4846,8 +5167,10 @@ export const executeRun = (
     if (parsed.json) {
       yield* terminal.writeStdout(`${JSON.stringify(summaryRecord)}\n`);
     }
+    reportFinalTaskMetrics();
     return exitCode;
   }).pipe(
+    Effect.scoped,
     Effect.onExit(() =>
       retainGeneratedStructuredLog
         ? Effect.void

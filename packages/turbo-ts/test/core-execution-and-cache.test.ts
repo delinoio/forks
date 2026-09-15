@@ -92,6 +92,7 @@ import {
   makeCachePublicationPermit,
   packageManagerCommand,
   planCargoWorkspaceTasks,
+  type RunMetricSnapshot,
   taskIdsWithUnrestorableCacheInputs,
   taskMatchesChangedFiles,
 } from "../src/run/engine.js";
@@ -1379,12 +1380,12 @@ describe("core CLI execution", () => {
     }
   }, 20_000);
 
-  it("serializes cache publication across concurrent task completions", async () => {
+  it("limits cache publication to the configured worker count", async () => {
     let activePublications = 0;
     let maximumActivePublications = 0;
     await Effect.runPromise(
       Effect.gen(function* () {
-        const withCachePublicationPermit = yield* makeCachePublicationPermit;
+        const withCachePublicationPermit = yield* makeCachePublicationPermit(2);
         const publication = withCachePublicationPermit(
           Effect.acquireUseRelease(
             Effect.sync(() => {
@@ -1401,12 +1402,12 @@ describe("core CLI execution", () => {
               }),
           ),
         );
-        yield* Effect.all([publication, publication], {
+        yield* Effect.all([publication, publication, publication], {
           concurrency: "unbounded",
         });
       }),
     );
-    expect(maximumActivePublications).toBe(1);
+    expect(maximumActivePublications).toBe(2);
   });
 
   it("preserves task success when cache output collection fails", async () => {
@@ -7503,6 +7504,81 @@ dependencies = [
     }
   }, 10_000);
 
+  it("publishes completed task metrics before a with group finishes", async () => {
+    const directory = await makeFixture();
+    const packageDirectory = `${directory}/packages/library`;
+    const snapshots: Array<RunMetricSnapshot> = [];
+    const finalSnapshots: Array<RunMetricSnapshot> = [];
+    try {
+      const configurationPath = `${directory}/turbo.json`;
+      const configuration = JSON.parse(
+        await readFile(configurationPath, "utf8"),
+      ) as { tasks: Record<string, unknown> };
+      configuration.tasks.check = { cache: false, with: ["serve"] };
+      configuration.tasks.serve = { cache: false };
+      await writeFile(
+        configurationPath,
+        `${JSON.stringify(configuration, null, 2)}\n`,
+      );
+      const manifestPath = `${packageDirectory}/package.json`;
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.check = 'node -e ""';
+      manifest.scripts.serve = 'node -e "setTimeout(() => {}, 250)"';
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+      const exitCode = await Effect.runPromise(
+        executeRun(
+          parseRunArguments([
+            "run",
+            "check",
+            "--cwd",
+            directory,
+            "--filter=synthetic-library",
+            "--concurrency=2",
+            "--no-cache",
+          ]),
+          {
+            onFinalTaskMetricsResolved: (snapshot) =>
+              finalSnapshots.push(snapshot),
+            onTaskMetricsResolved: (snapshot) => snapshots.push(snapshot),
+          },
+        ).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+
+      expect(exitCode).toBe(0);
+      expect(
+        snapshots.some(
+          (snapshot) =>
+            snapshot.tasks.some(
+              (task) =>
+                task.id === "synthetic-library#check" &&
+                task.status === "succeeded",
+            ) &&
+            !snapshot.tasks.some(
+              (task) => task.id === "synthetic-library#serve",
+            ),
+        ),
+      ).toBe(true);
+      expect(finalSnapshots).toHaveLength(1);
+      expect(finalSnapshots[0]?.tasks).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "synthetic-library#check",
+            status: "succeeded",
+          }),
+          expect.objectContaining({
+            id: "synthetic-library#serve",
+            status: "succeeded",
+          }),
+        ]),
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
   it("waits for a complete foreground companion cohort", async () => {
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;
@@ -11091,7 +11167,7 @@ dependencies = [
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  }, 30_000);
+  }, 60_000);
 
   it("applies ordered negations in structured task inputs", async () => {
     const directory = await mkdtemp(join(packageRoot, "turbo-ts-inputs-"));
@@ -13733,11 +13809,234 @@ describe("cache interoperability and safety", () => {
     }
   }, 10_000);
 
+  it("keeps remote cache events alive beyond a task group and flushes them", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-remote-event-"));
+    await cp(fixtureRoot, directory, { recursive: true });
+    const manifestPath = `${directory}/packages/library/package.json`;
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    manifest.scripts.build =
+      "node -e \"require('node:fs').writeFileSync('event-task-complete', 'done')\"";
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    let eventBody = "";
+    let markEventStarted = (): void => undefined;
+    const eventStarted = new Promise<void>((resolve) => {
+      markEventStarted = resolve;
+    });
+    let releaseEventResponse = (): void => undefined;
+    const server = createServer((request, response) => {
+      const chunks: Array<Buffer> = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
+        if (request.url?.startsWith("/v8/artifacts/events") === true) {
+          eventBody = Buffer.concat(chunks).toString("utf8");
+          releaseEventResponse = () => {
+            releaseEventResponse = () => undefined;
+            response.writeHead(200);
+            response.end();
+          };
+          markEventStarted();
+          return;
+        }
+        response.writeHead(404);
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    let runPromise: ReturnType<typeof run> | undefined;
+    try {
+      runPromise = run(
+        process.execPath,
+        [
+          candidateEntrypoint,
+          "run",
+          "build",
+          `--cwd=${directory}`,
+          "--filter=synthetic-library",
+          "--cache=remote:r",
+          "--output-logs=none",
+          `--api=http://127.0.0.1:${address.port}`,
+          "--token=synthetic-token",
+          "--team=synthetic-team",
+        ],
+        repositoryRoot,
+      );
+      let runSettled = false;
+      void runPromise.then(
+        () => {
+          runSettled = true;
+        },
+        () => {
+          runSettled = true;
+        },
+      );
+      await Promise.race([
+        eventStarted,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("cache event did not start")),
+            3_000,
+          ),
+        ),
+      ]);
+      const taskCompleted = await (async () => {
+        for (let attempt = 0; attempt < 300; attempt += 1) {
+          try {
+            await readFile(
+              `${directory}/packages/library/event-task-complete`,
+              "utf8",
+            );
+            return true;
+          } catch {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        }
+        return false;
+      })();
+      expect(taskCompleted).toBe(true);
+      expect(runSettled).toBe(false);
+      releaseEventResponse();
+      const result = await runPromise;
+      expect(result.exitCode, result.stderr).toBe(0);
+      expect(JSON.parse(eventBody)).toEqual([
+        expect.objectContaining({
+          event: "MISS",
+          source: "REMOTE",
+        }),
+      ]);
+    } finally {
+      releaseEventResponse();
+      await runPromise?.catch(() => undefined);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it("bounds remote cache event draining when request timeouts are disabled", async () => {
+    const directory = await makeFixture();
+    const taskMarker = `${directory}/packages/library/event-task-complete`;
+    const manifestPath = `${directory}/packages/library/package.json`;
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    manifest.scripts.build =
+      "node -e \"require('node:fs').writeFileSync('event-task-complete', 'done')\"";
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    let markEventStarted = (): void => undefined;
+    const eventStarted = new Promise<void>((resolve) => {
+      markEventStarted = resolve;
+    });
+    const server = createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
+        if (request.url?.startsWith("/v8/artifacts/events") === true) {
+          markEventStarted();
+          return;
+        }
+        response.writeHead(404);
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    const execution = Effect.scoped(
+      Effect.gen(function* () {
+        const processService = yield* ProcessService;
+        return yield* processService.run({
+          command: process.execPath,
+          args: [
+            candidateEntrypoint,
+            "run",
+            "build",
+            `--cwd=${directory}`,
+            "--filter=synthetic-library",
+            "--cache=remote:r",
+            "--output-logs=none",
+            "--remote-cache-timeout=0",
+            `--api=http://127.0.0.1:${address.port}`,
+            "--token=synthetic-token",
+            "--team=synthetic-team",
+          ],
+          cwd: repositoryRoot,
+        });
+      }),
+    ).pipe(Effect.provide(nodeFoundationLayer));
+    const runFiber = Effect.runFork(execution);
+    const runPromise = Effect.runPromise(Fiber.join(runFiber));
+    try {
+      await Promise.race([
+        eventStarted,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("cache event did not start")),
+            3_000,
+          ),
+        ),
+      ]);
+      let taskCompleted = false;
+      for (let attempt = 0; attempt < 300; attempt += 1) {
+        try {
+          await readFile(taskMarker, "utf8");
+          taskCompleted = true;
+          break;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+      expect(taskCompleted).toBe(true);
+      const result = await Promise.race([
+        runPromise,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("cache event drain did not finish")),
+            4_000,
+          ),
+        ),
+      ]);
+      expect(result.exitCode, result.stderr).toBe(0);
+    } finally {
+      await Effect.runPromise(Fiber.interrupt(runFiber));
+      const closed = new Promise<void>((resolve) =>
+        server.close(() => resolve()),
+      );
+      server.closeAllConnections();
+      await closed;
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 15_000);
+
   it("falls back to execution when remote cache restoration fails", async () => {
     const directory = await makeFixture();
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
         response.writeHead(200, {
           "content-type": "application/octet-stream",
         });
@@ -13783,6 +14082,11 @@ describe("cache interoperability and safety", () => {
       const chunks: Array<Buffer> = [];
       request.on("data", (chunk: Buffer) => chunks.push(chunk));
       request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
         if (request.method === "PUT") {
           artifact = new Uint8Array(Buffer.concat(chunks));
           response.writeHead(201);
@@ -13867,6 +14171,11 @@ describe("cache interoperability and safety", () => {
       const chunks: Array<Buffer> = [];
       request.on("data", (chunk: Buffer) => chunks.push(chunk));
       request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
         if (request.method === "PUT") {
           artifact = new Uint8Array(Buffer.concat(chunks));
           response.writeHead(201);
@@ -13960,6 +14269,16 @@ describe("cache interoperability and safety", () => {
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
+        if (request.method === "HEAD") {
+          response.writeHead(404);
+          response.end();
+          return;
+        }
         uploads += 1;
         response.writeHead(403);
         response.end();
@@ -13998,12 +14317,94 @@ describe("cache interoperability and safety", () => {
     }
   }, 10_000);
 
+  it("checks write-only remote artifacts before uploading", async () => {
+    const directory = await makeFixture();
+    const methods: Array<string> = [];
+    let artifactExists = false;
+    let headFails = false;
+    const server = createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
+        if (request.method === "HEAD") {
+          methods.push("HEAD");
+          response.writeHead(
+            headFails ? 403 : artifactExists ? 200 : 404,
+            artifactExists ? { "content-length": "1024" } : {},
+          );
+          response.end();
+          return;
+        }
+        if (request.method === "PUT") {
+          methods.push("PUT");
+          artifactExists = true;
+          response.writeHead(201);
+          response.end();
+          return;
+        }
+        response.writeHead(200);
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("missing loopback address");
+    }
+    const arguments_ = [
+      candidateEntrypoint,
+      "run",
+      "build",
+      "--cwd",
+      directory,
+      "--filter=synthetic-library",
+      "--cache=remote:w",
+      "--output-logs=hash-only",
+    ];
+    try {
+      for (let runIndex = 0; runIndex < 2; runIndex += 1) {
+        const result = await run(process.execPath, arguments_, repositoryRoot, {
+          TURBO_API: `http://127.0.0.1:${address.port}`,
+        });
+        expect(result.exitCode).toBe(0);
+      }
+      artifactExists = false;
+      headFails = true;
+      const fallback = await run(process.execPath, arguments_, repositoryRoot, {
+        TURBO_API: `http://127.0.0.1:${address.port}`,
+      });
+      expect(fallback.exitCode).toBe(0);
+      expect(fallback.stderr).toContain("remote cache existence check failed");
+      expect(fallback.stderr).toContain("continuing with upload");
+      expect(methods).toEqual(["HEAD", "PUT", "HEAD", "HEAD", "PUT"]);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 20_000);
+
   it("continues remote upload when a local cache write fails", async () => {
     const directory = await makeFixture();
     let uploads = 0;
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
+        if (request.method === "HEAD") {
+          response.writeHead(404);
+          response.end();
+          return;
+        }
         if (request.method === "PUT") uploads += 1;
         response.writeHead(201);
         response.end();
@@ -14108,7 +14509,7 @@ describe("cache interoperability and safety", () => {
             options,
             "abcdefabcdefabcd",
             allowCachePaths("**"),
-          ).pipe(Effect.provide(nodeFoundationLayer)),
+          ).pipe(Effect.provide(nodeFoundationLayer), Effect.scoped),
         ),
       ).rejects.toThrow(/escaping symlink/);
       await expect(lstat(`${outside}/app`)).rejects.toThrow();
@@ -14126,9 +14527,9 @@ describe("cache interoperability and safety", () => {
     let artifact = new Uint8Array();
     let tag = "";
     const server = createServer((request, response) => {
-      requestPaths.push(
-        new URL(request.url ?? "/", "http://127.0.0.1").pathname,
-      );
+      const requestPath = new URL(request.url ?? "/", "http://127.0.0.1")
+        .pathname;
+      requestPaths.push(requestPath);
       const chunks: Array<Buffer> = [];
       request.on("data", (chunk: Buffer) => chunks.push(chunk));
       request.on("end", () => {
@@ -14241,13 +14642,16 @@ describe("cache interoperability and safety", () => {
                 hmacSha256: () => Effect.fail(fileBoundaryError("signing")),
               }),
             );
-            return yield* restoreRemoteCache(
-              restoreRoot,
-              options,
-              "0011223344556677",
-              allowCachePaths("packages/app/**"),
-            ).pipe(Effect.provide(streamingLayer));
-          }).pipe(Effect.provide(nodeFoundationLayer)),
+            return yield* Effect.gen(function* () {
+              const restored = yield* restoreRemoteCache(
+                restoreRoot,
+                options,
+                "0011223344556677",
+                allowCachePaths("packages/app/**"),
+              );
+              return restored;
+            }).pipe(Effect.provide(streamingLayer));
+          }).pipe(Effect.provide(nodeFoundationLayer), Effect.scoped),
         ),
       ).toBe(true);
       expect(downloadedArtifactPath).toBeDefined();
@@ -14268,7 +14672,7 @@ describe("cache interoperability and safety", () => {
             options,
             "0011223344556677",
             allowCachePaths("packages/app/**"),
-          ).pipe(Effect.provide(nodeFoundationLayer)),
+          ).pipe(Effect.provide(nodeFoundationLayer), Effect.scoped),
         ),
       ).rejects.toThrow(/signature is invalid/);
       expect(requestPaths).toEqual([
@@ -14321,7 +14725,11 @@ describe("cache interoperability and safety", () => {
           options,
           "1111222233334444",
           allowCachePaths("remote.txt"),
-        ).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
+        ).pipe(
+          Effect.either,
+          Effect.provide(nodeFoundationLayer),
+          Effect.scoped,
+        ),
       );
       expect(restore._tag).toBe("Left");
       const upload = await Effect.runPromise(
@@ -14421,7 +14829,7 @@ describe("cache interoperability and safety", () => {
             options,
             "9988776655443322",
             allowCachePaths("remote.txt"),
-          ).pipe(Effect.provide(nodeFoundationLayer)),
+          ).pipe(Effect.provide(nodeFoundationLayer), Effect.scoped),
         ),
       ).toBe(true);
       expect(await readFile(`${directory}/remote.txt`, "utf8")).toBe(
@@ -14479,6 +14887,16 @@ describe("cache interoperability and safety", () => {
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
+        if (request.url?.startsWith("/v8/artifacts/status") === true) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end('{"status":"enabled"}');
+          return;
+        }
+        if (request.method === "HEAD") {
+          response.writeHead(404);
+          response.end();
+          return;
+        }
         uploads += 1;
         setTimeout(() => {
           response.writeHead(201);
@@ -14754,17 +15172,20 @@ describe("cache interoperability and safety", () => {
     }
   }, 30_000);
 
-  it("lets TURBO_TEAMID override the configured remote-cache team ID", async () => {
+  it("applies environment team selection precedence to remote requests", async () => {
     const directory = await makeFixture();
-    const teamIds: Array<string | null> = [];
+    const teamSelectors: Array<{
+      readonly teamId: string | null;
+      readonly teamSlug: string | null;
+    }> = [];
     const server = createServer((request, response) => {
       request.resume();
       request.on("end", () => {
-        teamIds.push(
-          new URL(request.url ?? "/", "http://127.0.0.1").searchParams.get(
-            "teamId",
-          ),
-        );
+        const url = new URL(request.url ?? "/", "http://127.0.0.1");
+        teamSelectors.push({
+          teamId: url.searchParams.get("teamId"),
+          teamSlug: url.searchParams.get("slug"),
+        });
         response.writeHead(201);
         response.end();
       });
@@ -14789,22 +15210,46 @@ describe("cache interoperability and safety", () => {
         configurationPath,
         `${JSON.stringify(configuration, null, 2)}\n`,
       );
-      const result = await run(
-        process.execPath,
-        [
-          candidateEntrypoint,
-          "run",
-          "build",
-          "--cwd",
-          directory,
-          "--filter=synthetic-library",
-          "--cache=remote:w",
-        ],
-        repositoryRoot,
-        { TURBO_TEAMID: "team_environment" },
-      );
-      expect(result.exitCode).toBe(0);
-      expect(teamIds).toEqual(["team_environment"]);
+      const runWithEnvironment = (environment: NodeJS.ProcessEnv) =>
+        run(
+          process.execPath,
+          [
+            candidateEntrypoint,
+            "run",
+            "build",
+            "--cwd",
+            directory,
+            "--filter=synthetic-library",
+            "--cache=remote:w",
+          ],
+          repositoryRoot,
+          environment,
+        );
+      expect(
+        (await runWithEnvironment({ TURBO_TEAMID: "team_environment" }))
+          .exitCode,
+      ).toBe(0);
+      expect(
+        (
+          await runWithEnvironment({
+            TURBO_TEAM: "environment-team",
+            TURBO_TEAMID: "team_stale",
+          })
+        ).exitCode,
+      ).toBe(0);
+      expect(
+        (
+          await runWithEnvironment({
+            TURBO_TEAM: "",
+            TURBO_TEAMID: "team_empty_slug",
+          })
+        ).exitCode,
+      ).toBe(0);
+      expect(teamSelectors).toEqual([
+        { teamId: "team_environment", teamSlug: null },
+        { teamId: null, teamSlug: "environment-team" },
+        { teamId: "team_empty_slug", teamSlug: null },
+      ]);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(directory, { force: true, recursive: true });
@@ -14899,7 +15344,7 @@ describe("cache interoperability and safety", () => {
             candidateRemoteOptions,
             "97b263bfd7db31de",
             allowCachePaths("packages/library/.turbo/turbo-build.log"),
-          ).pipe(Effect.provide(nodeFoundationLayer)),
+          ).pipe(Effect.provide(nodeFoundationLayer), Effect.scoped),
         ),
       ).toBe(true);
       expect(

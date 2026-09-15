@@ -27,6 +27,7 @@ export interface RemoteCacheOptions {
   readonly preflight: boolean;
   readonly signatureKey?: string;
   readonly requireSignature: boolean;
+  readonly sessionId?: string;
 }
 
 const remoteError = (
@@ -56,11 +57,24 @@ const artifactUrl = (options: RemoteCacheOptions, hash: string): string => {
   return url.toString();
 };
 
+const remoteRouteUrl = (options: RemoteCacheOptions, route: string): string => {
+  const url = new URL(options.apiUrl);
+  url.pathname = `${url.pathname.replace(/\/+$/, "")}${route}`;
+  url.search = "";
+  url.hash = "";
+  if (options.teamId?.startsWith("team_") === true) {
+    url.searchParams.set("teamId", options.teamId);
+  } else if (options.teamSlug !== undefined) {
+    url.searchParams.set("slug", options.teamSlug);
+  }
+  return url.toString();
+};
+
 const requestHeaders = (
   options: RemoteCacheOptions,
 ): Record<string, string> => ({
   "user-agent": `turbo-ts/${packageVersion}`,
-  ...(options.token === undefined
+  ...(options.token === undefined || options.token === ""
     ? {}
     : { authorization: `Bearer ${options.token}` }),
 });
@@ -103,6 +117,158 @@ const preflight = (
     }
   });
 
+export const verifyRemoteCacheStatus = (
+  options: RemoteCacheOptions,
+): Effect.Effect<boolean, CacheError, HttpService | RetryScheduleService> =>
+  Effect.gen(function* () {
+    const url = remoteRouteUrl(options, "/v8/artifacts/status");
+    yield* preflight(url, options);
+    const http = yield* HttpService;
+    const retry = yield* RetryScheduleService;
+    const response = yield* http
+      .request({
+        url,
+        method: "GET",
+        headers: {
+          ...requestHeaders(options),
+          "content-type": "application/json",
+        },
+        timeoutMilliseconds: options.timeoutMilliseconds,
+        maxResponseBodyBytes: maximumRemoteControlResponseBytes,
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          remoteError(url, error.message, error.retryable),
+        ),
+        Effect.flatMap((response) =>
+          isTransientStatus(response.status)
+            ? Effect.fail(
+                remoteError(
+                  url,
+                  `remote cache status returned ${response.status}`,
+                  true,
+                ),
+              )
+            : Effect.succeed(response),
+        ),
+        Effect.retry(retry.transient.pipe(retryTransientCacheErrors)),
+      );
+    if (response.status < 200 || response.status >= 300) {
+      return yield* Effect.fail(
+        remoteError(
+          url,
+          `remote cache status returned ${response.status}`,
+          isTransientStatus(response.status),
+        ),
+      );
+    }
+    let document: unknown;
+    try {
+      document = JSON.parse(new TextDecoder().decode(response.body));
+    } catch {
+      document = undefined;
+    }
+    return (
+      typeof document === "object" &&
+      document !== null &&
+      "status" in document &&
+      document.status === "enabled"
+    );
+  });
+
+export const headRemoteCache = (
+  options: RemoteCacheOptions,
+  hash: string,
+): Effect.Effect<boolean, CacheError, HttpService | RetryScheduleService> =>
+  Effect.gen(function* () {
+    const url = artifactUrl(options, hash);
+    yield* preflight(url, options);
+    const http = yield* HttpService;
+    const retry = yield* RetryScheduleService;
+    const response = yield* http
+      .request({
+        url,
+        method: "HEAD",
+        headers: requestHeaders(options),
+        timeoutMilliseconds: options.timeoutMilliseconds,
+        maxResponseBodyBytes: 0,
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          remoteError(url, error.message, error.retryable),
+        ),
+        Effect.flatMap((response) =>
+          isTransientStatus(response.status)
+            ? Effect.fail(
+                remoteError(
+                  url,
+                  `remote cache HEAD returned ${response.status}`,
+                  true,
+                ),
+              )
+            : Effect.succeed(response),
+        ),
+        Effect.retry(retry.transient.pipe(retryTransientCacheErrors)),
+      );
+    if (response.status === 404) return false;
+    if (response.status < 200 || response.status >= 300) {
+      return yield* Effect.fail(
+        remoteError(
+          url,
+          `remote cache HEAD returned ${response.status}`,
+          isTransientStatus(response.status),
+        ),
+      );
+    }
+    return true;
+  });
+
+export const recordRemoteCacheEvent = (
+  options: RemoteCacheOptions,
+  hash: string,
+  event: "HIT" | "MISS",
+): Effect.Effect<void, CacheError, HttpService | RetryScheduleService> =>
+  Effect.gen(function* () {
+    if (options.sessionId === undefined) return;
+    const url = remoteRouteUrl(options, "/v8/artifacts/events");
+    yield* preflight(url, options);
+    const http = yield* HttpService;
+    const response = yield* http
+      .request({
+        url,
+        method: "POST",
+        headers: {
+          ...requestHeaders(options),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify([
+          {
+            sessionId: options.sessionId,
+            source: "REMOTE",
+            event,
+            hash,
+            duration: 0,
+          },
+        ]),
+        timeoutMilliseconds: options.timeoutMilliseconds,
+        maxResponseBodyBytes: maximumRemoteControlResponseBytes,
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          remoteError(url, error.message, error.retryable),
+        ),
+      );
+    if (response.status < 200 || response.status >= 300) {
+      return yield* Effect.fail(
+        remoteError(
+          url,
+          `remote cache event returned ${response.status}`,
+          isTransientStatus(response.status),
+        ),
+      );
+    }
+  });
+
 export const restoreRemoteCache = (
   root: string,
   options: RemoteCacheOptions,
@@ -127,7 +293,7 @@ export const restoreRemoteCache = (
     const signing = yield* SigningService;
     const url = artifactUrl(options, hash);
     yield* preflight(url, options);
-    return yield* fileSystem
+    const restored = yield* fileSystem
       .withTemporaryDirectory((directory) => {
         const compressedPath = joinPath(directory, "remote-cache.tar.zst");
         const archivePath = joinPath(directory, "remote-cache.tar");
@@ -160,7 +326,9 @@ export const restoreRemoteCache = (
             Effect.retry(retry.transient.pipe(retryTransientCacheErrors)),
             Effect.flatMap((response) =>
               Effect.gen(function* () {
-                if (response.status === 404) return false;
+                if (response.status === 404) {
+                  return false;
+                }
                 if (response.status < 200 || response.status >= 300) {
                   return yield* Effect.fail(
                     remoteError(
@@ -240,6 +408,7 @@ export const restoreRemoteCache = (
             : remoteError(url, error.message),
         ),
       );
+    return restored;
   });
 
 export const writeRemoteCache = (

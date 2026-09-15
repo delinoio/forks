@@ -1,0 +1,489 @@
+import { Effect } from "effect";
+import type {
+  OpenTelemetryOptions,
+  OtlpProtocol,
+} from "../cli/common-options.js";
+import { renderTerminalSafeText } from "../cli/terminal-text.js";
+import { maximumNodeTimerMilliseconds } from "../core/time.js";
+import { BoundaryError } from "../effect/errors.js";
+import {
+  ClockService,
+  EnvironmentService,
+  HttpService,
+} from "../effect/services.js";
+import type { RunMetricTaskDetail } from "../run/engine.js";
+import { packageVersion } from "../version.js";
+
+export interface RunMetricSummary {
+  readonly exitCode: number;
+  readonly taskCount: number;
+  readonly tasks: ReadonlyArray<RunMetricTaskDetail>;
+}
+
+interface MetricSelection {
+  readonly runSummary: boolean;
+  readonly taskDetails: boolean;
+}
+
+const metricSelection = (options: OpenTelemetryOptions): MetricSelection => ({
+  runSummary: options.metricsRunSummary !== false,
+  taskDetails: options.metricsTaskDetails === true,
+});
+
+export const runMetricsEnabled = (
+  options: OpenTelemetryOptions,
+  environmentEnabled: string | undefined,
+): boolean => {
+  const enabled = options.enabled ?? environmentEnabled === "true";
+  const selection = metricSelection(options);
+  return enabled && (selection.runSummary || selection.taskDetails);
+};
+
+const protocolFromEnvironment = (
+  value: string | undefined,
+): OtlpProtocol | undefined => {
+  if (value === "grpc") return "grpc";
+  if (value === "http/protobuf" || value === "http-protobuf")
+    return "http-protobuf";
+  if (value === "http/json" || value === "http-json") return "http-json";
+  return undefined;
+};
+
+const decodeEnvironmentHeaderComponent = (value: string): string => {
+  const trimmed = value.trim();
+  try {
+    return decodeURIComponent(trimmed);
+  } catch {
+    return trimmed;
+  }
+};
+
+const parseEnvironmentHeaders = (
+  value: string | undefined,
+): ReadonlyArray<readonly [string, string]> =>
+  (value ?? "").split(",").flatMap((entry) => {
+    const separator = entry.indexOf("=");
+    return separator <= 0
+      ? []
+      : [
+          [
+            decodeEnvironmentHeaderComponent(entry.slice(0, separator)),
+            decodeEnvironmentHeaderComponent(entry.slice(separator + 1)),
+          ] as const,
+        ];
+  });
+
+const varint = (value: number): Uint8Array => {
+  const output: Array<number> = [];
+  let remaining = Math.max(0, Math.floor(value));
+  do {
+    const byte = remaining % 128;
+    remaining = Math.floor(remaining / 128);
+    output.push(byte | (remaining > 0 ? 0x80 : 0));
+  } while (remaining > 0);
+  return new Uint8Array(output);
+};
+
+const signedInt64Varint = (value: number): Uint8Array => {
+  const output: Array<number> = [];
+  let remaining = BigInt.asUintN(64, BigInt(Math.trunc(value)));
+  do {
+    const byte = Number(remaining & 0x7fn);
+    remaining >>= 7n;
+    output.push(byte | (remaining > 0n ? 0x80 : 0));
+  } while (remaining > 0n);
+  return new Uint8Array(output);
+};
+
+const concat = (...parts: ReadonlyArray<Uint8Array>): Uint8Array => {
+  const output = new Uint8Array(
+    parts.reduce((size, part) => size + part.length, 0),
+  );
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.length;
+  }
+  return output;
+};
+
+const field = (number: number, value: Uint8Array): Uint8Array =>
+  concat(varint(number * 8 + 2), varint(value.length), value);
+
+const stringField = (number: number, value: string): Uint8Array =>
+  field(number, new TextEncoder().encode(value));
+
+const int64Field = (number: number, value: number): Uint8Array =>
+  concat(varint(number * 8), signedInt64Varint(value));
+
+const fixed64Field = (number: number, value: bigint): Uint8Array => {
+  const bytes = new Uint8Array(8);
+  new DataView(bytes.buffer).setBigInt64(0, value, true);
+  return concat(varint(number * 8 + 1), bytes);
+};
+
+const resourceAttributes = (
+  configured: ReadonlyArray<readonly [string, string]>,
+): ReadonlyArray<readonly [string, string]> => [
+  ...configured.filter(
+    ([name]) => name !== "service.name" && name !== "service.version",
+  ),
+  ["service.name", "turbo-ts"],
+  ["service.version", packageVersion],
+];
+
+// This intentionally implements only the OTLP Metrics fields emitted below.
+// Keeping the encoder local and deterministic avoids importing native or WASM
+// protocol runtimes; it can be replaced when the package accepts a pure-JS
+// generated OTLP dependency.
+export const encodeOtlpMetrics = (
+  summary: RunMetricSummary,
+  observationTimeUnixNano: bigint,
+  configuredResources: ReadonlyArray<readonly [string, string]> = [],
+  selection: MetricSelection = { runSummary: true, taskDetails: false },
+): Uint8Array => {
+  const keyValue = (key: string, value: string | number) =>
+    concat(
+      stringField(1, key),
+      field(
+        2,
+        typeof value === "number"
+          ? int64Field(3, value)
+          : stringField(1, value),
+      ),
+    );
+  const resource = concat(
+    ...resourceAttributes(configuredResources).map(([key, value]) =>
+      field(1, keyValue(key, value)),
+    ),
+  );
+  const dataPoint = (
+    attributes: ReadonlyArray<readonly [string, string | number]>,
+  ): Uint8Array =>
+    concat(
+      fixed64Field(3, observationTimeUnixNano),
+      fixed64Field(6, 1n),
+      ...attributes.map(([key, value]) => field(7, keyValue(key, value))),
+    );
+  const gaugeMetric = (
+    name: string,
+    points: ReadonlyArray<Uint8Array>,
+  ): Uint8Array =>
+    concat(
+      stringField(1, name),
+      field(5, concat(...points.map((point) => field(1, point)))),
+    );
+  const metrics = [
+    ...(selection.runSummary
+      ? [
+          gaugeMetric("turbo.run", [
+            dataPoint([
+              ["turbo.exit_code", summary.exitCode],
+              ["turbo.task_count", summary.taskCount],
+            ]),
+          ]),
+        ]
+      : []),
+    ...(selection.taskDetails
+      ? [
+          gaugeMetric(
+            "turbo.task",
+            summary.tasks.map((task) =>
+              dataPoint([
+                ["turbo.task_id", task.id],
+                ["turbo.package", task.package],
+                ["turbo.task", task.task],
+                ["turbo.status", task.status],
+                ...(task.exitCode === undefined
+                  ? []
+                  : [["turbo.exit_code", task.exitCode] as const]),
+                ...(task.durationMilliseconds === undefined
+                  ? []
+                  : [
+                      ["turbo.duration_ms", task.durationMilliseconds] as const,
+                    ]),
+                ...(task.cacheSource === undefined
+                  ? []
+                  : [["turbo.cache_source", task.cacheSource] as const]),
+              ]),
+            ),
+          ),
+        ]
+      : []),
+  ];
+  const scope = concat(
+    stringField(1, "turbo-ts"),
+    stringField(2, packageVersion),
+  );
+  const scopeMetrics = concat(
+    field(1, scope),
+    ...metrics.map((metric) => field(2, metric)),
+  );
+  const resourceMetrics = concat(field(1, resource), field(2, scopeMetrics));
+  return field(1, resourceMetrics);
+};
+
+export const makeOtlpJsonMetrics = (
+  summary: RunMetricSummary,
+  observationTimeUnixNano: bigint,
+  configuredResources: ReadonlyArray<readonly [string, string]> = [],
+  selection: MetricSelection = { runSummary: true, taskDetails: false },
+): Readonly<Record<string, unknown>> => {
+  const integerAttribute = (key: string, value: number) => ({
+    key,
+    value: { intValue: String(value) },
+  });
+  const stringAttribute = (key: string, value: string) => ({
+    key,
+    value: { stringValue: value },
+  });
+  const metrics = [
+    ...(selection.runSummary
+      ? [
+          {
+            name: "turbo.run",
+            gauge: {
+              dataPoints: [
+                {
+                  asInt: "1",
+                  timeUnixNano: observationTimeUnixNano.toString(),
+                  attributes: [
+                    integerAttribute("turbo.exit_code", summary.exitCode),
+                    integerAttribute("turbo.task_count", summary.taskCount),
+                  ],
+                },
+              ],
+            },
+          },
+        ]
+      : []),
+    ...(selection.taskDetails
+      ? [
+          {
+            name: "turbo.task",
+            gauge: {
+              dataPoints: summary.tasks.map((task) => ({
+                asInt: "1",
+                timeUnixNano: observationTimeUnixNano.toString(),
+                attributes: [
+                  stringAttribute("turbo.task_id", task.id),
+                  stringAttribute("turbo.package", task.package),
+                  stringAttribute("turbo.task", task.task),
+                  stringAttribute("turbo.status", task.status),
+                  ...(task.exitCode === undefined
+                    ? []
+                    : [integerAttribute("turbo.exit_code", task.exitCode)]),
+                  ...(task.durationMilliseconds === undefined
+                    ? []
+                    : [
+                        integerAttribute(
+                          "turbo.duration_ms",
+                          task.durationMilliseconds,
+                        ),
+                      ]),
+                  ...(task.cacheSource === undefined
+                    ? []
+                    : [
+                        stringAttribute("turbo.cache_source", task.cacheSource),
+                      ]),
+                ],
+              })),
+            },
+          },
+        ]
+      : []),
+  ];
+  return {
+    resourceMetrics: [
+      {
+        resource: {
+          attributes: resourceAttributes(configuredResources).map(
+            ([key, value]) => ({ key, value: { stringValue: value } }),
+          ),
+        },
+        scopeMetrics: [
+          {
+            scope: { name: "turbo-ts", version: packageVersion },
+            metrics,
+          },
+        ],
+      },
+    ],
+  };
+};
+
+const endpointFor = (
+  configured: string,
+  protocol: OtlpProtocol,
+  appendHttpMetricsPath: boolean,
+): string => {
+  const url = new URL(configured);
+  if (url.username !== "" || url.password !== "") {
+    throw new TypeError("OTLP endpoint must not contain credentials");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new TypeError("OTLP endpoint must use HTTP or HTTPS");
+  }
+  if (appendHttpMetricsPath && protocol !== "grpc") {
+    url.pathname = `${url.pathname.replace(/\/+$/, "")}/v1/metrics`;
+  } else if (url.pathname === "/" || url.pathname === "") {
+    url.pathname =
+      protocol === "grpc"
+        ? "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export"
+        : "/v1/metrics";
+  }
+  return url.toString();
+};
+
+export const exportRunMetrics = (
+  options: OpenTelemetryOptions,
+  token: string | undefined,
+  summary: RunMetricSummary,
+): Effect.Effect<
+  void,
+  BoundaryError,
+  ClockService | EnvironmentService | HttpService
+> =>
+  Effect.gen(function* () {
+    const environment = yield* EnvironmentService;
+    const http = yield* HttpService;
+    if (
+      !runMetricsEnabled(
+        options,
+        yield* environment.get("TURBO_EXPERIMENTAL_OTEL_ENABLED"),
+      )
+    )
+      return;
+    const selection = metricSelection(options);
+    const clock = yield* ClockService;
+    const observationTimeUnixNano =
+      BigInt(Math.floor(yield* clock.now)) * 1_000_000n;
+    const protocol =
+      options.protocol ??
+      protocolFromEnvironment(
+        yield* environment.get("OTEL_EXPORTER_OTLP_PROTOCOL"),
+      ) ??
+      "http-protobuf";
+    const environmentEndpoint = yield* environment.get(
+      "OTEL_EXPORTER_OTLP_ENDPOINT",
+    );
+    const endpoint =
+      options.endpoint ??
+      environmentEndpoint ??
+      (protocol === "grpc" ? "http://127.0.0.1:4317" : "http://127.0.0.1:4318");
+    const environmentTimeout = Number(
+      yield* environment.get("OTEL_EXPORTER_OTLP_TIMEOUT"),
+    );
+    const configuredTimeout = options.timeoutMilliseconds ?? environmentTimeout;
+    const timeoutMilliseconds =
+      Number.isFinite(configuredTimeout) &&
+      configuredTimeout > 0 &&
+      configuredTimeout <= maximumNodeTimerMilliseconds
+        ? configuredTimeout
+        : 10_000;
+    const reservedHeaderNames = new Set([
+      "content-type",
+      ...(protocol === "grpc" ? ["te"] : []),
+    ]);
+    const configuredHeaders = new Map(
+      [
+        ...parseEnvironmentHeaders(
+          yield* environment.get("OTEL_EXPORTER_OTLP_HEADERS"),
+        ),
+        ...options.headers,
+      ]
+        .filter(([name]) => !reservedHeaderNames.has(name.toLowerCase()))
+        .map(([name, value]) => [name.toLowerCase(), value] as const),
+    );
+    const headers: Record<string, string> = {
+      "content-type":
+        protocol === "grpc"
+          ? "application/grpc"
+          : protocol === "http-json"
+            ? "application/json"
+            : "application/x-protobuf",
+      "user-agent": `turbo-ts/${packageVersion}`,
+      ...(protocol === "grpc" ? { te: "trailers" } : {}),
+      ...Object.fromEntries(configuredHeaders),
+      ...(options.useRemoteCacheToken === true && token
+        ? { authorization: `Bearer ${token}` }
+        : {}),
+    };
+    const payload =
+      protocol === "http-json"
+        ? new TextEncoder().encode(
+            JSON.stringify(
+              makeOtlpJsonMetrics(
+                summary,
+                observationTimeUnixNano,
+                options.resources,
+                selection,
+              ),
+            ),
+          )
+        : encodeOtlpMetrics(
+            summary,
+            observationTimeUnixNano,
+            options.resources,
+            selection,
+          );
+    const grpcHeader = new Uint8Array(5);
+    new DataView(grpcHeader.buffer).setUint32(1, payload.length, false);
+    const body = protocol === "grpc" ? concat(grpcHeader, payload) : payload;
+    const requestUrl = yield* Effect.try({
+      try: () =>
+        endpointFor(
+          endpoint,
+          protocol,
+          options.endpoint !== undefined || environmentEndpoint !== undefined,
+        ),
+      catch: () =>
+        new BoundaryError({
+          boundary: "observability",
+          message: "invalid OTLP endpoint",
+          retryable: false,
+        }),
+    });
+    const response = yield* http.request({
+      url: requestUrl,
+      method: "POST",
+      transport: protocol === "grpc" ? "http2" : undefined,
+      headers,
+      body,
+      timeoutMilliseconds,
+      maxResponseBodyBytes: 64 * 1024,
+    });
+    if (response.status < 200 || response.status >= 300) {
+      return yield* Effect.fail(
+        new BoundaryError({
+          boundary: "observability",
+          message: `OTLP export returned ${response.status}`,
+          retryable: response.status === 429 || response.status >= 500,
+        }),
+      );
+    }
+    const grpcStatusHeaders =
+      response.trailers?.["grpc-status"] !== undefined
+        ? response.trailers
+        : response.body.length === 0
+          ? response.headers
+          : response.trailers;
+    if (protocol === "grpc" && grpcStatusHeaders?.["grpc-status"] !== "0") {
+      const encodedMessage = grpcStatusHeaders?.["grpc-message"];
+      let message = encodedMessage ?? "gRPC status is missing";
+      if (encodedMessage !== undefined) {
+        try {
+          message = decodeURIComponent(encodedMessage);
+        } catch {
+          message = "gRPC status message is malformed";
+        }
+      }
+      return yield* Effect.fail(
+        new BoundaryError({
+          boundary: "observability",
+          message: `OTLP gRPC export failed: ${renderTerminalSafeText(message)}`,
+          retryable: false,
+        }),
+      );
+    }
+  });

@@ -975,6 +975,7 @@ version = "1.0.0"
     const parsed = parseRunArguments(["run", "build"]);
     const environment = {
       turbo_cache: "local:rw,remote:rw",
+      turbo_cache_workers: "3",
       turbo_remote_only: "1",
       turbo_remote_cache_read_only: "1",
       turbo_concurrency: "2",
@@ -1002,6 +1003,7 @@ version = "1.0.0"
       concurrency: 2,
       environmentMode: "loose",
       cacheDirectory: "/repo/.cache",
+      cacheWorkers: 3,
       cachePolicy: {
         localRead: false,
         localWrite: false,
@@ -1013,7 +1015,7 @@ version = "1.0.0"
       remote: {
         apiUrl: "https://cache.example.test/api",
         token: "token",
-        teamId: "team-id",
+        teamId: undefined,
         teamSlug: "team-slug",
         timeoutMilliseconds: 4_000,
         uploadTimeoutMilliseconds: 5_000,
@@ -1030,10 +1032,295 @@ version = "1.0.0"
       ),
     ).toMatchObject({
       cacheDirectory: "/repo/.turbo/cache",
+      cacheWorkers: 10,
       force: false,
       colorEnabled: true,
       remote: undefined,
     });
+  });
+
+  it("lets an explicit UI mode override an invalid environment value", () => {
+    const model = repository([]);
+    expect(
+      resolveOptions(
+        parseRunArguments(["run", "build", "--ui=stream"]),
+        model.root,
+        { TURBO_UI: "invalid" },
+        model.rootConfiguration,
+        8,
+      ).ui,
+    ).toBe("stream");
+    expect(() =>
+      resolveOptions(
+        parseRunArguments(["run", "build"]),
+        model.root,
+        { TURBO_UI: "invalid" },
+        model.rootConfiguration,
+        8,
+      ),
+    ).toThrow("invalid UI mode");
+  });
+
+  it("lets explicit log settings override invalid environment values", () => {
+    const model = repository([]);
+    const options = resolveOptions(
+      parseRunArguments([
+        "run",
+        "build",
+        "--log-order=stream",
+        "--log-prefix=task",
+      ]),
+      model.root,
+      {
+        TURBO_LOG_ORDER: "invalid",
+        TURBO_LOG_PREFIX: "invalid",
+      },
+      model.rootConfiguration,
+      8,
+    );
+    expect(options.logOrder).toBe("stream");
+    expect(options.logPrefix).toBe("task");
+
+    for (const [name, message] of [
+      ["TURBO_LOG_ORDER", "invalid log order"],
+      ["TURBO_LOG_PREFIX", "invalid log prefix"],
+    ] as const) {
+      expect(() =>
+        resolveOptions(
+          parseRunArguments(["run", "build"]),
+          model.root,
+          { [name]: "invalid" },
+          model.rootConfiguration,
+          8,
+        ),
+      ).toThrow(message);
+    }
+  });
+
+  it("rejects remote cache timeouts above the Node timer limit", () => {
+    const model = repository([]);
+    const parsed = parseRunArguments([
+      "run",
+      "build",
+      "--api=https://cache.example.test/api",
+      "--token=token",
+    ]);
+    for (const [name, message] of [
+      ["TURBO_REMOTE_CACHE_TIMEOUT", "invalid remote cache timeout"],
+      [
+        "TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT",
+        "invalid remote cache upload timeout",
+      ],
+    ] as const) {
+      expect(() =>
+        resolveOptions(
+          parsed,
+          model.root,
+          { [name]: "2147483.648" },
+          model.rootConfiguration,
+          8,
+        ),
+      ).toThrow(message);
+    }
+    expect(
+      resolveOptions(
+        parsed,
+        model.root,
+        {
+          TURBO_REMOTE_CACHE_TIMEOUT: "2147483.647",
+          TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: "2147483.647",
+        },
+        model.rootConfiguration,
+        8,
+      ).remote,
+    ).toMatchObject({
+      timeoutMilliseconds: 2_147_483_647,
+      uploadTimeoutMilliseconds: 2_147_483_647,
+    });
+  });
+
+  it("does not combine explicit team slugs with stored team IDs", () => {
+    const model = repository([]);
+    const options = resolveOptions(
+      parseRunArguments([
+        "run",
+        "build",
+        "--team=explicit-team",
+        "--api=https://cache.example.test/api",
+        "--token=token",
+      ]),
+      model.root,
+      {},
+      model.rootConfiguration,
+      8,
+      false,
+      {
+        project: {
+          teamId: "stored-team-id",
+          teamSlug: "stored-team-slug",
+        },
+      },
+    );
+    expect(options.remote).toMatchObject({
+      teamSlug: "explicit-team",
+    });
+    expect(options.remote?.teamId).toBeUndefined();
+
+    const environmentOptions = resolveOptions(
+      parseRunArguments([
+        "run",
+        "build",
+        "--api=https://cache.example.test/api",
+        "--token=token",
+      ]),
+      model.root,
+      {
+        TURBO_TEAM: "environment-team",
+        TURBO_TEAMID: "stale-environment-team-id",
+      },
+      model.rootConfiguration,
+      8,
+      false,
+      {
+        project: {
+          teamId: "stored-team-id",
+          teamSlug: "stored-team-slug",
+        },
+      },
+    );
+    expect(environmentOptions.remote).toMatchObject({
+      teamSlug: "environment-team",
+    });
+    expect(environmentOptions.remote?.teamId).toBeUndefined();
+  });
+
+  it("requires an explicit token or linked project before using a stored token", () => {
+    const model = repository([]);
+    const parsed = parseRunArguments(["run", "build"]);
+    for (const project of [undefined, {}] as const) {
+      const unlinked = resolveOptions(
+        parsed,
+        model.root,
+        {},
+        model.rootConfiguration,
+        8,
+        false,
+        { token: "stored-token", project },
+      );
+      expect(unlinked.remote).toBeUndefined();
+      expect(unlinked.remoteToken).toBe("stored-token");
+    }
+
+    const explicit = resolveOptions(
+      parseRunArguments(["run", "build", "--token=explicit-token"]),
+      model.root,
+      {},
+      model.rootConfiguration,
+      8,
+    );
+    expect(explicit.remote).toMatchObject({
+      apiUrl: "https://vercel.com/api",
+      token: "explicit-token",
+    });
+
+    const emptyExplicit = resolveOptions(
+      parsed,
+      model.root,
+      { TURBO_TOKEN: "" },
+      model.rootConfiguration,
+      8,
+      false,
+      {
+        token: "stored-token",
+        project: { apiUrl: "https://linked.example.test/api" },
+      },
+    );
+    expect(emptyExplicit.remote).toMatchObject({
+      apiUrl: "https://linked.example.test/api",
+      token: "",
+    });
+    expect(emptyExplicit.remoteToken).toBe("");
+  });
+
+  it("prefers linked project remote settings over root configuration", () => {
+    const model = repository([]);
+    const configuration = {
+      ...model.rootConfiguration,
+      value: {
+        remoteCache: {
+          apiUrl: "https://root.example.test/api",
+          enabled: true,
+          teamId: "root-team-id",
+          teamSlug: "root-team-slug",
+        },
+      },
+    };
+    const storedCredentials = {
+      token: "synthetic-token",
+      project: {
+        apiUrl: "https://linked.example.test/api",
+        teamId: "linked-team-id",
+        teamSlug: "linked-team-slug",
+      },
+    };
+    const linked = resolveOptions(
+      parseRunArguments(["run", "build"]),
+      model.root,
+      {},
+      configuration,
+      8,
+      false,
+      storedCredentials,
+    );
+    expect(linked.remote?.apiUrl).toBe("https://linked.example.test/api");
+    expect(linked.remote?.teamId).toBe("linked-team-id");
+    expect(linked.remote?.teamSlug).toBe("linked-team-slug");
+
+    const linkedSlug = resolveOptions(
+      parseRunArguments(["run", "build"]),
+      model.root,
+      {},
+      configuration,
+      8,
+      false,
+      {
+        token: "synthetic-token",
+        project: {
+          apiUrl: "https://linked.example.test/api",
+          teamSlug: "linked-team-slug",
+        },
+      },
+    );
+    expect(linkedSlug.remote?.teamId).toBeUndefined();
+    expect(linkedSlug.remote?.teamSlug).toBe("linked-team-slug");
+
+    const environment = resolveOptions(
+      parseRunArguments(["run", "build"]),
+      model.root,
+      { TURBO_API: "https://environment.example.test/api" },
+      configuration,
+      8,
+      false,
+      storedCredentials,
+    );
+    expect(environment.remote?.apiUrl).toBe(
+      "https://environment.example.test/api",
+    );
+
+    const explicit = resolveOptions(
+      parseRunArguments([
+        "run",
+        "build",
+        "--api=https://explicit.example.test/api",
+      ]),
+      model.root,
+      { TURBO_API: "https://environment.example.test/api" },
+      configuration,
+      8,
+      false,
+      storedCredentials,
+    );
+    expect(explicit.remote?.apiUrl).toBe("https://explicit.example.test/api");
   });
 
   it("builds dependency graphs, filters closures, and rejects cycles", () => {
@@ -1390,8 +1677,8 @@ version = "1.0.0"
     ).toBe(false);
   });
 
-  it("rejects blank remote cache timeout arguments", () => {
-    for (const value of ["", "   "]) {
+  it("rejects blank and over-limit remote cache timeout arguments", () => {
+    for (const value of ["", "   ", "2147483.648"]) {
       expect(() =>
         parseRunArguments(["run", "build", `--remote-cache-timeout=${value}`]),
       ).toThrow(/invalid remote cache timeout/);
@@ -1400,6 +1687,10 @@ version = "1.0.0"
       parseRunArguments(["run", "build", "--remote-cache-timeout=0"])
         .remoteCacheTimeoutSeconds,
     ).toBe(0);
+    expect(
+      parseRunArguments(["run", "build", "--remote-cache-timeout=2147483.647"])
+        .remoteCacheTimeoutSeconds,
+    ).toBe(2_147_483.647);
   });
 
   it("uses available parallelism and preserves Cargo pass-through arguments", () => {

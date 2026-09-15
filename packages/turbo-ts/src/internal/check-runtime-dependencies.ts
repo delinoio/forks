@@ -23,6 +23,7 @@ const expectedRuntimeDependencies = {
   minimatch: "10.2.6",
   semver: "7.8.5",
   "smol-toml": "1.8.0",
+  "validate-npm-package-name": "6.0.2",
   yaml: "2.8.3",
 } as const;
 

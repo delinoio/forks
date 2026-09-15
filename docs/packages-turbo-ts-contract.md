@@ -100,6 +100,8 @@ Git changes beneath a contained workspace symlink's canonical target map back
 to that workspace for package and task-aware affected selection, including
 `ls --affected`. `--single-package` skips child workspace discovery and treats
 the repository root as the only runnable package.
+`--dangerously-disable-package-manager-check` is valueless and rejects attached
+values instead of treating them as an enabled bypass.
 Tasks owned by a logical workspace path containing a symlink component execute
 without local or remote caching because restoration intentionally rejects
 symlink parents. Task scopes whose hashes depend on those tasks, including
@@ -256,7 +258,8 @@ Cache policy values use comma-separated `(local|remote):(r|w|rw)` entries and
 reject malformed entries. Remote artifact routes preserve configured API path
 prefixes. Active remote URLs must use HTTP or HTTPS, must not contain username
 or password credentials, and URLs and timeout values are validated before cache
-or task work begins; blank download and upload timeout strings are invalid.
+or task work begins; blank download and upload timeout strings are invalid, and
+timeouts above Node's 2,147,483,647-millisecond timer limit are rejected.
 Signature-key requirements
 apply only when a remote transport is active; disabled remotes and
 configurations without an API URL do not require a signing key. Every active
@@ -320,9 +323,10 @@ are skipped before contents are read. Sequential bounded reads enforce the
 remaining aggregate budget when an output grows after metadata collection; an
 over-limit read skips publication with a warning that preserves the successful
 task result.
-Output collection and cache publication are serialized within a run so
-concurrent task completion cannot multiply the archive writer's bounded memory
-footprint.
+The `--cache-workers` option overrides `TURBO_CACHE_WORKERS`, defaults to 10,
+and limits concurrent output collection and cache publication within a run.
+Worker counts must be positive integers, so archive writer memory remains
+bounded by the configured concurrency and per-archive limits.
 Tar headers, padding, PAX metadata, and end markers have an independent 64 MiB
 preflight limit that is enforced before archive chunks are constructed.
 Companion task hashes participate in the owning task's cache key. Local eviction
@@ -731,6 +735,8 @@ that select one scope. Cyclic package graphs never include the starting package
 in its own dependency or dependent relationship collections.
 Boundary diagnostics evaluate root, package, and tag dependency and dependent
 permissions against manifest and configured implicit package dependencies.
+Operator-facing boundary diagnostics encode C0 and C1 controls in derived
+messages, paths, and import values before terminal display.
 When a package has no local Turbo configuration, diagnostics point to its
 owning `package.json`, `Cargo.toml`, or `pyproject.toml` manifest. Package-graph
 center selection retains the named package and its
@@ -743,7 +749,10 @@ package identities, and same-named cross-ecosystem edge endpoints use qualified
 identities. Affected collections include the root package for root changes and
 when it depends on an affected workspace without allowing the root path to
 claim workspace-owned files. `query affected`, `query
-ls`, and `ls` share repository discovery and stable ordering. GraphQL documents
+ls`, and `ls` share repository discovery and stable ordering.
+The `--root-turbo-json` override is preserved across `ls`, `prune`, `query`,
+`query ls`, and `query affected` repository discovery.
+GraphQL documents
 are limited to 4,096 lexer tokens, 512 expanded selections, and a field depth
 of 16 before resolver execution; fragment spreads count each expanded
 selection. Package-predicate variables are limited to 512 nodes and a depth of
@@ -874,8 +883,10 @@ stream, grouped, timestamped stream, and NDJSON output;
 completion and info; Chrome-compatible named and anonymous profiles; and the
 approved V8 heap snapshot and trace substitutions. TUI requests retain stream
 semantics when no interactive terminal is available, and all color output
-continues to honor `NO_COLOR`. Rendered graph files create missing destination
-parent directories. Interactive TUI mode renders task status and
+continues to honor `NO_COLOR`. An explicit `--ui` value takes precedence over
+`TURBO_UI`, and only the effective environment value is validated. Rendered
+graph files create missing destination parent directories. Interactive TUI
+mode renders task status and
 falls back to stream mode when either terminal side is non-interactive. JSON
 mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
 completed task's full log replay. Structured log files append typed task events
@@ -910,8 +921,9 @@ patterns are merged into task hash inputs, and their repository-relative Git
 blob hashes are reported in summary `globalCacheInputs.files`, including when a
 valid requested task is filtered to a successful no-op. Dry runs do not perform local
 cache eviction, and
-`info` derives WSL status from the Linux kernel release. Log-prefix selection
-applies to live and cached output. Summaries record
+`info` derives WSL status from the Linux kernel release and honors the custom
+root Turbo configuration path. Log-prefix selection applies to live and cached
+output. Summaries record
 the actual local or remote cache source and saved duration, and summaries and
 profiles use each task's scheduling timestamps. Generated profiles omit tasks
 that were never scheduled, while summary task entries represent them with a
@@ -940,11 +952,247 @@ one child workspace and false in explicit single-package mode.
 Persisted, stdout, and
 newline-delimited summaries from one run share one canonical UUID v7 identifier.
 Mermaid graphs assign stable,
-unique node identifiers without truncated-hash collisions.
+unique node identifiers without truncated-hash collisions. The valueless
+`--skip-infer` flag disables framework environment inference for task hashing
+and execution; attached values are rejected.
 
-Only behavior with automated ledger evidence is a compatibility claim. Hosted
-authentication, devtools, telemetry transports, and full platform matrices
-remain later gates.
+Gate 4 hosted and secondary surfaces have automated ledger evidence except for
+runtime verbosity logging, workspace example-path selection, and workspace
+dependency selection, plus telemetry-notice suppression. These remain planned
+while `--verbosity`, `--example-path`, and `--show-all-dependencies` are only
+parsed and `TURBO_TELEMETRY_MESSAGE_DISABLED` is not consumed.
+`login`,
+`link`, `logout`, and `unlink` share the official user configuration under the
+platform configuration directory and the repository `.turbo/config.json`.
+`login` updates only the user credential file and never creates or rewrites a
+repository configuration file. Relative `XDG_CONFIG_HOME`, `HOME`, and Windows
+`APPDATA` values are ignored in favor of the absolute system home and platform
+configuration directory.
+Tokenless `login` requires an interactive terminal, opens the configured login
+origin at `/turborepo/token`, and accepts a token through a scoped loopback
+callback protected by a fresh UUID v7 state value. The callback response is
+sent before the token is validated and persisted, post-response work remains
+supervised by the loopback server scope, and neither the state nor the token is
+written to terminal output. Malformed callback request targets return HTTP 400
+without terminating the login process. Browser launcher errors and nonzero
+exits fail with manual-token guidance instead of waiting indefinitely for a
+callback.
+An explicit `--sso-team` adds the team slug
+to the browser authorization request and suppresses lower-precedence team IDs
+during validation. Manual and non-interactive login continue
+to require `--token` or `TURBO_TOKEN`; `--manual` is valueless and rejects
+attached values, and every login attempt ignores the persisted user token. Only
+tokenless interactive login resolves and validates the login
+URL, so explicit-token login, link, and logout do not read an unused login URL.
+Windows browser launches pass the full callback URL directly to the system URL
+protocol handler without command-interpreter expansion. Unlink resolves only
+the repository configuration path and does not read shared hosted settings or
+user credentials.
+User credentials use private directories, `0600` files on POSIX, atomic
+replacement, no-follow handle-based regular-file checks, reads bounded to 1
+MiB from the validated handle, and secret-safe diagnostics.
+Project configuration writes reject symlinked `.turbo` directories before
+creating or replacing `config.json`.
+HTTP boundary diagnostics redact complete nonempty outgoing header values
+before they can enter user-visible errors, including multiline bearer values.
+Link discovery uses the hosted user and team endpoints, verifies artifact
+status is exactly `enabled`, offers the personal user scope alongside team
+scopes, follows the hosted teams endpoint's `pagination.next` cursor through
+the `until` query parameter until every page is collected, and fails before
+requesting a 101st team page. It prompts
+interactive users to select a scope when none is configured.
+Linking requires confirmation unless the valueless `--yes` or `-y` flag is
+supplied; attached values are rejected. A non-interactive link must supply a
+scope and the confirmation flag. The command persists the selected identity and
+validated API URL, and keeps `.turbo` ignored unless `--no-gitignore` is
+requested. `--no-gitignore` is valueless and rejects attached values. A
+symlinked `.gitignore` is rejected when adding `.turbo` would otherwise replace
+the link; its target and existing project configuration remain unchanged.
+Relinking selects its API from CLI, environment, the persisted
+project link, and the public default in descending precedence. The project link
+is persisted only after the required `.gitignore` update succeeds. An explicit
+link team slug from `--team` or `TURBO_TEAM` suppresses `TURBO_TEAMID` before
+scope selection and validation. `--team` rejects empty attached and separated
+values. Link resolves CLI and environment tokens before shared user credentials
+and skips the shared credential read when either supplies a token. Hosted team
+names, slugs, and rejected scope identifiers encode terminal control characters
+before display without changing the identities used for selection, validation,
+or persistence. Logout invalidates the current token only against an API
+selected explicitly or persisted by the linked project. When the issuing API is
+unavailable, it skips remote invalidation before removing the token while
+retaining unrelated shared configuration fields. Logout resolves its effective
+CLI, environment, or persisted token
+before other hosted settings; without a token it skips API and timeout
+validation before retaining unrelated shared configuration fields.
+`logout --invalidate=false` removes the local token without resolving or
+validating hosted API and login URLs. A non-success response from the issuing
+API still removes the local token and retains unrelated user configuration
+before reporting the remote invalidation failure.
+
+Remote cache control and artifact traffic supports team IDs and slugs,
+preflight, bounded responses, separate download and upload timeouts, safe
+redirects, idempotent retries for transient and rate-limit responses, event
+records, and optional HMAC signatures. The `--preflight` option is valueless
+and rejects attached values. Redirects reject credentials,
+unsupported protocols, and HTTPS downgrades, and remove authorization,
+cookies, API keys, tokens, credentials, secrets, signatures, and all other
+caller-provided custom headers before crossing an origin. Only safe
+representation headers and the user agent are retained. Redirect-policy
+failures are non-retryable. A `HEAD` request remains `HEAD` across a 303
+redirect, and a bodyless HEAD response ignores a representation
+`Content-Length` when enforcing its zero-byte body limit. A remote status probe
+enables artifact traffic only when its bounded JSON document reports `status`
+exactly `enabled`; any other response or probe failure disables remote
+transport for that run while local execution
+continues. Local-only, configuration-disabled remote,
+no-cache, graph, and dry runs do not load remote credentials or probe hosted
+status; explicit OTLP token reuse may still read the shared user token without
+activating remote cache. A shared credential read needed only for optional OTLP
+token reuse is best-effort and cannot prevent task execution. A shared stored
+token activates remote cache only for a project configuration with a persisted
+linked API URL; an absent or empty project configuration does not activate it.
+When higher-precedence CLI or environment values fully specify the remote API,
+token, and team identity, the lower-precedence project credential file is not
+read.
+Explicit CLI and environment tokens may activate the default API. An explicit
+empty token does not emit a remote cache authorization header or fall back to a
+stored token. An explicit team slug suppresses lower-precedence stored team IDs.
+Hosted and OTLP requests identify as `turbo-ts/0.1.0`. Runtime remote API
+selection and `config` output use CLI, environment, linked project, root
+configuration, and default values in descending precedence. An empty
+`TURBO_TEAM` value is treated as unset and does not suppress `TURBO_TEAMID`. An
+empty `TURBO_TEAMID` value is likewise treated as unset both when deciding
+whether a remote connection is fully explicit and when selecting its tenant
+identity. A linked project's stored token is never redirected by a
+lower-precedence root API setting. A linked project's team ID likewise takes
+precedence over a root remote-cache team ID, and its team slug takes precedence
+over a root remote-cache team slug. Remote cache hit events are emitted only after signature
+verification, decompression, and archive restoration succeed. Remote cache hit
+and miss event reporting runs as supervised best-effort background work and does
+not delay restoration or local task execution. Pending event work is drained
+for at most one second before the run scope closes, after which unfinished
+event fibers are interrupted. This independent bound also applies when the
+remote cache request timeout is disabled.
+Write-only remote publication issues an artifact HEAD request before upload,
+skips PUT when the artifact already exists, and warns but continues to PUT when
+the existence check fails.
+
+Telemetry state remains compatible with official state that omits the optional
+alert timestamp, preserves valid identity across enable and disable operations,
+and applies `TURBO_TELEMETRY_DISABLED` as an effective opt-out without
+destroying the persisted preference. Disabling telemetry replaces unreadable or
+schema-invalid persisted state with a fresh disabled identity; enabling and
+status inspection continue to reject invalid state. OTLP run metrics support
+HTTP/JSON, HTTP/Protobuf, and HTTP/2 gRPC framing with bounded request timeouts,
+environment and CLI headers, resource attributes, run-summary and task-detail
+selection, and an explicit opt-in to reuse the resolved remote cache token.
+Data-bearing gRPC responses require a successful status in the trailing header
+block; true trailers-only responses may carry their status in the initial
+header block. Configured headers cannot replace the required
+content type or gRPC trailer negotiation header. Every exported run and task
+gauge point carries the export observation time in Unix nanoseconds. Task-detail
+metrics report actual execution and cache outcomes. Periodic snapshots omit
+tasks that have not reached an outcome, while final and non-executing snapshots
+identify tasks that were actually bypassed as skipped. Numeric task and run
+attributes use OTLP integer values for every protocol. Environment header names
+and values are percent-decoded after comma-separated entries are split, so an
+encoded comma remains part of its header value. Malformed percent encodings are
+preserved literally. Header names are normalized and deduplicated
+case-insensitively; CLI values override environment values and explicit remote
+cache token reuse overrides configured authorization. Synchronous HTTP/2 stream
+construction failures destroy their session before surfacing an export error.
+Decoded gRPC status
+messages encode terminal control characters before entering user-visible
+errors. Empty, zero, non-finite, and over-limit environment OTLP
+timeouts use the finite default. CLI timeout and interval values above Node's
+2,147,483,647-millisecond timer limit are rejected during argument parsing. A
+generic HTTP OTLP endpoint preserves its
+path prefix and appends `/v1/metrics`. A positive metric interval emits scoped,
+sequential in-progress snapshots and a final snapshot; zero or an absent
+interval emits only the final snapshot. Graph and dry runs report the resolved
+task count rather than the number of requested task names. Completed foreground
+task outcomes are available to in-progress snapshots without waiting for their
+entire `with` group to finish. Export failure never changes task execution
+status.
+
+The secondary command set includes versioned documentation search, internal
+workspace and configured generation without `@turbo/gen`, token-protected
+loopback devtools, boundary diagnostics, deterministic microfrontend ports,
+`bin`, hidden `config`, deprecated `scan`, and the remaining daemon, alias, and
+parser surfaces. Documentation output honors both `NO_COLOR` and `--no-color`,
+and encodes C0 and C1 controls in remote result titles and URLs before terminal
+display. Malformed result URLs are omitted independently so one invalid remote
+record does not suppress otherwise valid documentation results.
+During a successful automatic launch, devtools prints only its token-free
+loopback URL and passes its bearer URL only to the browser launcher. The
+`--no-open` flag is valueless and rejects attached values. When it is selected,
+the launcher is unavailable, or launch fails, devtools prints the authenticated
+loopback URL once for manual access. The authenticated
+root page renders the package and dependency graph exposed by the JSON graph
+Malformed devtools request targets return HTTP 400 without terminating the
+server. Boundary filters select the packages that own the evaluated rules using
+normal package-selector semantics. `--ignore=prompt` asks once before ignoring
+found violations, accepts only `y` or `yes`, skips prompting when no violation
+exists, and fails safely without an interactive terminal. Hidden `config` skips
+the project credential read when higher-precedence CLI or environment API and
+team-slug inputs make every project field irrelevant, suppresses
+lower-precedence team IDs when a CLI, environment, or linked-project team slug
+is selected, applies `TURBO_CACHE_DIR`, `TURBO_CONCURRENCY`, and `TURBO_UI`
+before repository configuration, validates the effective UI mode, and validates
+the effective API and login URLs before rendering them. It honors
+`TURBO_ROOT_TURBO_JSON` for repository discovery when no CLI root override is
+provided.
+Remote download and upload timeouts use CLI, environment, configuration, and
+default values in descending precedence and reject negative, empty, or
+non-finite environment values. Networked hosted commands use the remote cache
+timeout CLI option, `TURBO_REMOTE_CACHE_TIMEOUT`, and the 30-second default in
+descending precedence with the same validation, and documentation search uses
+the same CLI, environment, and default chain. For those hosted and documentation
+requests, explicit zero disables the request timer, while every positive timeout
+is converted to at least one millisecond.
+Microfrontend configuration is selected only from the explicit `--cwd`, or the
+process working directory when the option is absent, and its package ancestors
+after platform-aware canonical path normalization. Only JavaScript package
+scopes participate in selection; co-located Cargo and uv scopes are excluded.
+The repository root package remains eligible to own the selected microfrontend
+configuration.
+Absolute workspace generator destinations are used directly, while relative
+destinations resolve from the repository root. All generator destinations are
+validated through canonical existing ancestors, and recursive copies whose
+source contains their destination are rejected.
+Explicit generator roots must resolve from an existing directory through
+repository discovery before any destination is created.
+Requested workspace names must be valid for new npm packages, including
+reserved-name and core-module exclusions. The `--empty` workspace flag is
+valueless and rejects attached values. Copied workspace templates require an
+object `package.json`, preserve its other fields, and atomically rewrite `name`
+to the requested workspace name. Workspace type accepts only `app` or `package`
+and is validated before a destination is created. Failed template validation,
+copies, manifest rewrites, or interruption remove the partial destination only
+when the generator acquired that destination exclusively, so a concurrently
+created destination is preserved. Cleanup failures remain typed and are
+combined with the preceding materialization failure or interruption, leaving
+the partial destination observable. Configured generators collect unresolved
+prompt answers through the terminal before evaluating actions and fail without
+writing when those answers are unavailable non-interactively. Generator results
+use a nonce-scoped length-delimited frame, while ordinary configuration and action
+stdout and stderr are forwarded separately. Workspace example template path
+selection and workspace dependency selection, including the visibility change
+requested by `--show-all-dependencies`, remain planned. Update
+checks remain disabled by default; the explicit
+test-only forced check reads stable upstream tags and reports against the fixed
+2.10.12 baseline. Aube and Nub native or delegated lockfiles retain their
+declared command identity, and tool identity is probed through scoped mocked
+process boundaries in conformance tests. Cargo/rustc 1.97.1 and uv 0.12.7
+remain the fixed experimental matrix entries.
+
+Daemon preference forwarding through `--daemon`, `--no-daemon`, and
+`TURBO_DAEMON` remains planned until the runtime consumes or rejects the
+resolved startup and idle-time options.
+
+Only behavior with automated ledger evidence is a compatibility claim. The
+project-wide composed task-hash row remains planned as documented above; no
+hosted or secondary evidence is used to claim that separate Gate 2 gap.
 
 The approved compatibility differences are branding and version, Node-only
 distribution, hosted identity, default-disabled updates, V8 heap/trace output,
