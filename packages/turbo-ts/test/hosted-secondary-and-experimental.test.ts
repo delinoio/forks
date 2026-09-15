@@ -1233,6 +1233,27 @@ describe("hosted compatibility", () => {
           ).searchParams;
           expect(unsafeStatusQuery.get("teamId")).toBe("team_unsafe");
           expect(unsafeStatusQuery.get("slug")).toBe("unsafe\u001b[31m");
+
+          const unsafeUnknownScope =
+            "missing\u001b]52;c;c3ludGhldGlj\u0007\u009b31m";
+          const unknownScope = await runCandidate(
+            [
+              "link",
+              `--scope=${unsafeUnknownScope}`,
+              "--yes",
+              "--token=synthetic-token",
+              ...commonArguments,
+            ],
+            root,
+            { XDG_CONFIG_HOME: join(directory, "candidate-config") },
+          );
+          expect(unknownScope.code).toBe(1);
+          expect(unknownScope.stderr).toContain(
+            `unknown remote caching scope: ${renderTerminalSafeText(unsafeUnknownScope)}`,
+          );
+          expect(unknownScope.stderr).not.toContain("\u001b");
+          expect(unknownScope.stderr).not.toContain("\u0007");
+          expect(unknownScope.stderr).not.toContain("\u009b");
         },
       );
     } finally {
@@ -1972,14 +1993,15 @@ describe("hosted compatibility", () => {
     }
   }, 30_000);
 
-  it("skips project credentials for a fully explicit remote connection", async () => {
+  it("skips project credentials only for a fully explicit remote connection", async () => {
     const directory = await mkdtemp(
       join(tmpdir(), "turbo-ts-explicit-remote-"),
     );
     const root = join(directory, "repository");
+    const projectPath = join(root, ".turbo/config.json");
     await prepareRepository(root);
     await mkdir(join(root, ".turbo"), { recursive: true });
-    await writeFile(join(root, ".turbo/config.json"), "invalid credentials");
+    await writeFile(projectPath, "invalid credentials");
     try {
       await withServer(
         (request) =>
@@ -2017,6 +2039,35 @@ describe("hosted compatibility", () => {
                 request.method === "GET" &&
                 request.path.startsWith("/v8/artifacts/status") &&
                 request.path.includes("slug=synthetic-team"),
+            ),
+          ).toBe(true);
+
+          requests.length = 0;
+          await writeFile(
+            projectPath,
+            JSON.stringify({ teamId: "team_linked" }),
+          );
+          const emptyTeam = await runCandidate(
+            [
+              "run",
+              "build",
+              "--filter=synthetic-app",
+              "--cache=remote:r",
+              "--output-logs=none",
+              `--api=${baseUrl}`,
+              "--token=synthetic-token",
+              `--cwd=${root}`,
+            ],
+            root,
+            { TURBO_TEAM: "", TURBO_TEAMID: undefined },
+          );
+          expect(emptyTeam.code, emptyTeam.stderr).toBe(0);
+          expect(
+            requests.some(
+              (request) =>
+                request.method === "GET" &&
+                request.path.startsWith("/v8/artifacts/status") &&
+                request.path.includes("teamId=team_linked"),
             ),
           ).toBe(true);
         },
@@ -2151,6 +2202,53 @@ describe("secondary command and parser compatibility", () => {
       expect(JSON.parse(configuration.stdout)).toMatchObject({
         teamId: "team_environment",
         teamSlug: null,
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("reads project configuration only when it can affect config output", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-config-link-"));
+    const root = join(directory, "repository");
+    const projectPath = join(root, ".turbo/config.json");
+    await prepareRepository(root);
+    await mkdir(join(root, ".turbo"), { recursive: true });
+    await writeFile(projectPath, "invalid credentials");
+    try {
+      const explicit = await runCandidate(
+        [
+          "config",
+          "--api=https://cache.example.test/api",
+          "--token=synthetic-config-token",
+          "--team=explicit-team",
+          `--cwd=${root}`,
+        ],
+        root,
+      );
+      expect(explicit.code, explicit.stderr).toBe(0);
+      expect(JSON.parse(explicit.stdout)).toMatchObject({
+        apiUrl: "https://cache.example.test/api",
+        teamId: null,
+        teamSlug: "explicit-team",
+      });
+      expect(`${explicit.stdout}${explicit.stderr}`).not.toContain(
+        "synthetic-config-token",
+      );
+
+      await writeFile(
+        join(root, "turbo.json"),
+        JSON.stringify({
+          remoteCache: { teamId: "team_root" },
+          tasks: { build: {} },
+        }),
+      );
+      await writeFile(projectPath, JSON.stringify({ teamSlug: "linked-team" }));
+      const linked = await runCandidate(["config", `--cwd=${root}`], root);
+      expect(linked.code, linked.stderr).toBe(0);
+      expect(JSON.parse(linked.stdout)).toMatchObject({
+        teamId: null,
+        teamSlug: "linked-team",
       });
     } finally {
       await rm(directory, { recursive: true, force: true });

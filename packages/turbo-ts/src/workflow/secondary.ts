@@ -140,13 +140,17 @@ const executeConfig = (
     const root = repository.rootConfiguration.value;
     const global =
       root.futureFlags?.globalConfiguration === true ? root.global : root;
-    const project = yield* credentials.readProjectConfiguration(
-      repository.root,
-    );
     const environmentValue = (name: string) => environment.get(name);
+    const environmentApiUrl = yield* environmentValue("TURBO_API");
     const environmentTeamSlugValue = yield* environmentValue("TURBO_TEAM");
     const environmentTeamSlug =
       environmentTeamSlugValue === "" ? undefined : environmentTeamSlugValue;
+    const environmentTeamId = yield* environmentValue("TURBO_TEAMID");
+    const project =
+      (parsed.options.apiUrl ?? environmentApiUrl) !== undefined &&
+      (parsed.options.team ?? environmentTeamSlug) !== undefined
+        ? undefined
+        : yield* credentials.readProjectConfiguration(repository.root);
     const environmentTimeout = yield* environmentValue(
       "TURBO_REMOTE_CACHE_TIMEOUT",
     );
@@ -183,7 +187,7 @@ const executeConfig = (
     const remoteConfiguration = global?.remoteCache;
     const apiUrl = hostedUrl(
       parsed.options.apiUrl ??
-        (yield* environmentValue("TURBO_API")) ??
+        environmentApiUrl ??
         project?.apiUrl ??
         remoteConfiguration?.apiUrl ??
         "https://vercel.com/api",
@@ -217,9 +221,11 @@ const executeConfig = (
         null,
       teamId:
         parsed.options.team === undefined && environmentTeamSlug === undefined
-          ? ((yield* environmentValue("TURBO_TEAMID")) ??
+          ? (environmentTeamId ??
             project?.teamId ??
-            remoteConfiguration?.teamId ??
+            (project?.teamSlug === undefined
+              ? remoteConfiguration?.teamId
+              : undefined) ??
             null)
           : null,
       signature: remoteConfiguration?.signature ?? false,

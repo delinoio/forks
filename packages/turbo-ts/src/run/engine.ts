@@ -3612,10 +3612,14 @@ export const executeRun = (
       environmentValue("TURBO_EXPERIMENTAL_OTEL_ENABLED") === "true";
     const explicitRemoteApi = parsed.apiUrl ?? environmentValue("TURBO_API");
     const explicitRemoteToken = parsed.token ?? environmentValue("TURBO_TOKEN");
+    const explicitRemoteTeamSlugValue =
+      parsed.team ?? environmentValue("TURBO_TEAM");
+    const explicitRemoteTeamSlug =
+      explicitRemoteTeamSlugValue === ""
+        ? undefined
+        : explicitRemoteTeamSlugValue;
     const explicitRemoteTeam =
-      parsed.team ??
-      environmentValue("TURBO_TEAM") ??
-      environmentValue("TURBO_TEAMID");
+      explicitRemoteTeamSlug ?? environmentValue("TURBO_TEAMID");
     const remoteConnectionFullyExplicit =
       explicitRemoteApi !== undefined &&
       explicitRemoteToken !== undefined &&

@@ -839,7 +839,9 @@ export const executeHostedCommand = (
       );
       if (team === undefined) {
         return yield* Effect.fail(
-          fail(`unknown remote caching scope: ${configuredScope}`),
+          fail(
+            `unknown remote caching scope: ${renderTerminalSafeText(configuredScope)}`,
+          ),
         );
       }
     }

@@ -1010,9 +1010,9 @@ Relinking selects its API from CLI, environment, the persisted
 project link, and the public default in descending precedence. The project link
 is persisted only after the required `.gitignore` update succeeds. An explicit
 link team slug from `--team` or `TURBO_TEAM` suppresses `TURBO_TEAMID` before
-scope selection and validation. Hosted team names and slugs encode terminal
-control characters before display without changing the identities used for
-selection, validation, or persistence. Logout invalidates the current
+scope selection and validation. Hosted team names, slugs, and rejected scope
+identifiers encode terminal control characters before display without changing
+the identities used for selection, validation, or persistence. Logout invalidates the current
 token only against an API selected explicitly or persisted by the linked
 project. When the issuing API is unavailable, it skips remote invalidation
 before removing the token while retaining unrelated shared configuration
@@ -1121,11 +1121,13 @@ Malformed devtools request targets return HTTP 400 without terminating the
 server. Boundary filters select the packages that own the evaluated rules using
 normal package-selector semantics. `--ignore=prompt` asks once before ignoring
 found violations, accepts only `y` or `yes`, skips prompting when no violation
-exists, and fails safely without an interactive terminal. Hidden `config`
-suppresses lower-precedence team IDs when a CLI or environment team slug is
-selected, applies `TURBO_CACHE_DIR`, `TURBO_CONCURRENCY`, and `TURBO_UI` before
-repository configuration, validates the effective UI mode, and validates the
-effective API and login URLs before rendering them. It honors
+exists, and fails safely without an interactive terminal. Hidden `config` skips
+the project credential read when higher-precedence CLI or environment API and
+team-slug inputs make every project field irrelevant, suppresses
+lower-precedence team IDs when a CLI, environment, or linked-project team slug
+is selected, applies `TURBO_CACHE_DIR`, `TURBO_CONCURRENCY`, and `TURBO_UI`
+before repository configuration, validates the effective UI mode, and validates
+the effective API and login URLs before rendering them. It honors
 `TURBO_ROOT_TURBO_JSON` for repository discovery when no CLI root override is
 provided.
 Remote download and upload timeouts use CLI, environment, configuration, and
