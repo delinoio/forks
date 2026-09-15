@@ -11,16 +11,16 @@ export const redactText = (
   value: string,
   secrets: ReadonlyArray<string> = [],
 ): string => {
-  let redacted = value
-    .replaceAll(bearerValue, `Bearer ${redactedValue}`)
-    .replaceAll(urlCredentials, `$1${redactedValue}@`)
-    .replaceAll(namedSecretValue, `$1${redactedValue}`);
+  let redacted = value;
   for (const secret of [...new Set(secrets)].sort(
     (left, right) => right.length - left.length,
   )) {
     if (secret !== "") redacted = redacted.replaceAll(secret, redactedValue);
   }
-  return redacted;
+  return redacted
+    .replaceAll(bearerValue, `Bearer ${redactedValue}`)
+    .replaceAll(urlCredentials, `$1${redactedValue}@`)
+    .replaceAll(namedSecretValue, `$1${redactedValue}`);
 };
 
 const redactEntry = (

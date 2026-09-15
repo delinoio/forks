@@ -196,6 +196,9 @@ export const parseCommonArguments = (
         break;
       case "--team":
         [team, index] = requiredValue(arguments_, index, name);
+        if (team === "") {
+          throw configurationFailure(`${name} requires a value`);
+        }
         break;
       case "--token":
         [token, index] = requiredValue(arguments_, index, name);

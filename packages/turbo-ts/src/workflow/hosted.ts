@@ -782,12 +782,16 @@ export const executeHostedCommand = (
     const root = yield* resolveWorkflowRepositoryRoot({
       cwd: options.common.cwd,
     });
-    const existingUser = (yield* credentials.readUserConfiguration) ?? {};
+    const explicitToken = yield* resolveHostedToken(options, undefined);
+    const storedToken =
+      explicitToken === undefined
+        ? (yield* credentials.readUserConfiguration)?.token
+        : undefined;
     const existingProject =
       (yield* credentials.readProjectConfiguration(root)) ?? {};
     const settings = yield* resolveHostedSettings(options, {
       apiUrl: existingProject.apiUrl,
-      token: existingUser.token,
+      token: explicitToken ?? storedToken,
     });
     const token = settings.token;
     if (token === undefined) {

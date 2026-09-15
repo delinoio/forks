@@ -663,6 +663,35 @@ describe("hosted compatibility", () => {
               await readFile(join(root, ".turbo/config.json"), "utf8"),
             ),
           ).toEqual({});
+          const explicitTokenLink = await runCandidate(
+            [
+              "link",
+              "--scope=synthetic",
+              "--yes",
+              `--api=${baseUrl}`,
+              `--token=${token}`,
+              `--cwd=${root}`,
+            ],
+            root,
+            environment,
+          );
+          expect(explicitTokenLink.code, explicitTokenLink.stderr).toBe(0);
+          expect(await readFile(userPath, "utf8")).toBe("{malformed");
+          const environmentTokenLink = await runCandidate(
+            [
+              "link",
+              "--scope=later",
+              "--yes",
+              `--api=${baseUrl}`,
+              `--cwd=${root}`,
+            ],
+            root,
+            { ...environment, TURBO_TOKEN: token },
+          );
+          expect(environmentTokenLink.code, environmentTokenLink.stderr).toBe(
+            0,
+          );
+          expect(await readFile(userPath, "utf8")).toBe("{malformed");
           await writeFile(userPath, JSON.stringify({ token }));
           const personalLink = await runCandidate(
             [
@@ -1676,6 +1705,18 @@ describe("hosted compatibility", () => {
     expect(redactText("Bearer synthetic:secret? token=visible-secret")).toBe(
       "Bearer [REDACTED] token=[REDACTED]",
     );
+    const multilineSecret =
+      "synthetic-first-line\n\u001b]0;unsafe\u0007\u009b31msynthetic-second-line";
+    const redactedMultilineError = redactText(
+      `Headers.append: "Bearer ${multilineSecret}" is an invalid header value.`,
+      [multilineSecret],
+    );
+    expect(redactedMultilineError).toContain("Bearer [REDACTED]");
+    expect(redactedMultilineError).not.toContain("synthetic-first-line");
+    expect(redactedMultilineError).not.toContain("synthetic-second-line");
+    for (const control of ["\u001b", "\u0007", "\u009b"]) {
+      expect(redactedMultilineError).not.toContain(control);
+    }
 
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-permission-"));
     const root = join(directory, "repository");
@@ -1684,9 +1725,27 @@ describe("hosted compatibility", () => {
     const credentialDirectory = join(configurationHome, "turborepo");
     await mkdir(credentialDirectory, { recursive: true });
     const credentialPath = join(credentialDirectory, "config.json");
-    await writeFile(credentialPath, JSON.stringify({ token: secret }));
-    if (process.platform !== "win32") await chmod(credentialPath, 0o644);
     try {
+      const invalidHeader = await runCandidate(
+        [
+          "login",
+          "--manual",
+          `--token=${multilineSecret}`,
+          "--api=http://127.0.0.1:1",
+          `--cwd=${root}`,
+        ],
+        root,
+        { XDG_CONFIG_HOME: configurationHome },
+      );
+      expect(invalidHeader.code).toBe(1);
+      expect(invalidHeader.stderr).toContain("[REDACTED]");
+      expect(invalidHeader.stderr).not.toContain("synthetic-first-line");
+      expect(invalidHeader.stderr).not.toContain("synthetic-second-line");
+      for (const control of ["\u001b", "\u0007", "\u009b"]) {
+        expect(invalidHeader.stderr).not.toContain(control);
+      }
+      await writeFile(credentialPath, JSON.stringify({ token: secret }));
+      if (process.platform !== "win32") await chmod(credentialPath, 0o644);
       const result = await runCandidate(
         ["logout", "--invalidate=false", `--cwd=${root}`],
         root,
@@ -2530,6 +2589,9 @@ describe("secondary command and parser compatibility", () => {
       timeoutMilliseconds: 50,
       useRemoteCacheToken: true,
     });
+    expect(() => parseCommonArguments(["--team", ""])).toThrow(
+      "--team requires a value",
+    );
     expect(
       parseRunArguments([
         "run",

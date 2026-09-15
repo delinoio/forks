@@ -63,6 +63,7 @@ import { writeHeapSnapshot } from "node:v8";
 import { createZstdDecompress, zstdCompress, zstdDecompress } from "node:zlib";
 import { Cause, Effect, Exit, Fiber, Layer, Option, Ref, Stream } from "effect";
 import { createXxhash64 } from "../hash/xxhash64.js";
+import { redactText } from "../logging/redaction.js";
 import { BoundaryError, ProcessExecutionError } from "./errors.js";
 import {
   type BinaryExecutionRequest,
@@ -3508,6 +3509,18 @@ const requestWithHttp2 = (
     );
   });
 
+const httpRequestError = (
+  request: Pick<HttpRequest, "headers">,
+  cause: unknown,
+): BoundaryError =>
+  new BoundaryError({
+    boundary: "http",
+    message: redactText(String(cause), Object.values(request.headers ?? {})),
+    retryable:
+      !(cause instanceof HttpResponseBodyLimitError) &&
+      !(cause instanceof HttpRedirectPolicyError),
+  });
+
 const httpLayer = Layer.succeed(HttpService, {
   request: (request) =>
     Effect.tryPromise({
@@ -3541,14 +3554,7 @@ const httpLayer = Layer.succeed(HttpService, {
           }
         }
       },
-      catch: (cause) =>
-        new BoundaryError({
-          boundary: "http",
-          message: String(cause),
-          retryable:
-            !(cause instanceof HttpResponseBodyLimitError) &&
-            !(cause instanceof HttpRedirectPolicyError),
-        }),
+      catch: (cause) => httpRequestError(request, cause),
     }),
   downloadToFile: (request, destination) =>
     Effect.tryPromise({
@@ -3579,14 +3585,7 @@ const httpLayer = Layer.succeed(HttpService, {
           if (timeout !== undefined) clearTimeout(timeout);
         }
       },
-      catch: (cause) =>
-        new BoundaryError({
-          boundary: "http",
-          message: String(cause),
-          retryable:
-            !(cause instanceof HttpResponseBodyLimitError) &&
-            !(cause instanceof HttpRedirectPolicyError),
-        }),
+      catch: (cause) => httpRequestError(request, cause),
     }),
 });
 

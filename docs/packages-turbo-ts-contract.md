@@ -993,6 +993,8 @@ replacement, no-follow handle-based regular-file checks, reads bounded to 1
 MiB from the validated handle, and secret-safe diagnostics.
 Project configuration writes reject symlinked `.turbo` directories before
 creating or replacing `config.json`.
+HTTP boundary diagnostics redact complete nonempty outgoing header values
+before they can enter user-visible errors, including multiline bearer values.
 Link discovery uses the hosted user and team endpoints, verifies artifact
 status is exactly `enabled`, offers the personal user scope alongside team
 scopes, follows the hosted teams endpoint's `pagination.next` cursor through
@@ -1010,13 +1012,16 @@ Relinking selects its API from CLI, environment, the persisted
 project link, and the public default in descending precedence. The project link
 is persisted only after the required `.gitignore` update succeeds. An explicit
 link team slug from `--team` or `TURBO_TEAM` suppresses `TURBO_TEAMID` before
-scope selection and validation. Hosted team names, slugs, and rejected scope
-identifiers encode terminal control characters before display without changing
-the identities used for selection, validation, or persistence. Logout invalidates the current
-token only against an API selected explicitly or persisted by the linked
-project. When the issuing API is unavailable, it skips remote invalidation
-before removing the token while retaining unrelated shared configuration
-fields. Logout resolves its effective CLI, environment, or persisted token
+scope selection and validation. `--team` rejects empty attached and separated
+values. Link resolves CLI and environment tokens before shared user credentials
+and skips the shared credential read when either supplies a token. Hosted team
+names, slugs, and rejected scope identifiers encode terminal control characters
+before display without changing the identities used for selection, validation,
+or persistence. Logout invalidates the current token only against an API
+selected explicitly or persisted by the linked project. When the issuing API is
+unavailable, it skips remote invalidation before removing the token while
+retaining unrelated shared configuration fields. Logout resolves its effective
+CLI, environment, or persisted token
 before other hosted settings; without a token it skips API and timeout
 validation before retaining unrelated shared configuration fields.
 `logout --invalidate=false` removes the local token without resolving or
