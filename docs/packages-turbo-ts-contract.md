@@ -735,6 +735,8 @@ that select one scope. Cyclic package graphs never include the starting package
 in its own dependency or dependent relationship collections.
 Boundary diagnostics evaluate root, package, and tag dependency and dependent
 permissions against manifest and configured implicit package dependencies.
+Operator-facing boundary diagnostics encode C0 and C1 controls in derived
+messages, paths, and import values before terminal display.
 When a package has no local Turbo configuration, diagnostics point to its
 owning `package.json`, `Cargo.toml`, or `pyproject.toml` manifest. Package-graph
 center selection retains the named package and its
@@ -1048,7 +1050,8 @@ Explicit CLI and environment tokens may activate the default API. An explicit
 team slug suppresses lower-precedence stored team IDs. Hosted and OTLP requests
 identify as `turbo-ts/0.1.0`. Runtime remote API selection uses CLI,
 environment, linked project, root configuration, and default values in
-descending precedence, so a linked project's stored token is never redirected
+descending precedence. An empty `TURBO_TEAM` value is treated as unset and does
+not suppress `TURBO_TEAMID`. A linked project's stored token is never redirected
 by a lower-precedence root API setting. A linked project's team ID likewise
 takes precedence over a root remote-cache team ID, and its team slug takes precedence over a root
 remote-cache team slug. Remote cache hit events are emitted only after signature
@@ -1122,7 +1125,9 @@ exists, and fails safely without an interactive terminal. Hidden `config`
 suppresses lower-precedence team IDs when a CLI or environment team slug is
 selected, applies `TURBO_CACHE_DIR`, `TURBO_CONCURRENCY`, and `TURBO_UI` before
 repository configuration, validates the effective UI mode, and validates the
-effective API and login URLs before rendering them.
+effective API and login URLs before rendering them. It honors
+`TURBO_ROOT_TURBO_JSON` for repository discovery when no CLI root override is
+provided.
 Remote download and upload timeouts use CLI, environment, configuration, and
 default values in descending precedence and reject negative, empty, or
 non-finite environment values. Networked hosted commands use the remote cache

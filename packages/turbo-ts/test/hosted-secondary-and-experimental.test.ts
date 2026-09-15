@@ -2133,6 +2133,83 @@ describe("secondary command and parser compatibility", () => {
     }
   }, 30_000);
 
+  it("uses TURBO_ROOT_TURBO_JSON for config output", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-config-root-"));
+    const root = join(directory, "repository");
+    await prepareRepository(root);
+    await writeFile(
+      join(root, "custom-turbo.json"),
+      JSON.stringify({ tasks: { build: {} }, ui: "tui" }),
+    );
+    try {
+      const configuration = await runCandidate(
+        ["config", `--cwd=${root}`],
+        root,
+        { TURBO_ROOT_TURBO_JSON: "custom-turbo.json" },
+      );
+      expect(configuration.code, configuration.stderr).toBe(0);
+      expect(JSON.parse(configuration.stdout).ui).toBe("tui");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("encodes controls in boundary diagnostic fields", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-boundary-controls-"),
+    );
+    const root = join(directory, "repository");
+    const unsafeDirectory = "unsafe\u009b31m";
+    const unsafeName = "synthetic-library\u001b]52;c;payload\u0007";
+    const unsafeTag = "library\u009b31m";
+    await prepareRepository(root);
+    await mkdir(join(root, "packages", unsafeDirectory), { recursive: true });
+    await writeFile(
+      join(root, "packages/app/package.json"),
+      JSON.stringify({
+        name: "synthetic-app",
+        private: true,
+        dependencies: { [unsafeName]: "workspace:*" },
+      }),
+    );
+    await writeFile(
+      join(root, "packages/app/turbo.json"),
+      JSON.stringify({
+        extends: ["//"],
+        boundaries: { dependencies: { deny: [unsafeTag] } },
+      }),
+    );
+    await writeFile(
+      join(root, "packages", unsafeDirectory, "package.json"),
+      JSON.stringify({ name: unsafeName, private: true }),
+    );
+    await writeFile(
+      join(root, "packages", unsafeDirectory, "turbo.json"),
+      JSON.stringify({ extends: ["//"], tags: [unsafeTag] }),
+    );
+    try {
+      const boundaries = await runCandidate(
+        ["boundaries", `--cwd=${root}`],
+        root,
+      );
+      const safeDirectory = renderTerminalSafeText(unsafeDirectory);
+      const safeName = renderTerminalSafeText(unsafeName);
+      const safeTag = renderTerminalSafeText(unsafeTag);
+      expect(boundaries.code).toBe(1);
+      expect(boundaries.stderr).toContain(
+        `Package \`${safeName}\` found with tag listed in denylist for \`synthetic-app\`: \`${safeTag}\``,
+      );
+      expect(boundaries.stderr).toContain(
+        `at packages/${safeDirectory}/turbo.json: ${safeName}`,
+      );
+      for (const control of ["\u001b", "\u0007", "\u009b"]) {
+        expect(boundaries.stderr).not.toContain(control);
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it(evidenceId.secondaryCompatibility, async () => {
     const common = parseCommonArguments([
       "--skip-infer",

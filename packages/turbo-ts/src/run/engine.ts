@@ -426,7 +426,9 @@ export const resolveOptions = (
     );
   const configuredEnvironmentMode = environmentValue("TURBO_ENV_MODE");
   const configuredApiUrl = environmentValue("TURBO_API");
-  const configuredTeamSlug = environmentValue("TURBO_TEAM");
+  const configuredTeamSlugValue = environmentValue("TURBO_TEAM");
+  const configuredTeamSlug =
+    configuredTeamSlugValue === "" ? undefined : configuredTeamSlugValue;
   const configuredToken = environmentValue("TURBO_TOKEN");
   const configuredRemoteTimeout = environmentValue(
     "TURBO_REMOTE_CACHE_TIMEOUT",

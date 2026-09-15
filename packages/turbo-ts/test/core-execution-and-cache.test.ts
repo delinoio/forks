@@ -15221,9 +15221,18 @@ describe("cache interoperability and safety", () => {
           })
         ).exitCode,
       ).toBe(0);
+      expect(
+        (
+          await runWithEnvironment({
+            TURBO_TEAM: "",
+            TURBO_TEAMID: "team_empty_slug",
+          })
+        ).exitCode,
+      ).toBe(0);
       expect(teamSelectors).toEqual([
         { teamId: "team_environment", teamSlug: null },
         { teamId: null, teamSlug: "environment-team" },
+        { teamId: "team_empty_slug", teamSlug: null },
       ]);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));

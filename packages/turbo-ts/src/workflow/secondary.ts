@@ -126,9 +126,13 @@ const executeConfig = (
     const environment = yield* EnvironmentService;
     const credentials = yield* CredentialService;
     const terminal = yield* TerminalService;
+    const configuredRootTurboJson =
+      parsed.options.rootTurboJson === undefined
+        ? yield* environment.get("TURBO_ROOT_TURBO_JSON")
+        : undefined;
     const repository = yield* loadWorkflowRepository({
       cwd: parsed.options.cwd,
-      rootTurboJson: parsed.options.rootTurboJson,
+      rootTurboJson: parsed.options.rootTurboJson ?? configuredRootTurboJson,
     });
     const root = repository.rootConfiguration.value;
     const global =
@@ -288,8 +292,11 @@ const executeBoundaries = (
           );
     const diagnostics = boundaryDiagnostics(repository, selectedRuleOwners);
     for (const diagnostic of diagnostics) {
+      const message = renderTerminalSafeText(diagnostic.message);
+      const path = renderTerminalSafeText(diagnostic.path);
+      const importedPackage = renderTerminalSafeText(diagnostic.import);
       yield* terminal.writeStderr(
-        `${diagnostic.message}\n  at ${diagnostic.path}: ${diagnostic.import}${
+        `${message}\n  at ${path}: ${importedPackage}${
           reason === undefined ? "" : ` (${reason})`
         }\n`,
       );
