@@ -25,7 +25,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "@rstest/core";
-import { Effect, Fiber, Layer } from "effect";
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect";
 import {
   headRemoteCache,
   type RemoteCacheOptions,
@@ -753,6 +753,22 @@ describe("hosted compatibility", () => {
           expect(JSON.parse(await readFile(userPath, "utf8"))).toEqual({
             retained: "synthetic",
           });
+
+          const requestsBeforeTokenlessLogout = requests.length;
+          const tokenlessLogout = await runCandidate(
+            ["logout", `--cwd=${root}`],
+            root,
+            {
+              ...environment,
+              TURBO_API: "not-a-url",
+              TURBO_REMOTE_CACHE_TIMEOUT: "invalid",
+            },
+          );
+          expect(tokenlessLogout.code, tokenlessLogout.stderr).toBe(0);
+          expect(JSON.parse(await readFile(userPath, "utf8"))).toEqual({
+            retained: "synthetic",
+          });
+          expect(requests).toHaveLength(requestsBeforeTokenlessLogout);
 
           expect(
             requests.some(
@@ -2184,6 +2200,108 @@ describe("secondary command and parser compatibility", () => {
     }
   }, 30_000);
 
+  it("selects microfrontend ports only from JavaScript scopes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-mfe-polyglot-"));
+    const root = join(directory, "repository");
+    const app = join(root, "packages/app");
+    const cargoPackageId = "synthetic-cargo-package-id";
+    await prepareRepository(root);
+    await writeFile(
+      join(root, "turbo.json"),
+      JSON.stringify({
+        futureFlags: { experimentalCargoWorkspaces: true },
+        tasks: { build: {} },
+      }),
+    );
+    await mkdir(join(app, "src"), { recursive: true });
+    await writeFile(
+      join(app, "Cargo.toml"),
+      '[package]\nname = "aaa-cargo-app"\nversion = "0.1.0"\nedition = "2024"\n',
+    );
+    await writeFile(
+      join(app, "Cargo.lock"),
+      'version = 4\n\n[[package]]\nname = "aaa-cargo-app"\nversion = "0.1.0"\n',
+    );
+    await writeFile(join(app, "src/lib.rs"), "pub fn value() {}\n");
+    await writeFile(
+      join(app, "microfrontends.json"),
+      JSON.stringify({
+        applications: {
+          "synthetic-app": { development: { local: { port: 4123 } } },
+        },
+      }),
+    );
+    try {
+      const services = await Effect.runPromise(
+        Effect.gen(function* () {
+          return {
+            processes: yield* ProcessService,
+            terminal: yield* TerminalService,
+          };
+        }).pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const cargoMetadata = JSON.stringify({
+        workspace_root: app,
+        workspace_members: [cargoPackageId],
+        target_directory: join(app, "target"),
+        packages: [
+          {
+            id: cargoPackageId,
+            name: "aaa-cargo-app",
+            version: "0.1.0",
+            manifest_path: join(app, "Cargo.toml"),
+            dependencies: [],
+            targets: [{ kind: ["lib"], name: "aaa_cargo_app" }],
+          },
+        ],
+      });
+      let stdout = "";
+      const overrides = Layer.mergeAll(
+        Layer.succeed(ProcessService, {
+          ...services.processes,
+          run: (request) => {
+            if (request.command === "cargo" && request.args[0] === "metadata") {
+              return Effect.succeed({
+                exitCode: 0,
+                stdout: cargoMetadata,
+                stderr: "",
+                combinedOutput: cargoMetadata,
+              });
+            }
+            if (request.command === "rustc") {
+              const output =
+                "rustc 1.96.0-nightly\nhost: synthetic-target-triple\n";
+              return Effect.succeed({
+                exitCode: 0,
+                stdout: output,
+                stderr: "",
+                combinedOutput: output,
+              });
+            }
+            return services.processes.run(request);
+          },
+        }),
+        Layer.succeed(TerminalService, {
+          ...services.terminal,
+          writeStdout: (text) =>
+            Effect.sync(() => {
+              stdout += text;
+            }),
+        }),
+      );
+      const code = await Effect.runPromise(
+        executeSecondaryCommand("get-mfe-port", [`--cwd=${app}`]).pipe(
+          Effect.provide(overrides),
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
+      expect(code).toBe(0);
+      expect(stdout).toBe("4123\n");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("treats an empty TURBO_TEAM as unset in config output", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-config-team-"));
     const root = join(directory, "repository");
@@ -3216,6 +3334,58 @@ describe("secondary command and parser compatibility", () => {
       expect(
         JSON.parse(await readFile(join(destination, "package.json"), "utf8")),
       ).toEqual({ private: true, name: "generated-malformed" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans up an acquired workspace destination on interruption", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-generator-interrupted-copy-"),
+    );
+    const root = join(directory, "repository");
+    const template = join(root, "templates/interrupted");
+    const destination = join(root, "packages/generated-interrupted");
+    await prepareRepository(root);
+    await mkdir(template, { recursive: true });
+    await writeFile(
+      join(template, "package.json"),
+      JSON.stringify({ private: true }),
+    );
+    try {
+      const fileSystem = await Effect.runPromise(
+        FileSystemService.pipe(Effect.provide(nodeFoundationLayer)),
+      );
+      const outcome = await Effect.runPromise(
+        Effect.gen(function* () {
+          const copyStarted = yield* Deferred.make<void>();
+          const interruptedFileSystemLayer = Layer.succeed(FileSystemService, {
+            ...fileSystem,
+            copyFile: () =>
+              Deferred.succeed(copyStarted, undefined).pipe(
+                Effect.zipRight(Effect.never),
+              ),
+          });
+          const fiber = yield* executeGenerate([
+            "workspace",
+            "--name=generated-interrupted",
+            "--copy=templates/interrupted",
+            "--destination=packages/generated-interrupted",
+            `--root=${root}`,
+          ]).pipe(
+            Effect.provide(interruptedFileSystemLayer),
+            Effect.provide(nodeFoundationLayer),
+            Effect.fork,
+          );
+          yield* Deferred.await(copyStarted);
+          return yield* Fiber.interrupt(fiber);
+        }),
+      );
+      expect(Exit.isFailure(outcome)).toBe(true);
+      if (Exit.isFailure(outcome)) {
+        expect(Cause.isInterruptedOnly(outcome.cause)).toBe(true);
+      }
+      await expect(access(destination)).rejects.toThrow();
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

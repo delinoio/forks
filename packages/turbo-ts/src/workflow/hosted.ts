@@ -260,6 +260,18 @@ export const resolveHostedTimeoutMilliseconds = (
   return seconds === 0 ? 0 : Math.max(1, Math.round(seconds * 1_000));
 };
 
+const resolveHostedToken = (
+  options: HostedCommandOptions,
+  fallback: string | undefined,
+): Effect.Effect<string | undefined, never, EnvironmentService> =>
+  Effect.gen(function* () {
+    return (
+      options.common.token ??
+      (yield* configuredValue("TURBO_TOKEN")) ??
+      fallback
+    );
+  });
+
 const resolveHostedSettings = (
   options: HostedCommandOptions,
   fallbacks: HostedSettingsFallbacks = {},
@@ -270,10 +282,7 @@ const resolveHostedSettings = (
 > =>
   Effect.gen(function* () {
     const environment = yield* EnvironmentService;
-    const token =
-      options.common.token ??
-      (yield* configuredValue("TURBO_TOKEN")) ??
-      fallbacks.token;
+    const token = yield* resolveHostedToken(options, fallbacks.token);
     const environmentTeamId = yield* configuredValue("TURBO_TEAMID");
     const environmentTeamSlug = yield* configuredValue("TURBO_TEAM");
     const teamId =
@@ -734,12 +743,10 @@ export const executeHostedCommand = (
 
     if (command === "logout") {
       const existing = (yield* credentials.readUserConfiguration) ?? {};
-      const settings = yield* resolveHostedSettings(options, {
-        token: existing.token,
-      });
-      const token = settings.token;
+      const token = yield* resolveHostedToken(options, existing.token);
       let invalidationFailure: BoundaryError | undefined;
       if (options.invalidate && token !== undefined) {
+        const settings = yield* resolveHostedSettings(options, { token });
         const invalidationApi = yield* resolveLogoutInvalidationApi(
           options,
           settings.api,

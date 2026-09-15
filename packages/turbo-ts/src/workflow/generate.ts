@@ -1,4 +1,4 @@
-import { Effect } from "effect";
+import { Effect, Exit } from "effect";
 import validateNpmPackageName from "validate-npm-package-name";
 import { parseCommonArguments } from "../cli/common-options.js";
 import { parseJsonConfiguration } from "../config/runtime.js";
@@ -379,15 +379,7 @@ const executeWorkspaceGenerator = (
         failure("workspace destination already exists"),
       );
     }
-    let ownsDestination = false;
     const materialize = Effect.gen(function* () {
-      yield* fileSystem.makeDirectory(parentPath(destination));
-      ownsDestination = yield* fileSystem.createExclusiveDirectory(destination);
-      if (!ownsDestination) {
-        return yield* Effect.fail(
-          failure("workspace destination already exists"),
-        );
-      }
       if (options.copy === undefined || options.empty) {
         yield* fileSystem.writeTextAtomic(
           joinPath(destination, "package.json"),
@@ -445,23 +437,17 @@ const executeWorkspaceGenerator = (
         0o644,
       );
     });
-    yield* materialize.pipe(
-      Effect.catchAll((cause) =>
-        (ownsDestination ? fileSystem.remove(destination) : Effect.void).pipe(
-          Effect.either,
-          Effect.flatMap((cleanup) =>
-            cleanup._tag === "Right"
-              ? Effect.fail(cause)
-              : Effect.fail(
-                  new BoundaryError({
-                    boundary: "generator",
-                    message: `workspace generation failed and destination cleanup failed: ${String(cause)}; ${cleanup.left.message}`,
-                    retryable: false,
-                  }),
-                ),
-          ),
-        ),
-      ),
+    yield* fileSystem.makeDirectory(parentPath(destination));
+    yield* Effect.acquireUseRelease(
+      fileSystem.createExclusiveDirectory(destination),
+      (ownsDestination) =>
+        ownsDestination
+          ? materialize
+          : Effect.fail(failure("workspace destination already exists")),
+      (ownsDestination, exit) =>
+        ownsDestination && Exit.isFailure(exit)
+          ? fileSystem.remove(destination).pipe(Effect.orDie)
+          : Effect.void,
     );
     yield* terminal.writeStdout(
       `Generated workspace ${name} at ${destination}\n`,

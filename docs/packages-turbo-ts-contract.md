@@ -1016,10 +1016,13 @@ the identities used for selection, validation, or persistence. Logout invalidate
 token only against an API selected explicitly or persisted by the linked
 project. When the issuing API is unavailable, it skips remote invalidation
 before removing the token while retaining unrelated shared configuration
-fields. `logout --invalidate=false` removes the local token without resolving
-or validating hosted API and login URLs. A non-success response from the
-issuing API still removes the local token and retains unrelated user
-configuration before reporting the remote invalidation failure.
+fields. Logout resolves its effective CLI, environment, or persisted token
+before other hosted settings; without a token it skips API and timeout
+validation before retaining unrelated shared configuration fields.
+`logout --invalidate=false` removes the local token without resolving or
+validating hosted API and login URLs. A non-success response from the issuing
+API still removes the local token and retains unrelated user configuration
+before reporting the remote invalidation failure.
 
 Remote cache control and artifact traffic supports team IDs and slugs,
 preflight, bounded responses, separate download and upload timeouts, safe
@@ -1140,8 +1143,10 @@ requests, explicit zero disables the request timer, while every positive timeout
 is converted to at least one millisecond.
 Microfrontend configuration is selected only from the explicit `--cwd`, or the
 process working directory when the option is absent, and its package ancestors
-after platform-aware canonical path normalization. The repository root package
-remains eligible to own the selected microfrontend configuration.
+after platform-aware canonical path normalization. Only JavaScript package
+scopes participate in selection; co-located Cargo and uv scopes are excluded.
+The repository root package remains eligible to own the selected microfrontend
+configuration.
 Absolute workspace generator destinations are used directly, while relative
 destinations resolve from the repository root. All generator destinations are
 validated through canonical existing ancestors, and recursive copies whose
@@ -1154,12 +1159,12 @@ valueless and rejects attached values. Copied workspace templates require an
 object `package.json`, preserve its other fields, and atomically rewrite `name`
 to the requested workspace name. Workspace type accepts only `app` or `package`
 and is validated before a destination is created. Failed template validation,
-copies, or manifest rewrites remove the partial destination only when the
-generator acquired that destination exclusively, so a concurrently created
-destination is preserved. Configured generators collect unresolved prompt
-answers through the terminal before evaluating actions and fail without writing
-when those answers are unavailable non-interactively. Generator results use a
-nonce-scoped length-delimited frame, while ordinary configuration and action
+copies, manifest rewrites, or interruption remove the partial destination only
+when the generator acquired that destination exclusively, so a concurrently
+created destination is preserved. Configured generators collect unresolved
+prompt answers through the terminal before evaluating actions and fail without
+writing when those answers are unavailable non-interactively. Generator results
+use a nonce-scoped length-delimited frame, while ordinary configuration and action
 stdout and stderr are forwarded separately. Workspace example template path
 selection and workspace dependency selection, including the visibility change
 requested by `--show-all-dependencies`, remain planned. Update

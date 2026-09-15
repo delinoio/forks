@@ -606,7 +606,10 @@ const readMicrofrontendPort = (
       rootTurboJson: parsed.options.rootTurboJson,
     });
     const currentCwd = yield* fileSystem.realPath(requestedCwd);
-    const packages = [repository.rootPackage, ...repository.packages];
+    const packages = [repository.rootPackage, ...repository.packages].filter(
+      (packageModel) =>
+        packageModel.manager !== "cargo" && packageModel.manager !== "uv",
+    );
     const currentPackage = selectCurrentPackage(
       packages,
       currentCwd,
