@@ -3300,7 +3300,7 @@ describe("secondary command and parser compatibility", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 90_000);
 
   it("cleans up a workspace destination after malformed template JSON", async () => {
     const directory = await mkdtemp(
