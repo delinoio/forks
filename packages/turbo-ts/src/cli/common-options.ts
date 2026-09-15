@@ -168,6 +168,9 @@ export const parseCommonArguments = (
         noUpdateNotifier = true;
         break;
       case "--preflight":
+        if (argument !== name) {
+          throw configurationFailure(`${name} does not accept a value`);
+        }
         preflight = true;
         break;
       case "--remote-cache-timeout": {
@@ -255,6 +258,9 @@ export const parseCommonArguments = (
         let value: string;
         [value, index] = requiredValue(arguments_, index, name);
         otelInterval = nonNegativeInteger(value, "OTLP interval");
+        if (otelInterval > maximumNodeTimerMilliseconds) {
+          throw configurationFailure(`invalid OTLP interval: ${value}`);
+        }
         break;
       }
       case "--experimental-otel-header": {

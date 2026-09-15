@@ -1018,7 +1018,8 @@ or validating hosted API and login URLs.
 Remote cache control and artifact traffic supports team IDs and slugs,
 preflight, bounded responses, separate download and upload timeouts, safe
 redirects, idempotent retries for transient and rate-limit responses, event
-records, and optional HMAC signatures. Redirects reject credentials,
+records, and optional HMAC signatures. The `--preflight` option is valueless
+and rejects attached values. Redirects reject credentials,
 unsupported protocols, and HTTPS downgrades, and remove authorization,
 cookies, API keys, tokens, credentials, secrets, signatures, and all other
 caller-provided custom headers before crossing an origin. Only safe
@@ -1049,7 +1050,8 @@ takes precedence over a root remote-cache team ID, and its team slug takes prece
 remote-cache team slug. Remote cache hit events are emitted only after signature
 verification, decompression, and archive restoration succeed. Remote cache hit
 and miss event reporting runs as supervised best-effort background work and does
-not delay restoration or local task execution.
+not delay restoration or local task execution. Pending event work is drained
+before the run scope closes.
 Write-only remote publication issues an artifact HEAD request before upload,
 skips PUT when the artifact already exists, and warns but continues to PUT when
 the existence check fails.
@@ -1059,11 +1061,13 @@ alert timestamp, preserves valid identity across enable and disable operations,
 and applies `TURBO_TELEMETRY_DISABLED` as an effective opt-out without
 destroying the persisted preference. Disabling telemetry replaces unreadable or
 schema-invalid persisted state with a fresh disabled identity; enabling and
-status inspection continue to reject invalid state. OTLP run metrics support HTTP/JSON,
-HTTP/Protobuf, and HTTP/2 gRPC framing with required successful gRPC trailers,
-bounded request timeouts, environment and CLI headers, resource attributes,
-run-summary and task-detail selection, and an explicit opt-in to reuse the
-resolved remote cache token. Configured headers cannot replace the required
+status inspection continue to reject invalid state. OTLP run metrics support
+HTTP/JSON, HTTP/Protobuf, and HTTP/2 gRPC framing with bounded request timeouts,
+environment and CLI headers, resource attributes, run-summary and task-detail
+selection, and an explicit opt-in to reuse the resolved remote cache token.
+Data-bearing gRPC responses require a successful status in the trailing header
+block; true trailers-only responses may carry their status in the initial
+header block. Configured headers cannot replace the required
 content type or gRPC trailer negotiation header. Every exported run and task
 gauge point carries the export observation time in Unix nanoseconds. Task-detail
 metrics report actual execution and cache outcomes. Periodic snapshots omit
@@ -1073,7 +1077,7 @@ attributes use OTLP integer values for every protocol. Environment header names
 and values are percent-decoded after comma-separated entries are split, so an
 encoded comma remains part of its header value. Malformed percent encodings are
 preserved literally. Empty, zero, non-finite, and over-limit environment OTLP
-timeouts use the finite default. CLI timeout values above Node's
+timeouts use the finite default. CLI timeout and interval values above Node's
 2,147,483,647-millisecond timer limit are rejected during argument parsing. A
 generic HTTP OTLP endpoint preserves its
 path prefix and appends `/v1/metrics`. A positive metric interval emits scoped,
@@ -1102,7 +1106,9 @@ normal package-selector semantics. `--ignore=prompt` asks once before ignoring
 found violations, accepts only `y` or `yes`, skips prompting when no violation
 exists, and fails safely without an interactive terminal. Hidden `config`
 suppresses lower-precedence team IDs when a CLI or environment team slug is
-selected and validates the effective API and login URLs before rendering them.
+selected, applies `TURBO_CACHE_DIR` and `TURBO_CONCURRENCY` before repository
+configuration, and validates the effective API and login URLs before rendering
+them.
 Remote download and upload timeouts use CLI, environment, configuration, and
 default values in descending precedence and reject negative, empty, or
 non-finite environment values. Networked hosted commands use the remote cache

@@ -10,6 +10,7 @@ import {
 import {
   headRemoteCache,
   type RemoteCacheOptions,
+  recordRemoteCacheEvent,
   restoreRemoteCache,
   verifyRemoteCacheStatus,
   writeRemoteCache,
@@ -183,6 +184,11 @@ type WriteStructuredRecord = (
 type OutputPermit = <A, E, R>(
   output: Effect.Effect<A, E, R>,
 ) => Effect.Effect<A, E, R>;
+
+type ReportRemoteCacheEvent = (
+  hash: string,
+  event: "HIT" | "MISS",
+) => Effect.Effect<void, never, HttpService | RetryScheduleService>;
 
 export const resolveRunUiMode = (
   requested: ResolvedRunOptions["ui"],
@@ -2577,6 +2583,7 @@ const executeTask = (
   logIdentifier = node.task,
   withOutputPermit: OutputPermit = (output) => output,
   writeStructuredRecord: WriteStructuredRecord = () => Effect.void,
+  reportRemoteCacheEvent: ReportRemoteCacheEvent = () => Effect.void,
 ): Effect.Effect<TaskExecutionResult, unknown, RunRequirements | Scope.Scope> =>
   Effect.gen(function* () {
     const terminal = yield* TerminalService;
@@ -2798,6 +2805,9 @@ const executeTask = (
           cacheTimeSaved = duration;
         },
       ).pipe(
+        Effect.tap((restored) =>
+          reportRemoteCacheEvent(hash.hash, restored ? "HIT" : "MISS"),
+        ),
         Effect.catchTag("CacheError", (error) =>
           writeTaskWarning(
             `remote cache restore failed for ${taskLabel}; executing task locally: ${error.message}`,
@@ -4539,6 +4549,26 @@ export const executeRun = (
       orderedNodes.map((node) => [node.id, "queued"]),
     );
     const tuiSemaphore = yield* Effect.makeSemaphore(1);
+    const remoteCacheEventScope = yield* Effect.scope;
+    const remoteCacheEventFibers: Array<Fiber.RuntimeFiber<void, never>> = [];
+    const remoteCacheEventOptions = options.remote;
+    const reportRemoteCacheEvent: ReportRemoteCacheEvent =
+      remoteCacheEventOptions === undefined
+        ? () => Effect.void
+        : (hash, event) =>
+            recordRemoteCacheEvent(remoteCacheEventOptions, hash, event).pipe(
+              Effect.ignore,
+              Effect.forkIn(remoteCacheEventScope),
+              Effect.tap((fiber) =>
+                Effect.sync(() => {
+                  remoteCacheEventFibers.push(fiber);
+                }),
+              ),
+              Effect.asVoid,
+            );
+    const flushRemoteCacheEvents = Effect.suspend(() =>
+      Fiber.joinAll(remoteCacheEventFibers).pipe(Effect.asVoid),
+    );
     const updateTuiStatus = (
       id: string,
       status: RunTuiStatus,
@@ -4599,6 +4629,7 @@ export const executeRun = (
                   logIdentifiers.get(id),
                   withOutputPermit,
                   writeStructuredRecord,
+                  reportRemoteCacheEvent,
                 ).pipe(
                   Effect.catchAll((cause) =>
                     cause instanceof CacheRollbackError
@@ -4906,7 +4937,7 @@ export const executeRun = (
           }
         }
       }),
-    );
+    ).pipe(Effect.ensuring(flushRemoteCacheEvents));
     const runFinishedAt = yield* (yield* ClockService).now;
     const exitCode = [...outcomes.values()].some(
       (outcome) => outcome.exitCode !== 0,
@@ -5087,6 +5118,7 @@ export const executeRun = (
     reportTaskMetrics(true);
     return exitCode;
   }).pipe(
+    Effect.scoped,
     Effect.onExit(() =>
       retainGeneratedStructuredLog
         ? Effect.void

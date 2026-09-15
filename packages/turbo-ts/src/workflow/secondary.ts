@@ -144,6 +144,9 @@ const executeConfig = (
     const environmentUploadTimeout = yield* environmentValue(
       "TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT",
     );
+    const environmentCacheDirectory =
+      yield* environmentValue("TURBO_CACHE_DIR");
+    const environmentConcurrency = yield* environmentValue("TURBO_CONCURRENCY");
     const remoteConfiguration = global?.remoteCache;
     const apiUrl = hostedUrl(
       parsed.options.apiUrl ??
@@ -210,8 +213,8 @@ const executeConfig = (
       envMode: global?.envMode ?? "strict",
       scmBase: (yield* environmentValue("TURBO_SCM_BASE")) ?? null,
       scmHead: (yield* environmentValue("TURBO_SCM_HEAD")) ?? null,
-      cacheDir: global?.cacheDir ?? ".turbo/cache",
-      concurrency: global?.concurrency ?? null,
+      cacheDir: environmentCacheDirectory ?? global?.cacheDir ?? ".turbo/cache",
+      concurrency: environmentConcurrency ?? global?.concurrency ?? null,
     };
     yield* terminal.writeStdout(`${JSON.stringify(output, null, 2)}\n`);
     return 0;

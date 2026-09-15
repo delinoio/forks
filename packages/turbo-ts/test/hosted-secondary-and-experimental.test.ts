@@ -2127,6 +2127,15 @@ describe("secondary command and parser compatibility", () => {
         "does not accept a value",
       );
     }
+    for (const attachedPreflight of [
+      "--preflight=",
+      "--preflight=false",
+      "--preflight=true",
+    ]) {
+      expect(() => parseCommonArguments([attachedPreflight])).toThrow(
+        "does not accept a value",
+      );
+    }
     expect(parseDevtoolsArguments(["--no-open"]).noOpen).toBe(true);
     for (const attachedNoOpen of [
       "--no-open=",
@@ -2144,6 +2153,13 @@ describe("secondary command and parser compatibility", () => {
     expect(() =>
       parseCommonArguments(["--experimental-otel-timeout-ms=2147483648"]),
     ).toThrow("invalid OTLP timeout: 2147483648");
+    expect(
+      parseCommonArguments(["--experimental-otel-interval-ms=2147483647"])
+        .options.openTelemetry.intervalMilliseconds,
+    ).toBe(2_147_483_647);
+    expect(() =>
+      parseCommonArguments(["--experimental-otel-interval-ms=2147483648"]),
+    ).toThrow("invalid OTLP interval: 2147483648");
     expect(resolveHostedTimeoutMilliseconds(undefined, "12.5")).toBe(12_500);
     expect(resolveHostedTimeoutMilliseconds(1.25, "12.5")).toBe(1_250);
     expect(resolveHostedTimeoutMilliseconds(undefined, undefined)).toBe(30_000);
@@ -2628,12 +2644,16 @@ describe("secondary command and parser compatibility", () => {
         ["config", `--cwd=${root}`],
         root,
         {
+          TURBO_CACHE_DIR: "environment-cache",
+          TURBO_CONCURRENCY: "75%",
           TURBO_REMOTE_CACHE_TIMEOUT: "12.5",
           TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: "45",
           TURBO_TEAM: "environment-team",
         },
       );
       expect(JSON.parse(environmentConfiguration.stdout)).toMatchObject({
+        cacheDir: "environment-cache",
+        concurrency: "75%",
         teamId: null,
         teamSlug: "environment-team",
         timeout: 12.5,
@@ -3225,6 +3245,7 @@ describe("hosted protocols and experimental transports", () => {
           "synthetic-hash",
         );
         yield* recordRemoteCacheEvent(options, "synthetic-hash", "MISS");
+        yield* recordRemoteCacheEvent(options, "synthetic-hash", "HIT");
         return { enabled, present };
       }).pipe(Effect.provide(Layer.merge(httpLayer, deterministicRetryLayer))),
     );
@@ -3235,24 +3256,27 @@ describe("hosted protocols and experimental transports", () => {
     expect(
       requests.some((request) => request.url.endsWith("?slug=other-synthetic")),
     ).toBe(true);
-    const event = requests.find((request) => request.method === "POST");
-    expect(event?.url).toBe(
-      "https://cache.invalid/api/v8/artifacts/events?teamId=team_synthetic",
-    );
-    expect(JSON.parse(String(event?.body))).toEqual([
-      {
-        duration: 0,
-        event: "MISS",
-        hash: "synthetic-hash",
-        sessionId: "01992345-6789-7abc-8def-0123456789ab",
-        source: "REMOTE",
-      },
-    ]);
-    expect(event?.headers).toMatchObject({
-      authorization: "Bearer synthetic-token",
-      "content-type": "application/json",
-      "user-agent": "turbo-ts/0.1.0",
-    });
+    const events = requests.filter((request) => request.method === "POST");
+    expect(events).toHaveLength(2);
+    for (const [index, event] of events.entries()) {
+      expect(event.url).toBe(
+        "https://cache.invalid/api/v8/artifacts/events?teamId=team_synthetic",
+      );
+      expect(JSON.parse(String(event.body))).toEqual([
+        {
+          duration: 0,
+          event: index === 0 ? "MISS" : "HIT",
+          hash: "synthetic-hash",
+          sessionId: "01992345-6789-7abc-8def-0123456789ab",
+          source: "REMOTE",
+        },
+      ]);
+      expect(event.headers).toMatchObject({
+        authorization: "Bearer synthetic-token",
+        "content-type": "application/json",
+        "user-agent": "turbo-ts/0.1.0",
+      });
+    }
   });
 
   it("disables remote artifact traffic unless status is exactly enabled", async () => {
@@ -3783,28 +3807,40 @@ describe("hosted protocols and experimental transports", () => {
       readonly headers: Readonly<Record<string, unknown>>;
     }> = [];
     let grpcStatus = "0";
+    let statusInInitialHeaders = false;
+    let responseBody = Buffer.alloc(5);
     const server = createHttp2Server();
     server.on("stream", (stream, headers) => {
       const chunks: Array<Buffer> = [];
       stream.on("data", (chunk: Buffer) => chunks.push(chunk));
       stream.on("end", () => {
         requests.push({ body: Buffer.concat(chunks), headers });
-        stream.respond(
-          {
-            [http2Constants.HTTP2_HEADER_STATUS]: 200,
-            [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
-          },
-          { waitForTrailers: true },
-        );
-        stream.on("wantTrailers", () =>
-          stream.sendTrailers({
-            "grpc-status": grpcStatus,
-            ...(grpcStatus === "0"
-              ? {}
-              : { "grpc-message": "permission%20denied" }),
-          }),
-        );
-        stream.end(Buffer.alloc(5));
+        const responseHeaders = {
+          [http2Constants.HTTP2_HEADER_STATUS]: 200,
+          [http2Constants.HTTP2_HEADER_CONTENT_TYPE]: "application/grpc",
+          ...(statusInInitialHeaders
+            ? {
+                "grpc-status": grpcStatus,
+                ...(grpcStatus === "0"
+                  ? {}
+                  : { "grpc-message": "permission%20denied" }),
+              }
+            : {}),
+        };
+        if (statusInInitialHeaders) {
+          stream.respond(responseHeaders);
+        } else {
+          stream.respond(responseHeaders, { waitForTrailers: true });
+          stream.on("wantTrailers", () =>
+            stream.sendTrailers({
+              "grpc-status": grpcStatus,
+              ...(grpcStatus === "0"
+                ? {}
+                : { "grpc-message": "permission%20denied" }),
+            }),
+          );
+        }
+        stream.end(responseBody);
       });
     });
     await new Promise<void>((resolve, reject) => {
@@ -3857,6 +3893,28 @@ describe("hosted protocols and experimental transports", () => {
       expect(failed._tag).toBe("Left");
       if (failed._tag === "Right") throw new Error("expected gRPC failure");
       expect(failed.left.message).toContain("permission denied");
+
+      grpcStatus = "0";
+      statusInInitialHeaders = true;
+      const missingTrailers = await Effect.runPromise(
+        Effect.either(
+          exportRunMetrics(options, undefined, summary).pipe(
+            Effect.provide(nodeFoundationLayer),
+          ),
+        ),
+      );
+      expect(missingTrailers._tag).toBe("Left");
+      if (missingTrailers._tag === "Right") {
+        throw new Error("expected missing gRPC trailers to fail");
+      }
+      expect(missingTrailers.left.message).toContain("gRPC status is missing");
+
+      responseBody = Buffer.alloc(0);
+      await Effect.runPromise(
+        exportRunMetrics(options, undefined, summary).pipe(
+          Effect.provide(nodeFoundationLayer),
+        ),
+      );
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }

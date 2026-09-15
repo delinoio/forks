@@ -3414,6 +3414,7 @@ const requestWithHttp2 = (
     let settled = false;
     let status: number | undefined;
     const responseHeaders: Record<string, string> = {};
+    const responseTrailers: Record<string, string> = {};
     const chunks: Array<Buffer> = [];
     let responseLength = 0;
     const complete = (cause?: unknown) => {
@@ -3432,6 +3433,7 @@ const requestWithHttp2 = (
       resolve({
         status,
         headers: responseHeaders,
+        trailers: responseTrailers,
         body: new Uint8Array(Buffer.concat(chunks)),
       });
     };
@@ -3456,18 +3458,21 @@ const requestWithHttp2 = (
     });
     const recordHeaders = (
       headers: Readonly<Record<string, string | string[] | number | undefined>>,
+      destination: Record<string, string>,
     ) => {
       const responseStatus = headers[http2Constants.HTTP2_HEADER_STATUS];
       if (typeof responseStatus === "number") status = responseStatus;
       for (const [name, value] of Object.entries(headers)) {
         if (name.startsWith(":") || value === undefined) continue;
-        responseHeaders[name.toLowerCase()] = Array.isArray(value)
+        destination[name.toLowerCase()] = Array.isArray(value)
           ? value.join(", ")
           : String(value);
       }
     };
-    stream.on("response", recordHeaders);
-    stream.on("trailers", recordHeaders);
+    stream.on("response", (headers) => recordHeaders(headers, responseHeaders));
+    stream.on("trailers", (headers) =>
+      recordHeaders(headers, responseTrailers),
+    );
     stream.on("data", (chunk: Buffer) => {
       if (settled) return;
       responseLength += chunk.length;

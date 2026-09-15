@@ -1,4 +1,3 @@
-import type { Scope } from "effect";
 import { Effect, Schedule } from "effect";
 import { joinPath } from "../core/path.js";
 import { CacheError, CacheRollbackError } from "../effect/errors.js";
@@ -270,21 +269,6 @@ export const recordRemoteCacheEvent = (
     }
   });
 
-const dispatchRemoteCacheEvent = (
-  options: RemoteCacheOptions,
-  hash: string,
-  event: "HIT" | "MISS",
-): Effect.Effect<
-  void,
-  never,
-  HttpService | RetryScheduleService | Scope.Scope
-> =>
-  recordRemoteCacheEvent(options, hash, event).pipe(
-    Effect.ignore,
-    Effect.forkScoped,
-    Effect.asVoid,
-  );
-
 export const restoreRemoteCache = (
   root: string,
   options: RemoteCacheOptions,
@@ -300,7 +284,6 @@ export const restoreRemoteCache = (
   | FileSystemService
   | RetryScheduleService
   | SigningService
-  | Scope.Scope
 > =>
   Effect.gen(function* () {
     const http = yield* HttpService;
@@ -425,7 +408,6 @@ export const restoreRemoteCache = (
             : remoteError(url, error.message),
         ),
       );
-    yield* dispatchRemoteCacheEvent(options, hash, restored ? "HIT" : "MISS");
     return restored;
   });
 

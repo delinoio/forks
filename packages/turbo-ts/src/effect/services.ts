@@ -266,6 +266,7 @@ export interface HttpRequest {
 export interface HttpResponse {
   readonly status: number;
   readonly headers: Readonly<Record<string, string>>;
+  readonly trailers?: Readonly<Record<string, string>>;
   readonly body: Uint8Array;
 }
 

@@ -444,8 +444,14 @@ export const exportRunMetrics = (
         }),
       );
     }
-    if (protocol === "grpc" && response.headers["grpc-status"] !== "0") {
-      const encodedMessage = response.headers["grpc-message"];
+    const grpcStatusHeaders =
+      response.trailers?.["grpc-status"] !== undefined
+        ? response.trailers
+        : response.body.length === 0
+          ? response.headers
+          : response.trailers;
+    if (protocol === "grpc" && grpcStatusHeaders?.["grpc-status"] !== "0") {
+      const encodedMessage = grpcStatusHeaders?.["grpc-message"];
       let message = encodedMessage ?? "gRPC status is missing";
       if (encodedMessage !== undefined) {
         try {
