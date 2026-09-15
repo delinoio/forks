@@ -449,7 +449,10 @@ export const resolveOptions = (
       message: `invalid UI mode: ${configuredUi}`,
     });
   }
-  const configuredLogOrder = environmentValue("TURBO_LOG_ORDER");
+  const configuredLogOrder =
+    parsed.logOrder === undefined
+      ? environmentValue("TURBO_LOG_ORDER")
+      : undefined;
   if (
     configuredLogOrder !== undefined &&
     configuredLogOrder !== "auto" &&
@@ -461,7 +464,10 @@ export const resolveOptions = (
       message: `invalid log order: ${configuredLogOrder}`,
     });
   }
-  const configuredLogPrefix = environmentValue("TURBO_LOG_PREFIX");
+  const configuredLogPrefix =
+    parsed.logPrefix === undefined
+      ? environmentValue("TURBO_LOG_PREFIX")
+      : undefined;
   if (
     configuredLogPrefix !== undefined &&
     configuredLogPrefix !== "auto" &&
@@ -618,8 +624,9 @@ export const resolveOptions = (
         parsed.team === undefined && configuredTeamSlug === undefined
           ? (environmentValue("TURBO_TEAMID") ??
             storedCredentials.project?.teamId ??
-            remoteConfiguration?.teamId ??
-            undefined)
+            (storedCredentials.project?.teamSlug === undefined
+              ? (remoteConfiguration?.teamId ?? undefined)
+              : undefined))
           : undefined,
       teamSlug:
         parsed.team ??

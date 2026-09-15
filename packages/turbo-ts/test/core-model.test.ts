@@ -1061,6 +1061,42 @@ version = "1.0.0"
     ).toThrow("invalid UI mode");
   });
 
+  it("lets explicit log settings override invalid environment values", () => {
+    const model = repository([]);
+    const options = resolveOptions(
+      parseRunArguments([
+        "run",
+        "build",
+        "--log-order=stream",
+        "--log-prefix=task",
+      ]),
+      model.root,
+      {
+        TURBO_LOG_ORDER: "invalid",
+        TURBO_LOG_PREFIX: "invalid",
+      },
+      model.rootConfiguration,
+      8,
+    );
+    expect(options.logOrder).toBe("stream");
+    expect(options.logPrefix).toBe("task");
+
+    for (const [name, message] of [
+      ["TURBO_LOG_ORDER", "invalid log order"],
+      ["TURBO_LOG_PREFIX", "invalid log prefix"],
+    ] as const) {
+      expect(() =>
+        resolveOptions(
+          parseRunArguments(["run", "build"]),
+          model.root,
+          { [name]: "invalid" },
+          model.rootConfiguration,
+          8,
+        ),
+      ).toThrow(message);
+    }
+  });
+
   it("rejects remote cache timeouts above the Node timer limit", () => {
     const model = repository([]);
     const parsed = parseRunArguments([
@@ -1221,6 +1257,24 @@ version = "1.0.0"
     expect(linked.remote?.apiUrl).toBe("https://linked.example.test/api");
     expect(linked.remote?.teamId).toBe("linked-team-id");
     expect(linked.remote?.teamSlug).toBe("linked-team-slug");
+
+    const linkedSlug = resolveOptions(
+      parseRunArguments(["run", "build"]),
+      model.root,
+      {},
+      configuration,
+      8,
+      false,
+      {
+        token: "synthetic-token",
+        project: {
+          apiUrl: "https://linked.example.test/api",
+          teamSlug: "linked-team-slug",
+        },
+      },
+    );
+    expect(linkedSlug.remote?.teamId).toBeUndefined();
+    expect(linkedSlug.remote?.teamSlug).toBe("linked-team-slug");
 
     const environment = resolveOptions(
       parseRunArguments(["run", "build"]),

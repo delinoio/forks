@@ -2908,6 +2908,17 @@ describe("secondary command and parser compatibility", () => {
         timeout: 12.5,
         uploadTimeout: 45,
       });
+      for (const invalidConcurrency of ["0", "bogus"]) {
+        const invalidConfigConcurrency = await runCandidate(
+          ["config", `--cwd=${root}`],
+          root,
+          { TURBO_CONCURRENCY: invalidConcurrency },
+        );
+        expect(invalidConfigConcurrency.code).toBe(1);
+        expect(invalidConfigConcurrency.stderr).toContain(
+          `invalid concurrency: ${invalidConcurrency}`,
+        );
+      }
       const invalidConfigTimeout = await runCandidate(
         ["config", `--cwd=${root}`],
         root,
@@ -3004,6 +3015,10 @@ describe("secondary command and parser compatibility", () => {
                       url: "http://[",
                     },
                     {
+                      title: "Credential-bearing remote result",
+                      url: "https://user:synthetic-docs-password@example.invalid/guide",
+                    },
+                    {
                       title:
                         "Synthetic\u001b]52;c;payload\u0007\u009b31m guide",
                       url: "https://example.invalid/guide",
@@ -3029,6 +3044,8 @@ describe("secondary command and parser compatibility", () => {
             "Found 1 results for 'synthetic query'",
           );
           expect(docs.stdout).not.toContain("Malformed remote result");
+          expect(docs.stdout).not.toContain("Credential-bearing remote result");
+          expect(docs.stdout).not.toContain("synthetic-docs-password");
           expect(docs.stdout).toContain(
             "Synthetic\\u001b]52;c;payload\\u0007\\u009b31m guide",
           );

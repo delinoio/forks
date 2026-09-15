@@ -170,8 +170,10 @@ remove a concurrent publication. Local duration metadata reads are limited to
 Cache writes independently limit file content
 and tar metadata overhead to 64 MiB each. Cache output files are read
 sequentially against the remaining content budget, so growth after a metadata
-snapshot cannot exceed the collection bound. Cache publication is serialized
-within a run to bound writer memory independently of task concurrency. Remote
+snapshot cannot exceed the collection bound. Cache output collection and
+publication use up to 10 workers by default; `--cache-workers` overrides
+`TURBO_CACHE_WORKERS` with a positive integer to bound writer memory
+independently of task concurrency. Remote
 downloads, signature verification, and decompression use scoped files so
 concurrent cache hits do not retain or duplicate complete compressed response
 bodies in memory. Blank remote-cache timeout values are invalid. Run-option

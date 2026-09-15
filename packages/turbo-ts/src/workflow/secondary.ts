@@ -11,6 +11,7 @@ import {
 import { parseNodeTimerSeconds } from "../core/time.js";
 import { BoundaryError, ConfigurationError } from "../effect/errors.js";
 import {
+  ConcurrencyService,
   CredentialService,
   EnvironmentService,
   FileSystemService,
@@ -19,6 +20,7 @@ import {
   TerminalService,
 } from "../effect/services.js";
 import { selectPackages } from "../graph/task-graph.js";
+import { parseConcurrency } from "../run/options.js";
 import { packageVersion } from "../version.js";
 import { hostedUrl, resolveHostedTimeoutMilliseconds } from "./hosted.js";
 import { boundaryDiagnostics } from "./query.js";
@@ -111,6 +113,7 @@ const executeConfig = (
   number,
   unknown,
   | CredentialService
+  | ConcurrencyService
   | EnvironmentService
   | FileSystemService
   | ProcessService
@@ -153,6 +156,15 @@ const executeConfig = (
     const environmentCacheDirectory =
       yield* environmentValue("TURBO_CACHE_DIR");
     const environmentConcurrency = yield* environmentValue("TURBO_CONCURRENCY");
+    const effectiveConcurrency =
+      environmentConcurrency ?? global?.concurrency ?? undefined;
+    if (effectiveConcurrency !== undefined) {
+      const concurrency = yield* ConcurrencyService;
+      parseConcurrency(
+        effectiveConcurrency,
+        yield* concurrency.availableParallelism,
+      );
+    }
     const environmentUi =
       parsed.options.ui === undefined
         ? yield* environmentValue("TURBO_UI")
@@ -235,7 +247,7 @@ const executeConfig = (
       scmBase: (yield* environmentValue("TURBO_SCM_BASE")) ?? null,
       scmHead: (yield* environmentValue("TURBO_SCM_HEAD")) ?? null,
       cacheDir: environmentCacheDirectory ?? global?.cacheDir ?? ".turbo/cache",
-      concurrency: environmentConcurrency ?? global?.concurrency ?? null,
+      concurrency: effectiveConcurrency ?? null,
     };
     yield* terminal.writeStdout(`${JSON.stringify(output, null, 2)}\n`);
     return 0;
@@ -495,11 +507,14 @@ const executeDocs = (
       try {
         const url =
           "url" in result
-            ? new URL(String(result.url), endpoint.origin).toString()
+            ? new URL(String(result.url), endpoint.origin)
             : "href" in result
-              ? new URL(String(result.href), endpoint.origin).toString()
-              : "";
-        return [{ title, url }];
+              ? new URL(String(result.href), endpoint.origin)
+              : undefined;
+        if (url !== undefined && (url.username !== "" || url.password !== "")) {
+          return [];
+        }
+        return [{ title, url: url?.toString() ?? "" }];
       } catch {
         return [];
       }
