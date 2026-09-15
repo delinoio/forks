@@ -145,7 +145,9 @@ const executeConfig = (
     const environmentTeamSlugValue = yield* environmentValue("TURBO_TEAM");
     const environmentTeamSlug =
       environmentTeamSlugValue === "" ? undefined : environmentTeamSlugValue;
-    const environmentTeamId = yield* environmentValue("TURBO_TEAMID");
+    const environmentTeamIdValue = yield* environmentValue("TURBO_TEAMID");
+    const environmentTeamId =
+      environmentTeamIdValue === "" ? undefined : environmentTeamIdValue;
     const project =
       (parsed.options.apiUrl ?? environmentApiUrl) !== undefined &&
       (parsed.options.team ?? environmentTeamSlug) !== undefined

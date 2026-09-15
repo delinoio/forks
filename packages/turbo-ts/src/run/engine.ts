@@ -757,6 +757,7 @@ export interface RunMetricSnapshot {
 
 interface RunExecutionContext {
   readonly changedPaths?: ReadonlyArray<string>;
+  readonly onFinalTaskMetricsResolved?: (snapshot: RunMetricSnapshot) => void;
   readonly onRemoteTokenResolved?: (token: string | undefined) => void;
   readonly onTaskMetricsResolved?: (snapshot: RunMetricSnapshot) => void;
 }
@@ -4220,8 +4221,11 @@ export const executeRun = (
     );
     const outcomes = new Map<string, TaskOutcome>();
     const metricOutcomes = new Map<string, TaskOutcome>();
-    const reportTaskMetrics = (includeUnresolved = false): void =>
-      context.onTaskMetricsResolved?.({
+    const reportTaskMetrics = (
+      callback: ((snapshot: RunMetricSnapshot) => void) | undefined,
+      includeUnresolved = false,
+    ): void =>
+      callback?.({
         taskCount: orderedNodes.length,
         tasks: orderedNodes.flatMap((node) => {
           const outcome = metricOutcomes.get(node.id);
@@ -4253,7 +4257,14 @@ export const executeRun = (
           ];
         }),
       });
-    reportTaskMetrics();
+    const reportIncrementalTaskMetrics = (): void =>
+      reportTaskMetrics(context.onTaskMetricsResolved);
+    const reportFinalTaskMetrics = (): void =>
+      reportTaskMetrics(
+        context.onFinalTaskMetricsResolved ?? context.onTaskMetricsResolved,
+        true,
+      );
+    reportIncrementalTaskMetrics();
     const globalInputFileHashes =
       orderedNodes[0] === undefined
         ? yield* hashGlobalInputFiles(
@@ -4272,7 +4283,7 @@ export const executeRun = (
           normalizePath(repository.root, platform === "win32"),
       );
     if (parsed.graph !== undefined) {
-      reportTaskMetrics(true);
+      reportFinalTaskMetrics();
       const edges = orderedNodes.flatMap((node) =>
         node.dependencies.length === 0
           ? ([[node.id, "___ROOT___"]] as const)
@@ -4375,7 +4386,7 @@ export const executeRun = (
         };
     const globalExternalDependenciesHash = externalDependencyHashes.global;
     if (parsed.dryRun !== undefined) {
-      reportTaskMetrics(true);
+      reportFinalTaskMetrics();
       const terminal = yield* TerminalService;
       if (parsed.dryRun === "json") {
         yield* terminal.writeStdout(
@@ -4854,7 +4865,7 @@ export const executeRun = (
                         Effect.sync(() => {
                           groupOutcomes.set(outcome.id, outcome);
                           metricOutcomes.set(outcome.id, outcome);
-                          reportTaskMetrics();
+                          reportIncrementalTaskMetrics();
                         }),
                       ),
                     ),
@@ -4969,7 +4980,7 @@ export const executeRun = (
             outcomes.set(result.id, result);
             metricOutcomes.set(result.id, result);
           }
-          reportTaskMetrics();
+          reportIncrementalTaskMetrics();
           if (
             options.continueMode === "never" &&
             results.some((result) => result.exitCode !== 0)
@@ -5156,7 +5167,7 @@ export const executeRun = (
     if (parsed.json) {
       yield* terminal.writeStdout(`${JSON.stringify(summaryRecord)}\n`);
     }
-    reportTaskMetrics(true);
+    reportFinalTaskMetrics();
     return exitCode;
   }).pipe(
     Effect.scoped,

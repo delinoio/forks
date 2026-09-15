@@ -66,6 +66,7 @@ import {
   encodeOtlpMetrics,
   exportRunMetrics,
   makeOtlpJsonMetrics,
+  runMetricsEnabled,
 } from "../src/telemetry/observability.js";
 import { browserInvocation } from "../src/workflow/browser.js";
 import {
@@ -2302,7 +2303,7 @@ describe("secondary command and parser compatibility", () => {
     }
   }, 30_000);
 
-  it("treats an empty TURBO_TEAM as unset in config output", async () => {
+  it("treats empty team environment values as unset in config output", async () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-config-team-"));
     const root = join(directory, "repository");
     await prepareRepository(root);
@@ -2319,6 +2320,24 @@ describe("secondary command and parser compatibility", () => {
       expect(configuration.code, configuration.stderr).toBe(0);
       expect(JSON.parse(configuration.stdout)).toMatchObject({
         teamId: "team_environment",
+        teamSlug: null,
+      });
+      await mkdir(join(root, ".turbo"), { recursive: true });
+      await writeFile(
+        join(root, ".turbo/config.json"),
+        JSON.stringify({ teamId: "team_linked" }),
+      );
+      const linkedConfiguration = await runCandidate(
+        ["config", `--cwd=${root}`],
+        root,
+        {
+          XDG_CONFIG_HOME: join(directory, "configuration"),
+          TURBO_TEAMID: "",
+        },
+      );
+      expect(linkedConfiguration.code, linkedConfiguration.stderr).toBe(0);
+      expect(JSON.parse(linkedConfiguration.stdout)).toMatchObject({
+        teamId: "team_linked",
         teamSlug: null,
       });
     } finally {
@@ -4090,6 +4109,24 @@ describe("hosted protocols and experimental transports", () => {
         },
       ],
     };
+    expect(runMetricsEnabled({ headers: [], resources: [] }, undefined)).toBe(
+      false,
+    );
+    expect(
+      runMetricsEnabled(
+        {
+          enabled: true,
+          headers: [],
+          resources: [],
+          metricsRunSummary: false,
+          metricsTaskDetails: false,
+        },
+        undefined,
+      ),
+    ).toBe(false);
+    expect(runMetricsEnabled({ headers: [], resources: [] }, "true")).toBe(
+      true,
+    );
     for (const protocol of ["http-json", "http-protobuf"] as const) {
       await Effect.runPromise(
         exportRunMetrics(
@@ -4138,6 +4175,21 @@ describe("hosted protocols and experimental transports", () => {
         "x-synthetic": "yes",
       });
     }
+    await Effect.runPromise(
+      exportRunMetrics(
+        {
+          enabled: true,
+          protocol: "http-json",
+          endpoint: "http://127.0.0.1:4318",
+          headers: [["authorization", "Basic configured"]],
+          resources: [],
+          useRemoteCacheToken: true,
+        },
+        "",
+        summary,
+      ).pipe(Effect.provide(observabilityLayer)),
+    );
+    expect(requests.at(-1)?.headers?.authorization).toBe("Basic configured");
     const metricSelection = { runSummary: true, taskDetails: true };
     const json = makeOtlpJsonMetrics(
       summary,

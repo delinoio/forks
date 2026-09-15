@@ -7508,6 +7508,7 @@ dependencies = [
     const directory = await makeFixture();
     const packageDirectory = `${directory}/packages/library`;
     const snapshots: Array<RunMetricSnapshot> = [];
+    const finalSnapshots: Array<RunMetricSnapshot> = [];
     try {
       const configurationPath = `${directory}/turbo.json`;
       const configuration = JSON.parse(
@@ -7539,6 +7540,8 @@ dependencies = [
             "--no-cache",
           ]),
           {
+            onFinalTaskMetricsResolved: (snapshot) =>
+              finalSnapshots.push(snapshot),
             onTaskMetricsResolved: (snapshot) => snapshots.push(snapshot),
           },
         ).pipe(Effect.provide(nodeFoundationLayer)),
@@ -7558,6 +7561,19 @@ dependencies = [
             ),
         ),
       ).toBe(true);
+      expect(finalSnapshots).toHaveLength(1);
+      expect(finalSnapshots[0]?.tasks).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "synthetic-library#check",
+            status: "succeeded",
+          }),
+          expect.objectContaining({
+            id: "synthetic-library#serve",
+            status: "succeeded",
+          }),
+        ]),
+      );
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

@@ -25,6 +25,20 @@ interface MetricSelection {
   readonly taskDetails: boolean;
 }
 
+const metricSelection = (options: OpenTelemetryOptions): MetricSelection => ({
+  runSummary: options.metricsRunSummary !== false,
+  taskDetails: options.metricsTaskDetails === true,
+});
+
+export const runMetricsEnabled = (
+  options: OpenTelemetryOptions,
+  environmentEnabled: string | undefined,
+): boolean => {
+  const enabled = options.enabled ?? environmentEnabled === "true";
+  const selection = metricSelection(options);
+  return enabled && (selection.runSummary || selection.taskDetails);
+};
+
 const protocolFromEnvironment = (
   value: string | undefined,
 ): OtlpProtocol | undefined => {
@@ -333,15 +347,14 @@ export const exportRunMetrics = (
   Effect.gen(function* () {
     const environment = yield* EnvironmentService;
     const http = yield* HttpService;
-    const enabled =
-      options.enabled ??
-      (yield* environment.get("TURBO_EXPERIMENTAL_OTEL_ENABLED")) === "true";
-    if (!enabled) return;
-    const selection = {
-      runSummary: options.metricsRunSummary !== false,
-      taskDetails: options.metricsTaskDetails === true,
-    };
-    if (!selection.runSummary && !selection.taskDetails) return;
+    if (
+      !runMetricsEnabled(
+        options,
+        yield* environment.get("TURBO_EXPERIMENTAL_OTEL_ENABLED"),
+      )
+    )
+      return;
+    const selection = metricSelection(options);
     const clock = yield* ClockService;
     const observationTimeUnixNano =
       BigInt(Math.floor(yield* clock.now)) * 1_000_000n;
@@ -392,7 +405,7 @@ export const exportRunMetrics = (
       "user-agent": `turbo-ts/${packageVersion}`,
       ...(protocol === "grpc" ? { te: "trailers" } : {}),
       ...Object.fromEntries(configuredHeaders),
-      ...(options.useRemoteCacheToken === true && token !== undefined
+      ...(options.useRemoteCacheToken === true && token
         ? { authorization: `Bearer ${token}` }
         : {}),
     };

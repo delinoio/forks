@@ -457,6 +457,10 @@ export const cliProgram = Effect.gen(function* () {
             const observability = yield* Effect.promise(
               () => import("../telemetry/observability.js"),
             );
+            const metricsEnabled = observability.runMetricsEnabled(
+              options.openTelemetry,
+              yield* environment.get("TURBO_EXPERIMENTAL_OTEL_ENABLED"),
+            );
             const exportMetrics = (exitCode: number) =>
               observability
                 .exportRunMetrics(options.openTelemetry, remoteToken, {
@@ -466,38 +470,44 @@ export const cliProgram = Effect.gen(function* () {
                 })
                 .pipe(Effect.catchAll(() => Effect.void));
             const interval = options.openTelemetry.intervalMilliseconds ?? 0;
-            const periodicFiber =
-              interval > 0
-                ? yield* Effect.gen(function* () {
-                    const clock = yield* ClockService;
-                    return yield* Effect.forever(
-                      clock
-                        .sleep(interval)
-                        .pipe(
-                          Effect.zipRight(
-                            Effect.suspend(() =>
-                              taskSnapshot === undefined
-                                ? Effect.void
-                                : exportMetrics(
-                                    taskSnapshot.tasks.some(
-                                      (task) => task.status === "failed",
-                                    )
-                                      ? 1
-                                      : 0,
-                                  ),
-                            ),
+            const periodicMetricsEnabled = metricsEnabled && interval > 0;
+            const periodicFiber = periodicMetricsEnabled
+              ? yield* Effect.gen(function* () {
+                  const clock = yield* ClockService;
+                  return yield* Effect.forever(
+                    clock
+                      .sleep(interval)
+                      .pipe(
+                        Effect.zipRight(
+                          Effect.suspend(() =>
+                            taskSnapshot === undefined
+                              ? Effect.void
+                              : exportMetrics(
+                                  taskSnapshot.tasks.some(
+                                    (task) => task.status === "failed",
+                                  )
+                                    ? 1
+                                    : 0,
+                                ),
                           ),
                         ),
-                    ).pipe(Effect.forkScoped);
-                  })
-                : undefined;
+                      ),
+                  ).pipe(Effect.forkScoped);
+                })
+              : undefined;
+            const updateTaskSnapshot = (snapshot: RunMetricSnapshot): void => {
+              taskSnapshot = snapshot;
+            };
             const exitCode = yield* executeRun(options, {
               onRemoteTokenResolved: (token) => {
                 remoteToken = token;
               },
-              onTaskMetricsResolved: (snapshot) => {
-                taskSnapshot = snapshot;
-              },
+              ...(metricsEnabled
+                ? { onFinalTaskMetricsResolved: updateTaskSnapshot }
+                : {}),
+              ...(periodicMetricsEnabled
+                ? { onTaskMetricsResolved: updateTaskSnapshot }
+                : {}),
             });
             if (periodicFiber !== undefined) {
               yield* Fiber.interrupt(periodicFiber);
