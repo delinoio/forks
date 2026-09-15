@@ -1,3 +1,4 @@
+import type { Scope } from "effect";
 import { Effect, Schedule } from "effect";
 import { joinPath } from "../core/path.js";
 import { CacheError, CacheRollbackError } from "../effect/errors.js";
@@ -269,6 +270,21 @@ export const recordRemoteCacheEvent = (
     }
   });
 
+const dispatchRemoteCacheEvent = (
+  options: RemoteCacheOptions,
+  hash: string,
+  event: "HIT" | "MISS",
+): Effect.Effect<
+  void,
+  never,
+  HttpService | RetryScheduleService | Scope.Scope
+> =>
+  recordRemoteCacheEvent(options, hash, event).pipe(
+    Effect.ignore,
+    Effect.forkScoped,
+    Effect.asVoid,
+  );
+
 export const restoreRemoteCache = (
   root: string,
   options: RemoteCacheOptions,
@@ -284,6 +300,7 @@ export const restoreRemoteCache = (
   | FileSystemService
   | RetryScheduleService
   | SigningService
+  | Scope.Scope
 > =>
   Effect.gen(function* () {
     const http = yield* HttpService;
@@ -293,7 +310,7 @@ export const restoreRemoteCache = (
     const signing = yield* SigningService;
     const url = artifactUrl(options, hash);
     yield* preflight(url, options);
-    return yield* fileSystem
+    const restored = yield* fileSystem
       .withTemporaryDirectory((directory) => {
         const compressedPath = joinPath(directory, "remote-cache.tar.zst");
         const archivePath = joinPath(directory, "remote-cache.tar");
@@ -327,9 +344,6 @@ export const restoreRemoteCache = (
             Effect.flatMap((response) =>
               Effect.gen(function* () {
                 if (response.status === 404) {
-                  yield* recordRemoteCacheEvent(options, hash, "MISS").pipe(
-                    Effect.ignore,
-                  );
                   return false;
                 }
                 if (response.status < 200 || response.status >= 300) {
@@ -399,9 +413,6 @@ export const restoreRemoteCache = (
                     Number.isFinite(duration) ? Math.max(0, duration) : 0,
                   ),
                 );
-                yield* recordRemoteCacheEvent(options, hash, "HIT").pipe(
-                  Effect.ignore,
-                );
                 return true;
               }),
             ),
@@ -414,6 +425,8 @@ export const restoreRemoteCache = (
             : remoteError(url, error.message),
         ),
       );
+    yield* dispatchRemoteCacheEvent(options, hash, restored ? "HIT" : "MISS");
+    return restored;
   });
 
 export const writeRemoteCache = (

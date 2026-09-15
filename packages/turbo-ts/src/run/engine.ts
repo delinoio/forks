@@ -1,3 +1,4 @@
+import type { Scope } from "effect";
 import { Effect, Fiber, Queue, Stream } from "effect";
 import { maximumCacheArchiveInputBytes } from "../cache/archive.js";
 import {
@@ -425,7 +426,8 @@ export const resolveOptions = (
   const configuredRemoteUploadTimeout = environmentValue(
     "TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT",
   );
-  const configuredUi = environmentValue("TURBO_UI");
+  const configuredUi =
+    parsed.ui === undefined ? environmentValue("TURBO_UI") : undefined;
   if (
     configuredUi !== undefined &&
     configuredUi !== "stream" &&
@@ -2575,7 +2577,7 @@ const executeTask = (
   logIdentifier = node.task,
   withOutputPermit: OutputPermit = (output) => output,
   writeStructuredRecord: WriteStructuredRecord = () => Effect.void,
-): Effect.Effect<TaskExecutionResult, unknown, RunRequirements> =>
+): Effect.Effect<TaskExecutionResult, unknown, RunRequirements | Scope.Scope> =>
   Effect.gen(function* () {
     const terminal = yield* TerminalService;
     const fileSystem = yield* FileSystemService;
@@ -3587,7 +3589,16 @@ export const executeRun = (
     const openTelemetryEnabled =
       parsed.openTelemetry.enabled ??
       environmentValue("TURBO_EXPERIMENTAL_OTEL_ENABLED") === "true";
+    const explicitRemoteApi = parsed.apiUrl ?? environmentValue("TURBO_API");
     const explicitRemoteToken = parsed.token ?? environmentValue("TURBO_TOKEN");
+    const explicitRemoteTeam =
+      parsed.team ??
+      environmentValue("TURBO_TEAM") ??
+      environmentValue("TURBO_TEAMID");
+    const remoteConnectionFullyExplicit =
+      explicitRemoteApi !== undefined &&
+      explicitRemoteToken !== undefined &&
+      explicitRemoteTeam !== undefined;
     const telemetryNeedsStoredToken =
       openTelemetryEnabled &&
       parsed.openTelemetry.useRemoteCacheToken === true &&
@@ -3596,9 +3607,10 @@ export const executeRun = (
       remoteCacheActive || telemetryNeedsStoredToken
         ? yield* CredentialService
         : undefined;
-    const projectCredentials = remoteCacheActive
-      ? yield* credentialService!.readProjectConfiguration(preliminaryRoot)
-      : undefined;
+    const projectCredentials =
+      remoteCacheActive && !remoteConnectionFullyExplicit
+        ? yield* credentialService!.readProjectConfiguration(preliminaryRoot)
+        : undefined;
     const remoteCacheNeedsStoredToken =
       remoteCacheActive &&
       explicitRemoteToken === undefined &&
@@ -4550,7 +4562,11 @@ export const executeRun = (
       const taskStartedAt = new Map<string, number>();
       const runNode = (
         id: string,
-      ): Effect.Effect<TaskOutcome, CacheRollbackError, RunRequirements> =>
+      ): Effect.Effect<
+        TaskOutcome,
+        CacheRollbackError,
+        RunRequirements | Scope.Scope
+      > =>
         Effect.gen(function* () {
           const clock = yield* ClockService;
           const startTime = yield* clock.now;

@@ -1937,9 +1937,75 @@ describe("hosted compatibility", () => {
       await rm(directory, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it("skips project credentials for a fully explicit remote connection", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "turbo-ts-explicit-remote-"),
+    );
+    const root = join(directory, "repository");
+    await prepareRepository(root);
+    await mkdir(join(root, ".turbo"), { recursive: true });
+    await writeFile(join(root, ".turbo/config.json"), "invalid credentials");
+    try {
+      await withServer(
+        (request) =>
+          request.url?.startsWith("/v8/artifacts/status") === true
+            ? [
+                200,
+                { "content-type": "application/json" },
+                '{"status":"enabled"}',
+              ]
+            : request.url?.startsWith("/v8/artifacts/events") === true
+              ? [201, {}, ""]
+              : request.method === "GET" &&
+                  request.url?.startsWith("/v8/artifacts/") === true
+                ? [404, {}, ""]
+                : [500, {}, "unexpected hosted request"],
+        async (baseUrl, requests) => {
+          const result = await runCandidate(
+            [
+              "run",
+              "build",
+              "--filter=synthetic-app",
+              "--cache=remote:r",
+              "--output-logs=none",
+              `--api=${baseUrl}`,
+              "--token=synthetic-token",
+              "--team=synthetic-team",
+              `--cwd=${root}`,
+            ],
+            root,
+          );
+          expect(result.code, result.stderr).toBe(0);
+          expect(
+            requests.some(
+              (request) =>
+                request.method === "GET" &&
+                request.path.startsWith("/v8/artifacts/status") &&
+                request.path.includes("slug=synthetic-team"),
+            ),
+          ).toBe(true);
+        },
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 describe("secondary command and parser compatibility", () => {
+  it("rejects attached values for the manual login flag", () => {
+    for (const attachedManual of [
+      "--manual=",
+      "--manual=false",
+      "--manual=true",
+    ]) {
+      expect(() => parseHostedArguments("login", [attachedManual])).toThrow(
+        "does not accept a value",
+      );
+    }
+  });
+
   it(evidenceId.secondaryCompatibility, async () => {
     const common = parseCommonArguments([
       "--skip-infer",

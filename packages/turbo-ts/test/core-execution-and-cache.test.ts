@@ -13733,6 +13733,99 @@ describe("cache interoperability and safety", () => {
     }
   }, 10_000);
 
+  it("reports remote cache hits and misses without blocking restoration", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "turbo-ts-remote-event-"));
+    const artifact = await Effect.runPromise(
+      Effect.gen(function* () {
+        const compression = yield* CompressionService;
+        return yield* compression.compressZstd(
+          createTarArchive([
+            {
+              path: "remote.txt",
+              contents: new TextEncoder().encode("remote\n"),
+              mode: 0o644,
+              modifiedSeconds: 1,
+            },
+          ]),
+        );
+      }).pipe(Effect.provide(nodeFoundationLayer)),
+    );
+    try {
+      for (const cacheHit of [false, true]) {
+        let eventInterrupted = false;
+        const eventStarted = Effect.runSync(Deferred.make<void>());
+        const httpLayer = Layer.succeed(HttpService, {
+          request: (request) =>
+            request.method === "POST"
+              ? Deferred.succeed(eventStarted, undefined).pipe(
+                  Effect.zipRight(Effect.never),
+                  Effect.onInterrupt(() =>
+                    Effect.sync(() => {
+                      eventInterrupted = true;
+                    }),
+                  ),
+                )
+              : Effect.fail(
+                  new BoundaryError({
+                    boundary: "test",
+                    message: "unexpected remote request",
+                    retryable: false,
+                  }),
+                ),
+          downloadToFile: (_request, destination) =>
+            cacheHit
+              ? Effect.promise(() => writeFile(destination, artifact)).pipe(
+                  Effect.as({ status: 200, headers: {} }),
+                )
+              : Effect.succeed({ status: 404, headers: {} }),
+        });
+        const outcome = await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const restored = yield* Effect.raceFirst(
+                restoreRemoteCache(
+                  directory,
+                  {
+                    apiUrl: "https://cache.invalid/api",
+                    timeoutMilliseconds: 30_000,
+                    uploadTimeoutMilliseconds: 30_000,
+                    preflight: false,
+                    requireSignature: false,
+                    sessionId: "01992345-6789-7abc-8def-0123456789ab",
+                  },
+                  cacheHit ? "hit" : "miss",
+                  allowCachePaths("remote.txt"),
+                ).pipe(
+                  Effect.map((value) => ({ timedOut: false as const, value })),
+                ),
+                Effect.sleep("1 second").pipe(
+                  Effect.as({ timedOut: true as const }),
+                ),
+              );
+              const reportingStarted = restored.timedOut
+                ? false
+                : yield* Effect.raceFirst(
+                    Deferred.await(eventStarted).pipe(Effect.as(true)),
+                    Effect.sleep("1 second").pipe(Effect.as(false)),
+                  );
+              return { reportingStarted, restored };
+            }),
+          ).pipe(
+            Effect.provide(httpLayer),
+            Effect.provide(nodeFoundationLayer),
+          ),
+        );
+        expect(outcome).toEqual({
+          reportingStarted: true,
+          restored: { timedOut: false, value: cacheHit },
+        });
+        expect(eventInterrupted).toBe(true);
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("falls back to execution when remote cache restoration fails", async () => {
     const directory = await makeFixture();
     const server = createServer((request, response) => {
@@ -14215,7 +14308,7 @@ describe("cache interoperability and safety", () => {
             options,
             "abcdefabcdefabcd",
             allowCachePaths("**"),
-          ).pipe(Effect.provide(nodeFoundationLayer)),
+          ).pipe(Effect.provide(nodeFoundationLayer), Effect.scoped),
         ),
       ).rejects.toThrow(/escaping symlink/);
       await expect(lstat(`${outside}/app`)).rejects.toThrow();
@@ -14230,12 +14323,17 @@ describe("cache interoperability and safety", () => {
     const directory = await mkdtemp(join(tmpdir(), "turbo-ts-remote-"));
     const linkedRoot = `${directory}-link`;
     const requestPaths: Array<string> = [];
+    let markEventStarted = (): void => undefined;
+    const eventStarted = new Promise<void>((resolve) => {
+      markEventStarted = resolve;
+    });
     let artifact = new Uint8Array();
     let tag = "";
     const server = createServer((request, response) => {
-      requestPaths.push(
-        new URL(request.url ?? "/", "http://127.0.0.1").pathname,
-      );
+      const requestPath = new URL(request.url ?? "/", "http://127.0.0.1")
+        .pathname;
+      requestPaths.push(requestPath);
+      if (requestPath.endsWith("/v8/artifacts/events")) markEventStarted();
       const chunks: Array<Buffer> = [];
       request.on("data", (chunk: Buffer) => chunks.push(chunk));
       request.on("end", () => {
@@ -14349,13 +14447,17 @@ describe("cache interoperability and safety", () => {
                 hmacSha256: () => Effect.fail(fileBoundaryError("signing")),
               }),
             );
-            return yield* restoreRemoteCache(
-              restoreRoot,
-              options,
-              "0011223344556677",
-              allowCachePaths("packages/app/**"),
-            ).pipe(Effect.provide(streamingLayer));
-          }).pipe(Effect.provide(nodeFoundationLayer)),
+            return yield* Effect.gen(function* () {
+              const restored = yield* restoreRemoteCache(
+                restoreRoot,
+                options,
+                "0011223344556677",
+                allowCachePaths("packages/app/**"),
+              );
+              yield* Effect.promise(() => eventStarted);
+              return restored;
+            }).pipe(Effect.provide(streamingLayer));
+          }).pipe(Effect.provide(nodeFoundationLayer), Effect.scoped),
         ),
       ).toBe(true);
       expect(downloadedArtifactPath).toBeDefined();
@@ -14376,7 +14478,7 @@ describe("cache interoperability and safety", () => {
             options,
             "0011223344556677",
             allowCachePaths("packages/app/**"),
-          ).pipe(Effect.provide(nodeFoundationLayer)),
+          ).pipe(Effect.provide(nodeFoundationLayer), Effect.scoped),
         ),
       ).rejects.toThrow(/signature is invalid/);
       expect(requestPaths).toEqual([
@@ -14430,7 +14532,11 @@ describe("cache interoperability and safety", () => {
           options,
           "1111222233334444",
           allowCachePaths("remote.txt"),
-        ).pipe(Effect.either, Effect.provide(nodeFoundationLayer)),
+        ).pipe(
+          Effect.either,
+          Effect.provide(nodeFoundationLayer),
+          Effect.scoped,
+        ),
       );
       expect(restore._tag).toBe("Left");
       const upload = await Effect.runPromise(
@@ -14530,7 +14636,7 @@ describe("cache interoperability and safety", () => {
             options,
             "9988776655443322",
             allowCachePaths("remote.txt"),
-          ).pipe(Effect.provide(nodeFoundationLayer)),
+          ).pipe(Effect.provide(nodeFoundationLayer), Effect.scoped),
         ),
       ).toBe(true);
       expect(await readFile(`${directory}/remote.txt`, "utf8")).toBe(
@@ -15036,7 +15142,7 @@ describe("cache interoperability and safety", () => {
             candidateRemoteOptions,
             "97b263bfd7db31de",
             allowCachePaths("packages/library/.turbo/turbo-build.log"),
-          ).pipe(Effect.provide(nodeFoundationLayer)),
+          ).pipe(Effect.provide(nodeFoundationLayer), Effect.scoped),
         ),
       ).toBe(true);
       expect(

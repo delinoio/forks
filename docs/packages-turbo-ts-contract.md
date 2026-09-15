@@ -881,8 +881,10 @@ stream, grouped, timestamped stream, and NDJSON output;
 completion and info; Chrome-compatible named and anonymous profiles; and the
 approved V8 heap snapshot and trace substitutions. TUI requests retain stream
 semantics when no interactive terminal is available, and all color output
-continues to honor `NO_COLOR`. Rendered graph files create missing destination
-parent directories. Interactive TUI mode renders task status and
+continues to honor `NO_COLOR`. An explicit `--ui` value takes precedence over
+`TURBO_UI`, and only the effective environment value is validated. Rendered
+graph files create missing destination parent directories. Interactive TUI
+mode renders task status and
 falls back to stream mode when either terminal side is non-interactive. JSON
 mode emits only newline-delimited JSON on stdout. Grouped mode serializes each
 completed task's full log replay. Structured log files append typed task events
@@ -976,8 +978,9 @@ callback.
 An explicit `--sso-team` adds the team slug
 to the browser authorization request and suppresses lower-precedence team IDs
 during validation. Manual and non-interactive login continue
-to require `--token` or `TURBO_TOKEN`; every login attempt ignores the persisted
-user token. Only tokenless interactive login resolves and validates the login
+to require `--token` or `TURBO_TOKEN`; `--manual` is valueless and rejects
+attached values, and every login attempt ignores the persisted user token. Only
+tokenless interactive login resolves and validates the login
 URL, so explicit-token login, link, and logout do not read an unused login URL.
 Windows browser launches pass the full callback URL directly to the system URL
 protocol handler without command-interpreter expansion. Unlink resolves only
@@ -1033,6 +1036,9 @@ activating remote cache. A shared credential read needed only for optional OTLP
 token reuse is best-effort and cannot prevent task execution. A shared stored
 token activates remote cache only for a project configuration with a persisted
 linked API URL; an absent or empty project configuration does not activate it.
+When higher-precedence CLI or environment values fully specify the remote API,
+token, and team identity, the lower-precedence project credential file is not
+read.
 Explicit CLI and environment tokens may activate the default API. An explicit
 team slug suppresses lower-precedence stored team IDs. Hosted and OTLP requests
 identify as `turbo-ts/0.1.0`. Runtime remote API selection uses CLI,
@@ -1041,7 +1047,9 @@ descending precedence, so a linked project's stored token is never redirected
 by a lower-precedence root API setting. A linked project's team ID likewise
 takes precedence over a root remote-cache team ID, and its team slug takes precedence over a root
 remote-cache team slug. Remote cache hit events are emitted only after signature
-verification, decompression, and archive restoration succeed.
+verification, decompression, and archive restoration succeed. Remote cache hit
+and miss event reporting runs as supervised best-effort background work and does
+not delay restoration or local task execution.
 Write-only remote publication issues an artifact HEAD request before upload,
 skips PUT when the artifact already exists, and warns but continues to PUT when
 the existence check fails.

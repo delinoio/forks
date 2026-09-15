@@ -1039,6 +1039,28 @@ version = "1.0.0"
     });
   });
 
+  it("lets an explicit UI mode override an invalid environment value", () => {
+    const model = repository([]);
+    expect(
+      resolveOptions(
+        parseRunArguments(["run", "build", "--ui=stream"]),
+        model.root,
+        { TURBO_UI: "invalid" },
+        model.rootConfiguration,
+        8,
+      ).ui,
+    ).toBe("stream");
+    expect(() =>
+      resolveOptions(
+        parseRunArguments(["run", "build"]),
+        model.root,
+        { TURBO_UI: "invalid" },
+        model.rootConfiguration,
+        8,
+      ),
+    ).toThrow("invalid UI mode");
+  });
+
   it("rejects remote cache timeouts above the Node timer limit", () => {
     const model = repository([]);
     const parsed = parseRunArguments([
